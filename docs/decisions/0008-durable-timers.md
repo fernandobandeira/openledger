@@ -126,11 +126,12 @@ review demonstrably does not.
 - **Statement close is a self-rescheduling one-shot job**, not a periodic job — per-customer
   timezones make it one anyway, and it avoids River's commercial tier, which gates durable periodic
   jobs.
-- **A licence decision is now due.** River is MPL-2.0 (file-level copyleft; linking is
-  unencumbered, but distributing a static binary carries a notice obligation). This project has no
-  LICENSE file yet. If MPL is unacceptable, `gue` (MIT) is the fallback — it has delayed jobs,
-  `SKIP LOCKED`, backoff, and transactional enqueue; uniqueness would be hand-rolled on the event
-  log's idempotency keys, which exist anyway.
+- **River is MPL-2.0**, which is *file-level* copyleft and so does not constrain this project's
+  licence (the repo is MIT). Two obligations do survive: shipping a static binary means telling
+  recipients how to obtain River's source (§3.2), and any River file we *modify* stays MPL. If MPL
+  ever becomes unacceptable, `gue` (MIT) is the fallback — delayed jobs, `SKIP LOCKED`, backoff,
+  transactional enqueue; uniqueness would be hand-rolled on the event log's idempotency keys, which
+  exist anyway.
 - Documentation and the architecture diagram still say "Postgres · Temporal" and need updating.
 
 ## The bet, named
