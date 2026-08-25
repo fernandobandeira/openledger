@@ -13,7 +13,7 @@ lender's collateral, and the financial statements.
 | [docs/v1-vision.md](./docs/v1-vision.md) | The design. Read this first. ([original board](./docs/v1-vision.html)) |
 | [docs/roadmap.md](./docs/roadmap.md) | What gets built, in what order, and why that order |
 | [docs/decisions/](./docs/decisions/) | ADRs — why the stack is what it is |
-| [docs/spikes/](./docs/spikes/) | Open questions being actively killed |
+| [spikes/](./spikes/) | Timeboxed investigations — brief, findings, and code together |
 
 ## The shape of it, in four sentences
 
@@ -42,5 +42,6 @@ internal/ledger/  the ledger core — accounts, transactions, entries, posting
 internal/pg/      database plumbing
 migrations/       ordered .sql, applied by `make migrate`
 docs/             vision, roadmap, decisions, spike briefs
-spikes/           throwaway investigation code — separate modules, not built by CI
+spikes/           timeboxed investigations: brief + findings + throwaway code,
+                  one directory each. Separate Go modules, not built by CI.
 ```

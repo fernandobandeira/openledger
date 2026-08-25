@@ -57,9 +57,9 @@ explicitly declined to need.
 **TigerBeetle** (cited in the vision's sources) — purpose-built double-entry, but it solves the
 throughput problem we do not have, and does not help with bitemporal reporting, RLS
 multi-tenancy, or the working-set tables. Worth reading for its invariants; not worth adopting.
-See [spike 001](../spikes/001-formance.md) for the "learn from, don't adopt" pattern.
+See [spike 001](../../spikes/001-formance/README.md) for the "learn from, don't adopt" pattern.
 
-## Corroboration from [spike 001](../spikes/001-formance.md)
+## Corroboration from [spike 001](../../spikes/001-formance/README.md)
 
 Two parts of this ADR were later tested against Formance's production history, and both held —
 one of them for a reason we had not thought of.

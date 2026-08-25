@@ -14,7 +14,7 @@ WHERE account_id = :acct AND recorded_at <= :as_of
 ORDER BY account_seq DESC LIMIT 1;
 ```
 
-[Spike 001](../spikes/001-formance.md) found that Formance built exactly this design, hit a
+[Spike 001](../../spikes/001-formance/README.md) found that Formance built exactly this design, hit a
 wall, and demoted it — the running balance is now a *projection of* a separate balance table,
 behind a feature flag that is off in their own minimal configuration. Not for scale reasons.
 For **backdating**.
