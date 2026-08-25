@@ -140,9 +140,20 @@ Two traps from Formance's bug history:
   003 found that sorting within a single clearing does *not* order locks across a batch —
   throughput collapsed 10× into deadlocks.
 
-**Done when:** N concurrent posters against overlapping account sets produce a gapless,
-duplicate-free sequence per account, every `balance_after` equals recomputation, and batch-wide
-ordering holds with batching enabled.
+**Partly done.** [`tests/concurrency.sh`](../tests/concurrency.sh) runs N writers against
+overlapping account sets, half of them posting the legs in reverse order, and asserts zero
+deadlocks, gapless per-account sequences, every transaction balanced, and both drift views empty.
+It also hammers one hold group through `record_auth_event`, which is where the ingest lock either
+serialises the read-modify-write or does not.
+
+That found a live gap: **the deterministic lock ordering this section prescribes was not
+implemented.** `post()` locked balance rows in whatever order the legs arrived, so two writers
+touching the same two accounts in opposite order deadlocked — 138 deadlocks and 138 rollbacks out
+of 320 postings, every failure a deadlock. Sorting the legs by account id takes it to **zero**, and
+the test fails if the sort is removed.
+
+**Done when:** the same holds with **batching** enabled, which does not exist yet — batch-wide
+ordering is the harder half of this milestone and is untested.
 
 ## M3 · The posting engine
 
