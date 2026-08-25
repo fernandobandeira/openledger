@@ -108,6 +108,56 @@ The bonus is a **free corruption alarm**: `balance_after` and the recorded-axis 
 always agree. Any divergence is a bug, detectable by a cheap periodic check. Formance has no
 equivalent, because their running balance is derived rather than independently computed.
 
+## The effective axis is NOT precalculated, and that cost is real
+
+An earlier point-in-time measurement in this project was **invalid** and is corrected here. It
+queried `recorded_at` on a dataset seeded with `recorded_at = effective_at` — zero backdating —
+so it could not have distinguished the axes at all. It measured the cheap path and was presented
+as the answer to the expensive question.
+
+Re-measured on 32,000 entries across 64 stripes with **every entry backdated** (effective dates
+uncorrelated with insertion order):
+
+| balance as of 250 days ago | answer | |
+| --- | --- | --- |
+| `balance_after` lookup with an `effective_at` predicate | 32,000.00 | **wrong — off by 2×** |
+| aggregate over `effective_at` | 16,000.00 | correct |
+
+The lookup returned the *entire* balance, because under heavy backdating the highest
+`account_seq` within the cut is almost certainly the last-inserted entry, whose `balance_after`
+already includes everything.
+
+Cost of the correct path, which has no precalculation to fall back on:
+
+| entries in range | effective-axis aggregate | recorded-axis lookup |
+| --- | --- | --- |
+| 0 | 0.13 ms | 11.5 ms |
+| 6,400 | 1.24 ms | 11.3 ms |
+| 16,000 | 2.50 ms | 11.5 ms |
+| 31,360 | **7.18 ms** | 11.9 ms |
+
+**Linear, at roughly 0.22 µs per entry in range**, against a flat lookup. It is cheaper at this
+size and crosses over around 50k entries — extrapolating to ~220 ms at 1M and ~2.2 s at 10M,
+consistent with the 105.91 ms measured for a single 1M-entry account.
+
+So the tradeoff this ADR makes is real and has a price: **we trade an unbounded UPDATE on
+backdating (Formance's cost) for an unbounded SCAN on business-date reporting (ours).** Both are
+O(n); ours is on the read path, is not on the auth deadline, and does not mutate history.
+
+### The bound, and accounting already knows it
+
+The scan must be bounded before this is a finished design, and the mechanism is the one
+accountants have used forever: **period close.** Materialize each account's balance at each period
+end, and a business-date query becomes *"prior period's closing balance + aggregate of entries in
+this period only."* That bounds the scan to one period regardless of total history, and the
+materialized closing balances are a thing the business wants to exist anyway.
+
+Note this is an **effective-axis checkpoint** and is not the same as the recorded-axis
+`balance_after`. It needs its own design, and — unlike Formance's mutable effective volumes — a
+backdated entry landing in a closed period must be handled explicitly (restated period, or a
+prior-period-adjustment entry in the open period), which is also what accounting practice already
+requires. Not designed here; a prerequisite for M5.
+
 ## Consequences
 
 - `ledger_entries.effective_at` is denormalized and immutable, with an index on
