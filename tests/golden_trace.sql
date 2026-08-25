@@ -334,34 +334,73 @@ SELECT expect_state('08 repayment complete', ARRAY[
 DO $$
 DECLARE v_profit bigint; v_due bigint;
 BEGIN
-    SELECT COALESCE(SUM(balance_minor) FILTER (WHERE category='revenue'),0)
-         - COALESCE(SUM(balance_minor) FILTER (WHERE category='expense'),0)
+    -- debit-positive: revenue carries a negative sign and expense a positive one,
+    -- so profit is the NEGATED sum of the two.
+    SELECT -COALESCE(SUM(balance_debit_positive)
+                     FILTER (WHERE category IN ('revenue','expense')), 0)
       INTO v_profit FROM trial_balance WHERE tenant_id='t1';
-    SELECT balance_minor INTO v_due FROM trial_balance
+    SELECT balance_debit_positive INTO v_due FROM trial_balance
      WHERE tenant_id='t1' AND purpose='due_from_treasury';
-    IF v_profit <> v_due THEN
+    -- IS DISTINCT FROM, not <>. Pointed at an account that does not exist, v_due is
+    -- NULL, `0 <> NULL` is NULL, and the assertion silently passed -- including on
+    -- an empty database.
+    IF v_profit IS DISTINCT FROM v_due THEN
         RAISE EXCEPTION 't1 profit % <> intercompany claim %', v_profit, v_due;
+    END IF;
+    IF v_profit IS NULL THEN
+        RAISE EXCEPTION 't1 profit is NULL -- the trace did not run';
     END IF;
     RAISE NOTICE 'ok  t1 profit % == its claim on treasury', v_profit;
 END $$;
 
--- Completeness: the roll-up must lose nothing. Every account type carries a
--- NOT NULL financial-statement line, so summing by fs_line must reproduce the
--- trial balance exactly. If a report could omit an account, the equation would
--- STILL hold -- the missing account drops out of both sides (ADR-0009).
+-- Completeness, for real this time.
+--
+-- The previous check compared SUM(debits) from trial_balance against SUM(debits)
+-- from trial_balance joined to account_types and fs_lines. Both joins are
+-- FK-guaranteed to preserve every row -- purpose is a FK to account_types, and
+-- fs_line is NOT NULL with a FK to fs_lines -- so the two sides were the same
+-- number by construction and the check could never fail. It read `0 = 0` on an
+-- empty database too. That is precisely the "green check that did not execute"
+-- this project criticises elsewhere.
+--
+-- The replacement enumerates every balance-sheet line FROM THE CHART and requires
+-- assets to equal liabilities plus equity, per scope and per currency. It fails
+-- loudly, and it did: before `current_year_earnings` existed, the sheet was out by
+-- exactly net income, because un-closed revenue and expense had nowhere to go.
 DO $$
-DECLARE v_tb bigint; v_fs bigint; v_lines bigint;
+DECLARE r record; n int := 0;
 BEGIN
-    SELECT COALESCE(SUM(debits),0) INTO v_tb FROM trial_balance;
-    SELECT COALESCE(SUM(t.debits),0), count(DISTINCT ty.fs_line) INTO v_fs, v_lines
-      FROM trial_balance t
-      JOIN account_types ty ON ty.code = t.purpose
-      JOIN fs_lines f ON f.code = ty.fs_line;
-    IF v_tb <> v_fs THEN
-        RAISE EXCEPTION 'roll-up lost %: trial balance % vs by-statement-line %',
-            v_tb - v_fs, v_tb, v_fs;
+    FOR r IN SELECT * FROM balance_sheet_balances() LOOP
+        n := n + 1;
+        IF NOT r.balanced THEN
+            RAISE EXCEPTION 'balance sheet for %/% is out by %: assets % vs L+E %',
+                r.tenant_id, r.currency, r.assets - r.liabilities_and_equity,
+                r.assets, r.liabilities_and_equity;
+        END IF;
+        RAISE NOTICE 'ok  balance sheet %/%: assets % = liabilities + equity %',
+            r.tenant_id, r.currency, r.assets, r.liabilities_and_equity;
+    END LOOP;
+    IF n <> 2 THEN
+        RAISE EXCEPTION 'expected a balance sheet for both scopes, got %', n;
     END IF;
-    RAISE NOTICE 'ok  roll-up complete: % over % statement line(s)', v_tb, v_lines;
+END $$;
+
+-- And the income statement, enumerated from the chart, must reconcile to the
+-- earnings line the balance sheet carries.
+DO $$
+DECLARE v_is bigint; v_bs bigint;
+BEGIN
+    SELECT COALESCE(SUM(-tb.balance_debit_positive),0) INTO v_is
+      FROM trial_balance tb JOIN account_types ty ON ty.code = tb.purpose
+      JOIN fs_lines f ON f.code = ty.fs_line
+     WHERE f.statement = 'income_statement';
+    SELECT COALESCE(SUM(amount_minor),0) INTO v_bs
+      FROM balance_sheet WHERE fs_line = 'current_year_earnings';
+    IF v_is IS DISTINCT FROM v_bs THEN
+        RAISE EXCEPTION 'income statement (%) does not tie to retained earnings (%)',
+            v_is, v_bs;
+    END IF;
+    RAISE NOTICE 'ok  income statement ties to the balance sheet: %', v_is;
 END $$;
 
 ROLLBACK;
