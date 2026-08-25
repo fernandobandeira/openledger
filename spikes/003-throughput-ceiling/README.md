@@ -632,6 +632,114 @@ hardware-specific and the *mechanisms* as general.
   invalidate the throughput numbers, but it is a bug in the harness and a trap for anyone reading
   it as reference code.
 
+## External validation — what the industry actually does
+
+Researched across published engineering writeups. This reframes several of our conclusions.
+
+### We rediscovered a benchmark from 1985
+
+Jim Gray et al., *"A Measure of Transaction Processing Power"* (Datamation, 1985) — the
+**DebitCredit** benchmark, later TPC-A/TPC-B — models 10 branches, 100 tellers, 10,000 accounts.
+Every transaction touches a customer account **and** a branch account, so ~10 branch rows absorb
+every write. **The hot-shared-account bottleneck was constructed deliberately, forty years ago, as
+the defining OLTP stress case.** Our `network_settlement_payable` is TPC-B's branch record.
+
+### The consensus fix is batching, NOT splitting — and two teams rejected splitting explicitly
+
+| Team | Approach | Evidence |
+| --- | --- | --- |
+| **Uber** | 250ms batch windows, one read + one write per batch | 3–4 → **30+ ops/sec per account**; bulk jobs 21–24h → minutes |
+| **Modern Treasury** | Sync/async router; hot entries queued and coalesced | p90 processing 1s; **1,200 txn/s (4,800 entries/s)** in production |
+| **TigerBeetle** | Batching up to 8,190 transfers per query | — |
+| **Fragment** | Coalesced balance updates | p95 staleness 10s at 10k entries/s |
+
+**Uber considered splitting the account and declined:** *"Using multiple DynamoDB rows for a single
+account complicates the single-balance concept and hot account detection."*
+
+**TigerBeetle argues sharding cannot fix it:** *"a small number of hot accounts are often involved
+in a large proportion of the transactions, so the shards responsible for those accounts become
+bottlenecks."*
+
+This ranks batching **above** striping more strongly than our localhost numbers do — and
+[Result 9](#result-9--round-trips-and-why-localhost-lies-about-them) already predicted exactly
+that reordering on managed Postgres, where round trips cost 10× more.
+
+### Modern Treasury's published guidance: never lock the hot account
+
+> *"it is best practice to ensure that the hot account receives only asynchronous entries, so that
+> it can perform at high throughput… Often, transactions that involve a hot account will write
+> other entries that involve lower throughput accounts, like user-specific account. In this case,
+> the optimal design is locking only on these user accounts."*
+
+This is a **third option we never measured**: lock the tenant leg synchronously, let the house leg
+land asynchronously. [Result 2](#result-2--per-account-contention-on-the-customer-account-is-irrelevant)
+already showed the tenant leg is nearly free to lock (12% cost even fully concentrated). This is
+also **memo posting**, the technique core banking has used since the 1970s — provisional entries
+during the day, hard posting in an end-of-day batch.
+
+### The principled defence of per-tenant accounts is a modelling argument, not a performance one
+
+Martin Richards, on scaling a PSP ledger:
+
+> *"If you have a single account every payment touches, you're probably modeling an aggregate that
+> doesn't exist in the business."*
+
+This is the distinction that survives our skew correction. **Random stripes produce sub-accounts
+whose individual balances are meaningless. Per-tenant house accounts produce sub-accounts that are
+each a real, auditable, reportable figure.** Tenant A's interchange revenue and tenant B's were
+never one number in anyone's accounting — the current schema merges them by accident of
+`tenant_id NULL`. Richards splits revenue per acquirer BIN for the same reason.
+
+So the honest position: **per-tenant splitting is justified as a modelling correction, and
+striping is justified as the performance mechanism.** They are different arguments and we
+conflated them.
+
+### Escrow is not the technique we were missing
+
+Escrow (O'Neil, TODS 1986; IMS/VS Fast Path field calls, 1985) exists to enforce an invariant —
+*balance must not go negative* — on a hot account **without** serializing. Our house accounts have
+no such invariant; nothing checks that interchange revenue stays positive. **Applied to an
+unconstrained accumulator, escrow degenerates to "don't take the lock at all"** — which is exactly
+[Result 11](#result-11--do-we-need-the-lock-at-all-no). We are not missing it.
+
+Where it *would* apply: a per-tenant credit line with a hard limit checked on the auth path. Worth
+keeping for the reference product, not for house accounts.
+
+### Checkpointing is proven in production
+
+Monzo moved from pure aggregate-on-read to precomputed **"block" balances** — exactly the
+checkpointing scheme [Result 11](#result-11--do-we-need-the-lock-at-all-no) identified as
+mandatory. P99 balance read **400–500ms → ~200ms**. Their root cause is instructive: no time
+component in the partition key, so partitions grew unbounded.
+
+### Practices worth stealing
+
+- **Shopify enforces cross-shard safety in CI**, with verifiers named "Cross Shard Transaction",
+  "Cross Shard Write", "Cross Keyspace Query". Our "no cross-tenant transactions" claim is only
+  true if *enforced*. A CI check that no transaction's entry set spans more than one `tenant_id`
+  is the mechanical version — and it would have caught our `uq_accounts__house` problem.
+- **Modern Treasury degrades automatically on cache drift**: they verify cached balances against
+  the sum of entries and *"automatically turn off cache reads for Accounts that have drifted."*
+  That strengthens [ADR-0003](../../docs/decisions/0003-bitemporal-balances.md)'s self-audit from
+  "alarm" to "alarm and fall back to truth."
+- **Nubank's #1 published regret** is missing a customer ID on every transaction, which
+  *"dramatically"* complicated later sharding. That is our `tenant_id NULL` problem exactly.
+
+### The counter-argument to engage
+
+**Adyen rejected domain-based sharding** and shards round-robin instead: *"if we would put each
+processing merchant in one database, you still need to go to every shard when you need aggregate
+data."* Their objection is weaker for a ledger — balances, statements, and a tenant's own P&L are
+all tenant-local, and the operator's cross-tenant P&L is a batch read. But it is worth answering
+rather than ignoring.
+
+### What appears to be genuinely unpublished
+
+No source documents per-tenant copies of a house revenue account as a named pattern. Our Result 3
+and Result 12 measurements appear to be **novel published data** — which is an asset, but means
+ADR-0007 should present it as "the natural consequence of tenant sharding, measured here" rather
+than as industry standard.
+
 ## What this does NOT measure
 
 Stated so the numbers are not over-read:
