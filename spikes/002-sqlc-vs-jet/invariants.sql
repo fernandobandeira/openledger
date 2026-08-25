@@ -1,3 +1,16 @@
+-- Invariant suite: each test attempts an illegal write and asserts Postgres REFUSES it.
+-- Expected on a clean schema: 7 of 9 error (T1,T2,T3,T5,T6,T7,T9); T4 and T8 succeed.
+--
+-- ⚠️ REQUIRES A FRESH DATABASE. It creates fixed account and idempotency-key names, so
+-- running it against a database that already holds data (the golden trace, say) makes
+-- the setup collide on uq_accounts__owned and later tests fail for the wrong reason --
+-- T3 gets refused by account_seq instead of by the balance trigger, which would still
+-- look like a pass if you only counted errors.
+--
+-- When this becomes a CI check (ADR-0006), give it its own database. Namespacing the
+-- identifiers instead was tried and is NOT sufficient: the entries in T3/T4 target
+-- accounts by name, so renaming them changes which account_seq values collide.
+
 \set ON_ERROR_STOP 0
 \echo '=== setup: two accounts ==='
 INSERT INTO ledger_accounts (tenant_id, owner_type, owner_id, purpose, category, normal_balance, currency)
