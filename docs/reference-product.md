@@ -376,7 +376,7 @@ when they spend, and again when they pay.
 | customer_receivable | 0 | 0 | 300.00 | 500.00 | 500.00 | 500.00 | 500.00 | 500.00 | 500.00 | 0 | 0 |
 | operating_cash | 66.00 | 66.00 | 66.00 | 66.00 | 491.00 | 0 | 0 | 0 | 500.00 | 500.00 | 68.76 |
 | network_settlement_pay | 0 | 0 | 294.60 | 491.00 | 491.00 | 0 | 0 | 0 | 0 | 0 | 0 |
-| ach_pull_unsettled | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 500.00 | 0 | 0 |
+| ach_pull_returnable | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 500.00 | 0 | 0 |
 | facility_borrowings | 0 | 0 | 0 | 0 | 425.00 | 425.00 | 425.00 | 425.00 | 425.00 | 425.00 | 0 |
 | accrued_interest_pay | 0 | 0 | 0 | 0 | 0 | → | → | 3.54 | 3.54 | 3.54 | 0 |
 | platform_rev_share_pay | 0 | 0 | 1.62 | 2.70 | 2.70 | 2.70 | 2.70 | 2.70 | 2.70 | 2.70 | 0 |
@@ -465,7 +465,7 @@ Also in the chart, untouched by a card trace: `fbo_cash`, `customer_wallet`,
 *~2 banking days · cash is in the account, and reversible*
 
 - `ach_transfers` **UPDATE**: `state=settled`
-- ledger `evt_pull:settle`: `DR operating_cash 500.00` / `CR ach_pull_unsettled 500.00`
+- ledger `evt_pull:settle`: `DR operating_cash 500.00` / `CR ach_pull_returnable 500.00`
 - The cash is real and in your bank. **The receivable is untouched** — corporate ACH (CCD/CTX)
   can still come back R01 for ~2 banking days, so you hold a matching liability instead of
   extinguishing the debt.
@@ -474,7 +474,7 @@ Also in the chart, untouched by a card trace: `fbo_cash`, `customer_wallet`,
 ### 7.3 — Return window closes
 *durable timer · the money is finally yours*
 
-- ledger `evt_pull:final`: `DR ach_pull_unsettled 500.00` / `CR customer_receivable 500.00`
+- ledger `evt_pull:final`: `DR ach_pull_returnable 500.00` / `CR customer_receivable 500.00`
 - Only now is the debt extinguished. Release credit at 7.1 and they spend money that never
   arrived; release at 7.2 and they spend money that gets clawed back. The 2-day corporate
   window is short enough that risk-based instant release is a viable **product** — but that's

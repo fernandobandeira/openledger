@@ -34,8 +34,12 @@ psql: ## Open a psql shell
 	psql "$(DB_URL)"
 
 .PHONY: test
-test: ## Run tests
+test: test-sql ## Run every test
 	go test ./...
+
+.PHONY: test-sql
+test-sql: ## Run the SQL suites against a throwaway database
+	@./tests/run.sh
 
 .PHONY: build
 build: ## Build the binary

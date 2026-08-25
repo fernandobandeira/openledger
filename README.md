@@ -20,8 +20,10 @@ Its **reference implementation** is an embedded B2B charge card funded by a cred
 product exists to prove the core carries something real without forking, and to give the core a
 demanding acceptance test. It is not the project.
 
-**Status:** pre-implementation. The schema exists and is verified, but lives in a spike until M1
-graduates it.
+**Status:** pre-implementation, but the schema is real and attested. `migrations/` holds the
+ledger core, the chart of accounts, and the card hold model; `tests/` replays a full card
+lifecycle against them and then tries nineteen ways to break it, each of which must be
+refused. No Go service yet.
 
 ## Start here
 
@@ -30,6 +32,7 @@ graduates it.
 | [docs/vision.md](./docs/vision.md) | What this is, what is non-negotiable, and a primer if you have never built a ledger. **Read this first.** |
 | [docs/roadmap.md](./docs/roadmap.md) | What gets built, in what order, and why that order |
 | [docs/decisions/](./docs/decisions/) | ADRs — every architectural decision and its reasoning |
+| [tests/](./tests/) | The acceptance suites — a full card lifecycle, and every way we know to break it |
 | [spikes/](./spikes/) | Timeboxed investigations — brief, findings, and code together |
 | [docs/reference-product.md](./docs/reference-product.md) | The reference card product this ledger was designed against |
 
@@ -40,7 +43,8 @@ Requires Go 1.26+, Docker, and `psql`.
 ```sh
 make up        # start postgres on :5433
 make migrate   # apply migrations
-make test
+make test-sql  # replay the golden trace + every negative control
+make test      # the above, plus go test
 make help      # everything else
 ```
 
@@ -51,6 +55,9 @@ cmd/openledger/   entrypoint
 internal/ledger/  the ledger core — accounts, transactions, entries, posting
 internal/pg/      database plumbing
 migrations/       ordered .sql, applied by `make migrate`
+                  seed/ is example data — the card chart of accounts
+tests/            SQL acceptance suites, run by `make test-sql` against a
+                  throwaway database
 docs/             vision, roadmap, decisions, reference product spec
 spikes/           timeboxed investigations, one directory each.
                   Separate Go modules, not built by CI.

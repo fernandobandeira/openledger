@@ -12,15 +12,20 @@ part of the product — something unrunnable is not adoptable, however correct i
 
 # Phase 1 — the core
 
-## M0 · The conformance suite
+## M0 · The conformance suite — **mostly done**
 
-Properties, not a trace. The card lifecycle fixture tests the *product*, so it moves to M7.
+[`tests/`](../tests/) exists and runs against a throwaway database via `make test-sql`:
+a full card lifecycle asserted state-by-state, the hold flow, and nineteen deliberate breakages
+that must each be refused. Writing it found four real defects, two of which under-reserved credit
+([ADR-0010](./decisions/0010-authorization-holds.md)).
 
-Promote two things out of the spikes rather than rewriting them:
-[`invariants.sql`](../spikes/002-sqlc-vs-jet/invariants.sql) (nine invariants, each asserting
-Postgres *refuses* an illegal write) and
-[spike 003's verification queries](../spikes/003-throughput-ceiling/README.md), which ran clean
-over 1,721 accounts under concurrent load.
+One design note, learned the hard way: **counting errors is not a pass criterion.** An earlier
+suite expected "seven failures" and got eight, and the extra one was a *different* invariant
+failing for an unrelated reason. Every assertion names what it asserts, and every refusal checks
+the reason, not merely that something was refused.
+
+Still open: putting it in CI, and the
+[ADR-0006 schema snapshot test](./decisions/0006-schema-conventions.md).
 
 The properties the core must hold, at any point, against any history:
 
@@ -31,15 +36,26 @@ The properties the core must hold, at any point, against any history:
 - An as-of query at instant T returns the same answer whenever it is re-run.
 - **No transaction's entry set spans more than one tenant.** New, and load-bearing — see M1.
 
-**Done when:** the suite runs against a live database, fails loudly when an invariant is broken on
-purpose, and is in CI alongside the
-[ADR-0006 schema snapshot test](./decisions/0006-schema-conventions.md).
+Of these, the as-of reproducibility property is **not yet asserted** — it is blocked on
+[ADR-0005](./decisions/0005-reproducible-as-of.md), which is still `proposed`. The rest are.
 
-## M1 · Schema, invariants, and the snapshot test
+**Done when:** the suite is in CI alongside the schema snapshot test, and the as-of property is
+covered.
 
-Starts from [`schema.sql`](../spikes/002-sqlc-vs-jet/schema.sql), which already applies cleanly
-with nine Postgres-enforced invariants. Tables: `ledger_accounts`, `ledger_transactions`,
-`ledger_entries`, `ledger_account_balances`, `ledger_events`. No API, no Go beyond migrations.
+## M1 · Schema, invariants, and the snapshot test — **schema landed**
+
+[`migrations/0001`](../migrations/0001_ledger_core.sql) is the core —  `ledger_accounts`,
+`ledger_transactions`, `ledger_entries`, `ledger_account_balances`, `ledger_events` — written by
+hand rather than promoted from the spikes, which held three competing posting engines and two
+competing hold models. [`0002`](../migrations/0002_chart_of_accounts.sql) adds the chart of
+accounts and the completeness layer ([ADR-0009](./decisions/0009-chart-and-completeness.md));
+[`0003`](../migrations/0003_card_holds.sql) the hold model
+([ADR-0010](./decisions/0010-authorization-holds.md)). No API, no Go beyond migrations.
+
+Landed with it: composite `(tenant_id, …)` keys throughout, the cross-tenant guard as a composite
+foreign key, `REVOKE UPDATE, DELETE` on the journal, and the drift views both ADR-0003 and
+ADR-0010 rely on. **Striping is not built** — it is still one integer on the account row and a
+`SUM` on read, and nothing in `migrations/` implements it yet.
 
 Carried forward: balanced-per-currency enforced by the database; append-only via
 `REVOKE UPDATE, DELETE` from the app role; `amount_minor bigint CHECK (> 0)` so direction carries
@@ -50,14 +66,13 @@ majority of the lifecycle that writes no ledger transaction: authorizations, dec
 expiry, reversals, statement close, limit changes. None of those can be made idempotent today,
 because idempotency lives on a table they never touch.
 
-**Composite `(tenant_id, …)` keys.** Every ledger table gets `tenant_id NOT NULL` (`ledger_entries`
-has none today); primary keys become `(tenant_id, id)`, `UNIQUE (account_id, account_seq)` becomes
-`(tenant_id, account_id, account_seq)`, and every index and foreign key gains the prefix.
+**Composite `(tenant_id, …)` keys — done.** Every ledger table carries `tenant_id NOT NULL`,
+primary keys are `(tenant_id, id)`, and every index and foreign key carries the prefix.
 
-**This is the one irreversible decision on the list, and it is free right now.** It is the
-prerequisite for row-level security, partitioning, and ever splitting across instances — none work
-without it, all are expensive to retrofit. Notion named exactly this omission as their sharding
-regret. Do it before there is data.
+**This was the one irreversible decision on the list, and it was free.** It is the prerequisite for
+row-level security, partitioning, and ever splitting across instances — none work without it, all
+are expensive to retrofit. Notion named exactly this omission as their sharding regret. It is in
+before there is data, which was the whole point.
 
 **Tenant-local transactions, via intercompany clearing.** Some accounts genuinely cannot be
 per-tenant: `operating_cash` mirrors *one real bank account*. A treasury transaction therefore
@@ -67,14 +82,19 @@ half, leaving their books out by the full amount
 `due_to_tenants` pair, splitting one cross-scope transaction into two, each balanced *within* one
 scope. That is why "no transaction spans a tenant" is a conformance property, not an optimization.
 
+[The golden trace](../tests/golden_trace.sql) now runs on that pair rather than describing it: the
+facility draw, the network settlement and the ACH collection are all cross-scope, both scopes
+balance independently at every step, and the two sides are asserted to eliminate exactly. The
+program's profit turns out to equal its claim on treasury, from opposite directions.
+
 **Striping as a schema concept.** An account declares a stripe count; balance reads `SUM` across
 stripes. One integer on the account row, worth roughly 8×. Note *striping* is the contention
 mechanism, not per-tenant splitting — at 90/10 skew per-tenant gave 1.07× while striping still gave
 7.8×. Per-tenant accounts earn their place for reconciliation and tenant-locality, not throughput.
 
-**Done when:** every invariant has a migration and a test that tries to violate it and is refused
-*by Postgres*; the schema snapshot test is in CI; and no transaction can be constructed that spans
-two tenants.
+**Done when:** the schema snapshot test is in CI, and striping exists. The rest is done — every
+invariant listed above has a migration and a negative control that is refused *by Postgres*, and
+`fk_entries__txn` makes a cross-tenant transaction structurally unrepresentable.
 
 ## M2 · The concurrency proof
 
@@ -155,8 +175,8 @@ defaults to transaction *start* time and is not monotonic with commit order, so 
 query can return different answers when re-run. A reproducible cursor must be commit-ordered.
 Decide it before writing code against `recorded_at <= :as_of`.
 
-Also unbounded: the effective-axis aggregate grows linearly with history (~220 ms at 1M entries in
-range). Period-close checkpoints are the bound — materialize each account's closing balance per
+Also unbounded: the effective-axis aggregate grows linearly with history — measured 105.91 ms at
+1M entries in range. Period-close checkpoints are the bound — materialize each account's closing balance per
 period so a business-date query reads "prior close + entries since."
 
 **Done when:** an as-of query at instant T returns the same answer when re-run under concurrent
@@ -187,13 +207,17 @@ Only after Phase 1 holds. A *consumer* of the ledger, not part of it.
 [the reference product spec §03](./reference-product.md), against a fake processor. Read-only with respect to the ledger:
 an authorization writes no entry.
 
-The vision doc's balance table — 12 accounts × 11 columns plus three branch cases, with the
-accounting equation checking at every column — is this milestone's acceptance test. It includes the
-edge cases that decide whether you have built this before: over-capture clamping, forced posts,
-negative available credit as a **legal state**, and duplicate auths returning the **stored**
-decision rather than re-evaluating against a limit that may have moved.
+[The reference product's](./reference-product.md) balance table is this milestone's acceptance
+test, and it already replays: [`tests/golden_trace.sql`](../tests/golden_trace.sql) asserts the
+complete state after every step, and [`tests/card_holds.sql`](../tests/card_holds.sql) covers
+the hold flow including over-capture clamping, expiry, re-delivery and re-grouping.
 
-**Done when:** the golden trace replays end to end and every column matches, branch cases included.
+What is **not** covered, and is the real remaining work here: forced posts, negative available
+credit as a **legal state**, duplicate auths returning the **stored** decision rather than
+re-evaluating against a limit that may have moved, and STIP. Those need `credit_lines` and
+`spend_controls`, which do not exist.
+
+**Done when:** the branch cases replay too, against a fake processor.
 
 ## M8 · Durable timers
 

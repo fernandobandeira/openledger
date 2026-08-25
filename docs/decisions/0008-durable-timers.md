@@ -71,8 +71,7 @@ the specialised backend.
 
 ## The reframe that lowers the bar
 
-`card_holds.expires_at` is already a column, and available credit is computed from
-`WHERE state = 'open'` — **not** from `expires_at`. So a hold that has expired but not yet been
+`card_holds.expires_at` is already a column, and available credit is computed from `card_hold_groups.held_minor` — **not** from `expires_at`. So a hold that has expired but not yet been
 swept still counts against available credit.
 
 Every timer here **fails conservatively when it fires late**: a late expiry under-reports available
@@ -80,8 +79,20 @@ credit, a late ACH finalization keeps a receivable open longer. Nothing produces
 only a temporarily pessimistic one. The deadline is durable in our own table regardless; the
 scheduler is an *actuator*, not a correctness-critical component.
 
-So we also add a **reconciliation sweep** — `WHERE state = 'open' AND expires_at < now()`, behind a
+So we also add a **reconciliation sweep** — `WHERE expired_at IS NULL AND hold_expires_at < now()` over `card_hold_groups`, behind a
 partial index. It costs almost nothing and makes a lost job recoverable rather than silent.
+
+## Amendment — the schema moved
+
+This ADR was written against `card_holds`, which had a `state` column. Migration 0003 replaced it
+with `card_auth_events` + `card_hold_groups`, so the prescribed sweep predicate no longer exists
+as written and has been updated above.
+
+The *conclusion* survives, and for the same reason: an unswept expired hold still counts toward
+`held_minor` until the flag is set, so a lost timer job leaves the ledger temporarily
+**pessimistic**, never wrong. But the reframe rested on a specific predicate, and that predicate
+was dead for a while before anyone noticed — which is an argument for the schema snapshot test in
+[0006](./0006-schema-conventions.md) covering ADR-quoted SQL too.
 
 ## Consequences
 

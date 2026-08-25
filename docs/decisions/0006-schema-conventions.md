@@ -36,9 +36,7 @@ failure four times from two migrations.
 
 **3. Keep foreign keys.** Formance has essentially none — nullable back-pointers with no
 referential integrity — which is defensible for an engine chasing unconstrained write throughput.
-It is the wrong trade here, and we can now say so with numbers rather than taste: spike 003
-benchmarked this FK-carrying schema at **800 clearings/s unsharded and 7,897 striped**, and
-located the bottleneck precisely as row-lock contention on shared accounts. Not FK validation, not
+It is the wrong trade here, and we keep them on the project's stated correctness priority, NOT on a measurement. Not FK validation, not
 index maintenance, not I/O. The cost Formance dropped FKs to avoid is one we looked for and could
 not find. A general engine has *more* reason to keep them, because integrators will do things we
 never anticipated and a constraint is the only part of the design that survives an unanticipated

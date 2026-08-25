@@ -210,8 +210,11 @@ BEGIN
      LIMIT 1;
 
     IF FOUND THEN
+        -- COALESCE because a one-legged transaction reports the missing side as
+        -- NULL, which reads as though the value were unknown rather than zero.
         RAISE EXCEPTION 'transaction % does not balance in %: debits=% credits=%',
-            NEW.transaction_id, offending.currency, offending.dr, offending.cr;
+            NEW.transaction_id, offending.currency,
+            COALESCE(offending.dr, 0), COALESCE(offending.cr, 0);
     END IF;
     RETURN NULL;
 END $$;
