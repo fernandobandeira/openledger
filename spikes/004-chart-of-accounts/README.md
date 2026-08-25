@@ -442,6 +442,66 @@ ledger a valid ledger in its own right.
   Transaction". The equivalent here: assert no transaction's entry set spans more than one
   `tenant_id`. That check is cheap and belongs in M1.
 
+## RLS — three constraints measured on our own stack
+
+### `COPY FROM` is not supported on RLS tables. This conflicts with our batching design.
+
+```
+ERROR:  COPY FROM not supported with row-level security
+```
+
+Measured on PG 18.6. [Spike 002](../002-sqlc-vs-jet/README.md) found `CopyFrom` load-bearing —
+it is what made sqlc's native pgx mode worth choosing — and
+[spike 003 Result 5](../003-throughput-ceiling/README.md) uses `tx.CopyFrom` to insert a
+coalesced batch of entries, the lever worth 4.4×.
+
+**RLS on `ledger_entries` and bulk `COPY` batching are mutually exclusive.** Options: run the
+posting path as a `BYPASSRLS` role (RLS then protects only the read path — which is arguably all
+we wanted it for), fall back to multi-row `INSERT` for batches, or scope RLS to reads via views.
+This needs deciding, not discovering.
+
+### The policy must be written one specific way
+
+`current_setting()` is `STABLE`, not `IMMUTABLE`, so inside a policy it can be re-evaluated
+**per row**. Wrapping it in a scalar subquery forces an InitPlan evaluated once per statement.
+Supabase measured 178,000 ms → 12 ms on exactly this fix.
+
+```sql
+-- WRONG: evaluated per row
+USING (tenant_id = current_setting('app.tenant_id'))
+-- RIGHT: InitPlan-cached, and fails CLOSED when the GUC is unset
+USING (tenant_id = (SELECT current_setting('app.tenant_id', true)))
+```
+
+The two-argument form matters: one-arg *errors* when unset, two-arg returns NULL and
+`tenant_id = NULL` matches nothing.
+
+### Enums are not leakproof — but our hot path is safe
+
+Non-leakproof operators cannot be reordered ahead of the RLS security barrier, which routinely
+costs an index scan. Measured on our types:
+
+| operator | |
+| --- | --- |
+| `enum_eq` | **NOT leakproof** |
+| `uuid_eq`, `int8eq`, `texteq`, `timestamptz_le` | leakproof |
+
+Our hot-path indexes lead with `account_id` (uuid), `account_seq` (int8), and `recorded_at`
+(timestamptz) — all leakproof, so `ix_entries__balance_lookup` is unaffected. The exposure is on
+reporting queries filtering by `direction`, `state`, or `status`. Worth knowing before someone
+adds an enum to the leading column of an index.
+
+### Also worth banking
+
+- **The app role must not own the tables** — owners bypass RLS. Add `FORCE ROW LEVEL SECURITY`.
+- Use `SET LOCAL` per transaction, never `SET ROLE` per tenant. Two RLS plan-cache CVEs in two
+  years (CVE-2024-10978, CVE-2026-14666) were both triggered by role switching.
+- Only `pg_advisory_xact_lock` survives transaction pooling; session-level `pg_advisory_lock`
+  leaks onto the next client's connection.
+- **RDS Proxy may pin the session on `SET`** for PostgreSQL — which would defeat the
+  `SET LOCAL` GUC pattern on AWS's own proxy. Unverified; needs testing against
+  `DatabaseConnectionsCurrentlySessionPinned` before we recommend the combination.
+
 ## Open — posting rules
 
 The remaining piece of "how they tie together." A deployment declares its chart; it must also
