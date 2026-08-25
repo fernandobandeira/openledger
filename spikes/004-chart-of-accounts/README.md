@@ -121,6 +121,127 @@ recovered from `uuidv7` primary keys instead.
 **And the equation held under the wrong order anyway** — which is the theorem doing its job. Order
 independence is exactly what "any union of whole transactions is balanced" buys.
 
+## The accounting view — researched, and it changed the design
+
+### The vocabulary is "control account + subsidiary ledger", and our version is safer
+
+Splitting one reported figure across many physical accounts is the **centuries-old** bookkeeping
+norm: a **control account** in the general ledger carries the total, a **subsidiary ledger** holds
+the individual accounts, and the two are reconciled. Accounts receivable ↔ one account per
+customer is the canonical case. We are not proposing anything exotic; we are proposing a
+subsidiary ledger.
+
+**And our version is strictly stronger than the classical one.** In classical bookkeeping the
+control balance is *separately maintained* and can therefore drift from the subledger — which is
+why monthly control-account reconciliation is a SOX key control. In our design the total is
+**defined as** `SUM(instances)` over the same rows. Drift is not detected; it is impossible.
+
+That moves the entire risk onto one question: **is the set summed the complete set?**
+
+### The framing that dissolves most of the objection
+
+An accountant looking at our schema sees **`account_types` = the chart of accounts (16 entries)**
+and **`ledger_accounts` = dimensioned instances**. `interchange_revenue` is *one* account in the
+chart no matter how many rows carry that `purpose`.
+
+This matters because ERP practice is blunt about it: put the **"what"** in the account and the
+**"why/where"** in a dimension. *"One `interchange_revenue` account per tenant"* is the textbook
+**anti-pattern**. *"One `interchange_revenue` account type, with tenant as a dimension on the
+instances"* is the textbook **correct answer**. Our schema already does the latter.
+
+**Say "we partitioned the postings of one account", never "we split the account."** Avoid "shard"
+in accountant-facing documents. Never name a staging account "suspense" — that word has
+regulatory weight (FFIEC lists suspense/omnibus/settlement accounts as an examination focus);
+"clearing" is the word for designed staging.
+
+The standards register for the same distinction is **unit of account** (IFRS Conceptual Framework
+¶4.48ff): an *economic* split means the pieces genuinely are separate units of account
+(a receivable per customer — distinct enforceable right, distinct counterparty, aged and impaired
+individually); a *mechanical* split is one unit of account physically partitioned, with no
+accounting consequence.
+
+| Account | Split is… | Why |
+| --- | --- | --- |
+| `customer_receivable` per customer | **economic** | separate legal right, external confirmation, aged individually |
+| `interchange_revenue` per tenant | **mechanical** | our own income, no counterparty, no separate settlement |
+| `network_settlement_payable` per tenant | **mechanical — but see below** | one counterparty (the network) |
+
+### THE HOLE — the accounting equation does not prove completeness
+
+Removing `uq_accounts__house` removes a machine-checked guarantee that exactly one
+`interchange_revenue` exists per deployment. **The theorem does not replace it.** Demonstrated:
+
+```
+TRUE global interchange revenue (3 tenant shards)   30.00
+reported by a mapping that misses tenant t3         20.00
+accounting equation                                 BALANCED
+```
+
+**Revenue understated by a third, equation perfectly happy.** Because omitting a shard removes it
+from *both* sides, `A = L + E + (R − X)` still holds. The theorem proves the **ledger** is
+internally consistent; it says nothing about whether a **report** enumerated every account.
+
+This is precisely the audit finding to engineer against: a tenant is onboarded, its account row is
+created, and the reporting mapping misses it. Nothing imbalances, because the entry balanced.
+
+### The fix — enumerate from the chart outward
+
+[`completeness.sql`](./completeness.sql) adds an `fs_lines` table, a **`NOT NULL`** `fs_line` on
+every account type, and a `financial_statements` view that joins **chart → types → all instances**.
+There is no parameter in which to pass an incomplete list of accounts.
+
+Verified: adding a 4th tenant after the fact moved `instances` from 3 to 4 **with no mapping
+change**, and `unmapped_accounts` (the loud exception view, which must always be empty) stayed at
+zero.
+
+This is also the artifact an auditor actually asks for — a controlled, versioned mapping from
+trial balance to statement line, rather than a `SUM` someone wrote in a report.
+
+### Two corrections to the chart
+
+**`network_settlement_payable` is a perimeter account.** We marked it `is_perimeter = false`. It is
+the archetype: an external party (the card network) holds the authoritative balance and will
+confirm it. Fixed.
+
+**Summing shards is arithmetic netting, and netting has rules.** IAS 1.32 and ASC 210-20-45-1
+permit offsetting only for amounts due to and from the **same party**. A shard set may be summed
+only if all shards share one counterparty. If the shard key *is* the counterparty — a receivable
+per customer — then sign-flipped shards must be presented **gross**, not netted. (The classic case:
+customer accounts in credit may not be netted against other customers' debits; they are
+reclassified to liabilities.) Added `counterparty_scope: none | shared | per_shard` so the
+reporting layer can enforce it.
+
+### Where the design is genuinely weakest
+
+**Reconciliation granularity should mirror the counterparty's statement, not our contention
+profile.** The card network settles per BIN/ICA/settlement cycle — *not* per tenant. Sharding
+`network_settlement_payable` per tenant introduces a partition axis **orthogonal to the only axis
+that can ever be externally confirmed**, so every reconciliation must re-aggregate before it can
+start. Unless tenant maps 1:1 to BIN, **shard perimeter accounts on the counterparty's axis, or
+not at all.**
+
+### Still open, from the accounting side
+
+- **A reserved `unallocated` instance per account type.** Accruals, FX revaluation, corrections,
+  and cut-off adjustments have no natural tenant. Without a designated home the accountant will
+  either invent a shard (breaking the "mechanical" story) or post to an arbitrary tenant
+  (corrupting the analytics that motivated the split).
+- **Principal vs agent (ASC 606-10-55-36 / IFRS 15.B34–B38).** If a deployment is an *agent*, the
+  tenant's interchange is not revenue at all — it is a payable. Then the per-tenant rows are not
+  shards of one account; some are a *different account with a different classification*. That is
+  an accounting error, not a modelling preference, and it is invisible to a design that treats
+  "one account, N shards" as axiomatic. The gross-vs-net decision is a deployment decision, not an
+  engine decision, and the docs must say so.
+- **Multi-entity.** If tenants are separate legal entities, the theorem acquires a precondition:
+  "any union of whole transactions is balanced" gives a balanced *consolidated* set, **not** a
+  balanced *per-entity* set. One transaction touching two entities balances globally while leaving
+  each entity's trial balance out of balance. The fix is intercompany due-to/due-from clearing
+  accounts — a legitimate clearing-account use, and the primitive to add if we serve multi-entity.
+- **Segment reporting is a non-issue for most adopters.** IFRS 8 / ASC 280 apply only to public
+  entities, and the trigger is CODM review for resource allocation — *not* data availability.
+  Building per-tenant revenue in the ledger does not create a segment. Worth a docs note so nobody
+  panics.
+
 ## Open — posting rules
 
 The remaining piece of "how they tie together." A deployment declares its chart; it must also
