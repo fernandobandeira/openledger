@@ -26,6 +26,11 @@ fixture's own self-check, and the engine doesn't exist yet.
 
 ## M1 · Schema and invariants
 
+Starts from [`spikes/002-sqlc-vs-jet/schema.sql`](../spikes/002-sqlc-vs-jet/schema.sql), which
+already applies cleanly with nine invariants verified as enforced by Postgres, and already
+carries the [spike 001](./spikes/001-formance.md) corrections (tenant-scoped idempotency with
+`NULLS NOT DISTINCT`, request-body hash, double-reversal guards, denormalized `effective_at`).
+
 `ledger_accounts`, `ledger_transactions`, `ledger_entries`. Nothing else. No API, no Go beyond
 what runs migrations.
 
@@ -43,10 +48,31 @@ violate it and is refused *by Postgres*.
 
 ## M2 · The concurrency proof
 
-`account_seq` and `balance_after` mean writes to one account must serialize. Locking the
-affected account rows in a deterministic order (sorted by id, to avoid deadlocks) inside the
-posting transaction is the boring correct answer — but "boring and correct" needs a test, not
-a comment.
+`account_seq` and `balance_after` mean writes to one account must serialize.
+
+[Spike 001](./spikes/001-formance.md) supplies the mechanism: a per-(account, currency) balance
+row, updated by a single atomic upsert that returns **both** the new balance and the next
+sequence number —
+
+```sql
+INSERT INTO ledger_account_balances (...) VALUES (...)
+ON CONFLICT (account_id, currency) DO UPDATE
+   SET balance  = ledger_account_balances.balance + excluded.balance,
+       last_seq = ledger_account_balances.last_seq + 1
+RETURNING balance, last_seq;
+```
+
+The row lock *is* the serialization point — no `SELECT max()`, no advisory lock, no retry loop.
+Note our `UNIQUE (account_id, account_seq)` **creates** a concurrency problem Formance does not
+have (their sequence is a plain global bigserial, which cannot collide), and this upsert is what
+pays for it.
+
+Two traps to handle, both from their bug history:
+
+- **Insert the zero-balance row before locking it.** You cannot `FOR UPDATE` a row that does not
+  exist, so two writers race on an account's *first* entry.
+- **Deterministic lock ordering** — sort accounts by id in every operation, on both read and
+  write paths. This was a real deadlock fix for them.
 
 Get this wrong and two entries claim seq 7, or a `balance_after` is computed from a value
 another transaction is about to invalidate. It is the single most likely place in this codebase
@@ -66,15 +92,17 @@ transaction with `resolves_id`, never an UPDATE.
 
 ## M4 · Bitemporal reads
 
-`balance_after` as of an instant. Trial balance. The accounting equation at an arbitrary
-`as_of`.
+Shaped by [ADR-0003](./decisions/0003-bitemporal-balances.md): **two axes, two mechanisms.**
+Current and recorded-axis balances come from `balance_after`; business-date balances are an
+aggregate over `effective_at`. Every reporting function names its axis explicitly.
 
-The trap is not storage, it's boundaries — every `date_trunc`, every `BETWEEN`, every "as of"
-that turns an instant into a bucket. Reports pin an **instant**, not a date, or "as of June 30"
-re-runs to a different number and reproducibility is gone.
+Blocked on an open question ADR-0003 does not settle: `recorded_at` is not monotonic with commit
+order, so a reproducible cursor must be commit-ordered rather than a wall clock. Decide that
+first — it needs its own ADR.
 
-**Done when:** any column of the golden trace can be reconstructed by an as-of query alone,
-with no replay.
+**Done when:** any column of the golden trace can be reconstructed by an as-of query alone, with
+no replay — *and* the backdating case from ADR-0003 (insertion order ≠ effective order) returns
+the correct number on both axes.
 
 ## M5 · The auth hot path
 
@@ -91,6 +119,25 @@ Temporal enters here and not before — hold expiry and the ACH return window ar
 things that genuinely need it. Activities must be idempotent, which M3 already gives us.
 
 ---
+
+## Newly known work, not yet scheduled
+
+From [spike 001](./spikes/001-formance.md), in rough priority order:
+
+- **An event log table.** Their `logs` is the real source of truth; everything else is a
+  projection. Our idempotency key lives on `ledger_transactions`, so we can only dedupe things
+  that *produce* a transaction — a declined authorization, a limit change, an account opening
+  have no home and cannot be made idempotent. This is the one table we are genuinely missing.
+- **A commit-ordered cursor** for reproducible as-of reads (blocks M4).
+- **Per-row hash chaining** for tamper evidence. Nearly free at our volume; never build their
+  block-hashing layer.
+- **Metadata history**, if any metadata feeds collateral reporting. Cheapest path is to make
+  metadata changes *be* log entries rather than adding revision tables.
+- **Benchmark the hot account.** Every transaction touches the credit-line account. Their design
+  target is 1K writes/sec, but a real user hit a knee at ~8–12 TPS on a single ledger. Our 20–50
+  TPS peak is not automatically safe.
+- **Primary key / replica identity on every table** from day one, if lender reporting will ever
+  be fed by CDC.
 
 ## Deliberately not now
 
