@@ -38,6 +38,37 @@ for as-of balances — reproducible lender reporting, "as of June 30", statement
 here: `effective_at` is the network business date, and late clearing and chargebacks are
 inherently backdated.
 
+## What spike 001 did and did not find
+
+Worth stating explicitly, because it reads as a contradiction otherwise: *"Formance demoted their
+running balance because of backdating"* and *"we keep a running balance"* look incompatible.
+
+They are not. **Formance kept two running balances, on two axes**, and their own code comments
+distinguish them:
+
+| their column | axis | their comment |
+| --- | --- | --- |
+| `post_commit_volumes` | insertion | *"Those volumes will never change, as those are computed in flight."* |
+| `post_commit_effective_volumes` | effective | *"can be updated if a transaction is inserted in the past."* |
+
+**Only the second one cost them anything.** It is the mutable one — the trigger doing an unbounded
+`UPDATE ... WHERE effective_date > new.effective_date`, the `fillfactor = 80` tune that exists only
+because their journal became UPDATE-heavy, and the six migrations that exist purely to repair
+volume data.
+
+**Our `balance_after` is the first one.** It is ordered by `account_seq`, which is assigned on
+insertion. A backdated entry receives the *next* sequence number and its own `balance_after`;
+nothing already written changes. It never needs an UPDATE, because "what was this account's
+balance after this entry was recorded" is a historical fact that a later backdated entry cannot
+alter.
+
+Likewise, the 180-vs-130 counterexample below is **not** evidence that `balance_after` is broken.
+It is evidence that reading it on the *effective* axis is broken. On the recorded axis the
+running-balance lookup and the recomputed aggregate agree exactly.
+
+So the lesson taken from spike 001 is not "running balances are bad." It is **"a running balance
+on a mutable axis is bad"** — and the decision below is to have only the immutable one.
+
 ## Decision
 
 **Two axes, two mechanisms. Do not try to serve both with one running balance.**
