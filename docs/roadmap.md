@@ -43,6 +43,12 @@ what runs migrations.
   `interchange_revenue`).
 - `amount_minor bigint CHECK (> 0)` — direction carries the sign, never the amount.
 
+Now also includes **`ledger_events`** — see [ADR-0004](./decisions/0004-event-log.md). It is the
+idempotency spine for the majority of the lifecycle that writes no ledger transaction at all
+(authorizations, declines, hold expiry, reversals, statement close, repayment initiation, limit
+changes). Today those cannot be made idempotent, because idempotency is a column on a table they
+never touch.
+
 **Done when:** every invariant in v1-vision §04 has a migration and a test that tries to
 violate it and is refused *by Postgres*.
 
@@ -124,13 +130,9 @@ things that genuinely need it. Activities must be idempotent, which M3 already g
 
 From [spike 001](./spikes/001-formance.md), in rough priority order:
 
-- **An event log table.** Their `logs` is the real source of truth; everything else is a
-  projection. Our idempotency key lives on `ledger_transactions`, so we can only dedupe things
-  that *produce* a transaction — a declined authorization, a limit change, an account opening
-  have no home and cannot be made idempotent. This is the one table we are genuinely missing.
-- **A commit-ordered cursor** for reproducible as-of reads (blocks M4).
 - **Per-row hash chaining** for tamper evidence. Nearly free at our volume; never build their
-  block-hashing layer.
+  block-hashing layer. Deferred in [ADR-0004](./decisions/0004-event-log.md) because it needs a
+  total order — decide it with [ADR-0005](./decisions/0005-reproducible-as-of.md).
 - **Metadata history**, if any metadata feeds collateral reporting. Cheapest path is to make
   metadata changes *be* log entries rather than adding revision tables.
 - **Benchmark the hot account.** Every transaction touches the credit-line account. Their design
