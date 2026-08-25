@@ -74,6 +74,80 @@ recomputation.
 
 **More rows.** Five to ten per authorization instead of one. At this volume, irrelevant.
 
+## Research findings — three of them change the schema
+
+### ⚠️ 1. Processors disagree on whether an increment is a DELTA or a TOTAL
+
+This is the finding that most threatens the design, because getting it wrong is silent.
+
+| processor | an incremental authorization reports… |
+| --- | --- |
+| **Marqeta** | a **delta** — *"Increases the amount of a prior `authorization` journal entry by adding to it without replacing it."* |
+| **Adyen** | a **total** — `amount.value` is *"the sum of the original, pre-authorized amount and all later adjustments."* |
+| **Highnote** (acquiring) | request is a **delta** ("additional $500"); the *response* echoes the cumulative total |
+
+Our `amount_delta` column assumes deltas throughout. **Feed it a total and the hold double-counts**
+— a $200 authorization topped to $350 would reserve $550. The customer is declined with headroom,
+and nothing errors.
+
+So the schema needs an explicit **normalisation boundary**: each processor adapter converts its
+own convention into a delta before the event is written, and the raw payload is retained so the
+conversion can be audited. `amount_delta` is a *normalised* field, not a wire field, and the docs
+must say so.
+
+### ⚠️ 2. The network identifier is unique per DAY, not globally
+
+Galileo's documentation of Mastercard's Banknet Reference Number: 6–9 digits, *"guaranteed to be a
+unique value for any transaction within the specified financial network **on any processing
+day**."*
+
+Our holds live 5–30 days. **Two unrelated authorizations can carry the same network reference and
+be open simultaneously.** So:
+
+- `UNIQUE (network_ref)` — wrong.
+- `UNIQUE (card_id, network_ref)` — also wrong.
+- Correct scope is `(financial_network_code, network_ref, network_date)`. The date is *part of the
+  key*, which is exactly why Mastercard's own composite "Trace ID" includes the settlement date.
+
+Grouping on the bare number would merge two genuinely different holds.
+
+### ⚠️ 3. `999999` is a sentinel meaning "populated, but meaningless"
+
+Pismo, on Mastercard: the platform *"ignores the trace ID when the value received for the Banknet
+Reference Number is `999999`, since this value can be used only to populate the field without
+indicating any relationship."*
+
+**Grouping on the network identifier without stripping sentinels would collapse unrelated
+authorizations, across unrelated cards, into one hold group.** Assume other undocumented sentinels
+exist; the group-key extractor must null them rather than trust the field.
+
+### What the linking identifiers actually are
+
+| network | links an increment to its original |
+| --- | --- |
+| **Visa** | Transaction Identifier (field 62.2); Message Reason Code `3900` marks the message as incremental |
+| **Mastercard** | Trace ID / Banknet reference — but grouping is **match-based**: a message is an increment *because* its trace matches an open pre-authorization of yours, not because it says so |
+| **Mastercard (in migration)** | **TLID** in DE 105 replaces Banknet Reference, Trace ID and Switch Serial Number, and covers voids, refunds, increments and chargebacks. Sources disagree on its length — **store network identifiers as `text`, never a fixed width** |
+
+**Never key on the authorization code (DE 38).** Sources actively conflict on whether it repeats
+across an original and its increments. Either way it is a display field.
+
+### Event-id stability across redeliveries is not universal
+
+Our `UNIQUE (tenant_id, event_id)` assumes a processor reuses the id when it redelivers. **Stripe
+and Lithic document this. Marqeta and Highnote do not** — they document unique event ids and tell
+integrators to be idempotent, without stating that a *resend* carries the same id. Must be verified
+in each sandbox before the constraint is relied on.
+
+### Also worth knowing
+
+- **Lithic's `AUTHORIZATION_ADVICE` carries two unrelated meanings** — either an authorized amount
+  was modified, or the network declined on your behalf. Branch on the content, never on the event
+  type string.
+- **No prevalence figures for incremental authorization exist publicly**, from the networks or
+  analysts. Plan for it structurally — travel and entertainment spend exists, and both networks
+  now permit increments for all merchant categories — not from a rate estimate.
+
 ## The open question this does not answer
 
 **What is `group_key`, really?** The design assumes some identifier is stable across an original
@@ -86,9 +160,9 @@ don't reliably agree across messages. Needs exact match, then fuzzy fallback on
 card+merchant+amount±tolerance+window, then an explicit unmatched queue — never a silent guess."*
 
 So `group_key` may not always be knowable at write time, and the table must tolerate a row
-arriving before its group is resolved. **Under research; the schema here assumes the optimistic
-case.** That question, and whether each major issuer-processor exposes a webhook id stable across
-redeliveries (needed for `event_id`), is what decides whether this design is deployable as written.
+arriving before its group is resolved. **The research above narrows this considerably**: a group key exists on both networks, but it is
+composite, sentinel-polluted, day-scoped, and mid-migration on Mastercard. The optimistic single
+`group_key text` column in `holds.sql` is *not* sufficient as written.
 
 ## Reproduce
 
