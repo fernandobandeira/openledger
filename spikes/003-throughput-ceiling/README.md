@@ -471,24 +471,80 @@ colliding. This isolates the effect: per-tenant house accounts remove lock conte
 Total rises; **per-tenant throughput falls**. Append converges on the same ~13k hardware ceiling
 found in Result 11.
 
+### CORRECTION — the 8× is an artifact of uniform load
+
+Result 12's tenant selection is `rng.Intn(len(ts))` — **uniform**. Real payment volume is
+Zipfian: one or two tenants are most of the traffic. Re-measured with a whale tenant
+(32 tenants, own house accounts, c=32):
+
+| distribution | clearings/s | vs 1-tenant baseline (875) |
+| --- | --- | --- |
+| uniform | 7,991 | 9.1× |
+| whale = 50% | 1,435 | 1.6× |
+| whale = 80% | 1,018 | 1.16× |
+| **whale = 90%** | **936** | **1.07×** |
+| whale = 95% | 897 | 1.03× |
+
+**At a realistic 90/10 skew the gain is 7%, not 8×.** The mechanism is obvious in hindsight: the
+whale's *own* house accounts become the new single hot row. Per-tenant splitting **relocates** the
+bottleneck; it does not remove it.
+
+### Striping survives skew. That is the actual scaling mechanism.
+
+| config (c=32) | stripes=1 | stripes=64 | gain |
+| --- | --- | --- | --- |
+| 32 tenants, whale = 0.9 | 948 | 7,405 | 7.8× |
+| **1 tenant** (no tenant split at all) | 872 | **6,970** | **8.0×** |
+
+Striping delivers ~8× **regardless of tenant count or skew** — including with a single tenant,
+where per-tenant splitting is definitionally worthless. Striping splits *within* whatever account
+is hot, so it cannot be defeated by load distribution.
+
+**Per-tenant house accounts are a degenerate special case of striping**, where the stripe key
+happens to be the tenant and the gain depends on load being evenly spread. **Striping is the
+scaling story; tenancy is a coincidence.**
+
 ### The answer, in three parts
 
-1. **No per-account limit, and no per-tenant *lock* limit** — once house accounts are per-tenant
-   (or in append mode, where there are no locks at all). **No tenant can be capped by another
-   tenant's contention.** That is real isolation and it is worth having.
+1. **No per-account limit, and no per-tenant *lock* limit** — once the hot accounts are **striped**
+   (per-tenant splitting only achieves this under even load; see the correction above). Striping
+   removes the per-row ceiling whatever the load distribution.
 2. **But the ceiling is global, not per-tenant.** ~13k clearings/s is shared across everyone on
    that database. It is **not** 13k each. What per-tenant house accounts buy is that you can
    actually *reach* the hardware ceiling instead of being stopped at ~800/s by one row.
 3. **To get a ceiling per tenant, shard tenants across database instances** — and this design is
    unusually ready for that, for a reason worth spelling out below.
 
-### Per-tenant house accounts also make the system shardable
+### CORRECTION — "no cross-tenant transactions" is false
 
-This is the finding that outranks the throughput numbers.
+An earlier version of this section claimed tenant-sharding gives "no cross-shard transactions,
+ever." **That is wrong, and the schema already says so.**
 
-A ledger has no cross-tenant transactions — tenant A's money never moves to tenant B in one
-entry set. So sharding by tenant is embarrassingly parallel, and scaling becomes *linear in
-instances* rather than capped by one box.
+`operating_cash` and `fbo_cash` are **perimeter** accounts. [v1-vision](../../docs/v1-vision.md)
+requires that *"every perimeter account has exactly one external balance that must agree with
+it"* — the money physically sits in **one bank account**. A perimeter account cannot be split per
+tenant without destroying the reconciliation target the design was built around. The same applies
+to `facility_borrowings`: one warehouse line, one lender, one number they report on.
+
+Counted against the golden trace: **7 of 13 transactions touch `operating_cash`** — `open`,
+`evt_draw`, `evt_settle`, `evt_pull:settle`, and all three `evt_repay:*`.
+
+But the four **clearing** transactions do not. So the honest claim is:
+
+> **Clearings become tenant-local. Treasury does not.**
+
+Clearings are the volume; treasury is batched daily and low-volume. Cross-shard treasury may
+therefore be an acceptable trade — but it is a trade to be made explicitly, not a property to
+claim we have. An adopter would discover this the first time they ran a settlement.
+
+### What per-tenant house accounts still buy
+
+Even after both corrections, splitting is not worthless:
+
+- Under **even** load it removes contention (the uniform 8× is real, it is just not the common case).
+- It makes **clearings** tenant-local, which is most of the transaction volume.
+- For **reconciliation it is strictly better**: when Visa's settlement figure is 3 cents off, 1,000
+  per-tenant accounts tell you which tenant caused it; one account does not.
 
 **Except our schema currently forbids it.** `uq_accounts__house` guarantees exactly one
 `interchange_revenue` per **deployment**, so today a card clearing touches:
@@ -503,15 +559,20 @@ instances* rather than capped by one box.
 Half the legs are deployment-global, so **every transaction spans tenants** and no tenant can be
 moved to another database without breaking atomicity.
 
-Making house accounts per-tenant fixes three things at once, and they compound:
+Making house accounts per-tenant removes the deployment-global uniqueness, which is a
+prerequisite for tenant-scoped anything. But **striping is what actually moves throughput**, and
+it does so without depending on load distribution.
 
-- removes the lock contention (8× at fixed concurrency, Test A),
-- lets a deployment reach its hardware ceiling instead of one row's ceiling,
-- and makes every transaction **tenant-local**, so tenant → database routing becomes possible.
+### What this benchmark did NOT measure, and should have
 
-That third one is the scaling story for the open-source product: one instance for almost
-everyone, and shard by tenant when someone outgrows it — with no cross-shard transactions to
-coordinate, ever.
+`main.go` posts exactly three legs — `customer_receivable`, `network_settlement_payable`,
+`interchange_revenue`. **It never touches `operating_cash`, `fbo_cash`, `facility_borrowings`, or
+`accrued_interest_payable`** — which are precisely the accounts that *cannot* be split.
+
+The workload excluded the constraint that breaks the model. Every tenant-scaling number here is
+conditional on a workload that omits the hard case. Re-running against the full golden-trace
+account set, including a daily treasury batch through a global cash account, is required before
+any of this informs M1.
 
 ## Summary — the levers, ranked
 
