@@ -78,8 +78,18 @@ coalesces naturally.
 
 **5. Publish no throughput number until it is measured on RDS.** A round trip costs ~0.05 ms on
 localhost and ~0.5 ms on managed Postgres, which changes the *ranking* of the levers, not just the
-magnitudes. Independently corroborated: pgledger, a comparable Postgres ledger, publishes 10,637
-transfers/s locally collapsing to 1,631 over a network.
+magnitudes.
+
+**Correction.** An earlier version of this ADR cited pgledger as "publishing 10,637 transfers/s
+locally collapsing to 1,631 over a network." **The second figure does not exist** — pgledger has
+never published a network benchmark, and `1,631` appears nowhere in its history. It was
+fabricated, and it was the only external support this argument had. Struck.
+
+What pgledger *does* publish corroborates the other half of this ADR, and does so cleanly: the
+same local machine gives **10,636.8 transfers/s across 50 accounts and 7,558.9 across 10**, with
+worker count unchanged. That is a 1.41× swing produced purely by account contention — the lever
+this ADR argues is the real one. The network claim remains **unsupported by anything outside this
+repository**, which is precisely why no number gets published until M4 measures one.
 
 ### What must NOT change
 

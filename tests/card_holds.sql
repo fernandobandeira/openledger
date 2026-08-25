@@ -125,8 +125,12 @@ END $$;
 -- cumulative TOTAL rather than a delta. The adapter converts at the boundary,
 -- under the group's lock, so the stored model stays pure deltas.
 
+-- is_total on the authorization too: a processor that reports increments as
+-- cumulative totals reports the opening authorization as one as well (the total
+-- after the first message IS the authorization amount). A group may not mix the
+-- two conventions -- see the refusal control below for why that is not pedantry.
 SELECT record_auth_event('t1','msg_tip_auth','g_tip','acme','card_3',
-        'authorization', 10000,'USD',false, now());
+        'authorization', 10000,'USD',true, now());
 -- restaurant adds a 20% tip; the processor restates the TOTAL as 120.00
 SELECT record_auth_event('t1','msg_tip_inc','g_tip','acme','card_3',
         'incremental', 12000,'USD',true, now());
@@ -143,8 +147,12 @@ SELECT eq('re-delivered total is a no-op',
           (SELECT total_minor FROM card_hold_groups WHERE group_key='g_tip'), 12000);
 
 -- The SAME message id twice -- processor retry. Idempotent, not double-counted.
+-- is_total on the authorization too: a processor that reports increments as
+-- cumulative totals reports the opening authorization as one as well (the total
+-- after the first message IS the authorization amount). A group may not mix the
+-- two conventions -- see the refusal control below for why that is not pedantry.
 SELECT record_auth_event('t1','msg_tip_auth','g_tip','acme','card_3',
-        'authorization', 10000,'USD',false, now());
+        'authorization', 10000,'USD',true, now());
 SELECT eq('duplicate message id did not double-count',
           (SELECT total_minor FROM card_hold_groups WHERE group_key='g_tip'), 12000);
 SELECT no_drift('cumulative totals');
@@ -261,7 +269,7 @@ $q$, 'out-of-order cumulative total');
 -- A hold total is only meaningful in one currency.
 SELECT must_fail('event in another currency joining a group', $q$
     SELECT record_auth_event('t1','msg_eur','g_tip','acme','card_3',
-            'incremental', 1000,'EUR',false, now());
+            'incremental', 1000,'EUR',true, now());
 $q$, 'cannot join group');
 
 -- The sign is a property of the kind, enforced by the database.
@@ -282,6 +290,173 @@ $q$, 'uq_event_group__current');
 SELECT must_fail('materialised total tampered with', $q$
     UPDATE card_hold_groups SET total_minor = total_minor + 1 WHERE group_key='g_tip';
     SELECT no_drift('tamper');
+$q$, 'disagrees with the event log');
+
+
+-- =========================================================== the multiplicities
+--
+-- Everything above this line is one tenant, one company, one currency, one
+-- session. Mutation testing showed that is exactly the shape that cannot see the
+-- defects that matter: dropping the currency filter, the company filter, the
+-- tenant filter and the ingest lock from the shipped code all left the suite
+-- green. held_for_company -- the number the authorization decision is made on --
+-- was called three times, all before any of the conditions that make its
+-- correctness matter existed.
+
+-- Capture acme's USD number first, then introduce a second company, a second
+-- currency and a second tenant. The number must not move by one minor unit.
+-- Asserted as a DELTA rather than a literal, so it keeps testing isolation as the
+-- trace above it evolves.
+CREATE TEMP TABLE baseline AS SELECT held_for_company('t1','acme','USD') AS h;
+
+SELECT record_auth_event('t1','m_other_co','g_oc','globex','card_x',
+        'authorization', 11100,'USD',false, now());
+SELECT record_auth_event('t1','m_eur','g_eur','acme','card_e',
+        'authorization', 22200,'EUR',false, now());
+SELECT record_auth_event('t2','m_other_tn','g_ot','acme','card_t',
+        'authorization', 33300,'USD',false, now());
+
+SELECT eq('another company, currency and tenant move acme USD by',
+          held_for_company('t1','acme','USD') - (SELECT h FROM baseline), 0);
+SELECT eq('acme EUR is its own number',   held_for_company('t1','acme','EUR'), 22200);
+SELECT eq('globex USD is its own number', held_for_company('t1','globex','USD'), 11100);
+SELECT eq('tenant t2 is its own world',   held_for_company('t2','acme','USD'), 33300);
+SELECT no_drift('multiplicities');
+
+-- ...and the clamp and the expiry flag must apply THROUGH the function, not only
+-- to the column. Replacing SUM(held_minor) with SUM(total_minor) inside
+-- held_for_company bypassed both, and the suite never noticed, because nothing
+-- ever read them through here. g_fuel is over-captured, so the function must
+-- report strictly less than the raw sum of totals.
+DO $$
+DECLARE v_fn bigint; v_raw bigint;
+BEGIN
+    v_fn := held_for_company('t1','acme','USD');
+    SELECT COALESCE(SUM(total_minor),0) INTO v_raw FROM card_hold_groups
+     WHERE tenant_id='t1' AND company_id='acme' AND currency='USD';
+    IF v_fn <= v_raw THEN
+        RAISE EXCEPTION 'held_for_company (%) did not clamp: raw total sum is %',
+            v_fn, v_raw;
+    END IF;
+    RAISE NOTICE 'ok  held_for_company clamps and honours expiry: % vs raw %', v_fn, v_raw;
+END $$;
+
+-- =========================================================== expiry is not terminal
+
+SELECT record_auth_event('t1','r_auth','g_reopen','zeta','card_r',
+        'authorization', 30000,'USD',false, now());
+SELECT expire_hold_group('t1','zeta','g_reopen');
+SELECT eq('expired', held_for_company('t1','zeta','USD'), 0);
+-- A processor sends an increment on the same lifecycle id: a hotel guest extends
+-- their stay. Our release was premature. expired_at was a one-way latch that
+-- nothing ever cleared, so this event was silently voided -- 300.00 genuinely
+-- held, reported as 0.00, with no drift anywhere.
+SELECT record_auth_event('t1','r_inc','g_reopen','zeta','card_r',
+        'incremental', 5000,'USD',false, now());
+SELECT eq('an increment after expiry re-opens the hold',
+          held_for_company('t1','zeta','USD'), 35000);
+-- ...but a late CLEARING must not resurrect a released hold.
+SELECT expire_hold_group('t1','zeta','g_reopen');
+SELECT record_auth_event('t1','r_clr','g_reopen','zeta','card_r',
+        'clearing', 1000,'USD',false, now());
+SELECT eq('a late clearing does not resurrect it',
+          held_for_company('t1','zeta','USD'), 0);
+SELECT no_drift('expiry re-open');
+
+-- =========================================================== company isolation
+--
+-- group_key is INFERRED from network values (RRN, lifecycle id) which are not
+-- per-company, so two companies colliding on one is a real state. recompute_hold_group
+-- filtered on (tenant, group_key) only, for both its SUM and its UPDATE, so a
+-- different company's clearing reduced acme's held amount -- and running the repair
+-- again never converged.
+SELECT record_auth_event('t1','s_a','shared_key','acme','card_sa',
+        'authorization', 50000,'USD',false, now());
+SELECT record_auth_event('t1','s_b','shared_key','globex','card_sb',
+        'authorization', 70000,'USD',false, now());
+SELECT eq('two companies may share an inferred group key: acme',
+          (SELECT total_minor FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='acme' AND group_key='shared_key'), 50000);
+SELECT eq('...and globex is unaffected',
+          (SELECT total_minor FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='globex' AND group_key='shared_key'), 70000);
+SELECT recompute_hold_group('t1','acme','shared_key');
+SELECT recompute_hold_group('t1','globex','shared_key');
+SELECT eq('the repair is company-scoped and converges: acme',
+          (SELECT total_minor FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='acme' AND group_key='shared_key'), 50000);
+SELECT eq('...globex',
+          (SELECT total_minor FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='globex' AND group_key='shared_key'), 70000);
+SELECT no_drift('company isolation');
+
+-- =========================================================== over-capture evidence
+
+SELECT eq('the over-capture low-water mark is durable',
+          (SELECT low_water_minor FROM card_hold_groups WHERE group_key='g_fuel'), -9400);
+-- overcaptured_at is deliberately non-latching (a transient dip must not alarm),
+-- which means it is erased by the next event that lifts the total. The low-water
+-- mark is what keeps "did this ever over-capture" answerable.
+SELECT record_auth_event('t1','g_fuel_more','g_fuel','acme','card_4',
+        'authorization', 20000,'USD',false, now());
+SELECT eq('...and survives the total going positive again',
+          (SELECT low_water_minor FROM card_hold_groups WHERE group_key='g_fuel'), -9400);
+SELECT eq('while the live flag correctly clears',
+          (SELECT count(*) FROM card_hold_groups
+            WHERE group_key='g_fuel' AND overcaptured_at IS NULL), 1);
+
+-- =========================================================== zero-amount messages
+
+-- A $0.00 authorization is account verification (AVS / card-on-file). It is a real
+-- message on every network and was refused outright with an opaque CHECK error.
+SELECT record_auth_event('t1','v0','g_verify','acme','card_v',
+        'authorization', 0,'USD',false, now());
+SELECT eq('a $0.00 verification authorization is accepted',
+          (SELECT count(*) FROM card_auth_events WHERE processor_msg_id='v0'), 1);
+SELECT eq('...and holds nothing', held_for_company('t1','acme','USD')
+          - held_for_company('t1','acme','USD'), 0);
+
+-- =========================================================== more refusals
+
+-- Mixing conventions inside one group is irreconcilable, not merely awkward:
+-- {auth +100.00 delta, incremental 120.00 total} gives 120.00 in one order and
+-- 220.00 in the other, because a total arriving BEFORE the delta it restates
+-- carries no information saying it already includes it.
+SELECT must_fail('a cumulative total in a group that reports deltas', $q$
+    SELECT record_auth_event('t1','mix1','g_late','acme','card_6',
+            'incremental', 9999,'USD',true, now());
+$q$, 'cannot mix the two');
+
+SELECT must_fail('re-grouping an event into another currency''s group', $q$
+    SELECT regroup_auth_event('t1',
+        (SELECT id FROM card_auth_events WHERE processor_msg_id='m_eur'),
+        'g_late', 'operator:fernando');
+$q$, 'only meaningful in one currency');
+
+SELECT must_fail('re-grouping an event into an EXPIRED group', $q$
+    SELECT expire_hold_group('t1','acme','g_late');
+    SELECT regroup_auth_event('t1',
+        (SELECT id FROM card_auth_events WHERE processor_msg_id='msg_tip_inc'),
+        'g_late', 'operator:fernando');
+$q$, 'which expired at');
+
+SELECT must_fail('an expiry_reversal with a negative delta', $q$
+    INSERT INTO card_auth_events (tenant_id,processor_msg_id,company_id,card_id,kind,
+                                  amount_delta,currency,occurred_at)
+    VALUES ('t1','neg_exprev','acme','card_z','expiry_reversal', -999999,'USD', now());
+$q$, 'ck_auth_events__sign');
+
+-- The alarm must see a group whose events are not all in its declared currency --
+-- the state re-grouping used to be able to create. It compared total_minor and
+-- nothing else, so two currencies in one group reported no drift at all.
+SELECT must_fail('a group holding two currencies', $q$
+    INSERT INTO card_auth_events (tenant_id,processor_msg_id,company_id,card_id,kind,
+                                  amount_delta,currency,occurred_at)
+    VALUES ('t1','sneak_eur','acme','card_6','authorization', 100,'EUR', now());
+    INSERT INTO card_auth_event_group (tenant_id,event_id,group_key,method,assigned_by)
+    SELECT 't1', id, 'g_oc', 'manual', 'test'
+      FROM card_auth_events WHERE processor_msg_id='sneak_eur';
+    SELECT no_drift('two currencies');
 $q$, 'disagrees with the event log');
 
 DO $$ BEGIN RAISE NOTICE 'ok  card hold flow attested'; END $$;

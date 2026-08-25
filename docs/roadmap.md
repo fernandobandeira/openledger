@@ -36,8 +36,16 @@ The properties the core must hold, at any point, against any history:
 - An as-of query at instant T returns the same answer whenever it is re-run.
 - **No transaction's entry set spans more than one tenant.** New, and load-bearing — see M1.
 
-Of these, the as-of reproducibility property is **not yet asserted** — it is blocked on
-[ADR-0005](./decisions/0005-reproducible-as-of.md), which is still `proposed`. The rest are.
+Three of these are **not yet asserted**, and saying "the rest are" would be the kind of claim this
+project exists to avoid:
+
+- **As-of reproducibility** — blocked on [ADR-0005](./decisions/0005-reproducible-as-of.md), still
+  `proposed`.
+- **Gaplessness.** `uq_entries__account_seq` gives duplicate-freedom, and `ck_entries__seq_positive`
+  now rules out the worst case, but nothing asserts there are no *holes*.
+- **Idempotency replay.** There is no replay path to test: `idempotency_hash` is written and
+  **never read**. The negative control proves only that a unique index fires — identically for a
+  replay and for a different body, which is exactly the distinction the ADR says matters.
 
 **Done when:** the suite is in CI alongside the schema snapshot test, and the as-of property is
 covered.
@@ -67,7 +75,11 @@ expiry, reversals, statement close, limit changes. None of those can be made ide
 because idempotency lives on a table they never touch.
 
 **Composite `(tenant_id, …)` keys — done.** Every ledger table carries `tenant_id NOT NULL`,
-primary keys are `(tenant_id, id)`, and every index and foreign key carries the prefix.
+primary keys are `(tenant_id, id)`, and every index and foreign key on the ledger tables carries the
+prefix. Two foreign keys deliberately do not: `ledger_accounts.purpose → account_types` and
+`account_types.fs_line → fs_lines`. The chart is **deployment-global**, not per tenant — which is a
+real limitation, not an oversight: a tenant cannot add an account type without a migration. Listed
+in [ADR-0009](./decisions/0009-chart-and-completeness.md).
 
 **This was the one irreversible decision on the list, and it was free.** It is the prerequisite for
 row-level security, partitioning, and ever splitting across instances — none work without it, all
@@ -87,8 +99,12 @@ facility draw, the network settlement and the ACH collection are all cross-scope
 balance independently at every step, and the two sides are asserted to eliminate exactly. The
 program's profit turns out to equal its claim on treasury, from opposite directions.
 
-**Striping as a schema concept.** An account declares a stripe count; balance reads `SUM` across
-stripes. One integer on the account row, worth roughly 8×. Note *striping* is the contention
+**Striping as a schema concept — not built.** The design is that an account declares a stripe
+count and a balance read `SUM`s across stripes. There is no such column in `migrations/`, and
+`uq_accounts__house` currently makes it impossible anyway: it is `UNIQUE (tenant_id, purpose,
+currency)` for house accounts, so `network_settlement_payable` — one of the two accounts spike 003
+identifies as hot — cannot have a second row. Striping needs a stripe number in that key before it
+can exist at all. Worth roughly 8×. Note *striping* is the contention
 mechanism, not per-tenant splitting — at 90/10 skew per-tenant gave 1.07× while striping still gave
 7.8×. Per-tenant accounts earn their place for reconciliation and tenant-locality, not throughput.
 
@@ -102,15 +118,19 @@ The mechanism is settled. A per-(account, currency) balance row, updated by one 
 returning **both** the new balance and the next sequence number:
 
 ```sql
-INSERT INTO ledger_account_balances (...) VALUES (...)
-ON CONFLICT (account_id, currency) DO UPDATE
-   SET input    = ledger_account_balances.input  + excluded.input,
-       output   = ledger_account_balances.output + excluded.output,
-       last_seq = ledger_account_balances.last_seq + 1
-RETURNING input, output, last_seq;
+INSERT INTO ledger_account_balances AS b (tenant_id, account_id, currency, input, output, last_seq)
+VALUES (...)
+ON CONFLICT (tenant_id, account_id, currency) DO UPDATE
+   SET input    = b.input  + excluded.input,
+       output   = b.output + excluded.output,
+       last_seq = b.last_seq + 1
+RETURNING b.last_seq, b.input - b.output;
 ```
 
 The row lock *is* the serialization point — no `SELECT max()`, no advisory lock, no retry loop.
+`tenant_id` leads the conflict target because it leads the primary key; without it this statement
+does not run at all (`there is no unique or exclusion constraint matching the ON CONFLICT
+specification`). The working version is `post()` in [the golden trace](../tests/golden_trace.sql).
 Spike 003 ran it over 1,721 accounts: zero mismatches, zero gaps, zero unbalanced transactions.
 Two traps from Formance's bug history:
 
@@ -227,9 +247,11 @@ as the ledger write, so a hold and its expiry timer commit together or not at al
 ([ADR-0008](./decisions/0008-durable-timers.md)). Handlers are idempotent already, which M3 gives
 us.
 
-Ship the reconciliation sweep alongside it — `WHERE state = 'open' AND expires_at < now()` behind
-a partial index. The deadline lives in the business row, so a lost job becomes recoverable rather
-than silent.
+Ship the reconciliation sweep alongside it: groups past their deadline that are still holding,
+behind `ix_hold_groups__held`. The deadline lives on the event, so a lost job becomes recoverable
+rather than silent — [ADR-0008](./decisions/0008-durable-timers.md) has the query, executed against
+the shipped schema. (This line previously quoted `WHERE state = 'open' AND expires_at < now()`
+against a table migration 0003 deleted.)
 
 **A scheduler is not a throughput mechanism.** A contended row lock is held for the duration of a
 transaction; making the write asynchronous relocates who waits rather than removing it. Its place
