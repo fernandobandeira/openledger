@@ -201,15 +201,101 @@ even get paid for it.
 transaction block, so `psql -c "ALTER SYSTEM ...; SELECT pg_reload_conf();"` silently failed and
 the setting never changed. Re-run with separate statements.)*
 
+## Result 8 — worker-affinity striping makes the two levers COMPOSE
+
+Result 6 showed striping and batching cancel. The mechanism suggests the fix: they cancel because
+stripes are chosen **at random**, scattering a batch across many rows so coalescing has nothing to
+collapse. Give each writer **its own stripe** and a whole batch lands on one row — which both
+coalesces perfectly *and* contends with nobody.
+
+Measured, `-stripe-mode=worker`, stripes = concurrency, batch = 25:
+
+| concurrency | worker-affinity | random (control) |
+| --- | --- | --- |
+| 4 | 4,435 | — |
+| 8 | 4,575 | — |
+| 16 | 4,580 | 2,645 |
+| 32 | **4,790** | 2,395 |
+| 48 | 4,640 | 2,385 |
+
+**~2× random striping, and flat across concurrency** — it has stopped being contention-bound
+entirely. The antagonism is an artifact of random stripe selection, not a law.
+
+The accounting name for this is a **per-writer suspense account**: each writer posts the shared
+leg to a row it alone owns, every transaction stays balanced, and a periodic sweep consolidates
+suspense into the real house account. Worth noting that pure striping without batching still wins
+*on localhost* (6,850) — but see Result 9 for why that ordering flips on managed Postgres.
+
+## Result 9 — round trips, and why localhost lies about them
+
+Our clearing costs **6 round trips**: `BEGIN`, insert the transaction, three `post_entry` calls,
+`COMMIT`. Collapsing that into one server-side `post_clearing()` call:
+
+| stripes | 6 round trips | 1 round trip | gain |
+| --- | --- | --- | --- |
+| 1 | 748 | 842 | +13% |
+| 16 | 4,043 | 4,301 | +6% |
+| 64 | 6,756 | **7,816** | +16% |
+
+Only ~14% — because localhost RTT is negligible. Isolating it at c=1:
+
+| | clearings/s | ms per clearing |
+| --- | --- | --- |
+| 6 round trips | 645 | 1.55 |
+| 1 round trip | 771 | 1.30 |
+
+**5 round trips cost 0.25ms ⇒ ~0.05ms per round trip on localhost.**
+
+That number is the whole point. On RDS in the same AZ, RTT is roughly **0.5ms** — ten to twenty
+times higher. Modelled from the measured 1.30ms of actual work:
+
+| | work | + round trips | total | per-connection |
+| --- | --- | --- | --- | --- |
+| 6 round trips | 1.30ms | +3.0ms | 4.3ms | ~232/s |
+| 1 round trip | 1.30ms | +0.5ms | 1.8ms | ~555/s |
+
+**On managed Postgres, round trips dominate, and the ordering of the levers changes.** Batching
+and single-call posting matter *more* than they appear here; striping matters *less*, because
+striping buys parallelism against a bottleneck that network latency has already displaced.
+
+This is modelled, not measured — a real RDS benchmark is required before publishing a number.
+But it is the single strongest reason not to trust a localhost benchmark for an AWS claim.
+
+## Result 10 — table size barely matters
+
+The largest caveat on every number above was "small, fully-cached table." Tested: 5,001,944
+entries, **2,056 MB against 128 MB of `shared_buffers`** — 16× oversubscribed.
+
+| Configuration | 43 MB table | **2 GB table** | delta |
+| --- | --- | --- | --- |
+| unsharded | 748 | 744 | 0% |
+| striped-64 | 6,756 | 6,212 | −8% |
+| striped-64 + single call | 7,816 | **7,897** | 0% |
+
+**Essentially unchanged.** The workload is append-only, so new entries land on the rightmost
+index pages, which stay hot regardless of how much cold history sits behind them — and the
+balance table is tiny and fully cached no matter the entry count.
+
+This is a real property of the design worth stating, because many ledger designs degrade badly
+here. It does not extend indefinitely: 5M is not 500M, and months of vacuum and bloat are not
+simulated. But the *mechanism* — hot set bounded by account count, not entry count — should hold.
+
 ## Summary — the levers, ranked
 
 | Configuration | clearings/s | entries/s | notes |
 | --- | --- | --- | --- |
-| baseline (unsharded, unbatched) | ~800 | ~2,400 | plateaus at c=4 |
+| baseline (unsharded, unbatched) | ~800 | ~2,400 | plateaus at c=4, then declines |
 | + coalesced batching (25) | 3,420 | 10,260 | no schema change |
-| + striping (64) | **6,850** | **20,550** | needs read-side `SUM` |
-| both | 2,356 | 7,069 | **worse than either** |
+| + random striping (64) | 6,850 | 20,550 | needs read-side `SUM` |
+| random striping + batching | 2,356 | 7,069 | **worse than either** |
+| + **worker-affinity** striping + batching | 4,790 | 14,370 | levers compose; flat in concurrency |
+| + single-call posting (1 RTT), striped | **7,816** | **23,447** | best measured |
 | tenants=16, own house accounts | 4,319 | 12,956 | free if multi-tenant |
+| best config on a **2 GB** table | 7,897 | 23,692 | size-insensitive |
+
+**Caveat that outranks the table:** these are localhost numbers, where a round trip costs 0.05ms.
+On RDS it costs ~0.5ms, which reorders the levers (Result 9). Treat the *ranking* as
+hardware-specific and the *mechanisms* as general.
 
 ## What this means
 
@@ -237,9 +323,8 @@ the setting never changed. Re-run with separate statements.)*
 
 Stated so the numbers are not over-read:
 
-- **Small table.** Under 50MB, fully cached. At 100M+ entries, index maintenance, vacuum, and
-  cache misses all bite. The *contention* finding is structural and will not improve with size,
-  but the absolute numbers will fall.
+- ~~**Small table.**~~ **Closed by Result 10** — retested at 5M entries / 2 GB against 128 MB of
+  cache, essentially unchanged. Still not tested at 500M entries or after months of bloat.
 - **Single node.** No replication, no failover, no `synchronous_standby`. Synchronous replication
   will cost meaningfully on every commit.
 - **Stock config on a laptop.** Tuned RDS/Aurora with provisioned IOPS behaves differently —
@@ -247,8 +332,10 @@ Stated so the numbers are not over-read:
 - **The clearing path only.** The auth hot path is cheaper (writes no ledger entry) and
   serializes *per company*, so it parallelizes far better. It was not measured here and has a
   latency deadline rather than a throughput target — it deserves its own spike.
-- **No batching.** Everything is one clearing per transaction. Batching N clearings per
-  transaction would amortize commit cost substantially.
+- ~~**No batching.**~~ **Closed by Results 5, 6, 8.**
+- **Network latency.** Everything runs over localhost, where a round trip costs 0.05ms. On RDS it
+  costs ~0.5ms and reorders the levers (Result 9). **A real RDS benchmark is required before any
+  number here is published.**
 
 ## Reproduce
 
