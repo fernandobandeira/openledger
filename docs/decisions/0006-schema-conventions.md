@@ -37,11 +37,17 @@ failure four times from two migrations.
 **3. Keep foreign keys.** Formance has essentially none — nullable back-pointers with no
 referential integrity — which is defensible for an engine chasing unconstrained write throughput.
 It is the wrong trade here. We keep them on the project's stated correctness priority — and the
-cost is now measured rather than assumed: **~2.8x slower with foreign keys** (227/239/246 ms
-against 78/90/84 ms). An earlier version of this ADR said the cost "was sought and not found",
-which was not true: spike 003 never tested it. Not FK validation, not
-index maintenance, not I/O. The cost Formance dropped FKs to avoid is one we looked for and could
-not find. A general engine has *more* reason to keep them, because integrators will do things we
+cost is measured rather than assumed: **foreign keys cost roughly 3x on bulk insert.** An
+independent re-run on the shipped schema (three foreign keys, same CHECKs and indexes, 50k rows,
+three trials) gave 3002/3176/3672 ms with them against 1257/1067/793 ms without.
+
+Two honest notes. An earlier version of this ADR said the cost "was sought and not found" — that
+was untrue; spike 003 never tested foreign keys at all. A later version quoted 227/239/246 ms
+against 78/90/84 ms; the **ratio** holds up, but those absolutes have no recorded batch size,
+hardware or harness anywhere in the repo, so they are struck in favour of the reproducible run
+above. The cost is real, it is on the bulk-load path, and it is one we accept.
+
+A general engine has *more* reason to keep them, because integrators will do things we
 never anticipated and a constraint is the only part of the design that survives an unanticipated
 caller.
 

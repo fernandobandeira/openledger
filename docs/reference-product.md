@@ -80,6 +80,15 @@ statements — runs as a durable scheduled job calling **idempotent** ledger act
 
 ## 03 — The auth decision
 
+> ⚠️ **This section is a specification, not a description of what exists.** `card_holds`,
+> `credit_lines`, `spend_controls` and `card_transactions` are **not** in `migrations/`. The hold
+> model shipped instead as `card_auth_events` + `card_auth_event_group` + `card_hold_groups`
+> ([ADR-0010](./decisions/0010-authorization-holds.md)); the credit-line and spend-control tables
+> are unbuilt (roadmap M7). The SQL below shows intended *shape* — none of it runs against the
+> current schema, and its index comment is wrong for it besides: every shipped index leads with
+> `tenant_id`, so a lookup that omits it plans as a Seq Scan plus a Sort.
+
+
 ![The authorization latency budget: ~1000ms before the processor applies your default, with a
 p99 target around 300ms](./diagrams/02-auth-hot-path.svg)
 
@@ -447,6 +456,7 @@ chart** — they belong to a payouts flow that has not been designed.
 - **available 9,500** = 10,000 − 300 posted − 200 held · *unchanged* — 300 moved from held to posted
 
 ### 03 — Final clearing · $200
+
 *Processor · `card_transaction` · rest of the order*
 
 - `card_holds` **UPDATE**: `cleared_minor = 500` → state = `cleared`. Fully consumed, contributes 0 to held.

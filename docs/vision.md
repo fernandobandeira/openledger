@@ -116,7 +116,10 @@ Four properties. None is a setting.
   learned about. These differ constantly: a clearing's business date belongs to the network, not
   to the webhook's arrival.
 - **Event-logged.** Every accepted external event is recorded, including the many that produce no
-  ledger transaction at all — authorizations, declines, hold expiry, limit changes.
+  ledger transaction at all — authorizations, declines, hold expiry, limit changes. **Caveat, and
+  it belongs here rather than buried:** `ledger_transactions.event_id` is still nullable, so a
+  transaction *can* be written with no causing event. Making it `NOT NULL` is the obvious fix and
+  is not done — until it is, this is a convention, not the guarantee the other three are.
 
 **Correctness is never configurable.** Ledgers that make historization optional produce
 point-in-time queries that silently return empty results — a wrong answer that looks like an
@@ -177,8 +180,10 @@ it is the wrong fit here:
 2. **It cannot be the only datastore.** Its schema is deliberately fixed — no ad-hoc queries, no
    joins, no aggregation, no JSON. Reporting, statements, spend controls and multi-tenancy still
    need Postgres. That means operating two systems and a consistency boundary between them.
-3. **It defeats the deployment goal.** There is no managed AWS offering; it wants a replica cluster
-   on instances with fast local disk, operated by you. For a small team that *increases*
+3. **It defeats the deployment goal.** **Correction:** an earlier version of this said "there is no managed AWS offering."
+   [TigerBeetle Cloud](https://tigerbeetle.com/cloud) exists, on AWS/Azure/GCP. The accurate
+   narrower claim is that there is no AWS-*native* service, and that self-hosting wants a
+   six-replica cluster on local NVMe, operated by you. For a small team that *increases*
    operational burden at exactly the point this project claims to reduce it.
 
 None of that makes TigerBeetle wrong — it makes it a different tool. If your ledger genuinely is

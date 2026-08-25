@@ -15,8 +15,8 @@ part of the product — something unrunnable is not adoptable, however correct i
 ## M0 · The conformance suite — **mostly done**
 
 [`tests/`](../tests/) exists and runs against a throwaway database via `make test-sql`:
-a full card lifecycle asserted state-by-state, the hold flow, and nineteen deliberate breakages
-that must each be refused. Writing it found four real defects, two of which under-reserved credit
+a full card lifecycle asserted state-by-state, the hold flow, query-plan assertions, a concurrency
+suite, and thirty-eight deliberate breakages that must each be refused. Writing it found four real defects, two of which under-reserved credit
 ([ADR-0010](./decisions/0010-authorization-holds.md)).
 
 One design note, learned the hard way: **counting errors is not a pass criterion.** An earlier
@@ -307,9 +307,14 @@ is owning the *sweep* that consolidates suspense accounts, and draining event st
 
 - **Sharding across instances.** Striping *within* one instance is in scope because it is the
   lever that matters. The composite keys in M1 keep the door open.
-- **Partitioning by tenant.** Illegal against the current keys (measured), and it costs ~10 ms of
-  *uncacheable* planning per execution at high partition counts against ~1.3 ms of real work. It
-  buys per-tenant `DETACH`, not throughput — table size barely affects us.
+- **Partitioning by tenant.** **Not illegal** — an earlier version of this line said it was, and
+  said so "(measured)". Re-run on the shipped schema, `PARTITION BY HASH (tenant_id)` succeeds on
+  `ledger_entries`, `ledger_transactions` and `ledger_accounts` carrying every constraint they
+  actually have, including the composite FKs and both partial unique indexes. `tenant_id` leading
+  every key is precisely what makes it legal — which was the point of putting it there. What is
+  true: there is no in-place `ALTER TABLE` conversion, and it buys per-tenant `DETACH` rather than
+  throughput, since table size barely affects an append-only workload. The planning-cost figure
+  that accompanied the illegality claim has no method recorded anywhere and is struck.
 - **Caching balances.** `posted` is read straight off the ledger by construction, so there is no
   second copy to drift.
 - **Multi-currency FX.** The schema carries currency and balances per currency; conversion is a
