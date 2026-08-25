@@ -62,4 +62,4 @@ No published number yet, deliberately. [Spike 003](./spikes/003-throughput-ceili
 measured the design with durability on, but everything so far ran on localhost — where a network
 round trip costs 0.05 ms against roughly 0.5 ms on RDS. That reorders the tuning levers rather
 than merely scaling the result, so nothing goes in a README until it is measured over a real
-network. See [the vision doc](./docs/vision.md#performance-and-why-there-is-no-number-here).
+network. See [the vision doc](./docs/vision.md#performance).

@@ -118,6 +118,8 @@ reasons it is still wrong here:
    schema, no ad-hoc queries, no joins, no aggregation. Reporting, statements, multi-tenancy and
    RLS all still need Postgres — two datastores and a consistency boundary between them.
 3. **It defeats the deployment goal.** Postgres means RDS: managed, backed up, one click.
+   ([0008](./0008-durable-timers.md) removed the last thing that undercut this claim — durable
+   timers were going to require a Temporal cluster, and now run in-process on the same database.)
    TigerBeetle has no managed AWS offering; it wants a replica cluster on fast local disk that you
    operate. It *increases* operational burden precisely where we claim to reduce it.
 

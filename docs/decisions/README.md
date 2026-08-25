@@ -14,7 +14,7 @@ here, so the ADRs don't each stop to re-explain them.
   almost any adopter needs.
 - **sqlc**, no ORM — we write the SQL; it generates typed Go. The hot queries stay reviewable *as
   SQL*.
-- **Temporal** for durable timers — though whether it belongs in the core is still open.
+- **Postgres for durable timers too** — an in-process job queue, no scheduler cluster to run.
 
 ## The decisions
 
@@ -27,6 +27,7 @@ here, so the ADRs don't each stop to re-explain them.
 | [0005](./0005-reproducible-as-of.md) | Pin reports to a commit-ordered cursor, not a timestamp | `recorded_at` is transaction-*start* time, so the same "as of" query re-runs to a different answer | **proposed** |
 | [0006](./0006-schema-conventions.md) | Naming rules, a CI schema-snapshot test, keep FKs and enums | Dropping a column silently drops its indexes — Formance lost a hot-path index that way for thirty migrations | accepted |
 | [0007](./0007-open-source-positioning.md) | Reframe as a general open-source ledger; keep Postgres | The bottleneck is one contended row, not the hardware — and striping fixes it | **proposed** |
+| [0008](./0008-durable-timers.md) | Durable timers in Postgres, not Temporal | The need is durable *scheduling*, not workflow orchestration — and a job row commits in the same transaction as the ledger write, which Temporal cannot do | accepted |
 
 ## Non-negotiable
 
@@ -56,8 +57,8 @@ Undecided, listed plainly rather than buried:
   10M. The fix is the accountants' one: close each period and store its closing balance, so a
   query only has to add up the current period. Designed but not built —
   [0003](./0003-bitemporal-balances.md) has the numbers.
-- **Temporal's place.** [0001](./0001-go-and-postgres.md) leans on it, but it is a server cluster,
-  not a library — in tension with the "drop it into AWS" pitch. Needs its own ADR before M6.
+- **A licence has not been chosen.** There is no LICENSE file. The timer library is MPL-2.0, which
+  makes this due now rather than later — see [0008](./0008-durable-timers.md).
 - **No number has been measured on RDS.** Everything so far is localhost, where a round trip is
   ten times cheaper. Nothing gets published until that is fixed.
 - **Posting rules.** A deployment declares its own accounts; it must also declare how a business

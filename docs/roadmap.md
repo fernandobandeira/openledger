@@ -197,10 +197,17 @@ decision rather than re-evaluating against a limit that may have moved.
 
 ## M8 · Durable timers
 
-Temporal enters here and not before — hold expiry and the ACH return window are the first two
-things that genuinely need it. Activities must be idempotent, which M3 provides.
+Durable timers enter here and not before — hold expiry and the ACH return window are the first
+two things that genuinely need them. They run **in-process on Postgres**, in the same transaction
+as the ledger write, so a hold and its expiry timer commit together or not at all
+([ADR-0008](./decisions/0008-durable-timers.md)). Handlers are idempotent already, which M3 gives
+us.
 
-**Temporal is not a throughput mechanism.** A contended row lock is held for the duration of a
+Ship the reconciliation sweep alongside it — `WHERE state = 'open' AND expires_at < now()` behind
+a partial index. The deadline lives in the business row, so a lost job becomes recoverable rather
+than silent.
+
+**A scheduler is not a throughput mechanism.** A contended row lock is held for the duration of a
 transaction; making the write asynchronous relocates who waits rather than removing it. Its place
 is owning the *sweep* that consolidates suspense accounts, and draining event streams in batches.
 
