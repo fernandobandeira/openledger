@@ -242,6 +242,126 @@ not at all.**
   Building per-tenant revenue in the ledger does not create a segment. Worth a docs note so nobody
   panics.
 
+## Prior art — the pattern has six names and we are not inventing it
+
+Surveyed across open-source and commercial ledgers. Splitting one logical account into N physical
+rows is **standard practice**, attested under six names:
+
+| Name | Source | Shard key |
+| --- | --- | --- |
+| **Balance sharding** | Blnk, docs page *"Handling Hot Balances"* | hashed |
+| **Scoped accounts** | Envato `double_entry` (Rails, ~2012) | a business entity |
+| **Account pooling** | Formance, *Architecting for scale* | random (`@world:<random_id>`) |
+| **Template accounts** | Fragment (`template: true`) | the entity |
+| **Ledger Account Categories** | Modern Treasury (aggregation half only) | arbitrary grouping |
+| **Fund accounting / balanced segment** | Beancount, django-ledger, Oracle & SAP GL | the fund / unit |
+
+`double_entry`'s README states our exact justification: *"Scoping accounts is recommended.
+Unscoped accounts may perform more slowly than scoped accounts due to lock contention."* Shipped
+in a production marketplace since 2012.
+
+### Our key choice is the better one, and AWS names why
+
+Everyone sharding a hot ledger account in OSS shards on a **random or hashed** key. We propose a
+**semantically meaningful** one. AWS's DynamoDB write-sharding guidance draws exactly this line:
+
+- **Random suffixes** — great writes, but *"to read all the items for a given day, you would have
+  to query the items for all the suffixes and then merge the results."*
+- **Calculated suffixes** — *"use a number that you can calculate based upon something that you
+  want to query on."*
+
+A tenant key is a calculated suffix. Per-tenant reads become point reads on a known row; only the
+*global* roll-up scatters. Random stripes make every read a scatter.
+
+### This refines our "batching and striping are antagonistic" finding
+
+[Spike 003 Result 6](../003-throughput-ceiling/README.md) measured random striping and coalesced
+batching cancelling (2,356/s vs 6,850 or 3,420 alone), and
+[Result 8](../003-throughput-ceiling/README.md) found worker-affinity striping makes them compose
+(4,790/s, flat across concurrency).
+
+Blnk pairs balance sharding *with* coalescing deliberately, and explains why: *"Coalescing stays
+effective. With the queue enabled, each shard still batches transactions that share the same
+source, destination, and currency, **but with far less contention per pair** than a single
+overloaded balance."*
+
+**The affinity key should be the tenant, not the worker.** A batch of one tenant's clearings
+naturally coalesces onto that tenant's house rows — same mechanism as Result 8, but keyed on a
+business fact, so it survives a restart and needs no sweep process.
+
+### THE design rule: put the invariant on the rollup, not the shard
+
+The failure mode, found in the wild (`dineshsuthar123/Nexus`, `008_account_sharding.sql`): an
+`account_shard(account_id, shard_id, balance)` table with `CHECK (balance >= 0)` **per shard**. A
+debit then fails on one shard while the aggregate has funds, forcing shard rebalancing.
+
+Every mature system avoids it the same way:
+
+- **Modern Treasury**: `ledger_account_category_balance_locks` lock the **category** balance.
+- **Fragment**: entry conditions apply to `totalBalance`, *"which includes both the account's own
+  lines and its children's lines."*
+- **hledger**, in accounting terms: *"generally you should avoid writing balance assertions on
+  individual lots… you can usually write it on the parent account instead."*
+
+Directly relevant to the reference product: a **credit limit must be checked against the logical
+account**, never a stripe.
+
+### Fragment's three balances are the API shape to copy
+
+`ownBalance` (this account's own lines), `childBalance` (its children's), `balance` (both) — with
+matching `ownBalanceChange` / `childBalanceChange` / `balanceChange(period:)`. Don't leave
+"balance = SUM across stripes" as an implicit query convention; name it in the schema.
+
+### Beancount: the tenant belongs ABOVE the account roots, not below
+
+The sharpest accounting-theory statement of our theorem, from Beancount's fund-accounting design
+doc — *"An Accounting Fund is a self-balancing Chart of Accounts"*, with the rule *"it is required
+that any transaction be balanced in every fund that it uses"*, therefore any combination of funds
+balances. And the design guidance:
+
+> *"I don't see how this can be so easily or neatly achieved by pushing the idea of the 'funds'
+> down into the account hierarchy: **funds belong above the five root accounts** (Assets,
+> Liabilities, Equity, Income and Expenses), not below them."*
+
+Our theorem already says every per-tenant slice balances — but that only holds **if every
+transaction is tenant-local**, which is exactly what per-tenant house accounts buy. Making the
+tenant a first-class scope *above* the account type (rather than a suffix below
+`interchange_revenue`) is what keeps `A = L + E + (R − X)` provable per tenant, and that is what
+makes a future database split safe.
+
+### Nobody does global reporting inside the OLTP engine
+
+| System | Global reporting |
+| --- | --- |
+| Formance | per-ledger only; CDC to ClickHouse, `GROUP BY ledger` |
+| TigerBeetle | no server-side aggregation at all; CDC to a warehouse |
+| `double_entry` | materialized `double_entry_line_aggregates` cache table |
+| Modern Treasury / Fragment | precomputed rollups on write |
+| **Blnk** | **left to the user — and its own docs flag that as the reason not to shard** |
+
+Blnk's stated caveat is the one to design against: don't shard when *"you need a single balance
+identity for external reconciliation or regulatory reporting **without aggregation**."* That is
+the `network_settlement_payable` case exactly.
+
+### Two independent corroborations of our own numbers
+
+- **pgledger** (pure-SQL Postgres ledger, same running-balance + sorted-`FOR UPDATE` design as
+  ours) publishes 10,637 transfers/s local, 7,559 hot, and **1,631 over a network (36.8ms per
+  transfer)** — an ~85% collapse. Independent confirmation of
+  [Result 9](../003-throughput-ceiling/README.md) and of the decision not to publish a localhost
+  figure.
+- **Formance self-reports** being *"optimized for 1K writes per second on an underlying commodity
+  storage instance."* Our unsharded ~840 clearings/s with durability on is in the same league as
+  the closest comparable system.
+
+### A correction to how we read TigerBeetle
+
+Their objection — *"most accounts cannot be neatly partitioned between shards"*, *"row locks on hot
+accounts worsen when the transactions must execute across shards"* — is an argument against
+**distributed** sharding, where cross-shard transactions get expensive. **It does not apply to N
+rows in one Postgres.** [ADR-0007](../../docs/decisions/0007-open-source-positioning.md) leaned on
+it slightly too heavily.
+
 ## Open — posting rules
 
 The remaining piece of "how they tie together." A deployment declares its chart; it must also
