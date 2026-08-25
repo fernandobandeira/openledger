@@ -369,6 +369,37 @@ is the **first configuration whose ceiling is hardware rather than design** — 
 plateaued because of a lock. A bigger instance moves this number; a bigger instance did nothing
 for any of the others.
 
+### CORRECTION — the lever is contention, not the lock
+
+The framing above ("lock-free append is worth 13×") contains a confound, caught by isolating it.
+**Append mode writes one row per leg; pessimistic writes two** (the balance upsert *and* the
+entry). So some of the gap is simply doing less work, not avoiding locks.
+
+Isolating it — three configurations at c=32, medians of 3 runs on a dedicated database:
+
+| | writes balance row? | contended? | clearings/s |
+| --- | --- | --- | --- |
+| **A** pessimistic, one shared house row | yes | **yes** | 695 |
+| **B** pessimistic, worker-affinity (each writer owns its rows) | yes | **no** | 8,222 |
+| **C** append, no balance row at all | no | no | 10,025 |
+
+- **A → B: 11.8×.** This is removing *contention*, with the running balance fully intact.
+- **B → C: 1.22×.** This is everything else — abandoning the balance row entirely.
+
+**About 92% of the prize is contention removal. Abandoning the running balance adds ~20% more,
+and costs the O(1) balance read** (0.018ms → 105.91ms at a million entries), **the
+`balance_after`-vs-aggregate corruption cross-check, and the gaplessness proof.**
+
+So the earlier framing was wrong in an important way. The choice is not "keep the running balance
+at 800/s, or drop it for 13k/s." It is:
+
+> **Keep the running balance AND remove the contention.** That is 8,222/s — 82% of the lock-free
+> number — with every correctness property retained.
+
+Lock-free append is not the largest lever. It is a 22% top-up on the largest lever, bought with
+the properties the ledger's auditability rests on. **Recommendation: do not pursue it.** Remove
+contention instead — per-tenant house accounts, worker affinity, or striping.
+
 ### What it costs, measured
 
 The read side, forced onto the index path (20 iterations each):
@@ -401,10 +432,10 @@ Three other things the running balance buys that the append design loses:
    have holes after rollbacks, and Formance's own migration comments say so explicitly.
 3. **Cheap as-of reads on the recorded axis**, which become aggregates too.
 
-**Not proposing the change here.** The measurement establishes the size of the prize (13×, the
-largest single lever found), the shape of the cost (O(n) reads ⇒ mandatory checkpointing), and
-what is given up beyond speed. Deciding it needs a checkpointed-read benchmark, which does not
-exist yet.
+**Recommendation: do not pursue lock-free append.** Per the correction above, it is a ~20%
+top-up over contention-free pessimistic locking, paid for with O(1) reads, the corruption
+cross-check, and gaplessness. The contention was always the thing worth removing; the lock never
+was.
 
 ## Result 12 — is the ceiling per-tenant or global? Global. But tenant-sharding is free.
 
@@ -495,7 +526,8 @@ coordinate, ever.
 | tenants=16, own house accounts | 4,319 | 12,956 | free if multi-tenant |
 | best config on a **2 GB** table | 7,897 | 23,692 | size-insensitive |
 | optimistic locking | 437 | 1,311 | **worse**; 11.8 retries/success |
-| **lock-free append** (no running balance) | **13,042** | **39,127** | hardware-bound, not design-bound; needs checkpointed reads |
+| contention-free pessimistic (keeps running balance) | 8,222 | 24,666 | **the recommended shape** |
+| lock-free append (no running balance) | 10,025 | 30,074 | only +22% over the row above; costs O(1) reads |
 
 **Caveat that outranks the table:** these are localhost numbers, where a round trip costs 0.05ms.
 On RDS it costs ~0.5ms, which reorders the levers (Result 9). Treat the *ranking* as
@@ -522,6 +554,22 @@ hardware-specific and the *mechanisms* as general.
 5. **Batching and striping must not both be recommended.** They cancel. The docs need to say
    which one applies to which write path, or users will apply both and land at 2,356/s wondering
    why their "optimised" ledger is 3× slower than the default.
+
+## Methodology caveats found while auditing our own numbers
+
+- **Two harnesses on one database invalidate everything.** A concurrent run by another process
+  (whose `setup()` issues `TRUNCATE ... CASCADE`) produced deadlocks and wild variance until the
+  benchmark was moved to a dedicated database. Any re-run must be isolated.
+- **Single runs hide variance.** Repeating the A/B/C comparison three times gave 668/799/695,
+  8781/8222/4814, and 10025/9892/10889. The 4,814 is an outlier from CPU competition. **Treat
+  the ratios as the finding and the absolute numbers as approximate**; earlier single-run figures
+  in this document should be read the same way.
+- **`post_clearing_mode()` does not sort accounts before locking**, unlike the Go path in
+  `clearing()`, which sorts legs by account id. With `stripes=1` no cycle can form so it happens
+  not to deadlock, but the SQL path is not doing the deterministic lock ordering the design
+  requires. **Production posting code must sort; this benchmark path does not.** It does not
+  invalidate the throughput numbers, but it is a bug in the harness and a trap for anyone reading
+  it as reference code.
 
 ## What this does NOT measure
 

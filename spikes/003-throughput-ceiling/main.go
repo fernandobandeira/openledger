@@ -25,7 +25,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const dsn = "postgres://openledger:openledger@localhost:5433/openledger?pool_max_conns=64"
+var dsn = envOr("OL_DSN", "postgres://openledger:openledger@localhost:5433/openledger?pool_max_conns=64")
+
+func envOr(k, d string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return d
+}
 
 type tenant struct {
 	id        string
