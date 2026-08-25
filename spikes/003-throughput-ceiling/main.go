@@ -42,7 +42,26 @@ var (
 	conc       = flag.Int("c", 16, "concurrent writers")
 	dur        = flag.Duration("d", 5*time.Second, "measurement duration")
 	label      = flag.String("label", "", "row label")
+	stripeMode = flag.String("stripe-mode", "random", "random | worker (worker = each writer owns a stripe)")
+	oneCall    = flag.Bool("one-call", false, "whole clearing in ONE server-side call (1 round trip, not 6)")
+	keep       = flag.Bool("keep", false, "do NOT truncate -- measure against an existing large table")
 )
+
+// workerID is goroutine-local: with -stripe-mode=worker each writer always posts
+// to ITS OWN house stripe. Random striping scatters a batch across stripes, which
+// is why striping and coalescing cancel. Worker affinity should make them compose:
+// every posting in a batch lands on the same row, so it coalesces to ONE upsert,
+// AND no other writer contends for that row.
+type ctxKeyWorker struct{}
+
+func stripeFor(ctx context.Context, n int, rng *rand.Rand) int {
+	if *stripeMode == "worker" {
+		if w, ok := ctx.Value(ctxKeyWorker{}).(int); ok {
+			return w % n
+		}
+	}
+	return rng.Intn(n)
+}
 
 func main() {
 	flag.Parse()
@@ -58,8 +77,9 @@ func main() {
 	var wg sync.WaitGroup
 	for w := 0; w < *conc; w++ {
 		wg.Add(1)
-		go func(seed int64) {
+		go func(seed int64, worker int) {
 			defer wg.Done()
+			ctx := context.WithValue(ctx, ctxKeyWorker{}, worker)
 			rng := rand.New(rand.NewSource(seed))
 			for time.Now().Before(stop) {
 				if err := doBatch(ctx, pool, tenants, rng); err != nil {
@@ -70,7 +90,7 @@ func main() {
 				}
 				atomic.AddInt64(&ok, int64(*batch))
 			}
-		}(int64(w)*7919 + 13)
+		}(int64(w)*7919+13, w)
 	}
 	wg.Wait()
 
@@ -99,6 +119,15 @@ type posting struct {
 // then derive each entry's running balance by walking backwards from the returned
 // total. Their "demotion" of the running balance is what makes batching possible.
 func doBatch(ctx context.Context, pool *pgxpool.Pool, ts []tenant, rng *rand.Rand) error {
+	if *oneCall {
+		t := ts[rng.Intn(len(ts))]
+		_, err := pool.Exec(ctx, `SELECT post_clearing($1,$2,$3,$4,$5)`,
+			t.id, uuid.NewString(),
+			t.companies[rng.Intn(len(t.companies))],
+			t.netSettle[stripeFor(ctx, len(t.netSettle), rng)],
+			t.interch[stripeFor(ctx, len(t.interch), rng)])
+		return err
+	}
 	if *batch == 1 {
 		tx, err := pool.Begin(ctx)
 		if err != nil {
@@ -124,8 +153,8 @@ func doBatch(ctx context.Context, pool *pgxpool.Pool, ts []tenant, rng *rand.Ran
 		tids = append(tids, t.id)
 		posts = append(posts,
 			posting{id, t.companies[rng.Intn(len(t.companies))], "debit", 500},
-			posting{id, t.netSettle[rng.Intn(len(t.netSettle))], "credit", 491},
-			posting{id, t.interch[rng.Intn(len(t.interch))], "credit", 9})
+			posting{id, t.netSettle[stripeFor(ctx, len(t.netSettle), rng)], "credit", 491},
+			posting{id, t.interch[stripeFor(ctx, len(t.interch), rng)], "credit", 9})
 	}
 
 	tx, err := pool.Begin(ctx)
@@ -232,8 +261,8 @@ func clearing(ctx context.Context, tx pgx.Tx, t tenant, rng *rand.Rand) error {
 	}
 	legs := []leg{
 		{t.companies[rng.Intn(len(t.companies))], "debit", 500},
-		{t.netSettle[rng.Intn(len(t.netSettle))], "credit", 491},
-		{t.interch[rng.Intn(len(t.interch))], "credit", 9},
+		{t.netSettle[stripeFor(ctx, len(t.netSettle), rng)], "credit", 491},
+		{t.interch[stripeFor(ctx, len(t.interch), rng)], "credit", 9},
 	}
 	// deterministic lock ordering (spike 001)
 	for i := 1; i < len(legs); i++ {
@@ -252,10 +281,13 @@ func clearing(ctx context.Context, tx pgx.Tx, t tenant, rng *rand.Rand) error {
 }
 
 func setup(ctx context.Context, pool *pgxpool.Pool) []tenant {
-	_, err := pool.Exec(ctx,
-		`TRUNCATE ledger_entries, ledger_transactions, ledger_account_balances, ledger_accounts CASCADE;`)
-	must(err)
+	if !*keep {
+		_, err := pool.Exec(ctx,
+			`TRUNCATE ledger_entries, ledger_transactions, ledger_account_balances, ledger_accounts CASCADE;`)
+		must(err)
+	}
 
+	runID := uuid.NewString()[:8] // keeps -keep runs from colliding on uq_accounts__owned
 	out := make([]tenant, *nTenants)
 	for ti := range out {
 		t := tenant{id: fmt.Sprintf("tenant_%d", ti)}
@@ -263,8 +295,8 @@ func setup(ctx context.Context, pool *pgxpool.Pool) []tenant {
 			ids := make([]uuid.UUID, n)
 			rows := make([][]any, n)
 			for i := range rows {
-				rows[i] = []any{t.id, fmt.Sprintf("%s_%d_%d", kind, ti, i),
-					fmt.Sprintf("%s_%d_%d", kind, ti, i)}
+				rows[i] = []any{t.id, fmt.Sprintf("%s_%s_%d_%d", runID, kind, ti, i),
+					fmt.Sprintf("%s_%s_%d_%d", runID, kind, ti, i)}
 			}
 			_, err := pool.CopyFrom(ctx, pgx.Identifier{"ledger_accounts"},
 				[]string{"tenant_id", "owner_id", "purpose"},
@@ -274,7 +306,7 @@ func setup(ctx context.Context, pool *pgxpool.Pool) []tenant {
 			must(err)
 			must(pool.QueryRow(ctx, `SELECT array_agg(id ORDER BY owner_id)
 				FROM ledger_accounts WHERE tenant_id=$1 AND owner_id LIKE $2`,
-				t.id, kind+"_"+fmt.Sprint(ti)+"_%").Scan(&ids))
+				t.id, runID+"_"+kind+"_"+fmt.Sprint(ti)+"_%").Scan(&ids))
 			return ids
 		}
 		t.companies = mk("co", *nCompanies)

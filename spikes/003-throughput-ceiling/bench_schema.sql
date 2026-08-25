@@ -34,3 +34,18 @@ BEGIN
     VALUES (p_txn, p_account, p_dir, p_amount, p_currency, v_seq, v_bal, p_effective);
     RETURN v_bal;
 END $$;
+
+-- Whole clearing in ONE server-side call: 1 round trip instead of 6
+-- (BEGIN + txn insert + 3 post_entry + COMMIT).
+CREATE OR REPLACE FUNCTION post_clearing(
+    p_tenant text, p_key text, p_recv uuid, p_ns uuid, p_ic uuid
+) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE v_txn uuid; v_now timestamptz := now();
+BEGIN
+    INSERT INTO ledger_transactions (tenant_id, idempotency_key, idempotency_hash, kind, status, effective_at)
+    VALUES (p_tenant, p_key, sha256(convert_to(p_key,'UTF8')), 'clearing', 'posted', v_now)
+    RETURNING id INTO v_txn;
+    PERFORM post_entry(v_txn, p_recv, 'debit',  500, 'USD', v_now);
+    PERFORM post_entry(v_txn, p_ns,   'credit', 491, 'USD', v_now);
+    PERFORM post_entry(v_txn, p_ic,   'credit',   9, 'USD', v_now);
+END $$;

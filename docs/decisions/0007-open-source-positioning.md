@@ -62,9 +62,20 @@ Measured: 16 tenants with their own house accounts scale like 16 stripes (790 �
 path are a *reference implementation built on* the ledger, not the ledger. The core is accounts,
 transactions, entries, balances, bitemporal reads, and the event log.
 
-**4. Documentation must state which lever applies where** — batching for streams we control (a
-processor webhook queue drained by a workflow), striping for independent arrivals (the auth
-path). Recommending both lands users at 2,356/s wondering why tuning made it slower.
+**4. Documentation must state which lever applies where.** Batching and random striping cancel
+(2,356/s, worse than either alone). Two ways out, and the docs must name them:
+
+- **Worker-affinity striping** — each writer owns a stripe, so a batch coalesces onto one row
+  *and* contends with nobody. Measured 4,790/s, flat across concurrency. The accounting name is a
+  **per-writer suspense account**: post the shared leg to a row you alone own, keep every
+  transaction balanced, and sweep suspense into the house account periodically.
+- **Single-call posting** — the whole clearing in one server-side call. Worth only ~14% on
+  localhost but decisive on RDS, where the 5 saved round trips cost ~2.5ms (Result 9).
+
+**5. Publish no throughput number until it is measured on RDS.** Round trips cost 0.05ms on
+localhost and ~0.5ms on managed Postgres, which changes the *ranking* of the levers, not just the
+magnitudes. A localhost benchmark cannot support an AWS claim, and users will hold us to whatever
+the README says.
 
 ### What must NOT change
 
@@ -130,8 +141,9 @@ against instead of a hypothetical one.
 - **The auth path was not measured.** It writes no ledger entry and serializes per company, so it
   should scale far better — but it has a latency deadline rather than a throughput target and
   deserves its own spike before any claim is made about it.
-- **All numbers are from a small, fully-cached table.** The contention finding is structural and
-  will hold; the absolute numbers will fall at 100M+ entries. Needs re-measuring at size before
-  going in a README where users will hold us to it.
+- ~~**All numbers are from a small, fully-cached table.**~~ Closed: retested at 5M entries / 2 GB
+  against 128 MB of cache, essentially unchanged. The workload is append-only, so the hot set is
+  bounded by account count rather than entry count.
+- **Nothing has been measured over a network.** This is now the largest open caveat.
 - **Single node.** No replication or failover. Synchronous replication will cost on every commit
   and is not in these numbers.
