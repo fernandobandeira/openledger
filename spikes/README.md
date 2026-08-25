@@ -1,33 +1,26 @@
 # Spikes
 
-A spike is **timeboxed investigation to kill a specific uncertainty**, not exploratory coding.
-Every brief states the question, the timebox, and what evidence would settle it — before any
-code is written.
+A spike is **timeboxed investigation to kill a specific uncertainty**, not exploratory coding. One
+directory per spike, holding the question, the findings, and any throwaway code together. Each
+README leads with its answer — you should be able to get the value without reading the evidence.
 
-**One directory per spike**, holding the brief, the findings, and any throwaway code together.
-The `README.md` is the brief; findings get appended to it as the spike runs. Code is evidence
-for those findings — once a finding is written into an [ADR](../docs/decisions/), the code can
-be deleted without loss.
+Code here is throwaway: not built by CI, not imported by `/internal` or `/cmd`. Each spike with
+code is its own Go module so its dependencies never leak into the root `go.mod`.
 
-Code here is throwaway: not built by CI, not imported by `/internal` or `/cmd`, not held to the
-project's quality bar. Each spike with code is its own Go module so its dependencies never leak
-into the root `go.mod`.
-
-A spike ends one of three ways: it answers its question (write the finding into an ADR), it
-proves the question was wrong (say so), or it hits the timebox (record what's known and decide
-with partial information — do not extend silently).
-
-| # | Question | Outcome | Status |
+| # | Question | What we learned | Status |
 | --- | --- | --- | --- |
-| [001](./001-formance/) | What can we take from Formance's open-source ledger? | [ADR-0003](../docs/decisions/0003-bitemporal-balances.md), [0004](../docs/decisions/0004-event-log.md), [0005](../docs/decisions/0005-reproducible-as-of.md), [0006](../docs/decisions/0006-schema-conventions.md) | **closed** |
-| [002](./002-sqlc-vs-jet/) | sqlc or go-jet? | [ADR-0002](../docs/decisions/0002-data-access-layer.md) — sqlc | **closed** |
-| [003](./003-throughput-ceiling/) | Where does the Postgres design top out, and what moves it? | [ADR-0007](../docs/decisions/0007-open-source-positioning.md) | **closed** |
-| [004](./004-chart-of-accounts/) | What does a general ledger ship when the chart is business-specific? | chart as data; M0 acceptance test passing | **closed** |
+| [001](./001-formance/) | What can we take from Formance's production ledger? | Their running-balance problem was the **mutable business-date** one, not running balances in general. Ours is the immutable kind, so it stands. | **closed** |
+| [002](./002-sqlc-vs-jet/) | sqlc or go-jet? | **sqlc**, reversing the ADR's own proposal. Arrays were fine under both, so the pre-registered rule never fired; go-jet's silent-zero scan trap decided it. | **closed** |
+| [003](./003-throughput-ceiling/) | Where does the Postgres design top out, and what moves it? | **~800/s → 8,200/s** by removing contention on one shared row. Striping is the mechanism; dropping the running balance is not worth it. | **closed** |
+| [004](./004-chart-of-accounts/) | What does a general ledger ship when the chart of accounts is business-specific? | Ship the chart as **data** plus constraints that make the accounting identity a theorem. But the identity does **not** prove completeness — that needs its own guard. | **closed** |
+
+Outcomes fed [ADR-0002](../docs/decisions/0002-data-access-layer.md) through
+[ADR-0007](../docs/decisions/0007-open-source-positioning.md).
 
 ## Artifacts worth knowing about
 
-Spike 002 left behind files the project will actually use, because they were built against a
-real database rather than sketched:
+Spike 002 and 004 left behind files the project will actually use, because they were built against
+a real database rather than sketched:
 
 | File | What it is |
 | --- | --- |
@@ -35,3 +28,6 @@ real database rather than sketched:
 | [`002-sqlc-vs-jet/invariants.sql`](./002-sqlc-vs-jet/invariants.sql) | Nine invariants, each asserting Postgres *refuses* an illegal write. |
 | [`002-sqlc-vs-jet/expected_schema.sql`](./002-sqlc-vs-jet/expected_schema.sql) | The schema snapshot guard from [ADR-0006](../docs/decisions/0006-schema-conventions.md). |
 | [`002-sqlc-vs-jet/sqlc.yaml`](./002-sqlc-vs-jet/sqlc.yaml) | The verified codegen config. |
+| [`004-chart-of-accounts/chart.sql`](./004-chart-of-accounts/chart.sql) | Account types as data, with the constraints that keep them honest. |
+| [`004-chart-of-accounts/completeness.sql`](./004-chart-of-accounts/completeness.sql) | The guard against a report silently omitting an account. |
+| [`004-chart-of-accounts/golden_trace.sql`](./004-chart-of-accounts/golden_trace.sql) | M0's acceptance test — the v1-vision lifecycle, reproduced to the cent. |
