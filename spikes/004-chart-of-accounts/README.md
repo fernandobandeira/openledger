@@ -130,4 +130,29 @@ code, which means each integrator re-derives it and can get it wrong silently.
 
 Formance solves this with Numscript, a DSL. That is a large surface to own. A declarative
 template validated **at definition time** — proving the rule balances for all inputs, not just
-the ones that were tried — is probably the right first step. Needs its own spike before M3.
+the ones that were tried — is probably the right first step.
+
+**Adyen has shipped exactly that**, and it is the strongest external validation of this direction.
+Their ledger accepts entries *only* via a template, and templates are **mathematically verified**:
+they *"represent amounts that serve as inputs by logical entities and prove that every combination
+of amounts will result in a net sum of 0. This verification is fully automated and runs on every
+change to the templates."*
+
+That is a genuinely different correctness posture from ours. We check that a transaction balances
+**at runtime**, per transaction, forever. Adyen proves the *rule* balances **once, at design
+time** — so an unbalanced transaction becomes unconstructable rather than rejected. The two are
+complementary: keep the runtime constraint as a backstop, add design-time proof as the primary
+guarantee. Needs its own spike before M3.
+
+## Open — global rollups should be named, not ad-hoc
+
+Reporting across per-tenant accounts is a `SUM` (measured: 11.5ms across 1,000 tenants). But
+Modern Treasury's **Ledger Account Categories** are the better shape: *"free-form account groups
+that can be used to create account hierarchies"* where *"the balance of a Ledger Category is equal
+to the sum of the balances of all contained accounts"*, and categories nest.
+
+The difference matters. An ad-hoc `SUM` scattered through reporting code has no identity, gets
+rewritten slightly differently in three services, and has nowhere to cache. A **named, nested,
+first-class rollup** gives "global interchange revenue" an identity, one place to later
+materialize or push to a warehouse, and it generalizes to the sharded case (per-shard rollup, then
+sum of rollups) in a way a raw `SUM(*)` does not.
