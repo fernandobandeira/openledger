@@ -381,7 +381,7 @@ END $$;
 CREATE FUNCTION regroup_auth_event(
     p_tenant text, p_event uuid, p_new_group text, p_by text, p_method text DEFAULT 'manual')
 RETURNS void LANGUAGE plpgsql AS $$
-DECLARE v_old text; v_company text; v_ccy char(3); v_dest record;
+DECLARE v_old text; v_company text; v_ccy char(3); v_dest card_hold_groups; k text;
 BEGIN
     SELECT e.company_id, e.currency INTO v_company, v_ccy
       FROM card_auth_events e WHERE e.tenant_id=p_tenant AND e.id=p_event;
@@ -389,50 +389,66 @@ BEGIN
         RAISE EXCEPTION 'no such auth event %', p_event USING ERRCODE='data_exception';
     END IF;
 
-    -- The destination must be able to accept this event. record_auth_event refuses
-    -- a cross-currency join; this function -- the ROUTINE corrective operation --
-    -- did not, so moving a USD event into a EUR group produced a total that added
-    -- USD minor units to EUR minor units and raised USD available credit by 500.00.
-    -- Same vacuity 0002 removed from the accounting equation, through the back door.
-    SELECT * INTO v_dest FROM card_hold_groups
-     WHERE tenant_id=p_tenant AND company_id=v_company AND group_key=p_new_group
-     FOR UPDATE;
+    SELECT group_key INTO v_old FROM card_auth_event_group
+     WHERE tenant_id=p_tenant AND event_id=p_event AND superseded_at IS NULL;
 
-    IF FOUND AND v_dest.currency <> v_ccy THEN
+    -- MATERIALISE THE DESTINATION FIRST, then lock, then validate -- the order
+    -- record_auth_event already uses, and the reason it has no window.
+    --
+    -- The previous order (read FOR UPDATE, validate, then insert) was not
+    -- concurrency-safe: while a concurrent transaction was mid-creation of the
+    -- destination the row was invisible, FOUND was false, and BOTH guards below
+    -- were skipped entirely. Demonstrated twice, against this exact function:
+    --   * a USD event moved into a group being created as EUR -- 1500 "held",
+    --     being 1000 EUR plus 500 USD added as if they were the same unit
+    --   * a live 900-unit authorization moved into a group being expired --
+    --     held_for_company reported 0 against real exposure of 1000, and
+    --     card_hold_drift could not see it, because the clamp lives in
+    --     held_minor while the alarm compares total_minor, and those agreed
+    --
+    -- Serially both are refused. The guards were correct and reachable around.
+    INSERT INTO card_hold_groups (tenant_id, company_id, group_key, currency)
+    VALUES (p_tenant, v_company, p_new_group, v_ccy)
+    ON CONFLICT DO NOTHING;
+
+    -- Lock BOTH affected groups, in group_key order.
+    --
+    -- Destination-then-source is not a safe order: two operators moving events in
+    -- opposite directions between the same two groups take the same two row locks
+    -- backwards and deadlock. Measured at 198 deadlocks under mixed regroup/ingest
+    -- load -- introduced by adding the lock that fixed the lost update. Same
+    -- lesson as sorting the legs in post(): a deterministic order, decided up
+    -- front, is what makes concurrent lockers queue instead of die.
+    FOR k IN SELECT g FROM unnest(ARRAY[p_new_group, v_old]) AS g
+              WHERE g IS NOT NULL ORDER BY g
+    LOOP
+        PERFORM 1 FROM card_hold_groups
+         WHERE tenant_id=p_tenant AND company_id=v_company AND group_key=k FOR UPDATE;
+    END LOOP;
+
+    -- The destination now certainly exists and is locked, so these always run.
+    SELECT * INTO v_dest FROM card_hold_groups
+     WHERE tenant_id=p_tenant AND company_id=v_company AND group_key=p_new_group;
+
+    IF v_dest.currency <> v_ccy THEN
         RAISE EXCEPTION
           'cannot move a % event into group %, which holds %; a hold total is only '
           'meaningful in one currency', v_ccy, p_new_group, v_dest.currency
           USING ERRCODE='data_exception';
     END IF;
 
-    -- ...and an EXPIRED group is a released hold. Attaching a live authorization to
-    -- one hid 900.00 from held_for_company, from the drift alarm, AND from the
-    -- unmatched queue -- the operator's own corrective action made it invisible.
-    IF FOUND AND v_dest.expired_at IS NOT NULL THEN
+    IF v_dest.expired_at IS NOT NULL THEN
         RAISE EXCEPTION
           'cannot move an event into group %, which expired at %; re-open it or '
           'choose another group', p_new_group, v_dest.expired_at
           USING ERRCODE='data_exception';
     END IF;
 
-    SELECT group_key INTO v_old FROM card_auth_event_group
-     WHERE tenant_id=p_tenant AND event_id=p_event AND superseded_at IS NULL;
-
     UPDATE card_auth_event_group SET superseded_at = now()
      WHERE tenant_id=p_tenant AND event_id=p_event AND superseded_at IS NULL;
     INSERT INTO card_auth_event_group (tenant_id,event_id,group_key,method,assigned_by)
     VALUES (p_tenant,p_event,p_new_group,p_method,p_by);
 
-    -- Materialise the destination if it does not exist yet. Splitting a mis-grouped
-    -- event into its OWN group is the routine case, and without this the membership
-    -- row existed while the group did not: held_for_company reported 50.00 where
-    -- 80.00 was genuinely held. Under-reserving credit is the worst failure
-    -- available here, and card_hold_drift could not see it either.
-    INSERT INTO card_hold_groups (tenant_id, company_id, group_key, currency)
-    VALUES (p_tenant, v_company, p_new_group, v_ccy)
-    ON CONFLICT DO NOTHING;
-
-    -- Recompute BOTH affected groups from their events, company-scoped.
     PERFORM recompute_hold_group(p_tenant, v_company, g)
        FROM (SELECT unnest(ARRAY[v_old, p_new_group]) g) x
       WHERE g IS NOT NULL;
@@ -484,6 +500,17 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
         JOIN card_auth_events e ON e.tenant_id=m.tenant_id AND e.id=m.event_id
         WHERE m.tenant_id = g.tenant_id AND m.group_key = g.group_key
           AND m.superseded_at IS NULL AND e.company_id = g.company_id
-          AND e.currency <> g.currency);
+          AND e.currency <> g.currency)
+   -- ...or an event was attached to a group AFTER it expired. held_minor is
+   -- GENERATED to 0 once expired_at is set, so exposure attached later is
+   -- invisible to held_for_company while total_minor and the log still agree --
+   -- the alarm compared exactly those two and therefore reported nothing. The
+   -- clamp is the thing hiding the number, so the alarm has to look past it.
+   OR EXISTS (
+        SELECT 1 FROM card_auth_event_group m
+        JOIN card_auth_events e ON e.tenant_id=m.tenant_id AND e.id=m.event_id
+        WHERE m.tenant_id = g.tenant_id AND m.group_key = g.group_key
+          AND m.superseded_at IS NULL AND e.company_id = g.company_id
+          AND g.expired_at IS NOT NULL AND m.assigned_at > g.expired_at);
 
 COMMIT;
