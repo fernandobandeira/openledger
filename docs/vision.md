@@ -85,7 +85,7 @@ Four properties. None is a setting.
 point-in-time queries that silently return empty results — a wrong answer that looks like an
 answer, which is worse than an error. Make the product pluggable; never the invariants.
 
-Two consequences worth stating plainly, because they are easy to get wrong:
+Two consequences follow, and both are counter-intuitive:
 
 **Balanced books do not mean correct reports.** A report that enumerates only some accounts still
 satisfies the accounting equation, because a missing account drops out of both sides — so revenue
@@ -120,10 +120,11 @@ reading the balance sums them. It works regardless of *who* is generating the lo
 splits within whatever account is hot. Throughput is also close to insensitive to table size — the
 workload is append-only, so a 2 GB table behaves like a small one.
 
-**There is no headline number in this document, deliberately.** Those figures come from a local
-machine, where a database round trip costs 0.05 ms. On managed Postgres it costs roughly ten times
-that, which reorders the tuning levers rather than simply scaling the result. A number will be
-published when one has been measured over a real network, and not before.
+**Treat those figures as shape, not as a benchmark.** They come from a local machine, where a
+database round trip costs 0.05 ms. On managed Postgres it costs roughly ten times that, and the
+clearing path spends six round trips against 1.3 ms of actual work — so network latency reorders
+which optimisations matter rather than simply scaling the result down. openledger publishes no
+throughput figure until one has been measured over a real network.
 
 ## Why Postgres, and not TigerBeetle
 
@@ -141,9 +142,8 @@ it is the wrong fit here:
    on instances with fast local disk, operated by you. For a small team that *increases*
    operational burden at exactly the point this project claims to reduce it.
 
-Worth taking anyway: the two-phase transfer with timeout is a better-factored version of the holds
-table, and worth reading before that table is finalized. The decision is worth revisiting when a
-real deployment sustains thousands of clearings per second after applying the levers above.
+None of that makes TigerBeetle wrong — it makes it a different tool. If your ledger genuinely is
+the whole problem and you are willing to operate a cluster for it, it is the better engine.
 
 ## Where to go next
 
