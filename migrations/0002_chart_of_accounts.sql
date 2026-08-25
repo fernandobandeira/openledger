@@ -17,6 +17,12 @@ CREATE TABLE fs_lines (
     code       text PRIMARY KEY,
     caption    text NOT NULL,
     statement  text NOT NULL CHECK (statement IN ('balance_sheet','income_statement')),
+    -- Which side of the statement this line sits on, declared rather than
+    -- inferred. balance_sheet used to derive it from whatever happened to be
+    -- posted (`bool_or(category = 'asset')`), so a line with NO activity evaluated
+    -- to NULL and landed on the liability/equity side -- inferring the chart from
+    -- the data, in the one report whose whole purpose is the opposite.
+    side       text NOT NULL CHECK (side IN ('asset','liability_equity','credit','debit')),
     sort_order int  NOT NULL DEFAULT 1000
 );
 
@@ -63,6 +69,36 @@ END $$;
 CREATE TRIGGER ck_accounts__matches_type
     BEFORE INSERT OR UPDATE ON ledger_accounts
     FOR EACH ROW EXECUTE FUNCTION assert_account_matches_type();
+ALTER TABLE ledger_accounts ENABLE ALWAYS TRIGGER ck_accounts__matches_type;
+
+-- An account's PURPOSE decides which statement line its whole history reports
+-- under. Re-pointing it at a type with the SAME category and normal_balance
+-- passed every check while moving that history somewhere else: operating_cash to
+-- customer_receivable is asset/debit to asset/debit, and 1,573.00 moved from Cash
+-- to Accounts receivable with the equation, the drift view and the balance sheet
+-- all green. The seed ships three such same-shaped pairs.
+CREATE FUNCTION assert_purpose_not_repointed() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE n bigint;
+BEGIN
+    IF NEW.purpose IS DISTINCT FROM OLD.purpose THEN
+        SELECT count(*) INTO n FROM ledger_entries
+         WHERE tenant_id = OLD.tenant_id AND account_id = OLD.id;
+        IF n > 0 THEN
+            RAISE EXCEPTION
+              'cannot re-point account %/% from % to %: % entr% already report under %',
+              OLD.tenant_id, OLD.id, OLD.purpose, NEW.purpose, n,
+              CASE WHEN n = 1 THEN 'y' ELSE 'ies' END, OLD.purpose
+              USING ERRCODE = '23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER ck_accounts__purpose_stable
+    BEFORE UPDATE ON ledger_accounts
+    FOR EACH ROW EXECUTE FUNCTION assert_purpose_not_repointed();
+ALTER TABLE ledger_accounts ENABLE ALWAYS TRIGGER ck_accounts__purpose_stable;
 
 -- The other side of the same invariant: changing a TYPE must not orphan accounts
 -- that already declared the old classification.
@@ -105,14 +141,49 @@ END $$;
 CREATE TRIGGER ck_types__matches_accounts
     BEFORE UPDATE ON account_types
     FOR EACH ROW EXECUTE FUNCTION assert_type_matches_accounts();
+ALTER TABLE account_types ENABLE ALWAYS TRIGGER ck_types__matches_accounts;
+
+-- fs_lines had NO guard at all, while account_types.fs_line had one -- and the
+-- identical harm sits one table over. Swapping two captions relabelled an issued
+-- balance sheet (1,573.00 presented as "Accounts receivable", 470.00 as "Cash"),
+-- and moving a line to the other statement double-counted revenue into equity.
+-- `statement` and `side` are structural and are frozen once anything reports
+-- under the line; `caption` and `sort_order` are presentation and stay editable,
+-- which is the honest split until the chart is versioned (ADR-0009).
+CREATE FUNCTION assert_fs_line_stable() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE n bigint;
+BEGIN
+    IF NEW.statement IS DISTINCT FROM OLD.statement
+       OR NEW.side IS DISTINCT FROM OLD.side THEN
+        SELECT count(*) INTO n FROM ledger_accounts a
+          JOIN account_types t ON t.code = a.purpose
+         WHERE t.fs_line = OLD.code;
+        IF n > 0 THEN
+            RAISE EXCEPTION
+              'cannot move statement line % (% / %) to (% / %): % account(s) report under it',
+              OLD.code, OLD.statement, OLD.side, NEW.statement, NEW.side, n
+              USING ERRCODE = '23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER ck_fs_lines__stable
+    BEFORE UPDATE ON fs_lines
+    FOR EACH ROW EXECUTE FUNCTION assert_fs_line_stable();
+ALTER TABLE fs_lines ENABLE ALWAYS TRIGGER ck_fs_lines__stable;
 
 -- ------------------------------------------------------------ reporting
 
 CREATE VIEW trial_balance AS
 SELECT a.tenant_id, a.id AS account_id, a.owner_id, a.purpose,
        t.category, t.normal_balance, e.currency,
-       SUM(e.amount_minor) FILTER (WHERE e.direction='debit')  AS debits,
-       SUM(e.amount_minor) FILTER (WHERE e.direction='credit') AS credits,
+       -- COALESCE, because an account with only credits returned NULL for debits,
+       -- and `WHERE debits - credits <> 0` then DROPS the row instead of flagging
+       -- it -- the same NULL-swallowing class as the `NULL NOT IN (...)` bug.
+       COALESCE(SUM(e.amount_minor) FILTER (WHERE e.direction='debit'), 0)  AS debits,
+       COALESCE(SUM(e.amount_minor) FILTER (WHERE e.direction='credit'), 0) AS credits,
        -- natural balance: positive means more of what this account normally holds
        -- PRESENTATION value: positive means more of what this account normally
        -- holds. Correct for showing ONE account; WRONG to sum across a category,
@@ -175,6 +246,18 @@ BEGIN
             COALESCE(p_axis, '<NULL>');
     END IF;
 
+    -- The SAME failure, on the other parameter. The axis was guarded and the
+    -- tenant was not, so 'Acme', 'acme ' or any typo returned zero rows -- and
+    -- `bool_and(balanced)` over zero rows is NULL, while the idiomatic
+    -- `for rows.Next() { if !balanced }` loop passes on an empty result. That is
+    -- the green check that did not execute, reached through a different door.
+    -- aliased: tenant_id is also an OUT parameter of this function, so an
+    -- unqualified reference is ambiguous
+    IF p_tenant IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM ledger_accounts la WHERE la.tenant_id = p_tenant) THEN
+        RAISE EXCEPTION 'unknown tenant %; it holds no accounts', p_tenant;
+    END IF;
+
     RETURN QUERY
     WITH e AS (
         SELECT en.tenant_id, en.currency, t.category,
@@ -230,19 +313,26 @@ WITH dp AS (
     JOIN account_types   t ON t.code = a.purpose
     GROUP BY e.tenant_id, e.currency, t.fs_line, t.category
 ), scopes AS (
-    SELECT DISTINCT tenant_id, currency FROM dp
+    -- Enumerated from the ACCOUNTS, not from the entries. A scope that has been
+    -- opened but has not yet posted anything is still a scope, and a report that
+    -- cannot name it cannot claim completeness over it.
+    --
+    -- HONEST LIMIT: this is still enumeration from data, one level further out.
+    -- There is no tenant registry and no currency registry, so a scope with no
+    -- accounts at all remains invisible, and `p_tenant` below is exactly the
+    -- "parameter in which to pass an incomplete list" that ADR-0009 says should
+    -- not exist. Completeness here is guaranteed WITHIN a scope, not across them.
+    SELECT DISTINCT tenant_id, currency FROM ledger_accounts
 ), lines AS (
-    -- every balance-sheet line in the chart, for every scope that has any activity
-    SELECT s.tenant_id, s.currency, f.code AS fs_line, f.caption, f.sort_order,
+    SELECT s.tenant_id, s.currency, f.code AS fs_line, f.caption, f.sort_order, f.side,
            COALESCE(SUM(CASE WHEN d.category = 'asset' THEN d.v ELSE -d.v END), 0)::bigint
-               AS amount_minor,
-           CASE WHEN bool_or(d.category = 'asset') THEN 'asset' ELSE 'liability_equity' END AS side
+               AS amount_minor
     FROM scopes s
     CROSS JOIN fs_lines f
     LEFT JOIN dp d ON d.tenant_id = s.tenant_id AND d.currency = s.currency
                   AND d.fs_line = f.code
     WHERE f.statement = 'balance_sheet'
-    GROUP BY s.tenant_id, s.currency, f.code, f.caption, f.sort_order
+    GROUP BY s.tenant_id, s.currency, f.code, f.caption, f.sort_order, f.side
 )
 SELECT tenant_id, currency, fs_line, caption, sort_order, amount_minor, side FROM lines
 UNION ALL
@@ -253,14 +343,44 @@ LEFT JOIN dp d ON d.tenant_id = s.tenant_id AND d.currency = s.currency
               AND d.category IN ('revenue','expense')
 GROUP BY s.tenant_id, s.currency;
 
--- Assets must equal liabilities + equity, per scope and per currency, with the
--- earnings line included. Unlike the roll-up check it replaces -- which compared
--- SUM(debits) against SUM(debits) across two FK-guaranteed joins and was
--- therefore unreachable -- this one can and did fail.
+-- The income statement, enumerated the same way. Its absence was itself a gap:
+-- the completeness defence covered only the balance sheet, while revenue
+-- understatement -- the thing ADR-0009 is about -- had no chart-outward report.
+CREATE VIEW income_statement AS
+WITH dp AS (
+    SELECT e.tenant_id, e.currency, t.fs_line,
+           SUM(CASE WHEN e.direction='debit' THEN e.amount_minor ELSE -e.amount_minor END) AS v
+    FROM ledger_entries e
+    JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
+    JOIN account_types   t ON t.code = a.purpose
+    GROUP BY e.tenant_id, e.currency, t.fs_line
+), scopes AS (SELECT DISTINCT tenant_id, currency FROM ledger_accounts)
+SELECT s.tenant_id, s.currency, f.code AS fs_line, f.caption, f.sort_order,
+       -- credit-normal lines (revenue) present positive; debit-normal (expense) too
+       (CASE WHEN f.side = 'credit' THEN -1 ELSE 1 END
+        * COALESCE(SUM(d.v), 0))::bigint AS amount_minor,
+       f.side
+FROM scopes s
+CROSS JOIN fs_lines f
+LEFT JOIN dp d ON d.tenant_id = s.tenant_id AND d.currency = s.currency AND d.fs_line = f.code
+WHERE f.statement = 'income_statement'
+GROUP BY s.tenant_id, s.currency, f.code, f.caption, f.sort_order, f.side;
+
+-- Assets must equal liabilities + equity, PER SCOPE and PER CURRENCY, with the
+-- earnings line included. Unlike the roll-up check it replaced -- which compared
+-- SUM(debits) against SUM(debits) across two FK-guaranteed joins and so could
+-- never fail -- this one can and did.
 CREATE FUNCTION balance_sheet_balances(p_tenant text DEFAULT NULL)
 RETURNS TABLE (tenant_id text, currency char(3), assets bigint,
                liabilities_and_equity bigint, balanced boolean)
-LANGUAGE sql STABLE AS $fn$
+LANGUAGE plpgsql STABLE AS $fn$
+BEGIN
+    -- an unknown tenant must RAISE, not return an empty balanced report
+    IF p_tenant IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM ledger_accounts a WHERE a.tenant_id = p_tenant) THEN
+        RAISE EXCEPTION 'unknown tenant %; it holds no accounts', p_tenant;
+    END IF;
+    RETURN QUERY
     SELECT b.tenant_id, b.currency,
            COALESCE(SUM(b.amount_minor) FILTER (WHERE b.side = 'asset'), 0)::bigint,
            COALESCE(SUM(b.amount_minor) FILTER (WHERE b.side = 'liability_equity'), 0)::bigint,
@@ -270,7 +390,6 @@ LANGUAGE sql STABLE AS $fn$
     WHERE p_tenant IS NULL OR b.tenant_id = p_tenant
     GROUP BY b.tenant_id, b.currency
     ORDER BY b.tenant_id, b.currency;
-$fn$;
-
+END $fn$;
 
 COMMIT;

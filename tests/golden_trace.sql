@@ -138,26 +138,39 @@ BEGIN
     EXECUTE 'SET CONSTRAINTS ALL IMMEDIATE';
     EXECUTE 'SET CONSTRAINTS ALL DEFERRED';
 
+    -- PER CURRENCY. This grouped by (tenant, purpose) only, summing minor units
+    -- across denominations -- the exact vacuity 0002 exists to remove from the
+    -- accounting equation, sitting in the assertion that checks it. An account
+    -- holding 100.00 USD and 100.00 EUR read as 20000 and matched an expectation
+    -- of 20000. Expectations are 'tenant|purpose|amount' (USD implied) or
+    -- 'tenant|purpose|CCY|amount'.
     WITH want AS (
         SELECT split_part(x,'|',1) AS tenant_id,
                split_part(x,'|',2) AS purpose,
-               split_part(x,'|',3)::bigint AS balance_minor
+               CASE WHEN split_part(x,'|',4) = '' THEN 'USD'
+                    ELSE split_part(x,'|',3) END::char(3) AS currency,
+               CASE WHEN split_part(x,'|',4) = '' THEN split_part(x,'|',3)
+                    ELSE split_part(x,'|',4) END::bigint AS balance_minor
         FROM unnest(p_expect) AS x
     ), got AS (
-        SELECT tenant_id, purpose, SUM(balance_minor)::bigint AS balance_minor
-        FROM trial_balance GROUP BY tenant_id, purpose
+        SELECT tenant_id, purpose, currency, SUM(balance_minor)::bigint AS balance_minor
+        FROM trial_balance GROUP BY tenant_id, purpose, currency
     )
     SELECT string_agg(line, E'\n' ORDER BY line) INTO msg FROM (
-        SELECT format('  MISSING  %s/%s expected %s', w.tenant_id, w.purpose, w.balance_minor) AS line
-          FROM want w LEFT JOIN got g USING (tenant_id, purpose) WHERE g.purpose IS NULL
+        SELECT format('  MISSING  %s/%s/%s expected %s', w.tenant_id, w.purpose,
+                      w.currency, w.balance_minor) AS line
+          FROM want w LEFT JOIN got g USING (tenant_id, purpose, currency)
+         WHERE g.purpose IS NULL
         UNION ALL
         -- the mutation catch: a leg posted somewhere plausible but wrong
-        SELECT format('  UNEXPECTED %s/%s holds %s', g.tenant_id, g.purpose, g.balance_minor)
-          FROM got g LEFT JOIN want w USING (tenant_id, purpose) WHERE w.purpose IS NULL
+        SELECT format('  UNEXPECTED %s/%s/%s holds %s', g.tenant_id, g.purpose,
+                      g.currency, g.balance_minor)
+          FROM got g LEFT JOIN want w USING (tenant_id, purpose, currency)
+         WHERE w.purpose IS NULL
         UNION ALL
-        SELECT format('  WRONG    %s/%s expected %s, got %s', w.tenant_id, w.purpose,
-                      w.balance_minor, g.balance_minor)
-          FROM want w JOIN got g USING (tenant_id, purpose)
+        SELECT format('  WRONG    %s/%s/%s expected %s, got %s', w.tenant_id, w.purpose,
+                      w.currency, w.balance_minor, g.balance_minor)
+          FROM want w JOIN got g USING (tenant_id, purpose, currency)
          WHERE w.balance_minor <> g.balance_minor
     ) q;
 
@@ -398,22 +411,45 @@ BEGIN
     END IF;
 END $$;
 
--- And the income statement, enumerated from the chart, must reconcile to the
--- earnings line the balance sheet carries.
+-- The income statement must tie to the earnings line the balance sheet carries --
+-- PER SCOPE and PER CURRENCY.
+--
+-- This was a single ungrouped sum on both sides. Against a ledger holding
+-- 5.40 USD, 10.00 USD and 100.00 EUR it added them to 11540, compared 11540 to
+-- 11540, and printed "ok". Adding euros to dollars and calling it green is
+-- precisely the failure ADR-0009 documents as measured and fixed -- reintroduced
+-- in the assertion that is supposed to guard against it.
 DO $$
-DECLARE v_is bigint; v_bs bigint;
+DECLARE r record; n int := 0;
 BEGIN
-    SELECT COALESCE(SUM(-tb.balance_debit_positive),0) INTO v_is
-      FROM trial_balance tb JOIN account_types ty ON ty.code = tb.purpose
-      JOIN fs_lines f ON f.code = ty.fs_line
-     WHERE f.statement = 'income_statement';
-    SELECT COALESCE(SUM(amount_minor),0) INTO v_bs
-      FROM balance_sheet WHERE fs_line = 'current_year_earnings';
-    IF v_is IS DISTINCT FROM v_bs THEN
-        RAISE EXCEPTION 'income statement (%) does not tie to retained earnings (%)',
-            v_is, v_bs;
+    FOR r IN
+        SELECT COALESCE(i.tenant_id, b.tenant_id) AS tenant_id,
+               COALESCE(i.currency,  b.currency)  AS currency,
+               COALESCE(i.profit, 0) AS profit, COALESCE(b.earnings, 0) AS earnings
+        FROM (SELECT tenant_id, currency, SUM(amount_minor) AS profit
+                FROM income_statement
+               GROUP BY tenant_id, currency) i
+        FULL OUTER JOIN (SELECT tenant_id, currency, SUM(amount_minor) AS earnings
+                           FROM balance_sheet WHERE fs_line='current_year_earnings'
+                          GROUP BY tenant_id, currency) b
+          ON b.tenant_id = i.tenant_id AND b.currency = i.currency
+    LOOP
+        n := n + 1;
+        -- income_statement presents revenue and expense both positive, so profit
+        -- is revenue less the expense lines; compare against the derived equity line
+        IF r.earnings IS DISTINCT FROM (
+             SELECT COALESCE(SUM(CASE WHEN side='credit' THEN amount_minor
+                                      ELSE -amount_minor END), 0)
+               FROM income_statement
+              WHERE tenant_id = r.tenant_id AND currency = r.currency) THEN
+            RAISE EXCEPTION 'income statement does not tie for %/%: earnings line %',
+                r.tenant_id, r.currency, r.earnings;
+        END IF;
+    END LOOP;
+    IF n < 2 THEN
+        RAISE EXCEPTION 'expected an income statement per scope, got %', n;
     END IF;
-    RAISE NOTICE 'ok  income statement ties to the balance sheet: %', v_is;
+    RAISE NOTICE 'ok  income statement ties to the balance sheet in % scope(s)', n;
 END $$;
 
 ROLLBACK;

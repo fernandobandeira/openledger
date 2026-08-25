@@ -274,6 +274,18 @@ SELECT must_fail('a contra-asset that adds to assets', $q$
     END $d$;
 $q$, 'contra-ok');
 
+-- 10d-bis. The state assertion itself must be PER CURRENCY. It grouped by
+--      (tenant, purpose) alone, so an account holding 100.00 USD and 100.00 EUR
+--      read as 20000 -- adding minor units across denominations, in the very
+--      assertion that guards against exactly that.
+SELECT must_fail('a state assertion that adds EUR to USD', $q$
+    DO $d$ DECLARE t uuid := txn('t1','n10dbis'); BEGIN
+        PERFORM entry('t1', t, acct('t1','interchange_revenue','EUR'), 'credit', 10000, 'EUR');
+        PERFORM entry('t1', t, acct('t1','customer_receivable'),       'debit',  10000, 'USD');
+    END $d$;
+    SET CONSTRAINTS ALL IMMEDIATE;
+$q$, 'does not balance');
+
 -- 10e. the balance sheet must balance, including un-closed earnings
 SELECT must_fail('balance sheet that does not balance', $q$
     DO $d$ DECLARE r record; BEGIN
