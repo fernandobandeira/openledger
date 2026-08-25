@@ -74,6 +74,50 @@ and balance tracking optional. **Configurable historization means as-of queries 
 rather than loud.** Keep the core rigid: append-only, balanced-per-currency, bitemporal,
 event-logged. Make the *product* pluggable, never the invariants.
 
+## The layering, stated precisely
+
+"Core versus reference product" is too coarse. Three layers, and the boundaries are load-bearing:
+
+| | what it is | needs a scheduler? | writes the ledger? |
+| --- | --- | --- | --- |
+| **1. Ledger core** | accounts, transactions, entries, balances, event log | **no** | it *is* the ledger |
+| **2. Rails** | card, ACH, wallet — each with its own state machine and deadlines | yes ([0008](./0008-durable-timers.md)) | yes, on the events it decides are financial |
+| **3. Product** | authorization decisions, spend controls, credit lines | no | **no** |
+
+Two consequences that are easy to miss:
+
+**The ledger core needs no scheduler, ever.** Every timer belongs to a rail — hold expiry, ACH
+return windows, statement cycles. The core is synchronous and transactional: it is called, it
+writes, it returns. That is why [0008](./0008-durable-timers.md) can put the scheduler in the
+product layer without the core noticing.
+
+**The authorization path is an optional module, not part of the ledger.** It is worth being exact
+about what it does, because the naming misleads:
+
+- It **writes** only `card_holds` — never a ledger entry. Nothing is owed until clearing.
+- It **reads** one number from the ledger: the `customer_receivable` balance, a single index
+  lookup (0.018 ms).
+
+So the product layer's entire coupling to the ledger is *one read*. A deployment with no cards —
+a marketplace wallet, say — simply does not install layer 3, and nothing in layers 1 or 2 changes.
+This makes the auth path a genuine plug-in rather than a fork, which is what
+"[the reference product] is not the project" has to mean concretely.
+
+It also means the read interface must stay narrow — *give me this account's current balance* —
+rather than the product reaching into ledger internals. That is the seam to protect in M1.
+
+**And the money movement is already async.** A clearing arrives as an external event, is recorded,
+and is posted to the ledger by a job — outside the authorization deadline entirely. This is
+v1-vision's central claim ("the hot path is not the ledger write"), and
+[0008](./0008-durable-timers.md) makes the mechanism concrete: the event and its job commit in one
+transaction.
+
+**A simplification falls out.** The architecture diagram shows an *outbox* and a *job queue* as
+separate components. With transactional enqueue they are the same thing — the classic outbox
+pattern exists to bridge "commit to the database" and "publish to a broker that is not the
+database." When the consumer reads from the same database, the outbox *is* the queue. One
+component, not two.
+
 ## Scaling shape — what an adopter can expect
 
 **The ceiling is global, not per-tenant.** It is shared across every tenant on a database, not
