@@ -20,9 +20,9 @@ an API.
 
 **Go, on Postgres, with no ORM.**
 
-**Go** because Temporal is written in Go and its Go SDK is the reference implementation (every
-timer in the design is a Temporal workflow); because `int64` minor units are native, so no float
-ever comes near money; and because deployment is a static binary.
+**Go** because `int64` minor units are native, so no float ever comes near money; because
+deployment is a static binary with no runtime to install; and because the Postgres tooling we
+depend on — pgx and sqlc — is first-class there.
 
 **Postgres** because one instance is enough — see the measured ceiling below.
 
@@ -35,7 +35,7 @@ SQL*, by us and plausibly by an auditor.
 | --- | --- |
 | **Kotlin/JVM** | Strongest runner-up — sealed classes give exhaustive state machines. Rejected on stack weight, not merit. |
 | **TypeScript** | Default numeric type is a float. Every boundary would need `bigint` discipline forever. |
-| **Rust** | Temporal's Rust SDK is not ready. |
+| **Rust** | Strong on correctness, but slower to iterate and a smaller pool of contributors for an OSS project. |
 | **TigerBeetle** | See [0007](./0007-open-source-positioning.md#why-not-tigerbeetle), which makes the case properly. |
 
 Go also remains the lowest-friction language for outside contributors, which matters more for an
@@ -63,23 +63,15 @@ illegal state unrepresentable), and a deferred constraint trigger is the backsto
 its entire benchmark with that trigger active and never found it to be the bottleneck — up to
 7,897 clearings/s the limit was row-lock contention.
 
-## Open — Temporal is an unexamined dependency
+## Resolved — Temporal is gone
 
-Half this ADR's case for Go is Temporal SDK quality. But Temporal is not a library: it is a
-server cluster with its own database and worker fleet, or a paid cloud subscription.
-[0007](./0007-open-source-positioning.md) promises "a small team can drop this into AWS", which
-is a claim about *one* managed database. Those two things are in tension and no ADR owns it.
+Half this ADR's original case for Go was Temporal SDK quality. Temporal is not a library: it is a
+server cluster with its own databases, which contradicts
+[0007](./0007-open-source-positioning.md)'s promise of one binary and one database.
 
-Three positions, unchosen:
-
-1. **Temporal in the reference product only.** The ledger core needs no durable timers — hold
-   expiry and settlement windows belong to the card layer, which 0007 already demotes. Most
-   likely answer.
-2. **A pluggable timer interface**, Postgres-backed by default. Costs an abstraction over
-   something easy to get subtly wrong.
-3. **Accept the dependency** and drop the "drop into AWS" claim.
-
-**Needs its own ADR before M6**, where Temporal was scheduled to enter.
+[**0008**](./0008-durable-timers.md) resolves it: durable timers run in-process on Postgres, and
+the ledger core takes no scheduler dependency at all. **The case for Go now rests on `int64` money,
+static binaries, and pgx/sqlc quality** — not on an SDK we no longer use.
 
 ## Consequences
 

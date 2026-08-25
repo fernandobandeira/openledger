@@ -10,7 +10,10 @@
 > implementation* targets. It remains the best description of the card domain we have, and its
 > [lifecycle trace](#06--lifecycle-one-500-purchase-row-by-row) is still M0's acceptance test.
 >
-> One correction: **§01's sizing is superseded** by
+> Two corrections. The original specified **Temporal** for durable timers; that is superseded by
+> [ADR-0008](./decisions/0008-durable-timers.md), which runs them in-process on Postgres — the
+> design is otherwise unchanged, since every timer here is one-shot. And **§01's sizing is
+> superseded** by
 > [spike 003](../spikes/003-throughput-ceiling/README.md), which measured the design instead of
 > reasoning about one known workload. Its "throughput is not the constraint" conclusion happens
 > to survive, but the argument behind it does not transfer to a project that cannot know its
@@ -30,7 +33,7 @@ system of record for **customer funds**, a **lender's collateral**, and the **fi
 statements**. Three different masters, one table.
 
 Product surface assumed: charge card + wallet + AP/AR, warehouse-funded receivables, we own
-the auth decision, delegated KYB/KYC. Small team, boring tech: **Postgres + Temporal**.
+the auth decision, delegated KYB/KYC. Small team, boring tech: **Postgres**.
 
 ---
 
@@ -71,7 +74,7 @@ also when interchange is recognized — and that is what reaches back to close t
 hold row carries its own `expires_at`, so nothing has to be handed forward at auth time.
 
 Everything with a timer — hold expiry, clearing, settlement, ACH return windows, disputes,
-statements — runs as a Temporal workflow calling **idempotent** ledger activities.
+statements — runs as a durable scheduled job calling **idempotent** ledger activities.
 
 ---
 
@@ -322,7 +325,7 @@ amount_minor  bigint    -- what was authorized
 cleared_minor bigint    -- accumulated across N clearings. partial capture.
 state    ('open'|'cleared'|'voided'|'expired'|'closed')
 decision ('approved'|'declined')  -- declines land 'closed', never count
-expires_at              -- Temporal timer target. ~7d, longer for T&E.
+expires_at              -- durable timer target. ~7d, longer for T&E.
 created_at
 INDEX (company_id) WHERE state = 'open'   -- partial; makes SUM(held) an index scan
 ```
@@ -455,7 +458,7 @@ Also in the chart, untouched by a card trace: `fbo_cash`, `customer_wallet`,
 - **available 9,500** · cash in hand, credit still not released
 
 ### 7.3 — Return window closes
-*Temporal durable timer · the money is finally yours*
+*durable timer · the money is finally yours*
 
 - ledger `evt_pull:final`: `DR ach_pull_unsettled 500.00` / `CR customer_receivable 500.00`
 - Only now is the debt extinguished. Release credit at 7.1 and they spend money that never
@@ -475,7 +478,7 @@ Also in the chart, untouched by a card trace: `fbo_cash`, `customer_wallet`,
 
 ### Branches — the same trace when it doesn't go cleanly
 
-**A · Clearing never arrives** *(Temporal durable timer fires, ~7 days after step 01)*
+**A · Clearing never arrives** *(durable timer fires, ~7 days after step 01)*
 - `card_holds` **UPDATE**: `state = expired`, held contribution → 0
 - ledger: **— nothing. nothing was ever owed. —**
 - Merchants are *supposed* to send an auth reversal for what they don't capture. Many don't.

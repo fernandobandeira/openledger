@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 430" role="img" aria-label="Architecture diagram: the card authorization decision runs synchronously against a single-row availability table and returns to payment processor within the deadline, while the general ledger write happens asynchronously via an outbox, with Temporal driving all long-running money-movement lifecycles."><title>Architecture — the hot path is not the ledger write</title><style>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 430" role="img" aria-label="Architecture diagram: the card authorization decision runs synchronously against a single-row availability table and returns to payment processor within the deadline, while the general ledger write happens asynchronously via an outbox, with durable Postgres-backed jobs driving all long-running money-movement lifecycles."><title>Architecture — the hot path is not the ledger write</title><style>
   text { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
   .s-cool { stroke: #1f5f66; color: #1f5f66; }
   .s-faint { stroke: #d3dade; }
@@ -65,7 +65,7 @@
         <rect class="s-fill-card" x="270" y="300" width="200" height="58"/>
       </g>
       <text class="t-lbl" x="370" y="200" text-anchor="middle">Money Movement</text>
-      <text class="t-sub" x="370" y="217" text-anchor="middle">Temporal workflows</text>
+      <text class="t-sub" x="370" y="217" text-anchor="middle">durable jobs (Postgres)</text>
       <text class="t-lbl" x="370" y="324" text-anchor="middle">Ledger Writer</text>
       <text class="t-sub" x="370" y="341" text-anchor="middle">idempotent · append-only</text>
 

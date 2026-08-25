@@ -82,9 +82,10 @@ would make it slower — the least debuggable failure mode available, and one th
 The watermark has to be built and tested against concurrent writers. Unverified:
 
 1. That `pg_snapshot_xmin(pg_current_snapshot())` gives a usable watermark under our real write
-   pattern. (This question originally assumed long-running Temporal activities hold transactions
-   open — re-examine, since [0001](./0001-go-and-postgres.md#open--temporal-is-an-unexamined-dependency)
-   no longer settles that Temporal is in the write path.)
+   pattern. This originally assumed long-running workflow activities might hold transactions open;
+   [0008](./0008-durable-timers.md) settles that they do not — timers are one-shot jobs, and a job
+   handler's transaction is as short as any other write. **The risk that remains is a batched
+   posting run**, not the scheduler.
 2. The watermark's lag under a batched run — if one transaction stays open for minutes, every
    report in that window is pinned behind it.
 3. That the watermark advances past aborted transactions automatically. It should; confirm.
