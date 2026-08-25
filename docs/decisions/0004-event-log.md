@@ -5,7 +5,7 @@
 
 ## Context
 
-[Spike 001](../spikes/001-formance.md) identified this as the one table from Formance's schema
+[Spike 001](../../spikes/001-formance/README.md) identified this as the one table from Formance's schema
 we are genuinely missing. Their `logs` is the real source of truth — every other table is a
 projection, and they rebuild an entire ledger by replaying it.
 
@@ -41,7 +41,7 @@ Add **`ledger_events`**: an append-only record of every accepted external event,
 same transaction as whatever it causes.
 
 - `idempotency_key` + `idempotency_hash`, scoped to the tenant, `NULLS NOT DISTINCT` — the
-  same shape [ADR-0003's schema work](../spikes/001-formance.md) applied to
+  same shape [ADR-0003's schema work](../../spikes/001-formance/README.md) applied to
   `ledger_transactions`, now in one place instead of per-rail.
 - `kind`, `source` (processor / treasury / customer / internal), `payload jsonb`,
   `effective_at`, `recorded_at`.
@@ -80,7 +80,7 @@ this ADR, because it interacts with the ordering question in
 [ADR-0005](./0005-reproducible-as-of.md) and should be decided alongside it.
 
 When we do take it, **copy their `data` / `memento` split**, which the
-[table-design pass](../spikes/001-formance.md#logs--the-ddl-we-are-designing-adr-0004-from)
+[table-design pass](../../spikes/001-formance/README.md#logs--the-ddl-we-are-designing-adr-0004-from)
 identified as the best idea in their schema:
 
 - `payload jsonb` — the full event, for reads and replay.

@@ -28,7 +28,7 @@ fixture's own self-check, and the engine doesn't exist yet.
 
 Starts from [`spikes/002-sqlc-vs-jet/schema.sql`](../spikes/002-sqlc-vs-jet/schema.sql), which
 already applies cleanly with nine invariants verified as enforced by Postgres, and already
-carries the [spike 001](./spikes/001-formance.md) corrections (tenant-scoped idempotency with
+carries the [spike 001](../spikes/001-formance/README.md) corrections (tenant-scoped idempotency with
 `NULLS NOT DISTINCT`, request-body hash, double-reversal guards, denormalized `effective_at`).
 
 `ledger_accounts`, `ledger_transactions`, `ledger_entries`. Nothing else. No API, no Go beyond
@@ -56,7 +56,7 @@ violate it and is refused *by Postgres*.
 
 `account_seq` and `balance_after` mean writes to one account must serialize.
 
-[Spike 001](./spikes/001-formance.md) supplies the mechanism: a per-(account, currency) balance
+[Spike 001](../spikes/001-formance/README.md) supplies the mechanism: a per-(account, currency) balance
 row, updated by a single atomic upsert that returns **both** the new balance and the next
 sequence number —
 
@@ -128,7 +128,7 @@ things that genuinely need it. Activities must be idempotent, which M3 already g
 
 ## Newly known work, not yet scheduled
 
-From [spike 001](./spikes/001-formance.md), in rough priority order:
+From [spike 001](../spikes/001-formance/README.md), in rough priority order:
 
 - **Per-row hash chaining** for tamper evidence. Nearly free at our volume; never build their
   block-hashing layer. Deferred in [ADR-0004](./decisions/0004-event-log.md) because it needs a

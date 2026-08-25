@@ -52,7 +52,7 @@ So this is not "which generator" but **which driver stack**, and the generator f
 [`spikes/002-sqlc-vs-jet/sqlc.yaml`](../../spikes/002-sqlc-vs-jet/sqlc.yaml).
 
 **This reverses the proposal below.** The original argument for Option A is kept intact so the
-reasoning trail survives; [spike 002](../spikes/002-sqlc-vs-jet.md) is what changed it, and the
+reasoning trail survives; [spike 002](../../spikes/002-sqlc-vs-jet/README.md) is what changed it, and the
 section after it says why.
 
 ## Superseded proposal (kept for the trail)
@@ -82,7 +82,7 @@ needing manual unmarshalling at every call site.
 If that turns out to be pervasive and ugly, sqlc's native pgx handling is worth more than
 Jet's builder, and the decision flips to B.
 
-**[Spike 002](../spikes/002-sqlc-vs-jet.md) exists to answer exactly that**, plus whether the
+**[Spike 002](../../spikes/002-sqlc-vs-jet/README.md) exists to answer exactly that**, plus whether the
 auth transaction's `FILTER` aggregate and `ON CONFLICT ... DO NOTHING RETURNING` survive each
 stack intact.
 

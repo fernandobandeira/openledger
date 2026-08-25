@@ -12,7 +12,7 @@ different question.
 
 ## Why it's worth the time
 
-Our [v1 vision](../v1-vision.md) asserts a lot of design without showing the failures that
+Our [v1 vision](../../docs/v1-vision.md) asserts a lot of design without showing the failures that
 produced it. Formance has been run against real money in production, and its schema, its
 migration history, and its issue tracker are all public. That is a cheap way to find out which
 of our assertions are load-bearing and which are taste.
@@ -28,7 +28,7 @@ Formance is the one of that class whose **actual implementation** is readable.
    running balance, find out why; that is the single highest-value thing this spike can return.
 2. **Per-account sequence assignment.** However they order entries within an account, how do
    they avoid two writers claiming the same sequence, and what does it cost under contention?
-   This is [milestone 2 of our roadmap](../roadmap.md) and the most likely place to get it
+   This is [milestone 2 of our roadmap](../../docs/roadmap.md) and the most likely place to get it
    subtly wrong.
 3. **Idempotency.** We key on the *event*, not the purchase, so pending → posted is a new row
    rather than an UPDATE. Does theirs agree? What happens on a retry with the same key but a
@@ -63,7 +63,7 @@ A written finding in this file, structured as:
 - **Open** — things their design implies we haven't thought about, promoted to roadmap items
   or new spikes.
 
-Anything that contradicts [v1-vision.md](../v1-vision.md) gets an ADR, not a silent edit to
+Anything that contradicts [v1-vision.md](../../docs/v1-vision.md) gets an ADR, not a silent edit to
 the vision doc.
 
 ## Findings
@@ -123,12 +123,12 @@ is a **business-date** question, and on the effective axis `balance_after` is un
 anything is backdated. In this domain backdating is guaranteed: `effective_at` is the network
 business date, and late clearing and chargebacks are inherently backdated.
 
-Resolved in [ADR-0003](../decisions/0003-bitemporal-balances.md).
+Resolved in [ADR-0003](../../docs/decisions/0003-bitemporal-balances.md).
 
 ### COPY — adopted into the schema
 
-Applied to [`spikes/002-sqlc-vs-jet/schema.sql`](../../spikes/002-sqlc-vs-jet/schema.sql) and
-verified by [`invariants.sql`](../../spikes/002-sqlc-vs-jet/invariants.sql):
+Applied to [`spikes/002-sqlc-vs-jet/schema.sql`](../002-sqlc-vs-jet/schema.sql) and
+verified by [`invariants.sql`](../002-sqlc-vs-jet/invariants.sql):
 
 1. **Tenant-scope the idempotency key.** Their sequence is a cautionary tale: migration 5 shipped
    a *non-unique* index, migration 7 had to de-duplicate production rows before adding
@@ -225,7 +225,7 @@ a class of silent corruption into a failed insert.
 
 ### OPEN — promoted to work
 
-- **Effective-axis balances** → [ADR-0003](../decisions/0003-bitemporal-balances.md).
+- **Effective-axis balances** → [ADR-0003](../../docs/decisions/0003-bitemporal-balances.md).
 - **`recorded_at <= T` is not reproducible under concurrency.** `recorded_at` is not monotonic
   with *commit* order: a transaction starting at T1 and committing at T3 writes `recorded_at=T1`,
   while one starting at T2 > T1 and committing at T2.5 writes T2. The same "as of T" report run
@@ -282,7 +282,7 @@ Three findings that only that method surfaces:
 The pattern behind most of their schema debt is a single mechanism: **dropping a column silently
 drops its indexes and constraints, and nothing in their process caught it.** Four separate
 regressions trace to migrations 37 and 46 alone. That is what
-[ADR-0006's snapshot test](../decisions/0006-schema-conventions.md) exists to prevent.
+[ADR-0006's snapshot test](../../docs/decisions/0006-schema-conventions.md) exists to prevent.
 
 ### Verified against our schema, and the result was not what the headline implied
 
@@ -300,7 +300,7 @@ The third row is the one that matters. Index-only scans need the visibility map 
 set by vacuum — so on a **freshly inserted row, which is exactly what the auth hot path reads**,
 the heap fetch happens anyway. `INCLUDE` is justified by as-of reporting over settled history,
 not by the hot path. Adopted with that rationale recorded in the schema, per
-[ADR-0006 §6](../decisions/0006-schema-conventions.md).
+[ADR-0006 §6](../../docs/decisions/0006-schema-conventions.md).
 
 The mirror image is why their covering index on `accounts_volumes` is a mistake: it duplicates
 the PK's key columns on an **UPDATE-heavy** table, paying two index writes per posting to save a
@@ -332,7 +332,7 @@ the hash as they are not part of the decision-making process."*
 
 The chain therefore covers **the decision, not the derived state**, which means recomputing a
 balance never invalidates tamper evidence. Get this wrong and every backfill breaks the chain.
-Folded into [ADR-0004](../decisions/0004-event-log.md).
+Folded into [ADR-0004](../../docs/decisions/0004-event-log.md).
 
 The hash input also pins `"id":0` and `"hash":null` so the digest is position-independent. The
 predecessor lookup rides the PK as a backward index scan and is cheap — but it must see a stable
@@ -340,7 +340,7 @@ predecessor, which is why every write takes `pg_advisory_xact_lock(ledger_id)` a
 
 ### On our open ordering question — they have no answer
 
-Directly relevant to [ADR-0005](../decisions/0005-reproducible-as-of.md), and worth stating
+Directly relevant to [ADR-0005](../../docs/decisions/0005-reproducible-as-of.md), and worth stating
 plainly: **Formance has no commit-ordered total order anywhere in their schema.**
 
 - `transaction_date()` seeds from `statement_timestamp()` — start-ordered. It guarantees
@@ -379,7 +379,7 @@ unnoticed for thirty migrations. `_idx` / `_index` / no-suffix / `2`-suffixes al
 Column names drift badly too: `date`, `timestamp`, `insertion_date`, `inserted_at`, `added_at`,
 `addedat`, `created_at` all appear, several meaning the same thing.
 
-→ [ADR-0006 §1](../decisions/0006-schema-conventions.md).
+→ [ADR-0006 §1](../../docs/decisions/0006-schema-conventions.md).
 
 ### Their unfixed bugs, as a checklist of what to avoid
 

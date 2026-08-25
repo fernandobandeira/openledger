@@ -5,7 +5,7 @@
 
 ## Context
 
-The table-design pass in [spike 001](../spikes/001-formance.md#addendum--table-design-pass)
+The table-design pass in [spike 001](../../spikes/001-formance/README.md#addendum--table-design-pass)
 found that most of Formance's schema problems are not design mistakes. They are **process**
 mistakes that a convention would have caught:
 
@@ -61,7 +61,7 @@ could not run inside a transaction block — a real argument for `text` + `CHECK
 inside a transaction block (relaxed in PG12); the new value simply cannot be *used* until after
 commit. The argument was pre-PG12 reasoning.
 
-So we keep enums, and gain what [spike 002](../spikes/002-sqlc-vs-jet.md) verified: sqlc
+So we keep enums, and gain what [spike 002](../../spikes/002-sqlc-vs-jet/README.md) verified: sqlc
 generates typed Go constants plus a validating `Scan` from them. The residual cost is real but
 acceptable — a value cannot be removed, and reordering requires recreating the type.
 

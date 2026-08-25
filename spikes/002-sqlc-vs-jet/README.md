@@ -4,7 +4,7 @@
 transaction painful enough to outweigh Jet's builder and its one-struct-per-table model?
 
 **Timebox:** one session. Build both against the same real schema, then delete the loser.
-**Blocks:** [ADR-0002](../decisions/0002-data-access-layer.md).
+**Blocks:** [ADR-0002](../../docs/decisions/0002-data-access-layer.md).
 **Does not block:** milestone 1 (schema + constraints) — that is pure SQL. Start there.
 
 ## Already established
@@ -315,7 +315,7 @@ to `interface{}` and need an explicit override.
 
 **Option B — native `pgxpool` + sqlc.** ADR-0002 moves to `accepted`, reversing its own
 proposal. The recommended configuration is
-[`spikes/002-sqlc-vs-jet/sqlc.yaml`](../../spikes/002-sqlc-vs-jet/sqlc.yaml), verified
+[`spikes/002-sqlc-vs-jet/sqlc.yaml`](./sqlc.yaml), verified
 end to end against a live database.
 
 The decision rule written before the evidence said "if arrays and jsonb are ugly under
