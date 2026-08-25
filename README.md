@@ -22,8 +22,9 @@ demanding acceptance test. It is not the project.
 
 **Status:** pre-implementation, but the schema is real and attested. `migrations/` holds the
 ledger core, the chart of accounts, and the card hold model; `tests/` replays a full card
-lifecycle against them and then tries nineteen ways to break it, each of which must be
-refused. No Go service yet.
+lifecycle against them, asserts the plans of the queries the docs promise are O(1), and then tries
+thirty-eight ways to break it — each of which must be refused, and refused for the stated reason.
+No Go service yet.
 
 ## Start here
 
@@ -65,7 +66,9 @@ spikes/           timeboxed investigations, one directory each.
 
 ## Performance
 
-No published number yet, deliberately. [Spike 003](./spikes/003-throughput-ceiling/README.md)
+**No number here is a benchmark, and several in-repo documents quote figures that are only
+shapes.** Spike 003's own banner says so: re-auditing the same configurations moved its baseline
+from 833 to 482 clearings/s. Treat every throughput figure in `docs/` accordingly. [Spike 003](./spikes/003-throughput-ceiling/README.md)
 measured the design with durability on, but everything so far ran on localhost — where a network
 round trip costs 0.05 ms against roughly 0.5 ms on RDS. That reorders the tuning levers rather
 than merely scaling the result, so nothing goes in a README until it is measured over a real
