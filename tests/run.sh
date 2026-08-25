@@ -34,4 +34,8 @@ for f in tests/*.sql; do
     fi
 done
 
+# The concurrency suite needs many sessions, so it cannot be a .sql file.
+echo "── tests/concurrency.sh"
+if ! ./tests/concurrency.sh "$URL"; then fail=1; fi
+
 [ "$fail" -eq 0 ] && echo "PASS" || { echo "FAIL"; exit 1; }

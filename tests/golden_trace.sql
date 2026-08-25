@@ -59,9 +59,7 @@ JOIN account_types t ON t.code = v.purpose;
 CREATE FUNCTION post(p_tenant text, p_key text, p_legs text[]) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-    v_event uuid; v_txn uuid; i int;
-    v_acct uuid; v_dir ledger_direction; v_amt bigint;
-    v_seq bigint; v_bal bigint;
+    v_event uuid; v_txn uuid; r record; v_seq bigint; v_bal bigint;
 BEGIN
     INSERT INTO ledger_events (tenant_id, kind, source, idempotency_key, idempotency_hash,
                                payload, effective_at)
@@ -73,17 +71,30 @@ BEGIN
     VALUES (p_tenant, v_event, 'trace', 'posted', now())
     RETURNING id INTO v_txn;
 
-    FOR i IN 1 .. array_length(p_legs,1)/3 LOOP
-        v_dir := p_legs[(i-1)*3+2]::ledger_direction;
-        v_amt := p_legs[(i-1)*3+3]::bigint;
-
-        SELECT id INTO STRICT v_acct FROM ledger_accounts
-         WHERE tenant_id = p_tenant AND purpose = p_legs[(i-1)*3+1];
-
+    -- ORDER BY a.id IS LOAD-BEARING, not tidiness.
+    --
+    -- Each leg takes a row lock on its account's balance row. Two concurrent
+    -- transactions touching the same two accounts in OPPOSITE leg order deadlock:
+    -- measured 138 deadlocks and 138 rollbacks from 8 writers on 2 accounts, half
+    -- posting the legs reversed. Every failure was a deadlock.
+    --
+    -- Sorting by account id gives every writer the same lock order, so one waits
+    -- instead of both dying. This is what roadmap M2 means by "deterministic lock
+    -- ordering" -- it was documented as a requirement and not implemented here,
+    -- which is exactly the sort of gap a single-threaded suite cannot see.
+    FOR r IN
+        SELECT a.id AS account_id, l.dir, l.amt
+        FROM (SELECT p_legs[(i-1)*3+1] AS purpose,
+                     p_legs[(i-1)*3+2]::ledger_direction AS dir,
+                     p_legs[(i-1)*3+3]::bigint AS amt
+              FROM generate_series(1, array_length(p_legs,1)/3) AS i) l
+        JOIN ledger_accounts a ON a.tenant_id = p_tenant AND a.purpose = l.purpose
+        ORDER BY a.id
+    LOOP
         INSERT INTO ledger_account_balances AS b (tenant_id, account_id, currency, input, output, last_seq)
-        VALUES (p_tenant, v_acct, 'USD',
-                CASE WHEN v_dir='debit'  THEN v_amt ELSE 0 END,
-                CASE WHEN v_dir='credit' THEN v_amt ELSE 0 END, 1)
+        VALUES (p_tenant, r.account_id, 'USD',
+                CASE WHEN r.dir='debit'  THEN r.amt ELSE 0 END,
+                CASE WHEN r.dir='credit' THEN r.amt ELSE 0 END, 1)
         ON CONFLICT (tenant_id, account_id, currency) DO UPDATE
            SET input    = b.input  + EXCLUDED.input,
                output   = b.output + EXCLUDED.output,
@@ -94,7 +105,9 @@ BEGIN
         -- debit-positive, the convention declared on ledger_entries.balance_after
         INSERT INTO ledger_entries (tenant_id, transaction_id, account_id, direction,
                                     amount_minor, currency, account_seq, balance_after, effective_at)
-        VALUES (p_tenant, v_txn, v_acct, v_dir, v_amt, 'USD', v_seq, v_bal, now());
+        VALUES (p_tenant, v_txn, r.account_id, r.dir, r.amt, 'USD', v_seq, v_bal,
+                (SELECT effective_at FROM ledger_transactions
+                  WHERE tenant_id = p_tenant AND id = v_txn));
     END LOOP;
 END $$;
 

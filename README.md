@@ -57,8 +57,8 @@ internal/ledger/  the ledger core — accounts, transactions, entries, posting
 internal/pg/      database plumbing
 migrations/       ordered .sql, applied by `make migrate`
                   seed/ is example data — the card chart of accounts
-tests/            SQL acceptance suites, run by `make test-sql` against a
-                  throwaway database
+tests/            acceptance suites, run by `make test-sql` against a throwaway
+                  database. Mostly SQL; concurrency.sh needs many sessions
 docs/             vision, roadmap, decisions, reference product spec
 spikes/           timeboxed investigations, one directory each.
                   Separate Go modules, not built by CI.
