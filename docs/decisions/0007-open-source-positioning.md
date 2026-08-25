@@ -5,185 +5,141 @@
 
 ## Context
 
-[ADR-0001](./0001-go-and-postgres.md) chose the stack on the strength of *knowing* the workload:
-"throughput is not the constraint… under 1 TPS average, maybe 20–50 TPS at peak." Every
-subsequent decision leans on that, and several deliberately hardcode what a general engine would
-have to make configurable.
+[0001](./0001-go-and-postgres.md) chose the stack on the strength of *knowing* the workload —
+"under 1 TPS average, maybe 20–50 TPS at peak". Several later decisions deliberately hardcode
+things a general engine would have to make configurable.
 
-The question is whether this becomes **a general open-source ledger a small team can drop into
-AWS and run** — which invalidates the premise, because we would no longer know our users' volume.
+The question is whether this becomes **a general open-source ledger a small team can drop into AWS
+and run**, which removes that knowledge.
+[Spike 003](../../spikes/003-throughput-ceiling/README.md) measured the ceiling so the question
+can be answered with numbers. Durable settings throughout, stock Postgres, one 16-core machine:
 
-[Spike 003](../../spikes/003-throughput-ceiling/README.md) measured the ceiling so this can be
-decided on numbers.
-
-## What the measurements say
-
-| Configuration | clearings/s | entries/s |
-| --- | --- | --- |
-| baseline (unsharded, unbatched) | ~800 | ~2,400 |
-| + coalesced batching (25 per txn) | 3,420 | 10,260 |
-| + hot-account striping (64) | **6,850** | **20,550** |
-| both | 2,356 | 7,069 |
-
-Durable settings throughout (`fsync`, `synchronous_commit`, `full_page_writes` all on), stock
-Postgres on a 16-core laptop.
+| Configuration | clearings/s |
+| --- | --- |
+| baseline (one shared account row, no batching) | ~800 |
+| + coalesced batching | 3,420 |
+| + **striping** the hot account | **7,897** |
 
 Three findings shape the decision:
 
-1. **The baseline is ~17–40× the volume v1-vision sized for**, with no tuning. One unremarkable
-   Postgres covers the overwhelming majority of fintech startups.
-2. **The bottleneck is one row, not the hardware.** Routing every clearing through a single
-   *company* account costs 12%; the two shared *house* accounts are the entire ceiling.
-   Throughput plateaus at concurrency 4 and then declines.
-3. **Two levers, and they cancel each other.** Batching and striping each give 4–8×; applied
-   together they give 3× *less* than either alone.
+1. **The baseline is already 17–40× the volume 0001 sized for**, untuned. One unremarkable
+   Postgres covers the overwhelming majority of adopters.
+2. **The bottleneck is one row, not the hardware.** Routing every posting through a single
+   *customer* account costs 12%; the shared **hot account** — the one nearly every transaction
+   touches, like settlement or fee revenue — is the entire ceiling. Throughput plateaus at four
+   concurrent writers and then *declines*.
+3. **The levers interact, and one of them was mismeasured.** See "Scaling shape".
 
 ## Decision
 
 **Reframe as a general ledger. Keep Postgres. Change the argument, not the stack.**
 
-ADR-0001's conclusion survives; its *reasoning* does not. "Throughput is not the constraint" was
-an argument from known volume and cannot be made by a project that does not know its users. The
-defensible version is: **here is the measured ceiling, here is the single thing that limits it,
-and here are the two levers — pick the one matching your write pattern.**
+0001's conclusion survives; its reasoning does not. "Throughput is not the constraint" was an
+argument from known volume. The defensible version is: *here is the measured ceiling, here is the
+single thing that limits it, and here is the lever.*
 
-### What changes
+**1. Hot-account striping becomes a first-class feature.** **Striping** means storing one logical
+account as N physical balance rows and summing them to read the balance — so N writers take N
+different row locks instead of queueing on one. It is the difference between 800/s and 7,897/s and
+currently exists only as folklore. Design it in: an account declares a stripe count, writes pick a
+stripe, balance reads `SUM`.
 
-**1. Hot-account striping becomes a first-class feature.** It is the difference between 800/s and
-6,850/s and currently exists only as folklore. Design it in: an account declares a stripe count,
-writes pick a stripe, balance reads `SUM` across stripes. One integer on the account row.
+**2. House accounts become per-tenant.** A unique index currently guarantees exactly one shared
+revenue account per *deployment*. Correct for one product; wrong for a shared ledger, where it
+makes every tenant contend with every other. (See the correction below — this is a modelling fix
+and a prerequisite for tenant isolation, **not** the throughput mechanism it was first claimed to
+be.)
 
-**2. House accounts become per-tenant.** *(Strengthened — this is now the single most consequential
-schema change in the pivot, for a reason beyond contention. See "Scaling shape" below.)* `uq_accounts__house` currently guarantees exactly one
-`interchange_revenue` per *deployment*. Correct for one product; wrong for a shared ledger, where
-it makes every tenant contend with every other and **the system slows down as it succeeds**.
-Measured: 16 tenants with their own house accounts scale like 16 stripes (790 → 4,319/s).
+**3. The product layer becomes optional.** Cards, spend controls, and credit lines are a
+*reference implementation built on* the ledger. The core is accounts, transactions, entries,
+balances, bitemporal reads, and the event log.
 
-**3. The product layer becomes optional.** Cards, spend controls, credit lines, and the auth hot
-path are a *reference implementation built on* the ledger, not the ledger. The core is accounts,
-transactions, entries, balances, bitemporal reads, and the event log.
+**4. Documentation must state which lever applies where.** Batching and *randomly* chosen stripes
+cancel each other — together they measured worse than either alone, because random stripe
+selection scatters a batch across rows and defeats coalescing. Two ways out: give each writer its
+own stripe so a batch lands on one row, or key the stripe on the tenant so a tenant's batch
+coalesces naturally.
 
-**4. Documentation must state which lever applies where.** Batching and random striping cancel
-(2,356/s, worse than either alone). Two ways out, and the docs must name them:
-
-- **Worker-affinity striping** — each writer owns a stripe, so a batch coalesces onto one row
-  *and* contends with nobody. Measured 4,790/s, flat across concurrency. The accounting name is a
-  **per-writer suspense account**: post the shared leg to a row you alone own, keep every
-  transaction balanced, and sweep suspense into the house account periodically.
-- **Single-call posting** — the whole clearing in one server-side call. Worth only ~14% on
-  localhost but decisive on RDS, where the 5 saved round trips cost ~2.5ms (Result 9).
-
-**5. Publish no throughput number until it is measured on RDS.** Round trips cost 0.05ms on
-localhost and ~0.5ms on managed Postgres, which changes the *ranking* of the levers, not just the
-magnitudes. A localhost benchmark cannot support an AWS claim, and users will hold us to whatever
-the README says.
+**5. Publish no throughput number until it is measured on RDS.** A round trip costs ~0.05 ms on
+localhost and ~0.5 ms on managed Postgres, which changes the *ranking* of the levers, not just the
+magnitudes. Independently corroborated: pgledger, a comparable Postgres ledger, publishes 10,637
+transfers/s locally collapsing to 1,631 over a network.
 
 ### What must NOT change
 
-**Do not make correctness configurable.** [Spike 001](../../spikes/001-formance/README.md) found
-Formance's feature flags produce point-in-time queries that silently return `{}` when a
-historization flag is off — a reviewer's *"green check that didn't actually execute."* The
-temptation for a general engine is to make historization, hashing, and balance tracking
-optional. **Configurable historization means as-of queries that are wrong rather than loud.**
+**Correctness is never configurable.** Formance's feature flags produce point-in-time queries that
+silently return empty when a historization flag is off — a reviewer called it *"a green check that
+didn't actually execute."* The temptation for a general engine is to make historization, hashing,
+and balance tracking optional. **Configurable historization means as-of queries that are wrong
+rather than loud.** Keep the core rigid: append-only, balanced-per-currency, bitemporal,
+event-logged. Make the *product* pluggable, never the invariants.
 
-Keep the core rigid: append-only, balanced-per-currency, bitemporal, event-logged. Make the
-*product* pluggable, never the invariants.
+## Scaling shape — what an adopter can expect
 
-## Scaling shape — what a user can actually expect
+**The ceiling is global, not per-tenant.** It is shared across every tenant on a database, not
+granted to each.
 
-Measured in [spike 003 Result 12](../../spikes/003-throughput-ceiling/README.md). Stated plainly
-because adopters will ask, and the honest answer is more useful than a headline number.
+**Striping is the throughput mechanism, and it works regardless of how load is distributed.**
+Measured: 872 → 6,970 clearings/s with a *single* tenant, and 948 → 7,405 with 32 tenants where
+one tenant generates 90% of traffic.
 
-**The ceiling is global, not per-tenant.** ~13k clearings/s is shared across every tenant on a
-database. It is **not** 13k each.
+**Per-tenant accounts are not.** An earlier draft claimed 8× from splitting per tenant, from a
+**uniformly distributed** benchmark. Real payment volume is heavily **skewed** — a few tenants are
+most of the traffic — and re-measured with a dominant tenant the gain collapses from 9.1× to
+**1.07×**, because that tenant's own house accounts become the new hot row. **Per-tenant splitting
+relocates the bottleneck; striping removes it.**
 
-**Striping the hot accounts is what removes the per-row limit** — and it works regardless of how
-load is distributed. Measured at c=32: 872 → 6,970 clearings/s (8.0×) with a *single* tenant, and
-948 → 7,405 (7.8×) with 32 tenants under 90/10 skew.
+They still earn their place for other reasons: they are the correct data model (a revenue figure
+merged across tenants is an aggregate nobody's accounting asks for), they are better for
+reconciliation (1,000 accounts tell you *which* tenant caused a 3-cent break), and they are a
+prerequisite for correct per-tenant row-level security.
 
-**Per-tenant house accounts are a weaker, conditional version of the same thing.** An earlier
-draft of this ADR claimed 8× from splitting per tenant. That figure came from a **uniformly
-distributed** benchmark. Real payment volume is Zipfian, and re-measured with a whale tenant the
-gain collapses:
+**"No cross-tenant transactions, ever" was wrong.** Some accounts are physically singular:
+`operating_cash` mirrors *one* real bank account, and the facility is one line from one lender.
+Neither can be split per tenant. **7 of the reference trace's 13 transactions touch
+`operating_cash`.** The four *clearing* transactions do not — so the honest claim is **clearings
+are tenant-local; treasury is not.** Clearings are the volume and treasury is a daily batch, so
+that may be an acceptable trade, but it has to be stated rather than claimed away. Splitting a
+cross-scope transaction into two, joined by intercompany due-from/due-to accounts, restores
+tenant-locality where it matters.
 
-| distribution | clearings/s | vs baseline |
-| --- | --- | --- |
-| uniform | 7,991 | 9.1× |
-| whale = 90% | 936 | **1.07×** |
-
-The whale's own house accounts simply become the new hot row. **Per-tenant splitting relocates the
-bottleneck; striping removes it.** Striping is the mechanism to ship; tenancy is a coincidence
-that pays only under even load.
-
-**"No cross-shard transactions, ever" was also wrong.** `operating_cash` and `fbo_cash` are
-perimeter accounts, and v1-vision requires each to mirror *exactly one* external balance — the
-money is in one bank account. `facility_borrowings` is one line from one lender. None can be
-split per tenant. **7 of the golden trace's 13 transactions touch `operating_cash`.**
-
-The four *clearing* transactions do not. So the honest claim is: **clearings become tenant-local;
-treasury does not.** Clearings are the volume and treasury is a daily batch, so cross-shard
-treasury may be an acceptable trade — but it must be made explicitly rather than claimed away.
-
-The corrected story for an adopter: **one Postgres for almost everyone; stripe the hot accounts
-when you hit the per-row ceiling; shard by tenant only if you outgrow one instance, accepting
-that treasury transactions will span shards.**
+**The corrected story:** one Postgres for almost everyone; stripe the hot accounts when you reach
+the per-row ceiling; shard by tenant only if you outgrow one instance, accepting that treasury
+spans shards.
 
 ## Why not TigerBeetle
 
-The obvious alternative, and worth taking seriously — it is a genuinely excellent piece of
-engineering and its **two-phase transfer model maps onto card authorization almost exactly**:
-a pending transfer with a timeout is a hold with an expiry, `post_pending_transfer` with a lesser
-amount is a partial clearing, `void_pending_transfer` is an auth reversal, and pending/posted
-balances are precisely our `held`/`posted` split. If the ledger core were the whole problem, it
-would be a strong candidate.
+Worth taking seriously — it is excellent, and its two-phase transfer model maps onto card
+authorization almost exactly (a pending transfer with a timeout *is* a hold with an expiry). Three
+reasons it is still wrong here:
 
-Three reasons it is the wrong choice here:
+1. **It solves a throughput problem we measured ourselves not to have.**
+2. **It cannot be the only datastore, so it *adds* a system rather than replacing one.** Fixed
+   schema, no ad-hoc queries, no joins, no aggregation. Reporting, statements, multi-tenancy and
+   RLS all still need Postgres — two datastores and a consistency boundary between them.
+3. **It defeats the deployment goal.** Postgres means RDS: managed, backed up, one click.
+   TigerBeetle has no managed AWS offering; it wants a replica cluster on fast local disk that you
+   operate. It *increases* operational burden precisely where we claim to reduce it.
 
-**1. It solves a throughput problem we have measured ourselves not to have.** TigerBeetle targets
-orders of magnitude beyond 6,850/s. Adopting it to cross a ceiling almost no user will reach is
-paying a large fixed cost for headroom.
+One correction: TigerBeetle argues against sharding because hot accounts make shards bottlenecks.
+That is an argument against **distributed** sharding, where cross-shard transactions get
+expensive. It does not apply to N rows in one Postgres, and an earlier draft leaned on it too
+heavily.
 
-**2. It cannot be the only datastore, so it *adds* a system rather than replacing one.**
-TigerBeetle has a deliberately fixed schema — no ad-hoc queries, no joins, no aggregation, no
-jsonb, and user data limited to fixed-width integer fields. Statements, reporting, spend
-controls, ACH state machines, multi-tenancy, and RLS all still need Postgres. The result is two
-datastores to operate and a consistency boundary between them, in exchange for throughput we do
-not need.
-
-**3. It defeats the deployment goal outright.** The target is "a small startup drops this into
-AWS." Postgres means RDS or Aurora: managed, backed up, point-in-time restore, one click.
-TigerBeetle has no managed AWS offering — it wants a replica cluster on instances with fast local
-disk, operated by you, including upgrades and failure recovery. For the audience we are aiming
-at, choosing TigerBeetle *increases* operational burden at exactly the moment we are claiming to
-reduce it. The user's instinct that it "would give some maintenance" is correct, and it is the
-deciding factor rather than a footnote.
-
-**What to take from it anyway:** the two-phase transfer with timeout is a better-factored version
-of `card_holds`, and worth reading before M5 finalizes that table.
-
-**When to revisit:** if a real user is sustaining thousands of clearings per second *after*
-striping or batching. That is a good problem, it will announce itself, and the ledger core is a
-narrow enough interface to put behind an abstraction *then* — with a real workload to design
-against instead of a hypothetical one.
+**Take from it anyway:** the two-phase transfer with timeout is a better-factored `card_holds`.
+**Revisit if** a real user sustains thousands of clearings per second *after* striping — a good
+problem that will announce itself, and the core is a narrow enough interface to abstract then.
 
 ## Consequences
 
-- ADR-0001 needs an amendment recording that its sizing argument is superseded here, and that the
-  conclusion now rests on measurement rather than on a known workload.
-- The roadmap gains striping and per-tenant house accounts; M1's schema changes.
-- v1-vision becomes what it always was — a *reference product* spec — and should be labelled as
-  such rather than read as the system's requirements.
-- The README's framing changes from "embedded B2B spend management" to a ledger with that as its
-  reference implementation.
+- The roadmap gains striping; M1's schema changes.
+- v1-vision becomes what it always was — a *reference product* spec — and should be labelled so.
+- The README leads with the ledger, not the card product.
 
 ## Open
 
-- **The auth path was not measured.** It writes no ledger entry and serializes per company, so it
-  should scale far better — but it has a latency deadline rather than a throughput target and
-  deserves its own spike before any claim is made about it.
-- ~~**All numbers are from a small, fully-cached table.**~~ Closed: retested at 5M entries / 2 GB
-  against 128 MB of cache, essentially unchanged. The workload is append-only, so the hot set is
-  bounded by account count rather than entry count.
-- **Nothing has been measured over a network.** This is now the largest open caveat.
-- **Single node.** No replication or failover. Synchronous replication will cost on every commit
-  and is not in these numbers.
+- **The auth path was never measured.** It writes no ledger entry and serializes per customer, so
+  it should scale better — but it has a latency deadline rather than a throughput target and
+  deserves its own spike.
+- **Nothing has been measured over a network.** Now the largest caveat.
+- **Single node.** No replication or failover; synchronous replication will cost on every commit.

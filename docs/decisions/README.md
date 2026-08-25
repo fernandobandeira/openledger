@@ -1,42 +1,74 @@
-# Decisions (ADRs)
+# Decisions
 
-One file per decision, numbered, never deleted. A decision that turns out wrong gets a new
-ADR that supersedes it — the old one stays, with its status changed, so the reasoning trail
-survives.
+Everything we've decided, on one page. Read this to know where the project stands; follow a link
+only when you want the reasoning behind a particular call.
 
-Status: `proposed` · `accepted` · `superseded by NNNN` · `rejected`
+New to ledgers? Start with the [glossary](../glossary.md) — it defines every domain term used
+here, so the ADRs don't each stop to re-explain them.
 
-| # | Decision | Status | Amended by 0007 |
+## The stack
+
+- **Go** — because the interesting logic is SQL, and Go stays out of the way.
+- **Postgres**, one instance — measured at ~800 **clearings**/s untuned (a clearing is one card
+  transaction = 3 ledger entries), and 7,897/s with the hot account striped — far more than
+  almost any adopter needs.
+- **sqlc**, no ORM — we write the SQL; it generates typed Go. The hot queries stay reviewable *as
+  SQL*.
+- **Temporal** for durable timers — though whether it belongs in the core is still open.
+
+## The decisions
+
+| # | We decided | Because | Status |
 | --- | --- | --- | --- |
-| [0001](./0001-go-and-postgres.md) | Go + Postgres, no ORM | accepted | sizing superseded; **Temporal dependency flagged** |
-| [0002](./0002-data-access-layer.md) | Data access: native pgxpool + sqlc | accepted — reversed its own proposal, see [spike 002](../../spikes/002-sqlc-vs-jet/README.md) | strengthened |
-| [0003](./0003-bitemporal-balances.md) | Balances on two time axes: aggregate-on-read for the effective axis | accepted | **read-path cost now unmeasured** |
-| [0004](./0004-event-log.md) | An append-only event log — the idempotency spine | accepted | strengthened; replay requirement added |
-| [0005](./0005-reproducible-as-of.md) | A reproducible as-of cursor | **proposed** — blocks M4 | open question 4 answered |
-| [0006](./0006-schema-conventions.md) | Schema conventions: naming, snapshot test, FKs, enums | accepted | strengthened |
-| [0007](./0007-open-source-positioning.md) | Positioning: a general open-source ledger | **proposed** | — |
+| [0001](./0001-go-and-postgres.md) | Go + Postgres, no ORM | The load-bearing logic is SQL, so the host language's job is narrow; Postgres has measured headroom of 17–40× what we sized for | accepted |
+| [0002](./0002-data-access-layer.md) | Native pgx + sqlc, over go-jet | go-jet can silently scan a money column as zero with no error, and its codegen needs a live database | accepted |
+| [0003](./0003-bitemporal-balances.md) | Running balance for "now", aggregate-on-read for "as of a business date" | A backdated entry lands with a *later* sequence number, so a running balance answers business-date questions wrongly — measured 2× off | accepted |
+| [0004](./0004-event-log.md) | Add an append-only `ledger_events` table | Most accepted operations write no ledger transaction, so idempotency can't live on the transactions table | accepted |
+| [0005](./0005-reproducible-as-of.md) | Pin reports to a commit-ordered cursor, not a timestamp | `recorded_at` is transaction-*start* time, so the same "as of" query re-runs to a different answer | **proposed** |
+| [0006](./0006-schema-conventions.md) | Naming rules, a CI schema-snapshot test, keep FKs and enums | Dropping a column silently drops its indexes — Formance lost a hot-path index that way for thirty migrations | accepted |
+| [0007](./0007-open-source-positioning.md) | Reframe as a general open-source ledger; keep Postgres | The bottleneck is one contended row, not the hardware — and striping fixes it | **proposed** |
 
-## The 0007 audit
+## Non-negotiable
 
-[ADR-0007](./0007-open-source-positioning.md) reframes the project from a purpose-built
-single-product ledger into a general open-source one, which invalidates reasoning several earlier
-ADRs relied on — most of it variations of *"we are one product, at under 1 TPS."* Every ADR above
-has been audited against it and amended in place; **no decision was reversed**, and every
-amendment is marked as such so the original reasoning stays readable.
+No decision may trade these away. They are what makes the numbers trustworthy:
 
-Three outcomes are worth reading directly rather than trusting the table:
+- **Append-only.** No `UPDATE`, no `DELETE` on entries — enforced by revoking the grants, not by
+  discipline.
+- **Balanced per currency**, enforced by the database on every transaction.
+- **Bitemporal.** Every entry records both when it happened and when we learned about it.
+- **Event-logged.** Every accepted operation is recorded, whether or not it moves money.
+- **Correctness is never configurable.** Formance made historization a feature flag and got
+  point-in-time queries that silently return empty — *"a green check that didn't actually
+  execute."* Make the product pluggable; never the invariants.
 
-- **[0001 — Temporal](./0001-go-and-postgres.md#amendment--temporal-is-an-unexamined-dependency-for-the-open-source-goal).**
-  Half of 0001's case for Go is Temporal SDK quality. Temporal is a server cluster, not a
-  library, and 0007's "drop into AWS" goal never accounts for it. Needs its own ADR before M6.
-- **[0003 — the read path](./0003-bitemporal-balances.md#amendment--the-read-path-assumption-is-now-unsafe).**
-  Aggregate-on-read was justified by "thousands of rows, not millions." Spike 003 measured the
-  *write* path only, and the accounts it identified as hottest are exactly those that accumulate
-  the most entries. The decision stands; its cost is unmeasured. Needs a spike before M4.
-- **[0004 — hash chaining](./0004-event-log.md#deferred-deliberately).** "At our volume the
-  serialization is free" is measurably false for a general engine: a per-write chain lock is a
-  *global* contention point, so it nullifies every throughput lever 0007 depends on.
+## Still open
 
-Where the pivot **strengthened** a decision, that is recorded too — 0002, 0004, 0005, and 0006
-all now rest on measurement from [spike 003](../../spikes/003-throughput-ceiling/README.md)
-rather than on an assumption about volume.
+Undecided, listed plainly rather than buried:
+
+- **[0005](./0005-reproducible-as-of.md) and [0007](./0007-open-source-positioning.md) are
+  `proposed`**, not accepted. The as-of cursor blocks M4.
+- **Row-level security conflicts with bulk loading.** Postgres refuses `COPY FROM` on a table with
+  RLS enabled — and `COPY` is what makes batched posting fast. Likely resolution: post through a
+  role that bypasses RLS, so RLS guards reads only. Not yet decided.
+- **Historical balances get slower as history grows, and nothing bounds it yet.** Reading "the
+  balance right now" is a single index lookup (0.018 ms). Reading "the balance as of last June"
+  has to add up entries, which is linear — ~0.22 µs each, so ~7 ms at 30k entries but ~2 s at
+  10M. The fix is the accountants' one: close each period and store its closing balance, so a
+  query only has to add up the current period. Designed but not built —
+  [0003](./0003-bitemporal-balances.md) has the numbers.
+- **Temporal's place.** [0001](./0001-go-and-postgres.md) leans on it, but it is a server cluster,
+  not a library — in tension with the "drop it into AWS" pitch. Needs its own ADR before M6.
+- **No number has been measured on RDS.** Everything so far is localhost, where a round trip is
+  ten times cheaper. Nothing gets published until that is fixed.
+- **Posting rules.** A deployment declares its own accounts; it must also declare how a business
+  event becomes entries. Adyen proves those templates balance at design time. We have not designed
+  ours.
+
+## How this log works
+
+One file per decision, numbered, never deleted. A decision that turns out wrong gets a new ADR
+superseding it; the old one stays, with its status changed, so the reasoning trail survives.
+
+Where measurement later corrected a decision, the ADR states the current position **first** and
+summarises what it superseded — you should never have to read a change history to learn what we
+think now.

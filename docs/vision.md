@@ -1,34 +1,71 @@
 # Vision
 
-> Status: current. Supersedes [`v1-vision.md`](./v1-vision.md) as the *project* vision —
-> that document is now the **reference product** specification.
-> Positioning decision: [ADR-0007](./decisions/0007-open-source-positioning.md) (proposed).
+> Status: current. The *project* vision. [`v1-vision.md`](./v1-vision.md) is now the
+> **reference product** spec. Positioning: [ADR-0007](./decisions/0007-open-source-positioning.md).
 
 ## What this is
 
-An open-source double-entry ledger. Postgres for storage, Go for the service, a single binary
-plus a database you already know how to run.
+An open-source **double-entry ledger**. Postgres for storage, Go for the service — a single
+binary and a database you already know how to run.
 
 The bet is narrow: **most teams that need a real ledger do not need a fast one, but every one of
-them needs a correct one.** Correctness here means specific, testable things — every cent
-accounted for, no manual fixes, and any number reproducible as of any date, forever. Those are
-hard to retrofit and cheap to build in from the start, which is the whole argument for using
-something rather than rolling your own `balances` table.
+them needs a correct one.** Correct means testable things — every cent accounted for, no manual
+fixes, and any number reproducible as of any date, forever. Cheap to build in, painful to
+retrofit. That is the whole argument for using something instead of rolling your own `balances`
+table.
+
+## If you have never built a ledger
+
+A ledger records money movements as **entries**. Every entry is a **debit** or a **credit**, and
+within one transaction the debits and the credits must sum to the same amount. That is what
+*double-entry* means, and it is the only thing standing between you and a balance sheet that does
+not add up.
+
+A customer spends $500 on their card. Days later the card network sends a **clearing** message —
+the message that says the purchase is real and money is owed. We record:
+
+```
+DR  customer_receivable         500.00    the customer now owes us $500
+CR  network_settlement_payable  491.00    we owe the card network $491
+CR  interchange_revenue           9.00    we keep $9 as interchange
+                                -------
+              debits 500.00  =  credits 500.00
+```
+
+Three things to take from that:
+
+- **It balances**, and the database enforces it rather than the application.
+- **Interchange** is the fee the network hands back to the card issuer on every purchase. It is
+  most of how a card program makes money.
+- **The $9 was never cash.** No bank account moved. It is the gap between what the customer owes
+  us and what we owe the network — and it is revenue the moment we record it.
+
+And the part that surprises everyone: **the authorization writes nothing at all.** When the
+terminal beeps, no money has moved and nothing is owed. We record a *hold* against the customer's
+credit limit and start a timer. The ledger first hears about the purchase at clearing — which may
+be days later, may be for a different amount (tips, fuel pumps), and may never arrive.
+
+A few more terms, because the rest of these docs assume them:
+
+| Term | Meaning |
+| --- | --- |
+| **Bitemporal** | Recording *two* times per transaction: when it happened in the business (`effective_at`) and when we learned about it (`recorded_at`). They differ constantly, and conflating them is how reports become irreproducible. |
+| **Idempotency key** | A caller-supplied key that makes a retry safe: replaying it returns the stored result instead of posting twice. Non-negotiable when a payment processor retries a webhook. |
+| **Normal balance** | Whether an account grows on debits or on credits. Assets and expenses grow on debits; liabilities, equity and revenue grow on credits. **Not derivable from the category** — an *allowance for credit losses* is an asset that grows on credits. |
+| **Chart of accounts** | The list of account *types* a deployment uses. Ours is data, not code, because every business has different ones. |
+| **Trial balance** | Every account's balance, listed. It must satisfy `assets = liabilities + equity + (revenue − expenses)`. |
+| **Settlement** | Actually wiring the money. Here: paying the network its $491. Distinct from clearing, which only records the obligation. |
 
 ## Who it is for
 
-A small team that needs a ledger and does not want to operate a new class of infrastructure to
-get one. Concretely: you can put this behind RDS or Aurora, get managed backups and
-point-in-time restore for free, and not think about it again.
-
-That constraint drives more of the design than performance does. See
+A small team that needs a ledger and does not want to operate a new class of infrastructure to get
+one. Put it behind RDS or Aurora, get managed backups and point-in-time restore for free, stop
+thinking about it. That constraint drives more of the design than performance does — see
 [Why Postgres, and not TigerBeetle](#why-postgres-and-not-tigerbeetle).
 
 ## The core, and the product built on it
 
-Two layers, deliberately separated.
-
-**The core** is the ledger, and it is the project:
+**The core is the project:**
 
 | | |
 | --- | --- |
@@ -39,112 +76,110 @@ Two layers, deliberately separated.
 | Bitemporal reads | recorded axis and effective axis, never conflated ([ADR-0003](./decisions/0003-bitemporal-balances.md)) |
 | Event log | the idempotency spine and audit trail ([ADR-0004](./decisions/0004-event-log.md)) |
 
-**The reference product** is an embedded B2B charge card funded by a credit line — spend
-controls, credit lines, card holds, the authorization hot path. It is described in full by
-[`v1-vision.md`](./v1-vision.md), and it exists for two reasons: to prove the core can carry a
-real product without forking, and to give the core a demanding acceptance test. It is not the
-project.
+**The reference product** is the embedded B2B charge card sketched above — spend controls, credit
+lines, holds, the authorization path. [`v1-vision.md`](./v1-vision.md) describes it in full. It
+exists to prove the core carries a real product without forking, and to give the core a demanding
+acceptance test. **It is not the project.**
 
-The dividing line matters because it decides what is configurable. The product layer is meant to
-be replaced. The core is not.
+The line matters because it decides what is configurable. The product layer is meant to be
+replaced. The core is not.
 
 ## Non-negotiables
 
-Four properties of the core. None of them is a setting.
+Four properties. None is a setting.
 
-- **Append-only.** Entries are never updated or deleted. Enforced by revoking `UPDATE` and
-  `DELETE` from the application role, not by convention.
-- **Balanced per currency.** Enforced by the database, as a deferred constraint trigger, not by
-  application code.
-- **Bitemporal.** Every transaction carries both when it happened (`effective_at`, from the
-  source's clock) and when we learned about it (`recorded_at`).
-- **Event-logged.** Every accepted external event is recorded, including the ones that produce no
-  ledger transaction.
+- **Append-only.** Entries are never updated or deleted, enforced by revoking `UPDATE` and
+  `DELETE` from the application role.
+- **Balanced per currency**, enforced by the database as a deferred constraint trigger.
+- **Bitemporal.** Every transaction carries when it happened (`effective_at`, from the source's
+  clock) and when we learned about it (`recorded_at`). These differ constantly — a clearing's
+  business date is the network's, not our webhook's arrival time.
+- **Event-logged.** Every accepted external event is recorded, including the many that produce no
+  ledger transaction (authorizations, declines, hold expiry, limit changes).
 
-**Correctness is never configurable, and this is a lesson rather than a preference.**
-[Spike 001](../spikes/001-formance/README.md) found Formance made historization a feature flag;
-the result is point-in-time queries that silently return `{}` when the flag is off — what one
-reporter called *"a green check that didn't actually execute."* A wrong answer that looks like an
-answer is worse than an error. The temptation for a general engine is to let users trade
-historization, hashing, or balance tracking for throughput. We will not offer that trade.
+**Correctness is never configurable**, and that is a lesson rather than a preference.
+[Spike 001](../spikes/001-formance/README.md) found a ledger that made historization a feature
+flag; the result was point-in-time queries silently returning empty — what one reporter called
+*"a green check that didn't actually execute."* A wrong answer that looks like an answer is worse
+than an error.
 
 Make the product pluggable. Never the invariants.
 
-## Performance
+## Four measurements that shaped the design
+
+All from this session; the spikes have the method.
+
+**Reading a balance is a lookup, not a recomputation.** Every entry carries its account's running
+balance at that moment, so a current balance is one index hit. Summing history instead, on an
+account with 1,000,000 entries: **0.018 ms vs 105.91 ms.**
+
+**That running balance answers only one of two questions.** It is ordered by *insertion*, so on
+backdated history a *business-date* balance read from it is simply wrong — **32,000.00 where the
+truth was 16,000.00.** Hence two axes, never conflated
+([ADR-0003](./decisions/0003-bitemporal-balances.md)).
+
+**Balanced books do not mean correct reports.** A report enumerating only some accounts understated
+interchange revenue as **20.00 against a true 30.00** — and the accounting equation still passed,
+because the missing account drops out of *both* sides. Balancing is not completeness.
+
+**A tenant's slice of the books must balance on its own.** Under row-level security a transaction
+touching both a tenant account and a shared one shows the tenant only their half: **net −500.00,
+unbalanced**, where the operator sees 0.00. The fix is that no transaction may span tenants —
+which turns "tenant-local" from an optimization into a correctness rule.
+
+## Performance, and why there is no number here
 
 [Spike 003](../spikes/003-throughput-ceiling/README.md) measured the design rather than assuming
-it. Durable settings throughout — `fsync`, `synchronous_commit`, and `full_page_writes` all on.
+it, with durability on throughout (`fsync`, `synchronous_commit`, `full_page_writes`).
 
-| Configuration | clearings/s | entries/s |
-| --- | --- | --- |
-| baseline (unsharded, unbatched) | ~800 | ~2,400 |
-| + coalesced batching (25 per transaction) | 3,420 | 10,260 |
-| + hot-account striping (64) | 6,850 | 20,550 |
-| random striping **+** batching | 2,356 | 7,069 |
-| + worker-affinity striping + batching | 4,790 | 14,370 |
-| + single-call posting, striped | 7,897 | 23,692 |
+A **hot account** is one nearly every transaction touches — above, `network_settlement_payable`
+and `interchange_revenue` are hot, because every clearing in the system writes those same two
+rows. Updating a row takes a lock, so every writer queues behind them.
 
-**These numbers are not a claim, and none of them belongs in marketing copy yet.** They were
-measured on localhost on one 16-core laptop with stock Postgres. On localhost a round trip costs
-**0.05ms**; on RDS it costs roughly **0.5ms**, and our clearing path takes six of them against
-1.3ms of actual work. That does not merely scale the numbers down — it *reorders the levers*,
-making batching and single-call posting matter more and striping matter less. Nothing has been
-measured over a network. Until it is, we publish no throughput figure.
+| | clearings/s |
+| --- | --- |
+| one shared row | ~800 |
+| that row **striped** 64 ways | ~6,970 |
 
-What the measurements do support:
+**Striping** splits one logical account's balance across N physical rows; writers pick one, and
+reading the balance sums them. It is worth ~8× and it is the mechanism that actually works,
+because it splits *within* whatever account is hot regardless of who is causing the load.
 
-- **The bottleneck is one row, not the hardware.** Routing every clearing through a single
-  *company* account costs 12%. The shared *house* accounts are the entire ceiling, and throughput
-  plateaus at concurrency 4 and then declines — so adding workers to a struggling ledger makes it
-  slower.
-- **Table size barely matters.** Retested at 5 million entries and 2 GB against 128 MB of cache,
-  essentially unchanged. The workload is append-only, so the hot set is bounded by account count,
-  not entry count.
-- **There are two levers and they cancel** unless you pick correctly. Batching suits streams you
-  control; striping suits independent arrivals. Random striping combined with batching is worse
-  than either alone; worker-affinity striping makes them compose.
+Splitting per *tenant* instead only pays when traffic is evenly spread. **Skew** — how unevenly
+traffic is distributed across tenants — destroys it: with one tenant generating 90% of volume,
+per-tenant splitting gave 1.07× while striping still gave 7.8×. Per-tenant accounts earn their
+place for [other reasons](../spikes/004-chart-of-accounts/README.md), not for throughput.
 
-Both levers become first-class features rather than folklore, and house accounts become
-per-tenant — a shared ledger whose tenants contend with each other gets slower as it succeeds.
+**No headline number here, on purpose.** Everything above ran on localhost, where a round trip
+costs 0.05 ms. On RDS it costs roughly 0.5 ms, and the clearing path takes six of them against
+1.3 ms of real work — which *reorders* the tuning levers rather than merely scaling the result.
+Nothing has been measured over a network, so nothing is published. That is M4.
+
+Two results that do transfer: the bottleneck is **contention on one row, not hardware** (adding
+workers past concurrency 4 makes it slower), and throughput is **close to insensitive to table
+size** — unchanged at 5M entries and 2 GB against 128 MB of cache, because the workload is
+append-only.
 
 ## Why Postgres, and not TigerBeetle
 
-TigerBeetle deserves a straight answer, because it is excellent and the comparison is real. Its
-two-phase transfer model maps onto card authorization almost exactly: a pending transfer with a
-timeout is a hold with an expiry, posting a pending transfer for a lesser amount is a partial
-clearing, voiding one is an authorization reversal, and its pending/posted balance split is
-precisely the held/posted distinction the card product needs. If the ledger core were the whole
-problem, it would be a strong candidate.
+TigerBeetle deserves a straight answer, because it is excellent. Its two-phase transfer model maps
+onto card authorization almost exactly: a pending transfer with a timeout *is* a hold with an
+expiry, posting it for a lesser amount *is* a partial clearing, voiding it *is* an authorization
+reversal. If the ledger core were the whole problem it would be a strong candidate. Three reasons
+it is the wrong fit:
 
-Three reasons it is the wrong fit here:
-
-1. **It solves a throughput problem we measured ourselves not to have.** It targets orders of
-   magnitude beyond what spike 003 found, and almost no user will reach even that ceiling.
+1. **It solves a throughput problem we measured ourselves not to have.**
 2. **It cannot be the only datastore.** Its schema is deliberately fixed — no ad-hoc queries, no
-   joins, no aggregation, no JSON, user data limited to fixed-width integers. Reporting,
-   statements, spend controls, state machines, multi-tenancy, and row-level security all still
-   need Postgres. You end up operating two systems and a consistency boundary between them.
-3. **It defeats the deployment goal.** There is no managed AWS offering; it wants a replica
-   cluster on instances with fast local disk, operated by you, including upgrades and failure
-   recovery. For a small team, adopting it *increases* operational burden at exactly the moment
-   we claim to reduce it.
+   joins, no aggregation, no JSON. Reporting, statements, spend controls, and multi-tenancy all
+   still need Postgres. You operate two systems and a consistency boundary between them.
+3. **It defeats the deployment goal.** No managed AWS offering; it wants a replica cluster on
+   instances with fast local disk, operated by you. For a small team that *increases* operational
+   burden at exactly the moment we claim to reduce it.
 
-What we take from it anyway: the two-phase transfer with timeout is a better-factored version of
-our `card_holds` table, and worth reading before that table is finalized.
-
-When to revisit: when a real user sustains thousands of clearings per second *after* applying the
-levers above. That is a good problem, it will announce itself, and the ledger core is a narrow
-enough interface to put behind an abstraction then — against a real workload rather than a
-hypothetical one.
-
-## What we are deliberately not building
-
-- Sharding, read replicas for writes, or a cache in front of balances. The sizing does not call
-  for any of it, and a cache in front of a ledger is a second copy that can drift.
-- Configurable correctness, in any form.
-- A general-purpose scripting language for transactions.
-- Multi-currency FX conversion. The schema carries currency and balances per currency;
-  conversion is a separate problem with its own decision to make.
+What we take anyway: the two-phase transfer with timeout is a better-factored version of our
+`card_holds` table, and worth reading before that table is finalized. Revisit the decision when a
+real user sustains thousands of clearings per second *after* applying the levers above — that
+problem will announce itself.
 
 ## Where to go next
 
