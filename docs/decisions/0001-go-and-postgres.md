@@ -85,6 +85,17 @@ illegal state unrepresentable, which is the actual Formance insight — **and** 
 constraint trigger as a backstop. At our volume the trigger is free, and it converts a class of
 silent corruption into a failed insert.
 
+## Amendment — the sizing argument is superseded
+
+This ADR's opening move is "size it before designing," justified by *knowing* the workload.
+[ADR-0007](./0007-open-source-positioning.md) proposes reframing the project as a general
+open-source ledger, which removes that knowledge.
+
+The conclusion holds; the reasoning is replaced. [Spike 003](../../spikes/003-throughput-ceiling/README.md)
+measured the design at **~800 clearings/s unsharded, ~6,850/s striped**, on stock Postgres with
+durability on — 17–40× the peak this ADR sized for. Postgres remains correct, but on measured
+headroom and a known bottleneck (one contended row), not on an assumption about volume.
+
 ## Consequences
 
 - Correctness pressure moves into SQL, migrations, and tests. Constraints do the work that
