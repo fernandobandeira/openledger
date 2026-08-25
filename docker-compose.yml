@@ -1,0 +1,22 @@
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: openledger
+      POSTGRES_PASSWORD: openledger
+      POSTGRES_DB: openledger
+    ports:
+      # 5433 to stay clear of a host postgres on 5432
+      - "5433:5432"
+    volumes:
+      # postgres:18+ expects the mount at /var/lib/postgresql (NOT .../data) so it can
+      # use major-version subdirectories and support `pg_upgrade --link`.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openledger"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  pgdata:
