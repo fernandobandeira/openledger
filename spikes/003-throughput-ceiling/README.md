@@ -1,5 +1,29 @@
 # Spike 003 — Where does the Postgres design top out?
 
+> ## ⚠️ Read this before quoting any number below
+>
+> **The machine was never idle and its load was never recorded.** A re-audit measured
+> the same A/B/C configuration twice, at loadavg ~1.5 and ~6.3:
+>
+> | | idle-ish | loaded |
+> | --- | --- | --- |
+> | A contended | 833 | 482 |
+> | B contention-free | 9,873 | 3,994 |
+> | C append | 10,913 | 5,514 |
+> | **A→B ratio** | **11.85×** | **8.29×** |
+>
+> This document says elsewhere to "treat the ratios as the finding." **That is only
+> half right — the ratios move ~30% too.** A is lock-bound and degrades least; B and
+> C are CPU-bound and lose more, compressing the ratio. Every figure here is a
+> *shape*, not a benchmark, and the honest form of each is a range.
+>
+> **The lock-free append row is not comparable to the others and must not be read as
+> such.** Measured on 98,409 entries it produced a ledger that fails three of our own
+> invariants: `balance_after = 0` on *every* entry, `account_seq` from a global
+> sequence so *all 502 accounts* violate gaplessness, and `ledger_account_balances`
+> entirely empty. It is not a faster ledger; it is not a ledger.
+
+
 **The question.** [ADR-0001](../../docs/decisions/0001-go-and-postgres.md) chose Postgres because
 "throughput is not the constraint" — an argument that only works if you *know* the volume. As a
 general open-source ledger we don't. So: what is the actual ceiling, what limits it, and what
@@ -24,7 +48,7 @@ held until commit, so every writer in the system queues behind them.
 | --- | --- | --- |
 | baseline | ~800 | nothing — plateaus at 4 concurrent writers, then *declines* |
 | contention removed, running balance kept | **8,222** | **the recommended shape** |
-| lock-free append (no running balance) | 10,025 | only +22% more, and costs a great deal — see below |
+| ~~lock-free append~~ | ~~10,025~~ | ⚠️ **produces an INVALID ledger** — see banner |
 
 Two ways to remove the contention, and they are not equivalent:
 
@@ -267,7 +291,7 @@ double-entry.
 | --- | --- | --- | --- |
 | **pessimistic** (`ON CONFLICT DO UPDATE`, current) | 1,006 | 866 | 836 |
 | **optimistic** (compare-and-swap + retry) | 679 | 493 | **437** |
-| **lock-free append** (no balance row) | 2,482 | 8,046 | **11,269** |
+| ~~**lock-free append**~~ (no balance row) | ~~2,482~~ | ~~8,046~~ | ~~**11,269**~~ ⚠️ **produces an INVALID ledger** — see banner |
 
 ### Optimistic locking is actively worse
 
@@ -292,7 +316,7 @@ Isolated, c=32, medians of 3 runs on a dedicated database:
 | --- | --- | --- | --- |
 | **A** pessimistic, one shared house row | yes | **yes** | 695 |
 | **B** pessimistic, affinity stripes (no collisions) | yes | **no** | 8,222 |
-| **C** append, no balance row at all | no | no | 10,025 |
+| ~~**C** append, no balance row at all~~ | no | no | ~~10,025~~ ⚠️ **produces an INVALID ledger** — see banner |
 
 - **A → B: 11.8×** — removing *contention*, running balance fully intact.
 - **B → C: 1.22×** — everything else.
@@ -416,7 +440,7 @@ daily treasury batch, is required before any of this informs M1.
 | + single-call posting, striped | **7,816** | best measured |
 | best config on a **2 GB** table | 7,897 | size-insensitive |
 | **contention-free pessimistic** | **8,222** | **the recommended shape** |
-| lock-free append | 10,025 | +22% only; costs O(1) reads and the self-audit |
+| ~~lock-free append~~ | ~~10,025~~ | ⚠️ **produces an INVALID ledger** — see banner |
 
 **Caveat that outranks the table:** localhost numbers, where a round trip costs 0.05 ms. On RDS it
 costs ~0.5 ms and reorders the levers. Treat the *ranking* as hardware-specific and the
