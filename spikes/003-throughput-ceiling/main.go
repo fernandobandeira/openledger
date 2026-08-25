@@ -34,6 +34,8 @@ type tenant struct {
 	interch   []uuid.UUID // striped
 }
 
+var retries int64
+
 var (
 	nTenants   = flag.Int("tenants", 1, "distinct tenants, each with its OWN house accounts")
 	nCompanies = flag.Int("companies", 500, "companies per tenant")
@@ -45,6 +47,7 @@ var (
 	stripeMode = flag.String("stripe-mode", "random", "random | worker (worker = each writer owns a stripe)")
 	oneCall    = flag.Bool("one-call", false, "whole clearing in ONE server-side call (1 round trip, not 6)")
 	keep       = flag.Bool("keep", false, "do NOT truncate -- measure against an existing large table")
+	lockMode   = flag.String("lock-mode", "", "pessimistic | optimistic | append (implies -one-call)")
 )
 
 // workerID is goroutine-local: with -stripe-mode=worker each writer always posts
@@ -99,8 +102,13 @@ func main() {
 		name = fmt.Sprintf("t=%d co=%d s=%d b=%d", *nTenants, *nCompanies, *nStripes, *batch)
 	}
 	e := dur.Seconds()
-	fmt.Printf("%-26s c=%-3d  %8.0f clearings/s  %9.0f entries/s  err=%d\n",
-		name, *conc, float64(ok)/e, float64(ok*3)/e, errs)
+	r := atomic.LoadInt64(&retries)
+	extra := ""
+	if r > 0 {
+		extra = fmt.Sprintf("  retries=%d (%.1f per success)", r, float64(r)/float64(ok))
+	}
+	fmt.Printf("%-26s c=%-3d  %8.0f clearings/s  %9.0f entries/s  err=%d%s\n",
+		name, *conc, float64(ok)/e, float64(ok*3)/e, errs, extra)
 }
 
 type posting struct {
@@ -119,6 +127,25 @@ type posting struct {
 // then derive each entry's running balance by walking backwards from the returned
 // total. Their "demotion" of the running balance is what makes batching possible.
 func doBatch(ctx context.Context, pool *pgxpool.Pool, ts []tenant, rng *rand.Rand) error {
+	if *lockMode != "" {
+		t := ts[rng.Intn(len(ts))]
+		for attempt := 0; ; attempt++ {
+			_, err := pool.Exec(ctx, `SELECT post_clearing_mode($1,$2,$3,$4,$5,$6)`,
+				t.id, uuid.NewString(),
+				t.companies[rng.Intn(len(t.companies))],
+				t.netSettle[stripeFor(ctx, len(t.netSettle), rng)],
+				t.interch[stripeFor(ctx, len(t.interch), rng)], *lockMode)
+			if err == nil {
+				return nil
+			}
+			// optimistic mode: retry serialization failures, that IS the contract
+			if *lockMode == "optimistic" && attempt < 50 {
+				atomic.AddInt64(&retries, 1)
+				continue
+			}
+			return err
+		}
+	}
 	if *oneCall {
 		t := ts[rng.Intn(len(ts))]
 		_, err := pool.Exec(ctx, `SELECT post_clearing($1,$2,$3,$4,$5)`,

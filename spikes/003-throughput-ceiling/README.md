@@ -280,6 +280,64 @@ This is a real property of the design worth stating, because many ledger designs
 here. It does not extend indefinitely: 5M is not 500M, and months of vacuum and bloat are not
 simulated. But the *mechanism* — hot set bounded by account count, not entry count — should hold.
 
+## Result 11 — do we need the lock at all? (No.)
+
+The prior results all assume a lock on the shared account. Worth asking whether it is required.
+
+**It is not required by double-entry.** Two `INSERT`s into `ledger_entries` do not block each
+other. What serializes is the read-modify-write on the balance row — and that exists **only
+because we carry `balance_after` and a per-account `account_seq`**. The lock is a consequence of
+the running balance, not of the accounting.
+
+Three strategies, unsharded (worst case), single-call so the comparison is clean:
+
+| strategy | c=4 | c=16 | c=32 |
+| --- | --- | --- | --- |
+| **pessimistic** (`ON CONFLICT DO UPDATE`, current) | 1,006 | 866 | 836 |
+| **optimistic** (compare-and-swap on `last_seq` + retry) | 679 | 493 | **437** |
+| **lock-free append** (no balance row, global sequence) | 2,482 | 8,046 | **11,269** |
+
+### Optimistic locking is actively worse here
+
+437/s at c=32 versus 836 — **half**. And the retry count tells the story:
+
+| concurrency | retries per success |
+| --- | --- |
+| 4 | 2.9 |
+| 16 | 10.6 |
+| 32 | 11.8 |
+
+Optimistic concurrency wins when conflicts are **rare** — it trades a cheap lock for an
+occasional wasted attempt. On a row every writer touches, conflicts are not rare, they are the
+norm, so almost every attempt is wasted and the cost grows with concurrency. Postgres's row lock
+already queues waiters efficiently; optimistic replaces queuing with **busy-retrying**. It is the
+wrong tool for a hot shared account, and the measurement is unambiguous.
+
+(The same reasoning rules out `SERIALIZABLE` isolation here — SSI detects conflicts and aborts,
+which is optimistic concurrency with extra bookkeeping.)
+
+### Lock-free append is worth 13×
+
+**11,269 clearings/s (33,807 entries/s)** — and unlike every other configuration it *scales with
+concurrency* rather than plateauing or declining. There is no contention left to remove.
+
+This is Formance's `moves` shape: a global `bigserial` (which cannot collide), no per-account
+sequence, no balance row, balance computed by aggregation.
+
+**The cost is real and lands on reads.** Without a running balance, every balance read aggregates
+the account's entries — O(n) in an account's history. The auth hot path needs `posted` in
+milliseconds. The standard resolution is **periodic checkpoints**: materialise the balance at
+entry N, then a read is `checkpoint + SUM(entries after N)`, bounding the scan. That is a real
+design with real complexity, not a free win.
+
+Note it also interacts with [ADR-0003](../../docs/decisions/0003-bitemporal-balances.md), which
+already chose aggregate-on-read for the effective axis. Dropping the running balance would make
+*both* axes consistent — one mechanism instead of two.
+
+**Not proposing the change here.** The measurement establishes the size of the prize (13×, the
+largest single lever found) and the shape of the cost (checkpointed reads). Deciding it needs a
+read-path benchmark, which does not exist yet.
+
 ## Summary — the levers, ranked
 
 | Configuration | clearings/s | entries/s | notes |
@@ -292,6 +350,8 @@ simulated. But the *mechanism* — hot set bounded by account count, not entry c
 | + single-call posting (1 RTT), striped | **7,816** | **23,447** | best measured |
 | tenants=16, own house accounts | 4,319 | 12,956 | free if multi-tenant |
 | best config on a **2 GB** table | 7,897 | 23,692 | size-insensitive |
+| optimistic locking | 437 | 1,311 | **worse**; 11.8 retries/success |
+| **lock-free append** (no running balance) | **11,269** | **33,807** | scales with concurrency; needs checkpointed reads |
 
 **Caveat that outranks the table:** these are localhost numbers, where a round trip costs 0.05ms.
 On RDS it costs ~0.5ms, which reorders the levers (Result 9). Treat the *ranking* as
