@@ -1,4 +1,4 @@
--- M0's acceptance test: the v1-vision §06 trace, one $500 purchase, row by row.
+-- M0's acceptance test: the the reference product spec §06 trace, one $500 purchase, row by row.
 -- After every step the accounting equation must hold. Not checked at the end --
 -- checked at each step, because a ledger that is only right at the end is wrong.
 

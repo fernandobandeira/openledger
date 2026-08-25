@@ -16,10 +16,8 @@
 > to survive, but the argument behind it does not transfer to a project that cannot know its
 > users' volume.
 
-> Source of record: [`v1-vision.html`](./v1-vision.html) — the original design board,
-> with diagrams. This file is the greppable/diffable companion; it is a faithful
-> extraction, not a rewrite. **If the two disagree, the HTML wins** until someone
-> deliberately supersedes it here.
+> Source: extracted from the original design board. The three diagrams are in
+> [`diagrams/`](./diagrams/) and embedded below.
 >
 > Status: **vision / v1 plan**. Not yet decomposed into work. See [`roadmap.md`](./roadmap.md).
 
@@ -61,8 +59,8 @@ A single Postgres instance handles this on a laptop. The real constraints are:
 
 ## 02 — Architecture: the hot path is not the ledger write
 
-> **Diagram:** this section has an architecture diagram that exists only in
-> [`v1-vision.html`](./v1-vision.html#arch) — open it in a browser.
+![Architecture: external systems, services, Postgres stores, and which path is inside the
+authorization deadline](./diagrams/01-architecture.svg)
 
 The only synchronous work inside the auth deadline is one short transaction against a single
 company's row.
@@ -79,8 +77,8 @@ statements — runs as a Temporal workflow calling **idempotent** ledger activit
 
 ## 03 — The auth decision
 
-> **Diagram:** the latency-budget diagram for this section lives in
-> [`v1-vision.html`](./v1-vision.html#hotpath).
+![The authorization latency budget: ~1000ms before the processor applies your default, with a
+p99 target around 300ms](./diagrams/02-auth-hot-path.svg)
 
 The deadline (~1s) is generous relative to the work. The design goal is not speed — it is
 **never being the reason the deadline is missed**, because the failure mode is the network
@@ -342,8 +340,8 @@ permanent record; these are what's still in flight.
 
 ## 05 — Domain state machines vs. the ledger
 
-> **Diagram:** the state-machine diagram lives in
-> [`v1-vision.html`](./v1-vision.html#state).
+![Domain state machines beside the ledger: which transitions are financial events and which are
+not](./diagrams/03-state-machines.svg)
 
 Deciding **which** transitions are financial events is the actual modelling work, and it
 differs per rail. Push status onto the ledger row so it can be updated and you've traded away

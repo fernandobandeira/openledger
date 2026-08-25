@@ -184,7 +184,7 @@ Only after Phase 1 holds. A *consumer* of the ledger, not part of it.
 ## M7 · Cards
 
 `credit_lines`, `spend_controls`, `card_holds` — the transaction from
-[v1-vision §03](./v1-vision.md), against a fake processor. Read-only with respect to the ledger:
+[the reference product spec §03](./reference-product.md), against a fake processor. Read-only with respect to the ledger:
 an authorization writes no entry.
 
 The vision doc's balance table — 12 accounts × 11 columns plus three branch cases, with the

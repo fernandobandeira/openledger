@@ -1,6 +1,6 @@
 // Spike 003 — throughput ceiling, and which knobs move it.
 //
-// Simulates the clearing path (v1-vision §06 step 02): one transaction header plus
+// Simulates the clearing path (the reference product spec §06 step 02): one transaction header plus
 // three balanced entries.
 //
 //	DR customer_receivable   500   per-COMPANY  -> spreads

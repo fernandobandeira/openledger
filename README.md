@@ -31,7 +31,7 @@ graduates it.
 | [docs/roadmap.md](./docs/roadmap.md) | What gets built, in what order, and why that order |
 | [docs/decisions/](./docs/decisions/) | ADRs — every architectural decision and its reasoning |
 | [spikes/](./spikes/) | Timeboxed investigations — brief, findings, and code together |
-| [docs/v1-vision.md](./docs/v1-vision.md) | The reference product spec ([original design board](./docs/v1-vision.html)) |
+| [docs/reference-product.md](./docs/reference-product.md) | The reference card product this ledger was designed against |
 
 ## Local development
 
