@@ -406,6 +406,82 @@ largest single lever found), the shape of the cost (O(n) reads ⇒ mandatory che
 what is given up beyond speed. Deciding it needs a checkpointed-read benchmark, which does not
 exist yet.
 
+## Result 12 — is the ceiling per-tenant or global? Global. But tenant-sharding is free.
+
+The commercially important question: is this "13k per tenant" or "13k across all tenants"? Those
+are different products.
+
+**Test A — fixed concurrency (c=32), vary how many tenants it is divided among.** Each tenant has
+its own house accounts. Concurrency is held constant, so any gain is purely from removing lock
+contention:
+
+| tenants | total clearings/s |
+| --- | --- |
+| 1 | 881 |
+| 2 | 1,332 |
+| 4 | 2,256 |
+| 8 | 3,848 |
+| 16 | 5,958 |
+| 32 | **7,296** |
+
+**8× more throughput from the same 32 writers**, purely because their house-account writes stopped
+colliding. This isolates the effect: per-tenant house accounts remove lock contention, full stop.
+
+**Test B — 4 writers per tenant, so load grows with tenants:**
+
+| tenants | pessimistic total | per-tenant | append total | per-tenant |
+| --- | --- | --- | --- | --- |
+| 1 | 941 | 941 | 2,530 | 2,530 |
+| 2 | 1,239 | 619 | 4,574 | 2,287 |
+| 4 | 2,209 | 552 | 7,692 | 1,923 |
+| 8 | 3,859 | 482 | 10,888 | 1,361 |
+| 16 | 6,028 | 376 | **13,863** | 866 |
+
+Total rises; **per-tenant throughput falls**. Append converges on the same ~13k hardware ceiling
+found in Result 11.
+
+### The answer, in three parts
+
+1. **No per-account limit, and no per-tenant *lock* limit** — once house accounts are per-tenant
+   (or in append mode, where there are no locks at all). **No tenant can be capped by another
+   tenant's contention.** That is real isolation and it is worth having.
+2. **But the ceiling is global, not per-tenant.** ~13k clearings/s is shared across everyone on
+   that database. It is **not** 13k each. What per-tenant house accounts buy is that you can
+   actually *reach* the hardware ceiling instead of being stopped at ~800/s by one row.
+3. **To get a ceiling per tenant, shard tenants across database instances** — and this design is
+   unusually ready for that, for a reason worth spelling out below.
+
+### Per-tenant house accounts also make the system shardable
+
+This is the finding that outranks the throughput numbers.
+
+A ledger has no cross-tenant transactions — tenant A's money never moves to tenant B in one
+entry set. So sharding by tenant is embarrassingly parallel, and scaling becomes *linear in
+instances* rather than capped by one box.
+
+**Except our schema currently forbids it.** `uq_accounts__house` guarantees exactly one
+`interchange_revenue` per **deployment**, so today a card clearing touches:
+
+| leg | scope |
+| --- | --- |
+| `customer_receivable` | tenant |
+| `network_settlement_payable` | **global** |
+| `interchange_revenue` | **global** |
+| `platform_rev_share_payable` | tenant |
+
+Half the legs are deployment-global, so **every transaction spans tenants** and no tenant can be
+moved to another database without breaking atomicity.
+
+Making house accounts per-tenant fixes three things at once, and they compound:
+
+- removes the lock contention (8× at fixed concurrency, Test A),
+- lets a deployment reach its hardware ceiling instead of one row's ceiling,
+- and makes every transaction **tenant-local**, so tenant → database routing becomes possible.
+
+That third one is the scaling story for the open-source product: one instance for almost
+everyone, and shard by tenant when someone outgrows it — with no cross-shard transactions to
+coordinate, ever.
+
 ## Summary — the levers, ranked
 
 | Configuration | clearings/s | entries/s | notes |

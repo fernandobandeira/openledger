@@ -53,7 +53,8 @@ and here are the two levers — pick the one matching your write pattern.**
 6,850/s and currently exists only as folklore. Design it in: an account declares a stripe count,
 writes pick a stripe, balance reads `SUM` across stripes. One integer on the account row.
 
-**2. House accounts become per-tenant.** `uq_accounts__house` currently guarantees exactly one
+**2. House accounts become per-tenant.** *(Strengthened — this is now the single most consequential
+schema change in the pivot, for a reason beyond contention. See "Scaling shape" below.)* `uq_accounts__house` currently guarantees exactly one
 `interchange_revenue` per *deployment*. Correct for one product; wrong for a shared ledger, where
 it makes every tenant contend with every other and **the system slows down as it succeeds**.
 Measured: 16 tenants with their own house accounts scale like 16 stripes (790 → 4,319/s).
@@ -87,6 +88,34 @@ optional. **Configurable historization means as-of queries that are wrong rather
 
 Keep the core rigid: append-only, balanced-per-currency, bitemporal, event-logged. Make the
 *product* pluggable, never the invariants.
+
+## Scaling shape — what a user can actually expect
+
+Measured in [spike 003 Result 12](../../spikes/003-throughput-ceiling/README.md). Stated plainly
+because adopters will ask, and the honest answer is more useful than a headline number.
+
+**The ceiling is global, not per-tenant.** ~13k clearings/s is shared across every tenant on a
+database. It is **not** 13k each.
+
+**But there is no per-account or per-tenant *lock* limit** once house accounts are per-tenant. No
+tenant can be throttled by another tenant's contention; they compete only for CPU and WAL. At
+fixed concurrency, splitting the same 32 writers across 32 tenants took throughput from 881/s to
+7,296/s — **8×, purely from removing lock collisions.**
+
+**Scaling past one instance is by tenant, and it is clean.** A ledger has no cross-tenant
+transactions, so sharding by tenant is embarrassingly parallel and scaling is linear in
+instances.
+
+**Our schema currently forbids that**, which is why change (2) above matters more than it first
+appears. `uq_accounts__house` guarantees one `interchange_revenue` per *deployment*, so half the
+legs of a card clearing are deployment-global and **every transaction spans tenants**. No tenant
+can be relocated to another database without breaking atomicity. Making house accounts per-tenant
+removes the contention, lets a deployment reach its hardware ceiling instead of one row's ceiling,
+**and** makes every transaction tenant-local — which is what turns "buy a bigger instance" into
+"add an instance."
+
+The resulting story for an adopter: **one Postgres for almost everyone; shard by tenant when you
+outgrow it; no cross-shard transactions, ever.**
 
 ## Why not TigerBeetle
 
