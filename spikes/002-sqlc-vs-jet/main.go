@@ -8,9 +8,10 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"spike002/gen"
 )
@@ -36,17 +37,17 @@ func main() {
 	// --- 1. arrays round-trip natively? --------------------------------
 	sc, err := q.UpsertSpendControls(ctx, gen.UpsertSpendControlsParams{
 		CardID: "spike_card", CompanyID: "spike_co",
-		CapMinor: ptr(int64(200000)),
-		Period:   gen.NullControlPeriod{ControlPeriod: gen.ControlPeriodMonth, Valid: true},
-		Timezone: "America/Sao_Paulo",
-		AllowedMcc:       []int32{5812, 5814},
-		BlockedMcc:       []int32{7995},
+		CapMinor:         pgtype.Int8{Int64: 200000, Valid: true}, // NB: params struct keeps pgtype
+		Period:           gen.NullControlPeriod{ControlPeriod: gen.ControlPeriodMonth, Valid: true},
+		Timezone:         "America/Sao_Paulo",
+		AllowedMCC:       []int32{5812, 5814},
+		BlockedMCC:       []int32{7995},
 		AllowedMerchants: []string{"mrc_uber", "mrc_amzn"},
 		Active:           true,
 	})
 	must(err)
 	fmt.Printf("1. arrays        allowed_mcc=%v (%T)  merchants=%v (%T)\n",
-		sc.AllowedMcc, sc.AllowedMcc, sc.AllowedMerchants, sc.AllowedMerchants)
+		sc.AllowedMCC, sc.AllowedMCC, sc.AllowedMerchants, sc.AllowedMerchants)
 
 	// --- 2. the auth transaction, end to end ---------------------------
 	tx, err := pool.Begin(ctx)

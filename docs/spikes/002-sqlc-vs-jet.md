@@ -82,7 +82,7 @@ scoped, it always looks cheapest on day one, and it is how projects acquire a pr
 no documentation. If the spike ends pointing there, write a **new ADR** arguing for it
 explicitly, with the maintenance cost stated.
 
-## Findings — hands-on (sqlc v1.29.0, pgx/v5, Postgres 18.6)
+## Findings — hands-on (sqlc v1.31.1, pgx/v5, Postgres 18.6)
 
 Run against a real database, not read from docs. Code: [`/spikes/002-sqlc-vs-jet`](../../spikes/002-sqlc-vs-jet).
 The schema deliberately includes 9 enums, `int[]`, `text[]`, `jsonb`, `bigint` money, two
@@ -216,3 +216,111 @@ entries is the *first* thing every integration test does.
 - The deferred balance trigger is invisible to sqlc (it fires at COMMIT). Posting code must
   handle a constraint violation surfacing from `tx.Commit()`, not from the INSERT. Worth an
   explicit test in M1.
+
+---
+
+## Findings — the aggregate typing matrix (the important one)
+
+Superseding the simpler matrix above. `sqlc.yaml` accepts an optional
+`database.uri` + `analyzer.database: true`, which types queries by asking Postgres
+instead of guessing statically. Same four queries, both engines:
+
+| SQL | static engine | **db-backed analyzer** |
+| --- | --- | --- |
+| `SUM(x)` | `int64` ❌ | `pgtype.Numeric` ✅ |
+| `SUM(x)::bigint` | `int64` ⚠️ | `int64` ⚠️ |
+| `COALESCE(SUM(x), 0)` | `interface{}` ❌ | `pgtype.Numeric` ✅ |
+| `COALESCE(SUM(x), 0)::bigint` | `int64` ✅ | `int64` ✅ |
+
+**The static engine was wrong about the type, not just the nullability.**
+`SUM(bigint)` returns **`numeric`** in Postgres, not `bigint`. The static engine says
+`int64`; the analyzer correctly says `pgtype.Numeric`, which is also NULL-safe.
+
+Two rules follow, and they are independent:
+
+1. **Turn the analyzer on.** It converts the two dangerous forms from "compiles, then
+   fails at runtime on an empty account" into a NULL-safe type you notice at compile
+   time. This is a safety net, not a style preference.
+2. **`COALESCE(SUM(...), 0)::bigint` is still the only form correct under both engines.**
+   Row 2 is the residual landmine — `SUM(x)::bigint` types as a non-nullable `int64`
+   under *both* engines and returns NULL over zero rows. **Neither engine catches it.**
+   That is what needs the CI lint over `queries.sql`.
+
+Note the honesty cost: enabling the analyzer means codegen wants a live database, which
+was a criticism levelled at go-jet. The difference is real but narrower than it looks —
+sqlc degrades gracefully to static analysis when the database is absent, whereas go-jet's
+generator cannot run at all. Soft dependency vs hard one.
+
+## Findings — struct sprawl is smaller than assumed
+
+`sqlc.embed()` is not even the main mechanism. sqlc **already returns the bare table
+struct** whenever a query selects all columns of one table in declaration order —
+verified in our own output:
+
+```go
+func (q *Queries) GetSpendControls(ctx, cardID string) (SpendControl, error)      // SELECT *
+func (q *Queries) UpsertSpendControls(ctx, arg ...) (SpendControl, error)         // RETURNING *
+```
+
+Zero `Row` structs emitted for either. The condition is same column count, same order,
+same names, same types, one table — so **always write `SELECT *` or `SELECT alias.*`,
+never hand-list a full column set**, since re-ordering silently forces a `Row` struct
+(upstream #3328).
+
+`omit_unused_structs: true` prunes the rest per-package. What survives is genuine
+projections — `GetHeldRow`, `GetBalanceRow` — which are *report shapes*, not entities.
+go-jet gives you an ad-hoc destination struct for those too.
+
+⚠️ **`sqlc.embed` on a LEFT JOIN generates non-nullable fields and fails at runtime**
+(upstream #3240, #2997, #2348, all open). Use it on INNER JOINs only; for LEFT JOINs list
+columns explicitly and let sqlc's nullability analysis work. Also unsupported: embedding
+a CTE (hard error), and `array_agg` into a slice of embedded structs.
+
+## Findings — overrides, and their sharp edge
+
+The override block turns generated models into domain types with nothing left to map
+(`uuid.UUID`, `time.Time`, `*string`, `json.RawMessage`, `[]int32`, `[]string`, `int64`).
+
+**But the `db_type` spelling is not predictable and a miss is silent.** Measured on our
+own schema, where the DDL says `bigint`:
+
+| `db_type:` | applied? |
+| --- | --- |
+| `int8` | no |
+| `bigint` | no |
+| `pg_catalog.bigint` | no |
+| `pg_catalog.int8` | **yes** |
+
+Whereas `uuid`, `timestamptz`, `jsonb`, and `text` all take the bare name. There is no
+rule to memorise here — **verify every override actually landed by reading the generated
+struct.** A typo does not error; it silently leaves you with `pgtype.X`.
+
+**Overrides also apply asymmetrically.** Same column, same run:
+
+```go
+type SpendControl struct            { CapMinor *int64      }  // model:  overridden
+type UpsertSpendControlsParams struct { CapMinor pgtype.Int8 }  // params: NOT overridden
+```
+
+Not fatal, but it means "zero pgtype leakage" holds for entities and not for parameter
+structs.
+
+Other verified items: `initialisms: ["mcc"]` fixes `AllowedMcc` → `AllowedMCC` globally;
+`emit_db_tags: true` makes the models readable by `pgx.RowToStructByNameLax`, so
+hand-written dynamic queries return the *same* generated structs (flat models only — it
+does not recurse into `sqlc.embed`'s named fields); Postgres `DOMAIN` types fall through
+to `interface{}` and need an explicit override.
+
+## Verdict
+
+**Option B — native `pgxpool` + sqlc.** ADR-0002 moves to `accepted`, reversing its own
+proposal. The recommended configuration is
+[`spikes/002-sqlc-vs-jet/sqlc.yaml`](../../spikes/002-sqlc-vs-jet/sqlc.yaml), verified
+end to end against a live database.
+
+The decision rule written before the evidence said "if arrays and jsonb are ugly under
+`database/sql` → B." The evidence went differently: **arrays are fine under both tools**,
+so that rule never fired. B wins on two grounds neither option's brief anticipated —
+go-jet's silent-zero scan trap on mis-aliased columns, and its generator's hard
+requirement of a live database with no offline path.
+

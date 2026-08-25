@@ -12,4 +12,4 @@ decide with partial information — do not extend silently).
 | # | Question | Blocks | Status |
 | --- | --- | --- | --- |
 | [001](./001-formance.md) | What can we take from Formance's open-source ledger? | nothing — informs schema design | open |
-| [002](./002-sqlc-vs-jet.md) | sqlc or go-jet? | [ADR-0002](../decisions/0002-data-access-layer.md) | open |
+| [002](./002-sqlc-vs-jet.md) | sqlc or go-jet? | [ADR-0002](../decisions/0002-data-access-layer.md) | **closed** — sqlc |
