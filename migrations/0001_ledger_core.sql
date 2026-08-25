@@ -226,7 +226,13 @@ CREATE CONSTRAINT TRIGGER ck_entries__balances
 -- grants, not by convention." Until now that was a description, not an
 -- enforcement: a plain UPDATE mutated four committed entries in testing.
 
-CREATE ROLE openledger_app NOLOGIN;
+-- Roles are CLUSTER-global, not per-database, so a bare CREATE ROLE makes this
+-- migration fail on the second database it is applied to. Found by applying it
+-- twice.
+DO $$ BEGIN
+    CREATE ROLE openledger_app NOLOGIN;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 GRANT USAGE ON SCHEMA public TO openledger_app;
 GRANT SELECT, INSERT ON ledger_accounts, ledger_events, ledger_transactions,
                         ledger_entries TO openledger_app;
