@@ -59,6 +59,32 @@ throughput problem we do not have, and does not help with bitemporal reporting, 
 multi-tenancy, or the working-set tables. Worth reading for its invariants; not worth adopting.
 See [spike 001](../spikes/001-formance.md) for the "learn from, don't adopt" pattern.
 
+## Corroboration from [spike 001](../spikes/001-formance.md)
+
+Two parts of this ADR were later tested against Formance's production history, and both held —
+one of them for a reason we had not thought of.
+
+**"No ORM, logic in Go, the DB does constraints and locks" is the position Formance arrived at
+the expensive way.** Their v1 put the ledger *in the database*: insert a row into `logs`, and
+plpgsql triggers cascaded into transactions, moves, accounts, and volumes. Migration 37 is the
+demolition — it drops roughly 26 stored functions including `handle_log()`,
+`insert_transaction()`, `insert_move()`, and every volume-computation function, moving all of it
+into Go. We should not read that as "the database is the wrong place for correctness" — their
+*constraints* stayed. It is specifically **procedural logic** in the database that they reversed.
+
+**Constraints doing the work is load-bearing for us in a way it is not for them.** Formance's
+posting primitive is `Posting{Source, Destination, Asset, Amount}` — a balanced pair *by
+construction*, so there is no CHECK and no trigger enforcing that debits equal credits anywhere
+in their schema. Our `ledger_entries` are independent rows carrying a `direction`, which means
+we **can** express an unbalanced transaction and therefore **must** enforce that we don't.
+Formance offers us no help here, and their marketing line about debits always equalling credits
+has no runtime check behind it.
+
+The lesson taken: do both layers. Make the write API accept balanced pairs only — make the
+illegal state unrepresentable, which is the actual Formance insight — **and** keep the deferred
+constraint trigger as a backstop. At our volume the trigger is free, and it converts a class of
+silent corruption into a failed insert.
+
 ## Consequences
 
 - Correctness pressure moves into SQL, migrations, and tests. Constraints do the work that

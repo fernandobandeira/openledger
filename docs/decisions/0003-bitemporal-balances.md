@@ -85,7 +85,7 @@ equivalent, because their running balance is derived rather than independently c
 - Roadmap M4 (bitemporal reads) now has a concrete shape and must test the backdating case
   above, not merely the happy path.
 
-## Still unresolved — see [spike 001](../spikes/001-formance.md)
+## Still unresolved — now [ADR-0005](./0005-reproducible-as-of.md)
 
 **`recorded_at` is not monotonic with commit order.** A transaction starting at T1 and
 committing at T3 writes `recorded_at = T1`, while one starting at T2 > T1 and committing at
@@ -94,4 +94,5 @@ defeats the reproducibility the recorded axis exists to provide.
 
 A genuinely reproducible cursor must be **commit-ordered**, not a wall clock. `account_seq` is
 per-account, so this needs either a global monotonic entry id or an explicit "as of entry #N".
-This ADR does not settle it; it is a prerequisite for M4 and needs its own decision.
+This ADR does not settle it — [ADR-0005](./0005-reproducible-as-of.md) takes it up, and it
+blocks M4.
