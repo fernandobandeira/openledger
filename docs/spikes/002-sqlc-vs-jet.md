@@ -82,6 +82,137 @@ scoped, it always looks cheapest on day one, and it is how projects acquire a pr
 no documentation. If the spike ends pointing there, write a **new ADR** arguing for it
 explicitly, with the maintenance cost stated.
 
-## Findings
+## Findings — hands-on (sqlc v1.29.0, pgx/v5, Postgres 18.6)
 
-*(empty — spike not yet run)*
+Run against a real database, not read from docs. Code: [`/spikes/002-sqlc-vs-jet`](../../spikes/002-sqlc-vs-jet).
+The schema deliberately includes 9 enums, `int[]`, `text[]`, `jsonb`, `bigint` money, two
+partial unique indexes, and a deferred constraint trigger.
+
+### The array/jsonb objection — resolved, in sqlc's favour
+
+ADR-0002 named this as the thing that would flip the decision. It flipped it.
+
+`sql_package: "pgx/v5"` emits **native Go types** for arrays — not `pgtype.FlatArray`, not
+`[]byte`:
+
+```go
+AllowedMcc       []int32   // int[]
+BlockedMcc       []int32   // int[]
+AllowedMerchants []string  // text[]
+```
+
+Verified round-tripping through a live `UpsertSpendControls ... RETURNING *`. There is no
+wrapper type and no manual unmarshalling. The concern that motivated ADR-0002's proposal of
+go-jet does not exist under sqlc's pgx mode.
+
+### The entity-sprawl objection — mitigated by `sqlc.embed()`
+
+`sqlc.embed(table)` emits the **canonical table struct**, shared across every query, inside a
+one-line wrapper:
+
+```sql
+SELECT sqlc.embed(ledger_entries), sqlc.embed(ledger_accounts)
+FROM ledger_entries JOIN ledger_accounts ON ...
+```
+```go
+type ListEntriesWithAccountRow struct {
+    LedgerEntry   LedgerEntry   `json:"ledger_entry"`
+    LedgerAccount LedgerAccount `json:"ledger_account"`
+}
+```
+
+`LedgerEntry` here is the same `LedgerEntry` every other query uses. Embeds compose with joins
+and mix freely with bare scalar columns. The remaining sprawl is a named wrapper per query —
+which is a different, much smaller complaint than "a new copy of the entity per query."
+
+### Generated structs can BE the domain entities
+
+`overrides` reshapes the generated models so there is nothing left to map:
+
+```yaml
+overrides:
+  - {db_type: "uuid",           go_type: "github.com/google/uuid.UUID"}
+  - {db_type: "timestamptz",    go_type: "time.Time"}
+  - {db_type: "timestamptz",    nullable: true, go_type: {type: "time.Time", pointer: true}}
+  - {db_type: "pg_catalog.int8", nullable: true, go_type: {type: "int64",  pointer: true}}
+  - {db_type: "text",           nullable: true, go_type: {type: "string",  pointer: true}}
+  - {db_type: "jsonb",          go_type: {import: "encoding/json", type: "RawMessage"}}
+```
+
+Before → after, same table:
+
+```go
+ID         pgtype.UUID          →   ID         uuid.UUID
+TenantID   pgtype.Text          →   TenantID   *string
+Metadata   []byte               →   Metadata   json.RawMessage
+CreatedAt  pgtype.Timestamptz   →   CreatedAt  time.Time
+```
+
+**Zero `pgtype` leakage into the domain.** This is the answer to "how do we simplify the
+transition from sqlc into our domain entity": you don't transition, you generate the domain
+shape directly. Gotcha: `go_type` as a bare string only accepts basic types and
+`pkg.Type` — `map[string]any` is rejected, use the `{import:, type:}` form.
+
+Postgres enums become typed Go constants plus a `NullX` wrapper, with `Scan`/`Value` implemented:
+
+```go
+type HoldState string
+const (
+    HoldStateOpen    HoldState = "open"
+    HoldStateCleared HoldState = "cleared"
+    ...
+)
+```
+
+### The hard queries all survive intact
+
+Every one generated and executed on the first attempt:
+
+| Query | Result |
+| --- | --- |
+| `SELECT ... FOR UPDATE` | ✅ clean, works inside `q.WithTx(tx)` |
+| Two-grain `SUM(GREATEST(...)) FILTER (WHERE ...)` | ✅ both grains, both `int64` |
+| `ON CONFLICT DO NOTHING RETURNING` | ✅ **and** the duplicate case is distinguishable — `errors.Is(err, pgx.ErrNoRows) == true` |
+| `ORDER BY account_seq DESC LIMIT 1` | ✅ |
+| Dynamic filters via `sqlc.narg` + `IS NULL OR` | ✅ generated; 5 optional predicates + pagination |
+| `bigint` → `int64` | ✅ never a float, anywhere |
+
+The auth flow ran end to end: lock the credit line, read held, insert the hold, replay the
+duplicate, observe `company_held` go 0 → 50000 with no counter anywhere. The insert *is* the
+reduction, as designed.
+
+### ⚠️ The landmine — nullability inference on aggregates
+
+**This is the most important finding in the spike, and it is money-relevant.**
+
+sqlc infers `SUM()` as non-nullable. SQL says `SUM()` over **zero rows is NULL**. Confirmed at
+runtime, not theorised:
+
+```
+6. SUM, no rows  err = can't scan into dest[0] (col: total): cannot scan NULL into *int64
+```
+
+An explicit `::bigint` cast does **not** save you — it fixes type inference, not nullability.
+The full matrix:
+
+| SQL | Generated Go | Safe? |
+| --- | --- | --- |
+| `SUM(x)` | `int64` | ❌ runtime error on zero rows |
+| `SUM(x)::bigint` | `int64` | ❌ runtime error on zero rows |
+| `COALESCE(SUM(x), 0)` | `interface{}` | ⚠️ compiles, silently untyped |
+| `COALESCE(SUM(x), 0)::bigint` | `int64` | ✅ correct |
+
+**Rule: every aggregate gets `COALESCE(...)` AND an explicit cast. Both. Always.** Neither
+alone is sufficient — one gives you a runtime panic on an empty account, the other gives you
+`interface{}` money. This deserves a CI check over `queries.sql`, not a code-review convention.
+
+Note this is exactly the failure mode a ledger cannot tolerate: a brand-new account with no
+entries is the *first* thing every integration test does.
+
+### Still open
+
+- jsonb as `json.RawMessage` still needs an unmarshal at the call site. Acceptable — `metadata`
+  and `external_ref` are not hot-path.
+- The deferred balance trigger is invisible to sqlc (it fires at COMMIT). Posting code must
+  handle a constraint violation surfacing from `tx.Commit()`, not from the INSERT. Worth an
+  explicit test in M1.

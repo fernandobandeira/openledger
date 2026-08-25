@@ -32,3 +32,6 @@ vendor/
 
 # Scratch
 /tmp/
+
+# Spike codegen output — regenerate with `sqlc generate` in the spike dir
+/spikes/*/gen/
