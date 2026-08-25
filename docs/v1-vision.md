@@ -1,5 +1,21 @@
 # v1 Vision — Embedded Card Ledger
 
+> **This is the reference product specification, not the project's requirements.**
+>
+> openledger is a general open-source double-entry ledger — see [`vision.md`](./vision.md) for
+> the project vision, and [ADR-0007](./decisions/0007-open-source-positioning.md) for the
+> decision that made this document a product spec rather than a system spec.
+>
+> This document describes the embedded B2B charge card product that openledger's *reference
+> implementation* targets. It remains the best description of the card domain we have, and its
+> [lifecycle trace](#06--lifecycle-one-500-purchase-row-by-row) is still M0's acceptance test.
+>
+> One correction: **§01's sizing is superseded** by
+> [spike 003](../spikes/003-throughput-ceiling/README.md), which measured the design instead of
+> reasoning about one known workload. Its "throughput is not the constraint" conclusion happens
+> to survive, but the argument behind it does not transfer to a project that cannot know its
+> users' volume.
+
 > Source of record: [`v1-vision.html`](./v1-vision.html) — the original design board,
 > with diagrams. This file is the greppable/diffable companion; it is a faithful
 > extraction, not a rewrite. **If the two disagree, the HTML wins** until someone
@@ -21,6 +37,10 @@ the auth decision, delegated KYB/KYC. Small team, boring tech: **Postgres + Temp
 ---
 
 ## 01 — Size it before designing
+
+> **Superseded** by [spike 003](../spikes/003-throughput-ceiling/README.md), which measured the
+> ceiling rather than deriving it from one product's volume. The reasoning below is sound for
+> *this* product and does not generalise. Kept for the product context.
 
 Throughput is not the constraint.
 

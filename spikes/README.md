@@ -22,6 +22,7 @@ with partial information — do not extend silently).
 | [001](./001-formance/) | What can we take from Formance's open-source ledger? | [ADR-0003](../docs/decisions/0003-bitemporal-balances.md), [0004](../docs/decisions/0004-event-log.md), [0005](../docs/decisions/0005-reproducible-as-of.md), [0006](../docs/decisions/0006-schema-conventions.md) | **closed** |
 | [002](./002-sqlc-vs-jet/) | sqlc or go-jet? | [ADR-0002](../docs/decisions/0002-data-access-layer.md) — sqlc | **closed** |
 | [003](./003-throughput-ceiling/) | Where does the Postgres design top out, and what moves it? | [ADR-0007](../docs/decisions/0007-open-source-positioning.md) | **closed** |
+| [004](./004-chart-of-accounts/) | What does a general ledger ship when the chart is business-specific? | chart as data; M0 acceptance test passing | **closed** |
 
 ## Artifacts worth knowing about
 
