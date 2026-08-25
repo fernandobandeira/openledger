@@ -73,3 +73,7 @@ measured the design with durability on, but everything so far ran on localhost â
 round trip costs 0.05 ms against roughly 0.5 ms on RDS. That reorders the tuning levers rather
 than merely scaling the result, so nothing goes in a README until it is measured over a real
 network. See [the vision doc](./docs/vision.md#performance).
+
+## Licence
+
+[MIT](./LICENSE).

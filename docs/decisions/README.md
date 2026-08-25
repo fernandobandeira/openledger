@@ -71,8 +71,6 @@ Undecided, listed plainly rather than buried:
 - **There is no period close and no retained earnings posting.** Un-closed earnings are presented
   as a derived `current_year_earnings` line, which is correct interim presentation but means
   nothing bounds how far back a backdated entry can restate a reported period.
-- **A licence has not been chosen.** There is no LICENSE file. The timer library is MPL-2.0, which
-  makes this due now rather than later — see [0008](./0008-durable-timers.md).
 - **No number has been measured on RDS.** Everything so far is localhost, where a round trip is
   ten times cheaper. Nothing gets published until that is fixed.
 - **Posting rules.** A deployment declares its own accounts; it must also declare how a business
