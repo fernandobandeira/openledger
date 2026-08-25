@@ -62,7 +62,11 @@ CREATE TABLE ledger_transactions (
     tenant_id       text,
     -- scoped to the EVENT, not the business object. so pending -> posted is a
     -- NEW row, never an UPDATE. e.g. 'evt_clear_xyz:posting', 'evt_clear_xyz:revshare'
-    idempotency_key text NOT NULL UNIQUE,
+    idempotency_key text NOT NULL,
+    -- sha256 of the canonical request body. same key + same hash -> replay the
+    -- stored result. same key + DIFFERENT hash -> reject; it is a caller bug, and
+    -- replaying the wrong stored result silently is worse than failing.
+    idempotency_hash bytea NOT NULL,
     kind            text NOT NULL,
     status          ledger_txn_status NOT NULL,  -- NEVER MUTATES
     -- from the SOURCE's clock, never now(). a clearing's is the network business
@@ -75,6 +79,24 @@ CREATE TABLE ledger_transactions (
     metadata        jsonb NOT NULL DEFAULT '{}'::jsonb
 );
 
+-- Scoped to the tenant, NOT globally unique. Formance shipped a global key and
+-- needed a de-duplicating migration to re-scope it; skip that step.
+--
+-- NULLS NOT DISTINCT is load-bearing (PG15+). tenant_id is NULL on house-scoped
+-- transactions, and under default NULLS DISTINCT semantics this index would not
+-- constrain those rows AT ALL -- the same NULL != NULL trap the vision doc calls
+-- out for house accounts. Verified: without it, T7 silently passes.
+CREATE UNIQUE INDEX ledger_transactions_idem_key
+    ON ledger_transactions (tenant_id, idempotency_key) NULLS NOT DISTINCT;
+
+-- We refuse to mutate, so we cannot use the UPDATE ... WHERE reverted_at IS NULL
+-- guard against double-reversal. These give the same property declaratively:
+-- a transaction can be reversed once, and resolved once.
+CREATE UNIQUE INDEX ledger_transactions_one_reversal
+    ON ledger_transactions (reverses_id) WHERE reverses_id IS NOT NULL;
+CREATE UNIQUE INDEX ledger_transactions_one_resolution
+    ON ledger_transactions (resolves_id) WHERE resolves_id IS NOT NULL;
+
 CREATE TABLE ledger_entries (
     id             uuid PRIMARY KEY DEFAULT uuidv7(),
     transaction_id uuid NOT NULL REFERENCES ledger_transactions(id),
@@ -83,8 +105,13 @@ CREATE TABLE ledger_entries (
     amount_minor   bigint NOT NULL CHECK (amount_minor > 0),  -- never the amount
     currency       char(3) NOT NULL,
     account_seq    bigint NOT NULL,               -- monotonic per account
-    balance_after  bigint NOT NULL,               -- running balance of THIS account
+    -- running balance on the RECORDED axis only. See ADR-0003: this cannot answer
+    -- an effective-date as-of query once anything is backdated.
+    balance_after  bigint NOT NULL,
     recorded_at    timestamptz NOT NULL DEFAULT now(),
+    -- denormalized from ledger_transactions so the effective-axis aggregate is a
+    -- single-table index scan instead of a join. Immutable, like everything here.
+    effective_at   timestamptz NOT NULL,
 
     UNIQUE (account_id, account_seq)
 );
@@ -95,6 +122,10 @@ CREATE INDEX ledger_entries_balance_idx
 CREATE INDEX ledger_entries_asof_idx
     ON ledger_entries (account_id, recorded_at DESC, account_seq DESC);
 CREATE INDEX ledger_entries_txn_idx ON ledger_entries (transaction_id);
+-- the EFFECTIVE axis. balance as of a business date is an aggregate over this,
+-- not a running-balance lookup. See ADR-0003.
+CREATE INDEX ledger_entries_effective_idx
+    ON ledger_entries (account_id, effective_at);
 
 -- Balance enforced by the DATABASE, per currency, deferred to COMMIT so a
 -- transaction can be built up entry by entry.

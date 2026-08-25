@@ -10,3 +10,4 @@ Status: `proposed` · `accepted` · `superseded by NNNN` · `rejected`
 | --- | --- | --- |
 | [0001](./0001-go-and-postgres.md) | Go + Postgres, no ORM | accepted |
 | [0002](./0002-data-access-layer.md) | Data access: native pgxpool + sqlc | accepted — reversed its own proposal, see [spike 002](../spikes/002-sqlc-vs-jet.md) |
+| [0003](./0003-bitemporal-balances.md) | Balances on two time axes: aggregate-on-read for the effective axis | accepted |
