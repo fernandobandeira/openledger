@@ -148,6 +148,83 @@ in each sandbox before the constraint is relied on.
   analysts. Plan for it structurally — travel and entertainment spend exists, and both networks
   now permit increments for all merchant categories — not from a rate estimate.
 
+## Network rules — three of our assumptions were wrong
+
+From the **Visa Core Rules and Product and Service Rules, 18 April 2026**, read directly. Rule IDs
+are verbatim-checkable. (Mastercard's rulebooks are member-gated and returned 403 throughout, so
+every Mastercard figure below is from processor documentation, not primary.)
+
+### 1. Our expiry windows were Mastercard's, not Visa's
+
+We had "~7 days, longer for T&E." **Visa's Table 5-12 says 5 days card-present**, 10 card-absent,
+and **30 only when the Estimated or extended indicator is present** — a hotel that omits the
+indicator gets 5. Merchant-initiated transactions also get 5.
+
+The 7-and-30 figures are Mastercard's, and they are the industry default *hold* policy. Which
+leads to the real correction:
+
+### 2. There are TWO clocks and we modelled one
+
+| clock | what it is | who sets it |
+| --- | --- | --- |
+| **Clearing deadline** | Table 5-12. Breach gives the *issuer* a dispute right (Condition 11.3, 75 days) | the network |
+| **Hold release** | when we stop reserving the cardholder's credit | **us** |
+
+`expires_at` currently conflates them. They must be separate, and the hold clock should sit
+*longer* than the clearing deadline so a last-day clearing still matches.
+
+Two sharp edges: **an incremental authorization does not extend the clearing deadline**
+(§5.7.3.5, ID# 0031022) — the clock runs from the original — while Stripe *does* extend the hold.
+And **expiry is not terminal**: releasing the hold does not prevent a later clearing, and if one
+arrives you are liable for it.
+
+### 3. Visa incrementals are not free-standing
+
+*"A Merchant may submit an Incremental Authorization Request where it has obtained an Approval
+Response for a valid Estimated Authorization… The Merchant must use… **the same Transaction
+Identifier** used for the initial Estimated Authorization Request."* (§5.7.2.5, ID# 0030937)
+
+So on Visa it is a state machine — **Estimated → Incremental(s), all sharing one Transaction
+Identifier** — not a standalone message type. And the Transaction Identifier is exactly what the
+group key should be: Visa's glossary calls it *"a unique value assigned to each Transaction…
+[used] to maintain an audit trail throughout the life cycle of the Transaction and all related
+transactions, such as Reversals, Adjustments, confirmations, and Disputes"* (ID# 0025182).
+
+That corroborates the earlier finding from the processor side: group on the authorization's
+lifecycle identifier, never on the RRN or the approval code.
+
+### Other rules that change the model
+
+- **`authorized_amount` and `held_amount` must be separate fields.** Tolerance padding adjusts the
+  *hold*; rules evaluate the *authorization*. A $50 restaurant authorization reserves $65 at 30%
+  tolerance, but the authorization is still $50.
+- **Auth → clearing is one-to-many**, by rule: airlines, cruise lines, US railways and split
+  shipments may send multiple clearings against one authorization, keyed by Multiple Clearing
+  Sequence Number (§5.7.3.2, ID# 0027756). Our summed-deltas model handles this natively; a 1:1
+  foreign key would not.
+- **Tips are not increments.** A tip arrives as a *larger clearing* inside the tolerance table, and
+  Visa explicitly bars estimated authorizations from covering tips (§5.7.2.4). Never flag a
+  restaurant clearing merely for exceeding its authorization.
+- **Tolerance is a date-effective network × MCC × region lookup, not a constant.** US restaurants
+  move from 20% to 30% on 21 February 2026 (Table 7-10).
+- **Never diff billing-currency amounts across auth and clearing.** FX moves in between, so on
+  cross-currency transactions that delta is expected on *every* transaction. Compare
+  transaction-currency amounts only.
+- **STIP approvals are binding**: *"An Issuer is responsible for any Transaction approved or
+  declined by Stand-In Processing"* (§1.4.4.3, ID# 0004386). The ledger must ingest an approval it
+  never made.
+- **EEA/UK release on clearing, not on timer.** Visa's rules impose no general hold-release
+  mandate, but PSD2 Article 75 requires release without undue delay once the exact amount is known.
+  A timer-only implementation is non-compliant there.
+- **Unmatched clearing is a normal state.** Stripe ships `authorization: null`; Marqeta and Lithic
+  both model force-post as a first-class type. Our nullable `group_key` matches this.
+
+### And one number that does not exist
+
+**There is no published auth-to-clearing match failure rate**, from either network or any
+processor. Every research path looked. The widely repeated figures are folklore. Instrument
+`matched_by ∈ {lifecycle_id, rrn, fuzzy, unmatched}` from day one and measure our own.
+
 ## The open question this does not answer
 
 **What is `group_key`, really?** The design assumes some identifier is stable across an original
