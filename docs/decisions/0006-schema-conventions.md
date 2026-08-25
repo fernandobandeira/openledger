@@ -48,9 +48,26 @@ nullable back-pointers with no referential integrity. (One FK exists in their wh
 on an unrelated system table.)
 
 This is a reasonable choice for a general-purpose engine that shards by bucket and wants
-unconstrained write throughput. It is the wrong choice for us: we are one product, at under
-1 TPS, where the cost of a dangling `transaction_id` is a number in a lender report that no
-one can explain. Keep FKs, and keep them `NOT NULL` where the relationship is mandatory.
+unconstrained write throughput. ~~It is the wrong choice for us: we are one product, at under
+1 TPS~~ It is the wrong choice for us — see the measured version of this argument below — where
+the cost of a dangling `transaction_id` is a number in a lender report that no one can explain.
+Keep FKs, and keep them `NOT NULL` where the relationship is mandatory.
+
+> **Amended under [ADR-0007](./0007-open-source-positioning.md).** The original justification was
+> "we are one product, at under 1 TPS" — which the pivot removes, since we are now *also* a
+> general-purpose engine and no longer know our users' volume. The decision is unchanged and the
+> argument is now stronger, because it is measured rather than assumed.
+>
+> [Spike 003](../../spikes/003-throughput-ceiling/README.md) benchmarked the FK-carrying schema at
+> **800 clearings/s unsharded and 7,897 striped**, and identified the bottleneck precisely: row-lock
+> contention on shared accounts. Not FK validation, not index maintenance, not I/O, not WAL flush.
+> Formance's reason for dropping foreign keys — unconstrained write throughput — is a cost we
+> looked for and could not find at any configuration we tested.
+>
+> So the honest form is: **referential integrity is not what limits this design, and we have the
+> numbers to say so.** A general engine has *more* reason to keep FKs than a single product did,
+> because its integrators will do things to the schema we never anticipated, and a constraint is
+> the only part of the design that survives contact with an unanticipated caller.
 
 ### 4. Keep Postgres enums
 
@@ -100,6 +117,12 @@ balance into `ledger_accounts` would mean every posting updating a wide row carr
 jsonb` and several indexes. A narrow balance row is cheap to lock, cheap to update, and stays in
 cache. This is an independent argument for the `ledger_account_balances` table that roadmap M2
 already wants for sequence assignment.
+
+**Since confirmed by measurement.** [Spike 003](../../spikes/003-throughput-ceiling/README.md)
+built exactly this table and found that the balance row's lock *is* the system's serialization
+point — the thing that sets the ceiling, and the thing every throughput lever in
+[ADR-0007](./0007-open-source-positioning.md) manipulates. "Cheap to lock" stopped being an
+aesthetic preference and became the single most performance-critical property in the schema.
 
 ### 8. Never store JSON in a text column
 

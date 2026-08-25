@@ -84,8 +84,48 @@ accepted. Specifically unverified:
    one transaction open for minutes, every report during that window is pinned behind it.
 3. Whether the watermark should advance past aborted transactions automatically (it should, but
    confirm).
-4. Whether (a) is honestly good enough. At under 1 TPS average, global write serialization may
-   cost nothing measurable, and it is far simpler. **Measure before choosing the clever option.**
+4. ~~Whether (a) is honestly good enough. At under 1 TPS average, global write serialization may
+   cost nothing measurable, and it is far simpler.~~ **Measured — see the amendment below.**
 
 Do not build M4 on the vision doc's `recorded_at <= :as_of` in the meantime. It is not
 reproducible, and code written against it will need to change.
+
+## Amendment — open question 4 is now answered, and it favours (b)
+
+This ADR said **"Measure before choosing the clever option."**
+[Spike 003](../../spikes/003-throughput-ceiling/README.md) is that measurement, and it arrived
+without being aimed at this question.
+
+Option (a) — a single advisory lock handing out a commit-ordered number — is structurally
+identical to the single-contended-row case spike 003 characterised in detail:
+
+| | clearings/s |
+| --- | --- |
+| one contended row, unbatched | ~800, plateauing at concurrency 4 then **declining** |
+| one contended row, coalesced batching (25) | 3,420 |
+| no global contention, striped | 6,850 |
+| no global contention, striped + single-call | **7,897** |
+
+Two consequences the original analysis could not have known:
+
+**(a) costs roughly 8× unbatched and 2× batched — and it is worse than those numbers look**,
+because the lock is *global*. Every lever [ADR-0007](./0007-open-source-positioning.md) rests on
+— striping, worker-affinity striping, per-tenant house accounts — works by reducing contention on
+**account** rows. None of them touch a lock that every writer takes regardless of which account
+it is posting to. Adopting (a) does not merely lower the ceiling; it makes 0007's entire
+throughput story inoperative.
+
+**The concurrency-4 plateau is the specific danger.** Spike 003 found that throughput on a
+contended row *declines* past concurrency 4. A deployment that adds workers to a slow ledger
+would make it slower — the least debuggable failure mode available, and one that would land on
+users rather than on us.
+
+**This settles the proposal at (b)** on evidence rather than taste. It also raises the value of
+(b)'s specific shape: because the cursor lives on `ledger_events` and is assigned once per
+accepted event, batching amortises it exactly as it amortises everything else.
+
+Open questions 1–3 stand unchanged; the watermark still has to be built and tested against
+concurrent writers. Question 1's premise — "long-running Temporal activities holding transactions
+open" — should be re-examined in light of
+[ADR-0001's Temporal amendment](./0001-go-and-postgres.md#amendment--temporal-is-an-unexamined-dependency-for-the-open-source-goal),
+since it is no longer settled that Temporal is in the write path at all.

@@ -96,6 +96,64 @@ measured the design at **~800 clearings/s unsharded, ~6,850/s striped**, on stoc
 durability on — 17–40× the peak this ADR sized for. Postgres remains correct, but on measured
 headroom and a known bottleneck (one contended row), not on an assumption about volume.
 
+## Amendment — what else the pivot touches
+
+Beyond the sizing argument above, three things in this ADR need restating under
+[ADR-0007](./0007-open-source-positioning.md).
+
+**The "Alternatives considered" rationale leans on the superseded sizing.** The Rust rejection
+("at under 1 TPS we would be paying iteration speed for performance we have explicitly declined
+to need") and the Kotlin rejection ("stack weight for a small team") were both arguments from a
+known, small workload. The conclusions survive on other grounds — Temporal's Rust SDK is still
+not ready, and Go remains the lowest-friction language for outside contributors, which matters
+*more* for an open-source project than stack weight did for a small team. But the arguments as
+written no longer carry themselves.
+
+**The TigerBeetle dismissal here is superseded.** This ADR rejects it in three lines as solving
+a throughput problem we do not have. [ADR-0007](./0007-open-source-positioning.md#why-not-tigerbeetle)
+now makes the case properly, and reaches the same conclusion for a better reason: TigerBeetle
+cannot be the only datastore, so it *adds* a system rather than replacing one, and it has no
+managed AWS offering — which defeats the deployment goal outright. Read 0007's version, not this
+one.
+
+**The deferred balance trigger is no longer an assumption.** This ADR claims "at our volume the
+trigger is free." [Spike 003](../../spikes/003-throughput-ceiling/README.md) ran the entire
+benchmark with `ck_entries__balances` active, and the measured bottleneck was row-lock contention
+on shared accounts — not the trigger, not I/O, not WAL flush. The claim is now measured rather
+than assumed, and it holds up to at least 7,897 clearings/s.
+
+## Amendment — Temporal is an unexamined dependency for the open-source goal
+
+This is the largest unresolved tension the pivot creates, and no ADR currently owns it.
+
+Half this ADR's case for Go is Temporal: *"Every timer in the design — hold expiry, clearing,
+settlement, ACH return windows, disputes, statements — is a Temporal workflow, so SDK quality is
+a primary axis, not a secondary one."* That reasoning is sound for a team building one product
+who have already decided to run Temporal.
+
+[ADR-0007](./0007-open-source-positioning.md) states the goal as **"a small team can drop into
+AWS and run."** Temporal is not a library — it is a server cluster with its own persistence store
+and worker fleet, or a paid cloud subscription. Requiring it means the "drop into AWS" story is
+Postgres **plus** a Temporal deployment, which is materially harder than the one-managed-database
+pitch 0007 rests on, and harder than the thing it is arguing against on exactly those grounds.
+
+Three positions are available and this ADR does not choose between them:
+
+1. **Temporal in the reference product only.** The ledger core needs no durable timers — hold
+   expiry and ACH return windows belong to the *card* layer, which ADR-0007 already demotes to a
+   reference implementation. This is the most likely answer and would resolve the tension
+   cleanly.
+2. **A pluggable timer interface**, with a Postgres-backed default and Temporal as an option.
+   Costs an abstraction over something notoriously easy to get subtly wrong.
+3. **Accept Temporal as a hard dependency** and drop the "drop into AWS" claim to match.
+
+Note this interacts with [ADR-0005](./0005-reproducible-as-of.md), whose open question 1 assumes
+"long-running Temporal activities holding transactions open" as part of the write pattern.
+
+**Recommendation: this needs its own ADR before M6**, which is where Temporal was scheduled to
+enter. Flagged here rather than decided, because it is a positioning call that belongs with
+whoever accepts or rejects 0007.
+
 ## Consequences
 
 - Correctness pressure moves into SQL, migrations, and tests. Constraints do the work that

@@ -121,8 +121,13 @@ is exactly where the `"table.column"` convention gets forgotten.
 
 ## Consequences
 
-- **`pgxpool` native.** `pgx.Batch`, `CopyFrom`, and `pgtype` are available. We do not need
-  them at under 1 TPS, but they cost nothing to keep.
+- **`pgxpool` native.** `pgx.Batch`, `CopyFrom`, and `pgtype` are available. ~~We do not need
+  them at under 1 TPS, but they cost nothing to keep.~~ **Amended:** they turned out to be
+  load-bearing, not free extras. [Spike 003](../../spikes/003-throughput-ceiling/README.md)'s
+  coalesced-batching path — worth 4.4× on its own — is built on `CopyFrom` for bulk entry
+  insertion. Under the [ADR-0007](./0007-open-source-positioning.md) pivot this is the clearest
+  retrospective vindication of choosing B: go-jet's `database/sql` constraint would have made the
+  single highest-value throughput lever materially harder to build.
 - **Struct sprawl is smaller than the objection assumed.** sqlc returns the bare table struct
   for any `SELECT *` / `SELECT alias.*` / `RETURNING *`. Combined with `omit_unused_structs`,
   what remains is genuine projections. **Always `SELECT *`, never a hand-listed full column

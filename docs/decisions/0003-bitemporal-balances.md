@@ -70,6 +70,9 @@ to repair volume data**.
 entries is not a performance concern; these are thousands of rows, not millions. It preserves
 strict immutability, which is the property the whole ledger is built on.
 
+> **Amended under [ADR-0007](./0007-open-source-positioning.md).** The decision stands; the
+> second sentence does not. See "The read-path assumption" below.
+
 The bonus is a **free corruption alarm**: `balance_after` and the recorded-axis aggregate must
 always agree. Any divergence is a bug, detectable by a cheap periodic check. Formance has no
 equivalent, because their running balance is derived rather than independently computed.
@@ -84,6 +87,43 @@ equivalent, because their running balance is derived rather than independently c
 - The recorded-axis running balance stays the hot path. Nothing about the auth decision changes.
 - Roadmap M4 (bitemporal reads) now has a concrete shape and must test the backdating case
   above, not merely the happy path.
+
+## Amendment — the read-path assumption is now unsafe
+
+Option (c) was justified by "at under 1 TPS… thousands of rows, not millions." Both halves are
+assumptions the pivot removes, and **[spike 003](../../spikes/003-throughput-ceiling/README.md)
+does not rescue either** — it measured the *write* path exclusively. Nothing here has been
+measured on the as-of read path.
+
+The row-count assumption is the worse of the two, and it fails in a specific, predictable place.
+Spike 003 established that the accounts touched by every transaction are the shared house
+accounts. Those are therefore also the accounts that accumulate the **most entries** — by a
+margin that grows with total system volume. So the account most likely to be queried
+"as of last quarter" for a financial statement is precisely the one whose effective-axis
+aggregate scans the largest number of rows. In a general engine with no bound on deployment
+size, "thousands of rows, not millions" is not a claim we can make.
+
+**The decision does not change.** Option (b) still costs strict immutability and is still the
+design Formance needed six repair migrations for. But the justification is now:
+aggregate-on-read is chosen *because immutability is worth more than read latency*, not because
+the aggregate is cheap — and its cost is currently unmeasured.
+
+Two mitigations already exist in the design and should be tested rather than assumed:
+
+- **Striping cuts the aggregate too.** [ADR-0007](./0007-open-source-positioning.md) stripes hot
+  accounts for write throughput; the same split divides each stripe's entry count, so the
+  per-stripe scan shrinks even though the total does not. Whether summing K stripes beats one
+  large scan is an empirical question.
+- **The append-only property helps.** Spike 003 result 10 found throughput essentially
+  size-insensitive (5M entries / 2 GB against 128 MB of cache) because the hot set is bounded by
+  account count rather than entry count. That reasoning covers *balance-lookup* reads. It
+  explicitly does **not** cover a full-history aggregate, which is the one access pattern that
+  must touch cold pages by definition.
+
+**This needs its own spike before M4**: measure the effective-axis aggregate over an account with
+millions of entries, striped and unstriped. If it is untenable, the fallback is a periodic
+effective-axis checkpoint — a materialized balance at, say, each month end, so an aggregate only
+ever scans from the last checkpoint forward. That preserves immutability, which (b) does not.
 
 ## Still unresolved — now [ADR-0005](./0005-reproducible-as-of.md)
 
