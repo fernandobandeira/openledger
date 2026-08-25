@@ -334,9 +334,77 @@ Note it also interacts with [ADR-0003](../../docs/decisions/0003-bitemporal-bala
 already chose aggregate-on-read for the effective axis. Dropping the running balance would make
 *both* axes consistent — one mechanism instead of two.
 
+### Is the number per-account or global? Global — and that is the point
+
+Every run below has `stripes=1`, so **every clearing touches the same two house accounts**:
+
+| accounts in the system | pessimistic | lock-free append |
+| --- | --- | --- |
+| 3 (one company + one house pair) | 765 | 10,952 |
+| 502 (500 companies + one house pair) | 834 | 11,036 |
+
+Two things fall out.
+
+**Under pessimistic locking the ceiling is per contended ROW, not per account and not global.**
+Concentrating all traffic on 3 accounts costs almost nothing (765 vs 834) because the two shared
+house rows were already the limit. Global throughput ≈ *(per-row rate) × (number of distinct hot
+rows)* — which is exactly why striping works, and why a single un-striped shared row caps the
+whole system at roughly 800–1,000/s no matter how many accounts exist.
+
+**Under append there is no per-row ceiling at all.** 10,952 with three accounts, 11,036 with 502
+— identical. Appends to the same account do not block each other, so account count and account
+concentration stop being variables.
+
+### Is 11k a hard limit? No — it is where this laptop stops
+
+| concurrency | clearings/s | entries/s |
+| --- | --- | --- |
+| 32 | 10,992 | 32,975 |
+| 64 | 12,651 | 37,954 |
+| **96** | **13,042** | **39,127** |
+| 128 | 12,868 | 38,603 |
+
+It keeps climbing to ~13,000 at c=96 on a 16-core machine, then flattens as cores run out. This
+is the **first configuration whose ceiling is hardware rather than design** — every other one
+plateaued because of a lock. A bigger instance moves this number; a bigger instance did nothing
+for any of the others.
+
+### What it costs, measured
+
+The read side, forced onto the index path (20 iterations each):
+
+| entries in the account | running balance | aggregate on read |
+| --- | --- | --- |
+| 100 | 0.073 ms | 0.10 ms |
+| 10,000 | 0.017 ms | 0.97 ms |
+| 100,000 | 0.015 ms | 8.96 ms |
+| 1,000,000 | **0.018 ms** | **105.91 ms** |
+
+The running balance is genuinely **O(1)** — flat at ~0.02ms across four orders of magnitude. The
+aggregate is exactly linear: 10× the rows, 10× the time. At a million entries it is **~6,000×
+slower**, and it keeps growing forever.
+
+That is not survivable on the auth path, which has a ~1s deadline it must never be the reason
+for missing. So **checkpointing is mandatory, not optional**, if the running balance goes:
+materialise the balance at entry N, read `checkpoint + SUM(entries after N)`, and re-checkpoint
+often enough to bound the scan. Checkpointing puts write work back, so the true net gain is less
+than 13×.
+
+Three other things the running balance buys that the append design loses:
+
+1. **The self-audit.** [ADR-0003](../../docs/decisions/0003-bitemporal-balances.md) leans on
+   `balance_after` and the recomputed aggregate always agreeing — divergence is a corruption
+   alarm. With aggregation as the only source, the balance is true by construction and there is
+   nothing left to check it against.
+2. **Gaplessness.** `UNIQUE (account_id, account_seq)` proves no entry is missing from an
+   account's history. A global sequence gives ordering but not gaplessness — Postgres sequences
+   have holes after rollbacks, and Formance's own migration comments say so explicitly.
+3. **Cheap as-of reads on the recorded axis**, which become aggregates too.
+
 **Not proposing the change here.** The measurement establishes the size of the prize (13×, the
-largest single lever found) and the shape of the cost (checkpointed reads). Deciding it needs a
-read-path benchmark, which does not exist yet.
+largest single lever found), the shape of the cost (O(n) reads ⇒ mandatory checkpointing), and
+what is given up beyond speed. Deciding it needs a checkpointed-read benchmark, which does not
+exist yet.
 
 ## Summary — the levers, ranked
 
@@ -351,7 +419,7 @@ read-path benchmark, which does not exist yet.
 | tenants=16, own house accounts | 4,319 | 12,956 | free if multi-tenant |
 | best config on a **2 GB** table | 7,897 | 23,692 | size-insensitive |
 | optimistic locking | 437 | 1,311 | **worse**; 11.8 retries/success |
-| **lock-free append** (no running balance) | **11,269** | **33,807** | scales with concurrency; needs checkpointed reads |
+| **lock-free append** (no running balance) | **13,042** | **39,127** | hardware-bound, not design-bound; needs checkpointed reads |
 
 **Caveat that outranks the table:** these are localhost numbers, where a round trip costs 0.05ms.
 On RDS it costs ~0.5ms, which reorders the levers (Result 9). Treat the *ranking* as
