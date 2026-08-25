@@ -197,8 +197,11 @@ reasons it is still wrong here:
 3. **It defeats the deployment goal.** Postgres means RDS: managed, backed up, one click.
    ([0008](./0008-durable-timers.md) removed the last thing that undercut this claim — durable
    timers were going to require a Temporal cluster, and now run in-process on the same database.)
-   TigerBeetle has no managed AWS offering; it wants a replica cluster on fast local disk that you
-   operate. It *increases* operational burden precisely where we claim to reduce it.
+   **Correction:** an earlier version said TigerBeetle "has no managed AWS offering."
+   [TigerBeetle Cloud](https://tigerbeetle.com/cloud) exists, on AWS/Azure/GCP. The accurate,
+   narrower claim: there is no AWS-*native* service, and self-hosting wants a six-replica cluster
+   on local NVMe that you operate. It *increases* operational burden precisely where we claim to
+   reduce it — but by less than this ADR originally asserted.
 
 One correction: TigerBeetle argues against sharding because hot accounts make shards bottlenecks.
 That is an argument against **distributed** sharding, where cross-shard transactions get

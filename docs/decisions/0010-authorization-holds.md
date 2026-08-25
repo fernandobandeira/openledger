@@ -120,11 +120,15 @@ out-of-order, and the derived total was never wrong.
 
 - **Hold expiry windows are policy, not protocol.** Our release timer is not the network's clearing
   deadline: that clock drives dispute eligibility and does not extend on an increment. Both are
-  stored; neither is derived from the other. The specific day counts previously quoted here rest on
-  a citation to a Visa rules table that **could not be verified** — the public PDF was not
-  extractable, and the table number spike 006 cites appears to govern authorization *response*
-  time rather than auth-to-clearing days. Treat the numbers as unconfirmed until a primary source
-  is in hand.
+  stored; neither is derived from the other.
+
+  **Correction to a correction.** An earlier version of this bullet retracted the day counts as
+  unverifiable. That retraction was wrong: Visa Core Rules (18 Apr 2026) **§5.7.3.5, Table 5-12**
+  does specify **5 calendar days** for "All other Transactions in a Card-Present Environment",
+  with the clock starting on the date of a valid authorization. Spike 006's citation is sound and
+  is reinstated. Two real refinements: Visa treats authorization validity and the clearing deadline
+  as *one* rule rather than two, and the figure is region-variable — so it is policy input, not a
+  constant to hard-code.
 - **STIP** — stand-in processing, where the network approves on our behalf while we are down —
   produces authorizations we never saw. Unmodelled.
 - **Fuzzy matching itself.** The schema records *which* method assigned a group (`lifecycle_id`,

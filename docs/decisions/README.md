@@ -42,6 +42,7 @@ No decision may trade these away. They are what makes the numbers trustworthy:
 - **Balanced per currency**, enforced by the database on every transaction.
 - **Bitemporal.** Every entry records both when it happened and when we learned about it.
 - **Event-logged.** Every accepted operation is recorded, whether or not it moves money.
+  *Not yet enforced:* `ledger_transactions.event_id` is nullable — see "Still open".
 - **Correctness is never configurable.** Formance made historization a feature flag and got
   point-in-time queries that silently return empty — *"a green check that didn't actually
   execute."* Make the product pluggable; never the invariants.
@@ -61,6 +62,14 @@ Undecided, listed plainly rather than buried:
   has to add up entries, which is linear — ~0.10 µs each, so ~3 ms at 30k entries and a measured 105.91 ms at 1M. The fix is the accountants' one: close each period and store its closing balance, so a
   query only has to add up the current period. Designed but not built —
   [0003](./0003-bitemporal-balances.md) has the numbers.
+- **`event_id` is nullable**, so "every transaction references its causing event" is a convention
+  rather than an invariant. `NOT NULL` is the fix; it is not done.
+- **There is no idempotency replay path.** `idempotency_hash` is written and never read, so
+  "same key + same body replays the stored result; a different body is refused" is designed and
+  unbuilt. The unique index only makes the second attempt fail.
+- **The write path requires READ COMMITTED.** Measured: REPEATABLE READ and SERIALIZABLE lose
+  most writes to serialization failures on the balance upsert, and a retry loop does not rescue
+  it. A hard deployment constraint, recorded in no ADR.
 - **Hash chaining for tamper evidence is deferred, not decided.**
   [0004](./0004-event-log.md) leaves it explicitly open: it needs a total order, so it is entangled
   with [0005](./0005-reproducible-as-of.md). The cost figures quoted there are extrapolated from

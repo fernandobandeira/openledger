@@ -78,9 +78,13 @@ better for reconciliation).
 
 - **Network latency.** Everything is localhost, where a round trip costs 0.05 ms. On RDS it is
   ~0.5 ms, which *reorders* the levers (batching matters more, striping less). **No number here
-  should be published as an AWS figure until an RDS benchmark exists.** Independently
-  corroborated: pgledger, a Postgres ledger of near-identical design, publishes 10,637
-  transfers/s local collapsing to **1,631 over a network** — an ~85% loss.
+  should be published as an AWS figure until an RDS benchmark exists.**
+
+  **A corroborating figure here was struck as fabricated.** pgledger publishes 10,636.8 transfers/s across
+  50 accounts and 7,558.9 across 10, both on localhost; it has never published a network benchmark,
+  and `1,631` appears nowhere in its history (checked across all refs). What its two figures DO
+  corroborate is this document's actual thesis: same machine, same worker count, 1.41x purely from
+  account contention.
 - **`operating_cash`.** The benchmark posts only three legs and never touches the accounts that
   *cannot* be split (see [The account that breaks the model](#the-account-that-breaks-the-model)).
   It excluded the hard case.

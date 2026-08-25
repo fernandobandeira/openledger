@@ -4,9 +4,11 @@
 -- view was broken in four ways by adversarial review — one of them silently
 -- UNDER-reserving credit, which is the worst failure available here.
 --
--- THE ROOT CAUSE was mixing two conventions in the derivation. Six of eleven
--- processors report an incremental authorization as a cumulative TOTAL rather than
--- a delta. v2 stored both and resolved absolutes by `occurred_at` — but processors
+-- THE ROOT CAUSE was mixing two conventions in the derivation. Processors disagree
+-- on whether an incremental authorization carries a DELTA or a cumulative TOTAL --
+-- spike 006 surveys three and they do not agree. (An earlier version of this header
+-- said "six of eleven processors". No such survey exists; the disagreement is real,
+-- the sample size was invented, and it is struck.) v2 stored both and resolved absolutes by `occurred_at` — but processors
 -- emit second-granularity timestamps and none guarantees ordering, so ties fell
 -- through to insertion order and the same facts produced different holds depending
 -- on which webhook's TCP connection finished first.
@@ -142,8 +144,13 @@ CREATE TABLE webhook_deliveries (
 );
 
 -- Materialised per-group total. Every processor surveyed ships one; against a
--- 1500ms real-time-decisioning budget, deriving it on read was measured at 1131ms
--- on two years of history. This is the design, not a contingency.
+-- ~1s real-time-decisioning budget, deriving a hold by summing an unbounded event
+-- log is unbounded work. This is the design, not a contingency.
+--
+-- That is an ARGUMENT, not a measurement. An earlier version of this comment said
+-- "measured at 1131ms on two years of history against a 1500ms budget"; neither
+-- number has a source, spike 006 says the derivation "has not been benchmarked
+-- here", and every other budget figure in this repo says ~1s. Both are struck.
 CREATE TABLE card_hold_groups (
     tenant_id   text NOT NULL,
     company_id  text NOT NULL,

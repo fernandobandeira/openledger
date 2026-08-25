@@ -121,8 +121,9 @@ END $$;
 
 -- =========================================================== cumulative totals
 --
--- Six of eleven processors surveyed report an incremental authorization as a
--- cumulative TOTAL rather than a delta. The adapter converts at the boundary,
+-- Processors disagree on whether an incremental authorization carries a delta or a
+-- cumulative TOTAL. (An earlier comment here said "six of eleven processors
+-- surveyed" -- no such survey exists, and it is struck.) The adapter converts at the boundary,
 -- under the group's lock, so the stored model stays pure deltas.
 
 -- is_total on the authorization too: a processor that reports increments as
