@@ -83,6 +83,26 @@ executable attestation over careful reading:
 The first two both under-reserve credit, which the design document already names as the worst
 failure available here. Neither was found by reading.
 
+### And three more, which needed *concurrent* attack
+
+Fixing the four above introduced or exposed three defects that no single-session test can reach.
+All three were reproduced with two interleaved sessions and are now covered by
+[`tests/concurrency.sh`](../../tests/concurrency.sh):
+
+| | |
+| --- | --- |
+| **The re-grouping guards were bypassable.** `regroup_auth_event` read the destination `FOR UPDATE` *before* materialising it, so while another transaction was mid-creation of that group the row was invisible, `FOUND` was false, and **both** guards were skipped. A USD event joined a group being created as EUR — 1500 "held", being 1000 EUR plus 500 USD summed as if they were one unit. | Materialise first, then lock, then validate — the order `record_auth_event` already used. |
+| **Worse: a live authorization joined a group being expired.** `held_for_company` then reported **0 against real exposure of 1000**, and `card_hold_drift` could not see it, because the clamp lives in `held_minor` while the alarm compares `total_minor` — and those agreed. Invisible to the unmatched queue too, since the event had a live membership row. | Same fix. The alarm now also reports any event assigned to a group *after* it expired, because the clamp is the thing hiding the number. |
+| **The lock that fixed the lost update introduced a deadlock.** Re-grouping locked the destination, then `recompute_hold_group` locked the source — so two operators moving events in opposite directions between the same two groups took the same two locks backwards. 198 deadlocks under mixed load. | Lock both groups up front, in `group_key` order. The same lesson as sorting the legs in `post()`. |
+
+**What held under the same attack**, and is worth recording as attested rather than assumed:
+`record_auth_event` has no window — `INSERT … ON CONFLICT DO NOTHING` waits on a concurrent
+inserter (measured: a second session blocked 2.96 s, then saw the row and locked it). 3,600
+concurrent calls on one group produced a materialised total exactly equal to the log, and
+**concurrent ingest on a single group cannot deadlock** — it takes exactly one row lock. The
+cumulative-total conversion also fails closed: 1,304 of 1,800 racing attempts were refused as
+out-of-order, and the derived total was never wrong.
+
 ## Consequences
 
 - **The unmatched queue is a view, not a special value.** An event with no live assignment is

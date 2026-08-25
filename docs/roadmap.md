@@ -128,14 +128,27 @@ RETURNING b.last_seq, b.input - b.output;
 ```
 
 The row lock *is* the serialization point — no `SELECT max()`, no advisory lock, no retry loop.
+
+**That last clause holds only under READ COMMITTED, and that had never been written down.**
+Measured, same sorted workload, no retry: READ COMMITTED **1200/1200 committed**; REPEATABLE READ
+**369**, with 831 serialization failures; SERIALIZABLE **244**, with 956. The failure is the
+`ON CONFLICT DO UPDATE` itself — `could not serialize access due to concurrent update`. It fails
+closed, so nothing corrupts, but a deployment that sets a stricter default silently loses most of
+its writes. Adding an external retry loop does not rescue it either: at REPEATABLE READ with 25
+retries it still takes 2.8 retries per posting and leaves 28 permanent failures. **The write path
+requires READ COMMITTED**, or it needs a different concurrency primitive.
 `tenant_id` leads the conflict target because it leads the primary key; without it this statement
 does not run at all (`there is no unique or exclusion constraint matching the ON CONFLICT
 specification`). The working version is `post()` in [the golden trace](../tests/golden_trace.sql).
 Spike 003 ran it over 1,721 accounts: zero mismatches, zero gaps, zero unbalanced transactions.
 Two traps from Formance's bug history:
 
-- **Insert the zero-balance row before locking it.** You cannot `FOR UPDATE` a row that does not
-  exist, so two writers race on an account's *first* entry.
+- **The first-entry race does not apply to the upsert form, and this was worth testing rather than
+  assuming.** The warning is real for `SELECT … FOR UPDATE` — you cannot lock a row that does not
+  exist. But `INSERT … ON CONFLICT DO UPDATE` *is* the insert-and-lock, so there is no gap to race
+  through. Attacked with 25 independent races, each a fresh tenant with no balance row and 32
+  writers released simultaneously on a start barrier: **800/800 committed, zero deadlocks, zero
+  unique violations**, every sequence gapless from 1. This is a genuine strength of the design.
 - **Deterministic lock ordering, batch-wide.** Sort accounts by id on read and write paths. Spike
   003 found that sorting within a single clearing does *not* order locks across a batch —
   throughput collapsed 10× into deadlocks.

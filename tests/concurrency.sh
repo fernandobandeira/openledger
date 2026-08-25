@@ -89,4 +89,73 @@ chk "every account_seq gapless"     "$(q "select bool_and(mx=n and dc=n) from (s
 chk "every transaction balanced"    "$(q "select bool_and(dr=cr) from (select transaction_id, sum(amount_minor) filter (where direction='debit') dr, sum(amount_minor) filter (where direction='credit') cr from ledger_entries group by transaction_id) q")" "t"
 chk "accounting equation holds"     "$(q "select bool_and(balanced) from accounting_equation()")" "t"
 
+# ---------------------------------------------------------------- workload C
+# Re-grouping races. All three of these were LIVE defects found by adversarial
+# review, and none is reachable from a single session.
+TMPD="$TMP"
+
+# C1: two operators shuttling events between the SAME two groups in opposite
+# directions. regroup locks the destination, then recompute locks the source --
+# opposite orders, so they deadlocked (198 of them under mixed load). Both groups
+# are now locked up front in group_key order.
+psql "$URL" -q -v ON_ERROR_STOP=1 <<'SQL'
+DO $$ DECLARE i int; BEGIN
+  FOR i IN 1..40 LOOP
+    PERFORM record_auth_event('rg','ea'||i,'gA','co1','c1','incremental',10,'USD',false,now());
+    PERFORM record_auth_event('rg','eb'||i,'gB','co1','c1','incremental',10,'USD',false,now());
+  END LOOP;
+END $$;
+SQL
+shuttle() {  # dir, n, worker
+    local from to pfx; if [ "$1" = AB ]; then from=gA; to=gB; pfx=ea; else from=gB; to=gA; pfx=eb; fi
+    : > "$TMPD/c$3.sql"
+    for i in $(seq 1 "$2"); do
+        echo "SELECT regroup_auth_event('rg',(SELECT m.event_id FROM card_auth_event_group m JOIN card_auth_events e ON e.tenant_id=m.tenant_id AND e.id=m.event_id WHERE m.tenant_id='rg' AND m.group_key='$from' AND m.superseded_at IS NULL AND e.processor_msg_id LIKE '$pfx%' LIMIT 1),'$to','op$3');" >> "$TMPD/c$3.sql"
+    done
+    psql "$URL" -qAt -f "$TMPD/c$3.sql" >/dev/null 2>"$TMPD/c$3.err"
+}
+dl_before=$(q "select deadlocks from pg_stat_database where datname=current_database()")
+for w in 1 2 3; do shuttle AB 12 "$w" & done
+for w in 4 5 6; do shuttle BA 12 "$w" & done
+wait
+dl_after=$(q "select deadlocks from pg_stat_database where datname=current_database()")
+chk "regroup deadlocks"          "$(( dl_after - dl_before ))" 0
+chk "regroup conserves the total" "$(q "select sum(total_minor) from card_hold_groups where tenant_id='rg'")" 800
+chk "regroup leaves no drift"     "$(q "select count(*) from card_hold_drift where tenant_id='rg'")" 0
+
+# C2/C3: the destination group's guards must hold even when the destination is
+# being CREATED by another transaction. regroup used to read it FOR UPDATE before
+# materialising it, so mid-creation the row was invisible, FOUND was false, and
+# both guards were skipped -- a USD event joined a EUR group, and a live
+# authorization joined a group being expired (held_for_company then reported 0
+# against real exposure, invisible to the drift alarm because the clamp lives in
+# held_minor while the alarm compares total_minor).
+race_guard() {  # tenant, setup-sql-in-open-txn, event-msg, dest, expect-substring, label
+    local t="$1" setup="$2" msg="$3" dest="$4" expect="$5" label="$6"
+    local fifo="$TMPD/f_$t"; rm -f "$fifo"; mkfifo "$fifo"
+    ( psql "$URL" -qAt -f "$fifo" >/dev/null 2>&1 ) &
+    exec 9>"$fifo"
+    echo "BEGIN;" >&9; echo "$setup" >&9
+    sleep 1
+    # BACKGROUND, deliberately: the racing regroup blocks on the row lock the open
+    # transaction holds, so running it synchronously would wait for a COMMIT that
+    # is issued after it. It has to be in flight when the other side commits --
+    # that IS the race.
+    ( psql "$URL" -qAt -c "SELECT regroup_auth_event('$t',(SELECT id FROM card_auth_events WHERE tenant_id='$t' AND processor_msg_id='$msg'),'$dest','operator')" \
+        >"$TMPD/g_$t.out" 2>&1 ) &
+    local racer=$!
+    sleep 1
+    echo "COMMIT;" >&9; exec 9>&-
+    wait "$racer" 2>/dev/null
+    if grep -qi "$expect" "$TMPD/g_$t.out"; then echo "   ok  $label refused under the race"
+    else echo "   FAIL $label was ALLOWED under the race: $(head -1 "$TMPD/g_$t.out")"; fail=1; fi
+}
+psql "$URL" -q -c "SELECT record_auth_event('xg','m-usd','gU','co1','c1','authorization',500,'USD',false,now())" -o /dev/null
+race_guard xg "SELECT record_auth_event('xg','m-eur','gN','co1','c1','authorization',1000,'EUR',false,now());" \
+    m-usd gN "one currency" "cross-currency regroup"
+psql "$URL" -q -c "SELECT record_auth_event('xe','m-live','gU','co1','c1','authorization',900,'USD',false,now())" -o /dev/null
+race_guard xe "SELECT record_auth_event('xe','m-seed','gX','co1','c1','authorization',100,'USD',false,now()); SELECT expire_hold_group('xe','co1','gX');" \
+    m-live gX "expired at" "regroup into an expiring group"
+chk "no hidden exposure after the races" "$(q "select count(*) from card_hold_drift where tenant_id in ('xg','xe')")" 0
+
 exit "$fail"
