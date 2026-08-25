@@ -1,16 +1,20 @@
 -- Reference chart of accounts for the card product. SEED DATA, not engine:
 -- a marketplace or wallet deployment ships a different one against the same core.
-INSERT INTO fs_lines (code, caption, statement) VALUES
-  ('receivables','Accounts receivable','balance_sheet'),
-  ('cash','Cash and cash equivalents','balance_sheet'),
-  ('other_assets','Other assets','balance_sheet'),
-  ('payables','Accounts payable and accrued','balance_sheet'),
-  ('borrowings','Borrowings','balance_sheet'),
-  ('customer_funds','Customer funds payable','balance_sheet'),
-  ('equity','Shareholders equity','balance_sheet'),
-  ('revenue','Revenue','income_statement'),
-  ('cost_of_revenue','Cost of revenue','income_statement'),
-  ('interest','Interest expense','income_statement')
+INSERT INTO fs_lines (code, caption, statement, sort_order) VALUES
+  ('cash','Cash and cash equivalents','balance_sheet',100),
+  ('receivables','Accounts receivable','balance_sheet',200),
+  ('other_assets','Other assets','balance_sheet',300),
+  ('payables','Accounts payable and accrued','balance_sheet',400),
+  ('customer_funds','Customer funds payable','balance_sheet',500),
+  ('borrowings','Borrowings','balance_sheet',600),
+  ('equity','Shareholders equity','balance_sheet',700),
+  -- Where a close would put prior periods' earnings. Nothing writes to it: there
+  -- is no closing process yet, so un-closed earnings appear as the derived
+  -- `current_year_earnings` line in the balance_sheet view instead.
+  ('retained_earnings','Retained earnings','balance_sheet',800),
+  ('revenue','Revenue','income_statement',100),
+  ('cost_of_revenue','Cost of revenue','income_statement',200),
+  ('interest','Interest expense','income_statement',300)
 ON CONFLICT DO NOTHING;
 
 INSERT INTO account_types (code,category,normal_balance,description,fs_line,is_perimeter,counterparty_scope) VALUES
@@ -31,6 +35,8 @@ INSERT INTO account_types (code,category,normal_balance,description,fs_line,is_p
   ('ach_pull_returnable','liability','credit','collected by ACH, still inside the return window','payables',false,'per_shard'),
   ('due_to_tenants','liability','credit','operator-side obligation to tenant scopes','payables',false,'shared'),
   ('paid_in_capital','equity','credit','equity funding','equity',false,'none'),
+  -- prior periods' accumulated earnings. Unused until a close exists.
+  ('retained_earnings','equity','credit','accumulated earnings of prior periods','retained_earnings',false,'none'),
   ('interchange_revenue','revenue','credit','interchange we keep','revenue',false,'none'),
   ('fee_revenue','revenue','credit','fees charged to customers','revenue',false,'none'),
   ('interest_expense','expense','debit','interest on the facility','interest',false,'none'),

@@ -46,6 +46,8 @@ FROM (VALUES
   ('t1','house',NULL,'interchange_revenue','USD'),
   ('t1','house',NULL,'fee_revenue','USD'),
   ('t1','house',NULL,'due_from_treasury','USD'),
+  ('t1','house',NULL,'credit_loss_expense','USD'),
+  ('t1','house',NULL,'allowance_for_credit_losses','USD'),
   ('t1','house',NULL,'interchange_revenue_eur','EUR'),
   ('t2','company','beta','customer_receivable','USD'),
   ('_treasury','house',NULL,'due_to_tenants','USD')
@@ -84,10 +86,56 @@ END $$;
 
 -- ---------------------------------------------------------------- the controls
 
--- 1. debits <> credits
+-- 1. debits <> credits. TWO legs, deliberately: a one-legged transaction is now
+--    refused by ck_txn__has_entries first, which would test a different rule.
 SELECT must_fail('unbalanced transaction', $q$
-    SELECT entry('t1', txn('t1','n1'), acct('t1','customer_receivable'), 'debit', 100);
+    DO $d$ DECLARE t uuid := txn('t1','n1'); BEGIN
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  100);
+        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit',  99);
+    END $d$;
 $q$, 'does not balance');
+
+-- 1b. a transaction with NO entries is VACUOUSLY balanced, so the per-row balance
+--     trigger never fires for it. It used to commit -- a posted clearing that moved
+--     nothing and consumed an idempotency key.
+SELECT must_fail('transaction with no entries', $q$
+    SELECT txn('t1','n1b');
+$q$, 'needs at least two');
+
+-- 1c. deleting one leg of a COMMITTED transaction. The trigger was AFTER INSERT
+--     only, so this left 900 debits against 0 credits and nothing complained.
+SELECT must_fail('deleting one leg of a balanced transaction', $q$
+    DO $d$ DECLARE t uuid := txn('t1','n1c'); BEGIN
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  900);
+        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 900);
+    END $d$;
+    SET CONSTRAINTS ALL IMMEDIATE;
+    DELETE FROM ledger_entries WHERE tenant_id='t1' AND transaction_id IN
+        (SELECT id FROM ledger_transactions WHERE tenant_id='t1'
+          AND event_id=(SELECT id FROM ledger_events WHERE idempotency_key='n1c'))
+      AND direction='credit';
+$q$, 'does not balance');
+
+-- 1d. session_replication_role='replica' is the logical-replication apply path and
+--     what pg_restore --disable-triggers sets. Under it an unbalanced transaction
+--     COMMITTED. A subscriber must enforce what its publisher enforces.
+SELECT must_fail('unbalanced under session_replication_role=replica', $q$
+    SET LOCAL session_replication_role = 'replica';
+    DO $d$ DECLARE t uuid := txn('t1','n1d'); BEGIN
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  424242);
+        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit',      1);
+    END $d$;
+$q$, 'does not balance');
+RESET ROLE;
+
+-- 1e. a transaction cannot reverse itself
+SELECT must_fail('self-reversal', $q$
+    DO $d$ DECLARE t uuid := txn('t1','n1e'); BEGIN
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  10);
+        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 10);
+        UPDATE ledger_transactions SET reverses_id = id WHERE id = t;
+    END $d$;
+$q$, 'ck_txn__no_self_reference');
 
 -- 2. THE ONE THE OLD SUITE MISSED. Perfectly balanced, both legs revenue-typed,
 --    accounting equation entirely happy -- and posted to the wrong account.
@@ -166,10 +214,137 @@ SELECT must_fail('unknown as-of axis', $q$
     SELECT * FROM accounting_equation(NULL, now(), 'efective');
 $q$, 'unknown axis');
 
+-- 10b. ...and so must a NULL one. `NULL NOT IN (...)` is NULL, not TRUE, so a nil
+--      *string from Go fell straight through the guard and returned the empty,
+--      trivially-BALANCED report the guard exists to prevent.
+SELECT must_fail('NULL as-of axis', $q$
+    SELECT * FROM accounting_equation(NULL, now(), NULL);
+$q$, 'unknown axis');
+
+-- 10c. THE EQUATION ITSELF MUST BE ABLE TO FAIL.
+--
+--      Mutation testing showed that hardcoding `balanced := true` passed the whole
+--      suite: no control existed in which the accounting equation was the thing
+--      that failed. Writing one surfaced something worth stating plainly.
+--
+--      RECLASSIFYING AN ACCOUNT CANNOT MAKE THE EQUATION FALSE. The debit-positive
+--      sum over ALL categories is zero whenever debits equal credits, so moving an
+--      amount between category buckets leaves the identity intact. Given the
+--      per-transaction balance invariant, A = L + E + (R - X) is a COROLLARY, not
+--      an independent check.
+--
+--      So its real job is detecting state that got in some other way -- and the
+--      only way to produce that is to bypass the trigger, which is what corruption,
+--      a restore, or a replication apply would do.
+SELECT must_fail('the accounting equation, made false', $q$
+    ALTER TABLE ledger_entries      DISABLE TRIGGER ck_entries__balances;
+    ALTER TABLE ledger_transactions DISABLE TRIGGER ck_txn__has_entries;
+    DO $d$ DECLARE t uuid := txn('t1','n10c'); BEGIN
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit', 500);
+    END $d$;
+    ALTER TABLE ledger_entries      ENABLE ALWAYS TRIGGER ck_entries__balances;
+    ALTER TABLE ledger_transactions ENABLE ALWAYS TRIGGER ck_txn__has_entries;
+    DO $d$ DECLARE r record; BEGIN
+        FOR r IN SELECT * FROM accounting_equation('t1') LOOP
+            IF NOT r.balanced THEN
+                RAISE EXCEPTION 'EQUATION IS FALSE: lhs=% rhs=%', r.lhs, r.rhs;
+            END IF;
+        END LOOP;
+    END $d$;
+$q$, 'equation is false');
+
+-- 10d. a CONTRA account must SUBTRACT. The equation normalised each account to its
+--      own normal_balance and then summed those into category buckets, so
+--      allowance_for_credit_losses (asset/CREDIT) added +100 to assets instead of
+--      -100 -- wrong on the exact account the design cites as its hard case, and
+--      still reporting balanced=true.
+SELECT must_fail('a contra-asset that adds to assets', $q$
+    DO $d$ DECLARE t uuid := txn('t1','n10d'); BEGIN
+        PERFORM entry('t1', t, acct('t1','credit_loss_expense'),         'debit',  100);
+        PERFORM entry('t1', t, acct('t1','allowance_for_credit_losses'), 'credit', 100);
+    END $d$;
+    SET CONSTRAINTS ALL IMMEDIATE;
+    DO $d$ DECLARE v bigint; BEGIN
+        SELECT balance_debit_positive INTO v FROM trial_balance
+         WHERE tenant_id='t1' AND purpose='allowance_for_credit_losses';
+        IF v <> -100 THEN
+            RAISE EXCEPTION 'CONTRA ACCOUNT HAS THE WRONG SIGN: %', v;
+        END IF;
+        RAISE EXCEPTION 'CONTRA-OK';   -- expected: the control passes by raising this
+    END $d$;
+$q$, 'contra-ok');
+
+-- 10e. the balance sheet must balance, including un-closed earnings
+SELECT must_fail('balance sheet that does not balance', $q$
+    DO $d$ DECLARE r record; BEGIN
+        FOR r IN SELECT * FROM balance_sheet_balances() LOOP
+            IF NOT r.balanced THEN
+                RAISE EXCEPTION 'BALANCE SHEET IS OUT by %',
+                    r.assets - r.liabilities_and_equity;
+            END IF;
+        END LOOP;
+        RAISE EXCEPTION 'BS-OK';
+    END $d$;
+$q$, 'bs-ok');
+
+-- 10f. an account may not disagree with its type on normal_balance ALONE. Control
+--      8 differs on BOTH fields, so it passed even when the trigger checked only
+--      category.
+SELECT must_fail('account matching its type category but not its normal balance', $q$
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    VALUES ('t1','house',NULL,'fbo_cash','asset','credit','USD');
+$q$, 'but type');
+
+-- 10g. the statement line an account reports under may not be silently rewritten
+SELECT must_fail('moving a type to a different statement line', $q$
+    UPDATE account_types SET fs_line='other_assets' WHERE code='interchange_revenue';
+$q$, 'cannot move');
+
+-- 10h. a lowercase currency code splits "per currency" on spelling
+SELECT must_fail('lowercase currency code', $q$
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    VALUES ('t1','house',NULL,'fbo_cash','asset','debit','usd');
+$q$, 'currency_iso');
+
+-- 10i. account_seq orders history; a negative one reorders an account's past
+SELECT must_fail('negative account_seq', $q$
+    DO $d$ DECLARE t uuid := txn('t1','n10i'); BEGIN
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  5, 'USD', -9999);
+    END $d$;
+$q$, 'seq_positive');
+
+-- 10j. an entry may not disagree with its transaction about when it happened
+SELECT must_fail('entry effective_at disagreeing with its transaction', $q$
+    DO $d$ DECLARE t uuid := txn('t1','n10j'); BEGIN
+        INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,
+                                    amount_minor,currency,account_seq,balance_after,effective_at)
+        VALUES ('t1', t, acct('t1','customer_receivable'), 'debit', 5,'USD',900,5,
+                '1999-01-01'::timestamptz);
+    END $d$;
+$q$, 'fk_entries__txn_effective');
+
 -- 11. the same idempotency key twice
 SELECT must_fail('duplicate idempotency key', $q$
     SELECT txn('t1','dup'), txn('t1','dup');
 $q$, 'uq_events__idempotency');
+
+-- 11b. the alarm must cover ledger_account_balances -- the copy the hot path reads
+--      and the ONLY one the app role may UPDATE. It was outside the view entirely.
+SELECT must_fail('cached balance desynchronised from the journal', $q$
+    DO $d$ DECLARE t uuid := txn('t1','n11b'); BEGIN
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  600);
+        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 600);
+    END $d$;
+    SET CONSTRAINTS ALL IMMEDIATE;
+    INSERT INTO ledger_account_balances (tenant_id,account_id,currency,input,output,last_seq)
+    VALUES ('t1', acct('t1','customer_receivable'), 'USD', 99999999, 0, 7);
+    DO $d$ BEGIN
+        IF EXISTS (SELECT 1 FROM ledger_balance_drift) THEN
+            RAISE EXCEPTION 'DRIFT DETECTED: %',
+                (SELECT problem FROM ledger_balance_drift LIMIT 1);
+        END IF;
+    END $d$;
+$q$, 'drift detected');
 
 -- 12. the corruption alarm: tamper with a stored running balance
 SELECT must_fail('balance_after tampered with', $q$
@@ -178,8 +353,11 @@ SELECT must_fail('balance_after tampered with', $q$
         PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 900);
     END $d$;
     SET CONSTRAINTS ALL IMMEDIATE;
+    -- the FIRST entry, not the last. The alarm compared only last_value() against
+    -- a full-partition sum, so corrupting any intermediate running balance was
+    -- invisible -- and those are exactly the rows an as-of read returns.
     UPDATE ledger_entries SET balance_after = balance_after + 1
-     WHERE account_id = acct('t1','customer_receivable');
+     WHERE account_id = acct('t1','customer_receivable') AND account_seq = 1;
     DO $d$ BEGIN
         IF EXISTS (SELECT 1 FROM ledger_balance_drift WHERE stored <> recomputed) THEN
             RAISE EXCEPTION 'DRIFT DETECTED';
@@ -205,6 +383,6 @@ SELECT must_fail('one-sided intercompany movement', $q$
     END $d$;
 $q$, 'intercompany does not eliminate');
 
-DO $$ BEGIN RAISE NOTICE 'ok  13/13 refused'; END $$;
+DO $$ BEGIN RAISE NOTICE 'ok  every breakage above was refused, for the stated reason'; END $$;
 
 ROLLBACK;

@@ -20,11 +20,18 @@ for f in migrations/*.sql migrations/seed/*.sql; do
     psql "$URL" -v ON_ERROR_STOP=1 -q -f "$f"
 done
 
+# `set -o pipefail` above is what actually propagates a psql failure through the
+# sed filter. An earlier version also tested ${PIPESTATUS[0]}, which was dead code
+# -- PIPESTATUS is rewritten by the next command, so it always read 0, and dropping
+# pipefail made a hard-failing test file report PASS. Removed rather than left as a
+# safety net that isn't one.
 fail=0
 for f in tests/*.sql; do
     echo "── $f"
-    if psql "$URL" -v ON_ERROR_STOP=1 -q -f "$f" 2>&1 | sed 's/^psql:[^ ]* //;s/^NOTICE:  //;s/^/   /'; then :; else fail=1; fi
-    [ "${PIPESTATUS[0]:-0}" -ne 0 ] && fail=1
+    if ! psql "$URL" -v ON_ERROR_STOP=1 -q -f "$f" 2>&1 \
+         | sed 's/^psql:[^ ]* //;s/^NOTICE:  //;s/^/   /'; then
+        fail=1
+    fi
 done
 
 [ "$fail" -eq 0 ] && echo "PASS" || { echo "FAIL"; exit 1; }

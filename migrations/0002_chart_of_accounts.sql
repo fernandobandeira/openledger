@@ -14,9 +14,10 @@ BEGIN;
 -- makes omission structurally impossible: reports enumerate from the chart
 -- outward, so there is no parameter in which to pass an incomplete account list.
 CREATE TABLE fs_lines (
-    code      text PRIMARY KEY,
-    caption   text NOT NULL,
-    statement text NOT NULL CHECK (statement IN ('balance_sheet','income_statement'))
+    code       text PRIMARY KEY,
+    caption    text NOT NULL,
+    statement  text NOT NULL CHECK (statement IN ('balance_sheet','income_statement')),
+    sort_order int  NOT NULL DEFAULT 1000
 );
 
 CREATE TABLE account_types (
@@ -77,6 +78,27 @@ BEGIN
           'cannot reclassify % to %/%: % existing account(s) declare the old classification',
           NEW.code, NEW.category, NEW.normal_balance, n;
     END IF;
+
+    -- fs_line decides which STATEMENT LINE every historical number appears on, and
+    -- it was freely mutable: one UPDATE silently moved 9.00 of interchange from
+    -- 'revenue' to 'other_income' on an already-issued income statement, with no
+    -- ledger row changed and every check green. That falsifies the project's
+    -- headline claim that any number is reproducible as of any date.
+    --
+    -- Blocking the UPDATE is a STOPGAP, not the answer: IAS 1.41 REQUIRES
+    -- reclassifying comparatives when presentation changes, so a real system must
+    -- version the mapping and resolve it as of the report date. Recorded as open
+    -- in ADR-0009; refusing the silent rewrite is strictly better than allowing it.
+    IF NEW.fs_line <> OLD.fs_line THEN
+        SELECT count(*) INTO n FROM ledger_accounts a WHERE a.purpose = NEW.code;
+        IF n > 0 THEN
+            RAISE EXCEPTION
+              'cannot move % from statement line % to %: % account(s) exist, and '
+              'their history is already reported under %. The chart is not versioned '
+              '(ADR-0009), so this would silently restate issued statements',
+              NEW.code, OLD.fs_line, NEW.fs_line, n, OLD.fs_line;
+        END IF;
+    END IF;
     RETURN NEW;
 END $$;
 
@@ -92,10 +114,17 @@ SELECT a.tenant_id, a.id AS account_id, a.owner_id, a.purpose,
        SUM(e.amount_minor) FILTER (WHERE e.direction='debit')  AS debits,
        SUM(e.amount_minor) FILTER (WHERE e.direction='credit') AS credits,
        -- natural balance: positive means more of what this account normally holds
+       -- PRESENTATION value: positive means more of what this account normally
+       -- holds. Correct for showing ONE account; WRONG to sum across a category,
+       -- because a contra account (asset/credit) would then ADD to assets.
        CASE WHEN t.normal_balance = 'debit'
             THEN SUM(CASE WHEN e.direction='debit'  THEN e.amount_minor ELSE -e.amount_minor END)
             ELSE SUM(CASE WHEN e.direction='credit' THEN e.amount_minor ELSE -e.amount_minor END)
-       END AS balance_minor
+       END AS balance_minor,
+       -- ARITHMETIC value -- roll up with this one. normal_balance never enters it,
+       -- so a contra account carries its own sign instead of being flipped twice.
+       SUM(CASE WHEN e.direction='debit' THEN e.amount_minor ELSE -e.amount_minor END)
+           AS balance_debit_positive
 FROM ledger_entries e
 JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
 JOIN account_types   t ON t.code = a.purpose
@@ -103,12 +132,28 @@ GROUP BY a.tenant_id, a.id, a.owner_id, a.purpose, t.category, t.normal_balance,
 
 -- A = L + E + (R - X), PER CURRENCY and PER TENANT.
 --
--- Evaluating this across currencies is not merely imprecise, it is VACUOUS. The
--- identity follows from total debits = total credits, which holds for any union
--- of per-currency-balanced transactions REGARDLESS of denomination -- so a
--- currency-blind check reports `true` for arbitrary currency mixing and can never
--- detect it. Measured before the fix: 100.00 USD + 100.00 EUR reported
--- "assets 200.00, balanced".
+-- Two corrections, both found by adversarial review, both of which produced a
+-- GREEN check on wrong books:
+--
+-- 1. PER CURRENCY. Evaluating across currencies is not merely imprecise, it is
+--    VACUOUS. The identity follows from total debits = total credits, which holds
+--    for any union of per-currency-balanced transactions REGARDLESS of
+--    denomination -- so a currency-blind check reports `true` for arbitrary
+--    currency mixing and can never detect it. Measured before the fix: 100.00 USD
+--    + 100.00 EUR reported "assets 200.00, balanced".
+--
+-- 2. DEBIT-POSITIVE, and normal_balance does NOT appear. The earlier version
+--    normalised each account to ITS OWN normal balance and then summed those into
+--    category buckets -- so a contra account got flipped twice.
+--    `allowance_for_credit_losses` (asset / CREDIT) contributed +100 to assets
+--    instead of -100, and the seed ships that account as the flagship proof that
+--    normal_balance is not derivable from category. The equation was wrong on
+--    exactly the case the design singles out as its hard one, and still reported
+--    `balanced = true` with both sides overstated.
+--
+--    Signs now come from `direction` alone. Since total debits = total credits,
+--    the debit-positive sum over ALL categories is zero, and this identity is a
+--    restatement of that fact. normal_balance is a PRESENTATION concern.
 CREATE FUNCTION accounting_equation(
     p_tenant text DEFAULT NULL,
     p_as_of  timestamptz DEFAULT NULL,
@@ -116,19 +161,26 @@ CREATE FUNCTION accounting_equation(
 RETURNS TABLE (tenant_id text, currency char(3), assets bigint, liabilities bigint,
                equity bigint, revenue bigint, expense bigint,
                lhs bigint, rhs bigint, balanced boolean)
-LANGUAGE plpgsql STABLE AS $$
+LANGUAGE plpgsql STABLE AS $fn$
 BEGIN
     -- Fail loudly. A mis-typed axis previously fell through every predicate and
     -- returned an empty, BALANCED report -- the "green check that didn't actually
     -- execute" failure this project cites Formance for.
-    IF p_axis NOT IN ('recorded','effective') THEN
-        RAISE EXCEPTION 'unknown axis %; expected ''recorded'' or ''effective''', p_axis;
+    --
+    -- `p_axis IS NULL` must be tested SEPARATELY: `NULL NOT IN (...)` evaluates to
+    -- NULL, not TRUE, so a nil *string from Go fell straight through this guard
+    -- into exactly the empty balanced report it exists to prevent.
+    IF p_axis IS NULL OR p_axis NOT IN ('recorded','effective') THEN
+        RAISE EXCEPTION 'unknown axis %; expected recorded or effective',
+            COALESCE(p_axis, '<NULL>');
     END IF;
 
     RETURN QUERY
     WITH e AS (
-        SELECT en.tenant_id, en.currency, t.category, t.normal_balance,
-               en.direction, en.amount_minor
+        SELECT en.tenant_id, en.currency, t.category,
+               -- debit-positive, always
+               SUM(CASE WHEN en.direction = 'debit' THEN en.amount_minor
+                        ELSE -en.amount_minor END) AS dp
         FROM ledger_entries en
         JOIN ledger_accounts a ON a.tenant_id = en.tenant_id AND a.id = en.account_id
         JOIN account_types   t ON t.code = a.purpose
@@ -136,31 +188,89 @@ BEGIN
           AND (p_as_of IS NULL
                OR (p_axis = 'recorded'  AND en.recorded_at  <= p_as_of)
                OR (p_axis = 'effective' AND en.effective_at <= p_as_of))
-    ), n AS (
-        SELECT e.tenant_id, e.currency, e.category,
-               SUM(CASE WHEN e.normal_balance='debit'
-                        THEN CASE WHEN e.direction='debit'  THEN e.amount_minor ELSE -e.amount_minor END
-                        ELSE CASE WHEN e.direction='credit' THEN e.amount_minor ELSE -e.amount_minor END
-                   END) AS bal
-        FROM e GROUP BY e.tenant_id, e.currency, e.category
+        GROUP BY en.tenant_id, en.currency, t.category
+    ), c AS (
+        -- assets and expenses are debit-normal CATEGORIES, presented as-is;
+        -- liabilities, equity and revenue are credit-normal, negated once here,
+        -- for presentation only.
+        SELECT e.tenant_id, e.currency,
+                COALESCE(SUM(dp) FILTER (WHERE category='asset'),0)::bigint       AS a,
+               (-COALESCE(SUM(dp) FILTER (WHERE category='liability'),0))::bigint AS l,
+               (-COALESCE(SUM(dp) FILTER (WHERE category='equity'),0))::bigint    AS q,
+               (-COALESCE(SUM(dp) FILTER (WHERE category='revenue'),0))::bigint   AS r,
+                COALESCE(SUM(dp) FILTER (WHERE category='expense'),0)::bigint     AS x
+        FROM e GROUP BY e.tenant_id, e.currency
     )
-    SELECT n.tenant_id, n.currency,
-           COALESCE(SUM(bal) FILTER (WHERE category='asset'),0)::bigint,
-           COALESCE(SUM(bal) FILTER (WHERE category='liability'),0)::bigint,
-           COALESCE(SUM(bal) FILTER (WHERE category='equity'),0)::bigint,
-           COALESCE(SUM(bal) FILTER (WHERE category='revenue'),0)::bigint,
-           COALESCE(SUM(bal) FILTER (WHERE category='expense'),0)::bigint,
-           COALESCE(SUM(bal) FILTER (WHERE category='asset'),0)::bigint,
-           (COALESCE(SUM(bal) FILTER (WHERE category='liability'),0)
-          + COALESCE(SUM(bal) FILTER (WHERE category='equity'),0)
-          + COALESCE(SUM(bal) FILTER (WHERE category='revenue'),0)
-          - COALESCE(SUM(bal) FILTER (WHERE category='expense'),0))::bigint,
-           COALESCE(SUM(bal) FILTER (WHERE category='asset'),0)
-             = COALESCE(SUM(bal) FILTER (WHERE category='liability'),0)
-             + COALESCE(SUM(bal) FILTER (WHERE category='equity'),0)
-             + COALESCE(SUM(bal) FILTER (WHERE category='revenue'),0)
-             - COALESCE(SUM(bal) FILTER (WHERE category='expense'),0)
-    FROM n GROUP BY n.tenant_id, n.currency ORDER BY n.tenant_id, n.currency;
-END $$;
+    SELECT c.tenant_id, c.currency, c.a, c.l, c.q, c.r, c.x,
+           c.a, (c.l + c.q + c.r - c.x), c.a = (c.l + c.q + c.r - c.x)
+    FROM c ORDER BY c.tenant_id, c.currency;
+END $fn$;
+
+-- ------------------------------------------------------------ the balance sheet
+--
+-- ADR-0009 claimed "reports enumerate from the chart outward, so there is no
+-- parameter in which to pass an incomplete account list." That was ASPIRATIONAL:
+-- trial_balance and accounting_equation both start FROM ledger_entries and
+-- enumerate INWARD, so an account with no entries is simply absent. This view is
+-- the claim made true -- it starts FROM fs_lines and left-joins the numbers on, so
+-- a statement line with no activity appears as a zero rather than vanishing.
+--
+-- It also carries the line the chart could not previously produce. Before this,
+-- a balance sheet built from fs_lines was out by exactly net income: there is no
+-- retained_earnings account and no close, so revenue and expense had nowhere to
+-- go. Un-closed books present that residual as CURRENT YEAR EARNINGS inside
+-- equity, which is standard interim presentation -- and it is a derived line, not
+-- an account, precisely because no closing entry has been made.
+CREATE VIEW balance_sheet AS
+WITH dp AS (
+    SELECT e.tenant_id, e.currency, t.fs_line, t.category,
+           SUM(CASE WHEN e.direction='debit' THEN e.amount_minor ELSE -e.amount_minor END) AS v
+    FROM ledger_entries e
+    JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
+    JOIN account_types   t ON t.code = a.purpose
+    GROUP BY e.tenant_id, e.currency, t.fs_line, t.category
+), scopes AS (
+    SELECT DISTINCT tenant_id, currency FROM dp
+), lines AS (
+    -- every balance-sheet line in the chart, for every scope that has any activity
+    SELECT s.tenant_id, s.currency, f.code AS fs_line, f.caption, f.sort_order,
+           COALESCE(SUM(CASE WHEN d.category = 'asset' THEN d.v ELSE -d.v END), 0)::bigint
+               AS amount_minor,
+           CASE WHEN bool_or(d.category = 'asset') THEN 'asset' ELSE 'liability_equity' END AS side
+    FROM scopes s
+    CROSS JOIN fs_lines f
+    LEFT JOIN dp d ON d.tenant_id = s.tenant_id AND d.currency = s.currency
+                  AND d.fs_line = f.code
+    WHERE f.statement = 'balance_sheet'
+    GROUP BY s.tenant_id, s.currency, f.code, f.caption, f.sort_order
+)
+SELECT tenant_id, currency, fs_line, caption, sort_order, amount_minor, side FROM lines
+UNION ALL
+SELECT s.tenant_id, s.currency, 'current_year_earnings', 'Current year earnings', 9000,
+       (-COALESCE(SUM(d.v), 0))::bigint, 'liability_equity'
+FROM scopes s
+LEFT JOIN dp d ON d.tenant_id = s.tenant_id AND d.currency = s.currency
+              AND d.category IN ('revenue','expense')
+GROUP BY s.tenant_id, s.currency;
+
+-- Assets must equal liabilities + equity, per scope and per currency, with the
+-- earnings line included. Unlike the roll-up check it replaces -- which compared
+-- SUM(debits) against SUM(debits) across two FK-guaranteed joins and was
+-- therefore unreachable -- this one can and did fail.
+CREATE FUNCTION balance_sheet_balances(p_tenant text DEFAULT NULL)
+RETURNS TABLE (tenant_id text, currency char(3), assets bigint,
+               liabilities_and_equity bigint, balanced boolean)
+LANGUAGE sql STABLE AS $fn$
+    SELECT b.tenant_id, b.currency,
+           COALESCE(SUM(b.amount_minor) FILTER (WHERE b.side = 'asset'), 0)::bigint,
+           COALESCE(SUM(b.amount_minor) FILTER (WHERE b.side = 'liability_equity'), 0)::bigint,
+           COALESCE(SUM(b.amount_minor) FILTER (WHERE b.side = 'asset'), 0)
+             = COALESCE(SUM(b.amount_minor) FILTER (WHERE b.side = 'liability_equity'), 0)
+    FROM balance_sheet b
+    WHERE p_tenant IS NULL OR b.tenant_id = p_tenant
+    GROUP BY b.tenant_id, b.currency
+    ORDER BY b.tenant_id, b.currency;
+$fn$;
+
 
 COMMIT;
