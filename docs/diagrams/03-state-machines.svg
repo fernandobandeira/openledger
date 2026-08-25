@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 300" role="img" aria-label="Diagram showing an ACH transfer state machine on top with four states, and below it the immutable ledger transactions emitted by only some of those transitions; the submitted-to-Fed transition emits nothing."><title>Domain state machines vs. the ledger</title><style>
+  text { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .s-cool { stroke: #1f5f66; color: #1f5f66; }
+  .s-faint { stroke: #d3dade; }
+  .s-fill-card { fill: #fbfcfc; }
+  .s-fill-cool { fill: #dfeced; }
+  .s-fill-hot { fill: #f5e4e0; }
+  .s-hot { stroke: #ab2f1c; color: #ab2f1c; }
+  .s-stroke { stroke: #12171c; }
+  .t-edge { font-size: 10.5px; fill: #46545f; }
+  .t-hdr { font-size: 10px; letter-spacing: .12em; fill: #7b8994; }
+  .t-hot { font-size: 10.5px; fill: #ab2f1c; font-weight: 600; }
+  .t-lbl { font-size: 12px; font-weight: 600; }
+  .t-sub { font-size: 10.5px; fill: #7b8994; }
+  @media (prefers-color-scheme: dark) {
+    .s-cool { stroke: #6fb3ba; color: #6fb3ba; }
+    .s-faint { stroke: #2a343a; }
+    .s-fill-card { fill: #141a1e; }
+    .s-fill-cool { fill: #142428; }
+    .s-fill-hot { fill: #2c1a16; }
+    .s-hot { stroke: #e2705a; color: #e2705a; }
+    .s-stroke { stroke: #e4eaed; }
+    .t-edge { font-size: 10.5px; fill: #9dabb4; }
+    .t-hdr { font-size: 10px; letter-spacing: .12em; fill: #6d7c86; }
+    .t-hot { font-size: 10.5px; fill: #e2705a; font-weight: 600; }
+    .t-lbl { font-size: 12px; font-weight: 600; }
+    .t-sub { font-size: 10.5px; fill: #6d7c86; }
+  }
+  </style>
+      <defs>
+        <marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+
+      <text class="t-hdr" x="20" y="20">MUTABLE DOMAIN OBJECT · AchTransfer · has status, retries, external ids</text>
+
+      <g class="s-stroke" stroke-width="1.25">
+        <rect class="s-fill-card" x="20"  y="38" width="150" height="40"/>
+        <rect class="s-fill-card" x="250" y="38" width="150" height="40"/>
+        <rect class="s-fill-card" x="480" y="38" width="150" height="40"/>
+        <rect class="s-fill-card" x="710" y="38" width="150" height="40"/>
+      </g>
+      <text class="t-lbl" x="95"  y="63" text-anchor="middle">initiated</text>
+      <text class="t-lbl" x="325" y="63" text-anchor="middle">submitted</text>
+      <text class="t-lbl" x="555" y="63" text-anchor="middle">settled</text>
+      <text class="t-lbl" x="785" y="63" text-anchor="middle">returned</text>
+
+      <g class="s-faint" stroke-width="1.4" fill="none">
+        <line x1="170" y1="58" x2="250" y2="58" marker-end="url(#ah3)"/>
+        <line x1="400" y1="58" x2="480" y2="58" marker-end="url(#ah3)"/>
+        <line x1="630" y1="58" x2="710" y2="58" marker-end="url(#ah3)"/>
+      </g>
+      <text class="t-edge" x="210" y="32" text-anchor="middle">submit</text>
+      <text class="t-edge" x="440" y="32" text-anchor="middle">ack</text>
+      <text class="t-edge" x="670" y="32" text-anchor="middle">R01…R29</text>
+
+      <line class="s-faint" x1="20" y1="112" x2="940" y2="112" stroke-width="1" stroke-dasharray="3 4"/>
+      <text class="t-hdr" x="20" y="134">IMMUTABLE LEDGER · append-only, balanced, never updated</text>
+
+      <g class="s-cool" stroke-width="1.5">
+        <rect class="s-fill-cool" x="20"  y="152" width="150" height="62"/>
+        <rect class="s-fill-cool" x="480" y="152" width="150" height="62"/>
+        <rect class="s-fill-cool" x="710" y="152" width="150" height="62"/>
+      </g>
+      <text class="t-sub" x="95"  y="171" text-anchor="middle">txn · pending</text>
+      <text class="t-sub" x="95"  y="188" text-anchor="middle">DR wallet</text>
+      <text class="t-sub" x="95"  y="204" text-anchor="middle">CR in_transit</text>
+      <text class="t-sub" x="555" y="171" text-anchor="middle">txn · posted</text>
+      <text class="t-sub" x="555" y="188" text-anchor="middle">DR in_transit</text>
+      <text class="t-sub" x="555" y="204" text-anchor="middle">CR fbo_cash</text>
+      <text class="t-sub" x="785" y="171" text-anchor="middle">txn · reversing</text>
+      <text class="t-sub" x="785" y="188" text-anchor="middle">DR in_transit</text>
+      <text class="t-sub" x="785" y="204" text-anchor="middle">CR wallet</text>
+
+      <g class="s-cool" stroke-width="1.4" fill="none" stroke-dasharray="4 3">
+        <line x1="95"  y1="78" x2="95"  y2="152" marker-end="url(#ah3)"/>
+        <line x1="555" y1="78" x2="555" y2="152" marker-end="url(#ah3)"/>
+        <line x1="785" y1="78" x2="785" y2="152" marker-end="url(#ah3)"/>
+      </g>
+
+      <g class="s-hot" stroke-width="1.5" fill="none" stroke-dasharray="4 3">
+        <line x1="325" y1="78" x2="325" y2="130"/>
+      </g>
+      <text class="t-hot" x="335" y="150">no entry — not a financial event</text>
+
+      <text class="t-lbl" x="20" y="252">State transitions emit ledger transactions. The ledger never mutates.</text>
+      <text class="t-sub" x="20" y="272">The domain object's status column changes four times. The ledger only ever gets appended to — three times.</text>
+      <text class="t-sub" x="20" y="288">This is the Temporal boundary: the workflow is the state machine; "write the ledger transaction" is an idempotent activity.</text>
+    </svg>

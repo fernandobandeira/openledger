@@ -1,6 +1,6 @@
 # Vision
 
-> Status: current. The *project* vision. [`v1-vision.md`](./v1-vision.md) is now the
+> Status: current. The *project* vision. [`reference-product.md`](./reference-product.md) is now the
 > **reference product** spec. Positioning: [ADR-0007](./decisions/0007-open-source-positioning.md).
 
 ## What this is
@@ -77,7 +77,7 @@ thinking about it. That constraint drives more of the design than performance do
 | Event log | the idempotency spine and audit trail ([ADR-0004](./decisions/0004-event-log.md)) |
 
 **The reference product** is the embedded B2B charge card sketched above — spend controls, credit
-lines, holds, the authorization path. [`v1-vision.md`](./v1-vision.md) describes it in full. It
+lines, holds, the authorization path. [`reference-product.md`](./reference-product.md) describes it in full. It
 exists to prove the core carries a real product without forking, and to give the core a demanding
 acceptance test. **It is not the project.**
 
@@ -187,5 +187,5 @@ problem will announce itself.
 | --- | --- |
 | [`roadmap.md`](./roadmap.md) | What gets built, in what order, and why that order |
 | [`decisions/`](./decisions/) | ADRs — every architectural decision and its reasoning |
-| [`v1-vision.md`](./v1-vision.md) | The reference product: the embedded card ledger in full |
+| [`reference-product.md`](./reference-product.md) | The reference product: the embedded card ledger in full |
 | [`../spikes/`](../spikes/) | Timeboxed investigations — brief, findings, and code together |

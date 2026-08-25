@@ -1,7 +1,7 @@
 # Glossary
 
 Every term this project uses that you'd only know if you'd built a ledger before. Examples are
-real — they come from [the reference product spec](./v1-vision.md) or from something we measured.
+real — they come from [the reference product spec](./reference-product.md) or from something we measured.
 
 ## Accounting
 

@@ -133,7 +133,7 @@ problem that will announce itself, and the core is a narrow enough interface to 
 ## Consequences
 
 - The roadmap gains striping; M1's schema changes.
-- v1-vision becomes what it always was — a *reference product* spec — and should be labelled so.
+- The reference product spec is labelled as such: it describes the card product this ledger was designed against, not the project's own requirements.
 - The README leads with the ledger, not the card product.
 
 ## Open

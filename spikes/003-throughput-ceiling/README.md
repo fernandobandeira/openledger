@@ -74,7 +74,7 @@ better for reconciliation).
 ## Method
 
 A Go harness ([`main.go`](./main.go)) drives the clearing path from
-[v1-vision §06 step 02](../../docs/v1-vision.md):
+[the reference product spec §06 step 02](../../docs/reference-product.md):
 
 ```
 DR customer_receivable   500     per-company — spreads across 500 companies
@@ -109,7 +109,7 @@ Textbook serialization: plateaus at 4 concurrent writers and then **declines**. 
 more concurrency buys only lock waiting — **adding workers to a struggling ledger makes it
 slower.** Worth knowing before someone tries it at 3am.
 
-For scale: v1-vision sized for 20–50 TPS peak. The untuned baseline is **17–40× that**.
+For scale: the reference product spec sized for 20–50 TPS peak. The untuned baseline is **17–40× that**.
 
 ### The contention is on the shared row, not the customer's
 
@@ -379,7 +379,7 @@ entry count, should hold.)
 An earlier claim that tenant-sharding gives "no cross-shard transactions, ever" is **false, and
 the schema already said so.**
 
-A *perimeter account* mirrors exactly one external balance — v1-vision requires that "every
+A *perimeter account* mirrors exactly one external balance — the reference product spec requires that "every
 perimeter account has exactly one external balance that must agree with it". `operating_cash` and
 `fbo_cash` are perimeter accounts: the money physically sits in **one bank account**, so they
 cannot be split per tenant without destroying the reconciliation the design is built around. Same

@@ -28,7 +28,7 @@ It follows because *every individual transaction balances*, so **any union of wh
 balances** — every prefix, every as-of cut, every per-tenant slice. So we don't *check* the math;
 we make the two premises structurally impossible to violate.
 
-**Proven:** the [v1-vision §06](../../docs/v1-vision.md) golden trace — one $500 purchase, 13
+**Proven:** the [the reference product spec §06](../../docs/reference-product.md) golden trace — one $500 purchase, 13
 transactions — reproduces the vision doc's hand-computed figures to the cent, with the equation
 verified after **every** transaction. That is M0's acceptance test, passing.
 
@@ -120,7 +120,7 @@ of the engine. A marketplace ships a different one against the same core.
 
 ## Proof: the golden trace
 
-[`golden_trace.sql`](./golden_trace.sql) posts the full v1-vision lifecycle;
+[`golden_trace.sql`](./golden_trace.sql) posts the full the reference product spec lifecycle;
 [`verify.sql`](./verify.sql) evaluates the equation after each transaction.
 
 ```
