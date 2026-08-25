@@ -362,6 +362,86 @@ accounts worsen when the transactions must execute across shards"* — is an arg
 rows in one Postgres.** [ADR-0007](../../docs/decisions/0007-open-source-positioning.md) leaned on
 it slightly too heavily.
 
+## RLS — per-tenant accounts make it possible, and make it a CORRECTNESS constraint
+
+### Today RLS cannot work at all
+
+`ledger_accounts.tenant_id` is NULL for house accounts, so a policy like
+`USING (tenant_id = current_setting('app.tenant_id'))` makes every house account **invisible to
+every tenant**. Per-tenant house accounts fix that — every account row gets a real tenant.
+
+But two more things are required, and the second is not a security issue at all.
+
+### 1. `ledger_entries` needs a denormalized `tenant_id`
+
+It currently has none — tenant is reachable only by joining `ledger_accounts`. An RLS policy with
+a subquery runs **per row** and is a well-known planner trap. Denormalize it, the same way
+[ADR-0003](../../docs/decisions/0003-bitemporal-balances.md) denormalized `effective_at`. It is
+also the column a future `PARTITION BY HASH (tenant_id)` would need.
+
+### 2. Every transaction must be tenant-local, or tenants see an UNBALANCED ledger
+
+This is the finding that matters, and it is demonstrated rather than argued.
+
+Perimeter accounts genuinely **cannot** be per-tenant — `operating_cash` mirrors one real bank
+account. So a treasury transaction spans scopes: `DR operating_cash (__house__) / CR
+customer_receivable (t1)`.
+
+With RLS scoped to `t1`:
+
+| viewer | sees | net |
+| --- | --- | --- |
+| operator | both legs | 0.00 ✅ |
+| **tenant t1** | the credit leg only | **−500.00** ❌ |
+
+**The tenant's trial balance is off by the entire amount, and their accounting equation fails.**
+RLS silently turns a valid ledger into an invalid one, because it filters *within* a transaction.
+
+This is precisely Beancount's rule from the fund-accounting prior art: *"it is required that any
+transaction be balanced in every fund that it uses."* A tenant scope is a fund.
+
+### The fix: intercompany clearing accounts
+
+Split the cross-scope transaction into **two transactions, each balanced within one scope**,
+joined by a due-from/due-to pair:
+
+```
+-- inside tenant t1
+DR due_from_treasury (t1)        500
+CR customer_receivable (t1)      500
+
+-- inside the house scope
+DR operating_cash (__house__)    500
+CR due_to_tenants (__house__)    500
+```
+
+Verified in the same tenant's RLS view, side by side:
+
+| transaction | t1 sees | verdict |
+| --- | --- | --- |
+| `treasury2` (cross-scope, single transaction) | −500.00 | **UNBALANCED** |
+| `fixed:tenant` (intercompany pair) | 0.00 | **BALANCED** |
+
+This is the same primitive the accounting review identified for **multi-entity** deployments, and
+it generalizes: `due_from_*` / `due_to_*` clearing accounts are what make any scoped view of a
+ledger a valid ledger in its own right.
+
+### Consequences
+
+- **RLS is not merely a security feature here — it is a correctness constraint.** If RLS is on,
+  the tenant's view must itself satisfy `A = L + E + (R − X)`. That is only true if no transaction
+  crosses scopes.
+- **This tightens the theorem.** [The theorem above](#the-theorem) says any union of *whole*
+  transactions balances. Under RLS a tenant does not see whole transactions — they see a filtered
+  subset — so the theorem's precondition is violated unless transactions are tenant-local by
+  construction.
+- **It gives "no cross-tenant transactions" a reason to exist beyond sharding.** ADR-0007 wanted
+  that property for tenant→database routing. It turns out to be required for per-tenant reporting
+  to be correct at all, on a single database, with no sharding involved.
+- **It needs enforcement, not intention.** Shopify runs CI verifiers named "Cross Shard
+  Transaction". The equivalent here: assert no transaction's entry set spans more than one
+  `tenant_id`. That check is cheap and belongs in M1.
+
 ## Open — posting rules
 
 The remaining piece of "how they tie together." A deployment declares its chart; it must also
