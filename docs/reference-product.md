@@ -334,6 +334,20 @@ A hold is **partially consumed**, not open/closed:
 `held = SUM(GREATEST(amount_minor - cleared_minor, 0)) WHERE company_id = ? AND state = 'open'`.
 `GREATEST` clamps over-capture: a $1 fuel auth clearing at $95 goes to 0, not −94.
 
+> ⚠️ **This table is being redesigned.** `auth_id UNIQUE` assumes one authorization is one row —
+> which **rejects an incremental authorization**, the hotel and fuel-pump case this document's own
+> edge-case table lists two sections above. It is also the only mutable table in an otherwise
+> append-only design.
+>
+> [Spike 006](../spikes/006-append-only-holds/README.md) replaces it with immutable signed events
+> and a derived hold, where `held = SUM(GREATEST(group_total, 0))` covers increments, partial
+> capture, over-capture, reversal, expiry, clearing-before-auth and forced posts with one formula
+> — and is order-tolerant for free, because `SUM` commutes.
+>
+> Not yet adopted: the spike depends on an identifier stable across an authorization and its
+> increments, and this document already warns that network ids *"don't reliably agree across
+> messages."* Under research.
+
 Other rails get the same shape: `ach_transfers`, `disputes`, `statements`. The ledger is the
 permanent record; these are what's still in flight.
 
