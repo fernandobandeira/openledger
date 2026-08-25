@@ -5,6 +5,13 @@
 -- trigger. If a generator handles this cleanly it handles the real thing.
 --
 -- Graduates to migrations/0001 once ADR-0002 lands and M1 starts for real.
+--
+-- NAMING: ix_<table>__<cols> / uq_<table>__<cols> / ck_<table>__<rule>. Mechanical
+-- and greppable, so "does this table have an index on X" is answerable without a
+-- catalog query. Formance names two of their composite PKs `accounts_ledger` and
+-- `logs_ledger`, and named a migration `accounts-metadata-index` that indexes a
+-- DIFFERENT table -- which is precisely how a missing index on the hot write path
+-- went unnoticed for thirty migrations.
 
 BEGIN;
 
@@ -40,7 +47,7 @@ CREATE TABLE ledger_accounts (
     metadata       jsonb                NOT NULL DEFAULT '{}'::jsonb,
     created_at     timestamptz          NOT NULL DEFAULT now(),
 
-    CONSTRAINT house_accounts_have_no_owner
+    CONSTRAINT ck_accounts__house_has_no_owner
         CHECK ((owner_type = 'house') = (owner_id IS NULL))
 );
 
@@ -48,10 +55,10 @@ CREATE TABLE ledger_accounts (
 -- A plain UNIQUE(owner_type, owner_id, purpose, currency) would NOT constrain
 -- house rows at all: owner_id is NULL there and NULL != NULL in Postgres, so it
 -- would happily allow a second interchange_revenue.
-CREATE UNIQUE INDEX ledger_accounts_owned_key
+CREATE UNIQUE INDEX uq_accounts__owned
     ON ledger_accounts (owner_type, owner_id, purpose, currency)
     WHERE owner_type <> 'house';
-CREATE UNIQUE INDEX ledger_accounts_house_key
+CREATE UNIQUE INDEX uq_accounts__house
     ON ledger_accounts (purpose, currency)
     WHERE owner_type = 'house';
 -- (PG15+ could express the first as UNIQUE NULLS NOT DISTINCT, but the partial
@@ -86,15 +93,15 @@ CREATE TABLE ledger_transactions (
 -- transactions, and under default NULLS DISTINCT semantics this index would not
 -- constrain those rows AT ALL -- the same NULL != NULL trap the vision doc calls
 -- out for house accounts. Verified: without it, T7 silently passes.
-CREATE UNIQUE INDEX ledger_transactions_idem_key
+CREATE UNIQUE INDEX uq_txn__idempotency
     ON ledger_transactions (tenant_id, idempotency_key) NULLS NOT DISTINCT;
 
 -- We refuse to mutate, so we cannot use the UPDATE ... WHERE reverted_at IS NULL
 -- guard against double-reversal. These give the same property declaratively:
 -- a transaction can be reversed once, and resolved once.
-CREATE UNIQUE INDEX ledger_transactions_one_reversal
+CREATE UNIQUE INDEX uq_txn__one_reversal
     ON ledger_transactions (reverses_id) WHERE reverses_id IS NOT NULL;
-CREATE UNIQUE INDEX ledger_transactions_one_resolution
+CREATE UNIQUE INDEX uq_txn__one_resolution
     ON ledger_transactions (resolves_id) WHERE resolves_id IS NOT NULL;
 
 CREATE TABLE ledger_entries (
@@ -116,15 +123,26 @@ CREATE TABLE ledger_entries (
     UNIQUE (account_id, account_seq)
 );
 
--- current balance AND as-of balance are the same index lookup.
-CREATE INDEX ledger_entries_balance_idx
-    ON ledger_entries (account_id, account_seq DESC);
-CREATE INDEX ledger_entries_asof_idx
+-- The balance lookup. INCLUDE makes it a true index-only scan.
+--
+-- MEASURED on 400k rows: Heap Fetches drops to 0 on settled data, at +19% index
+-- size (19MB vs 16MB). But on a FRESHLY INSERTED row -- which is exactly what the
+-- auth hot path reads -- the visibility map bit is not yet set and it is still
+-- Heap Fetches: 1. So INCLUDE is justified by the REPORTING workload (ADR-0003
+-- as-of reads over settled history), not by the hot path.
+--
+-- This works for us and would not for Formance: index-only scans need the
+-- visibility map, which stays set only on an append-only table. Their equivalent
+-- covering index sits on an UPDATE-heavy balances table, where it pays two index
+-- writes per posting to save a heap fetch it mostly will not get.
+CREATE INDEX ix_entries__balance_lookup
+    ON ledger_entries (account_id, account_seq DESC) INCLUDE (balance_after);
+CREATE INDEX ix_entries__asof_recorded
     ON ledger_entries (account_id, recorded_at DESC, account_seq DESC);
-CREATE INDEX ledger_entries_txn_idx ON ledger_entries (transaction_id);
+CREATE INDEX ix_entries__txn ON ledger_entries (transaction_id);
 -- the EFFECTIVE axis. balance as of a business date is an aggregate over this,
 -- not a running-balance lookup. See ADR-0003.
-CREATE INDEX ledger_entries_effective_idx
+CREATE INDEX ix_entries__effective
     ON ledger_entries (account_id, effective_at);
 
 -- Balance enforced by the DATABASE, per currency, deferred to COMMIT so a
@@ -152,7 +170,7 @@ BEGIN
     RETURN NULL;
 END $$;
 
-CREATE CONSTRAINT TRIGGER ledger_entries_balance_check
+CREATE CONSTRAINT TRIGGER ck_entries__balances
     AFTER INSERT ON ledger_entries
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW EXECUTE FUNCTION assert_transaction_balances();
@@ -182,7 +200,7 @@ CREATE TABLE spend_controls (
     allowed_merchants text[] NOT NULL DEFAULT '{}',
     active            boolean NOT NULL DEFAULT true,
 
-    CONSTRAINT cap_needs_period CHECK ((cap_minor IS NULL) = (period IS NULL))
+    CONSTRAINT ck_controls__cap_needs_period CHECK ((cap_minor IS NULL) = (period IS NULL))
 );
 
 CREATE TABLE card_holds (
@@ -198,12 +216,12 @@ CREATE TABLE card_holds (
     expires_at     timestamptz,             -- Temporal timer target. ~7d, longer for T&E.
     created_at     timestamptz NOT NULL DEFAULT now(),
 
-    CONSTRAINT declines_are_closed
+    CONSTRAINT ck_holds__declines_are_closed
         CHECK (decision = 'approved' OR state = 'closed')
 );
 
 -- partial -- makes SUM(held) an index scan
-CREATE INDEX card_holds_open_idx ON card_holds (company_id) WHERE state = 'open';
+CREATE INDEX ix_holds__open ON card_holds (company_id) WHERE state = 'open';
 
 CREATE TABLE card_transactions (
     id           uuid PRIMARY KEY DEFAULT uuidv7(),
@@ -216,6 +234,6 @@ CREATE TABLE card_transactions (
     posted_at    timestamptz NOT NULL
 );
 
-CREATE INDEX card_transactions_budget_idx ON card_transactions (card_id, posted_at DESC);
+CREATE INDEX ix_card_txn__budget ON card_transactions (card_id, posted_at DESC);
 
 COMMIT;
