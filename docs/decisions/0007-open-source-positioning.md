@@ -97,25 +97,36 @@ because adopters will ask, and the honest answer is more useful than a headline 
 **The ceiling is global, not per-tenant.** ~13k clearings/s is shared across every tenant on a
 database. It is **not** 13k each.
 
-**But there is no per-account or per-tenant *lock* limit** once house accounts are per-tenant. No
-tenant can be throttled by another tenant's contention; they compete only for CPU and WAL. At
-fixed concurrency, splitting the same 32 writers across 32 tenants took throughput from 881/s to
-7,296/s — **8×, purely from removing lock collisions.**
+**Striping the hot accounts is what removes the per-row limit** — and it works regardless of how
+load is distributed. Measured at c=32: 872 → 6,970 clearings/s (8.0×) with a *single* tenant, and
+948 → 7,405 (7.8×) with 32 tenants under 90/10 skew.
 
-**Scaling past one instance is by tenant, and it is clean.** A ledger has no cross-tenant
-transactions, so sharding by tenant is embarrassingly parallel and scaling is linear in
-instances.
+**Per-tenant house accounts are a weaker, conditional version of the same thing.** An earlier
+draft of this ADR claimed 8× from splitting per tenant. That figure came from a **uniformly
+distributed** benchmark. Real payment volume is Zipfian, and re-measured with a whale tenant the
+gain collapses:
 
-**Our schema currently forbids that**, which is why change (2) above matters more than it first
-appears. `uq_accounts__house` guarantees one `interchange_revenue` per *deployment*, so half the
-legs of a card clearing are deployment-global and **every transaction spans tenants**. No tenant
-can be relocated to another database without breaking atomicity. Making house accounts per-tenant
-removes the contention, lets a deployment reach its hardware ceiling instead of one row's ceiling,
-**and** makes every transaction tenant-local — which is what turns "buy a bigger instance" into
-"add an instance."
+| distribution | clearings/s | vs baseline |
+| --- | --- | --- |
+| uniform | 7,991 | 9.1× |
+| whale = 90% | 936 | **1.07×** |
 
-The resulting story for an adopter: **one Postgres for almost everyone; shard by tenant when you
-outgrow it; no cross-shard transactions, ever.**
+The whale's own house accounts simply become the new hot row. **Per-tenant splitting relocates the
+bottleneck; striping removes it.** Striping is the mechanism to ship; tenancy is a coincidence
+that pays only under even load.
+
+**"No cross-shard transactions, ever" was also wrong.** `operating_cash` and `fbo_cash` are
+perimeter accounts, and v1-vision requires each to mirror *exactly one* external balance — the
+money is in one bank account. `facility_borrowings` is one line from one lender. None can be
+split per tenant. **7 of the golden trace's 13 transactions touch `operating_cash`.**
+
+The four *clearing* transactions do not. So the honest claim is: **clearings become tenant-local;
+treasury does not.** Clearings are the volume and treasury is a daily batch, so cross-shard
+treasury may be an acceptable trade — but it must be made explicitly rather than claimed away.
+
+The corrected story for an adopter: **one Postgres for almost everyone; stripe the hot accounts
+when you hit the per-row ceiling; shard by tenant only if you outgrow one instance, accepting
+that treasury transactions will span shards.**
 
 ## Why not TigerBeetle
 

@@ -43,6 +43,22 @@ type tenant struct {
 
 var retries int64
 
+// pickTenant applies skew. With -whale=0.9, tenant 0 receives 90% of traffic --
+// which is what real payment volume looks like. Uniform selection is the
+// optimistic case and flatters any per-tenant sharding scheme.
+func pickTenant(ts []tenant, rng *rand.Rand) tenant {
+	if *whale > 0 && rng.Float64() < *whale {
+		return ts[0]
+	}
+	if len(ts) == 1 {
+		return ts[0]
+	}
+	if *whale > 0 {
+		return ts[1+rng.Intn(len(ts)-1)]
+	}
+	return ts[rng.Intn(len(ts))]
+}
+
 var (
 	nTenants   = flag.Int("tenants", 1, "distinct tenants, each with its OWN house accounts")
 	nCompanies = flag.Int("companies", 500, "companies per tenant")
@@ -55,6 +71,7 @@ var (
 	oneCall    = flag.Bool("one-call", false, "whole clearing in ONE server-side call (1 round trip, not 6)")
 	keep       = flag.Bool("keep", false, "do NOT truncate -- measure against an existing large table")
 	lockMode   = flag.String("lock-mode", "", "pessimistic | optimistic | append (implies -one-call)")
+	whale      = flag.Float64("whale", 0, "fraction of traffic sent to tenant 0 (0 = uniform). Real payment load is Zipfian, not uniform.")
 )
 
 // workerID is goroutine-local: with -stripe-mode=worker each writer always posts
@@ -135,7 +152,7 @@ type posting struct {
 // total. Their "demotion" of the running balance is what makes batching possible.
 func doBatch(ctx context.Context, pool *pgxpool.Pool, ts []tenant, rng *rand.Rand) error {
 	if *lockMode != "" {
-		t := ts[rng.Intn(len(ts))]
+		t := pickTenant(ts, rng)
 		for attempt := 0; ; attempt++ {
 			_, err := pool.Exec(ctx, `SELECT post_clearing_mode($1,$2,$3,$4,$5,$6)`,
 				t.id, uuid.NewString(),
@@ -154,7 +171,7 @@ func doBatch(ctx context.Context, pool *pgxpool.Pool, ts []tenant, rng *rand.Ran
 		}
 	}
 	if *oneCall {
-		t := ts[rng.Intn(len(ts))]
+		t := pickTenant(ts, rng)
 		_, err := pool.Exec(ctx, `SELECT post_clearing($1,$2,$3,$4,$5)`,
 			t.id, uuid.NewString(),
 			t.companies[rng.Intn(len(t.companies))],
@@ -168,7 +185,7 @@ func doBatch(ctx context.Context, pool *pgxpool.Pool, ts []tenant, rng *rand.Ran
 			return err
 		}
 		defer tx.Rollback(ctx)
-		if err := clearing(ctx, tx, ts[rng.Intn(len(ts))], rng); err != nil {
+		if err := clearing(ctx, tx, pickTenant(ts, rng), rng); err != nil {
 			return err
 		}
 		return tx.Commit(ctx)
@@ -180,7 +197,7 @@ func doBatch(ctx context.Context, pool *pgxpool.Pool, ts []tenant, rng *rand.Ran
 	tids := make([]string, 0, *batch)
 	var posts []posting
 	for i := 0; i < *batch; i++ {
-		t := ts[rng.Intn(len(ts))]
+		t := pickTenant(ts, rng)
 		id := uuid.New()
 		txns = append(txns, id)
 		keys = append(keys, uuid.NewString())
