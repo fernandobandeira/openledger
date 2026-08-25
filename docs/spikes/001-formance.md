@@ -257,3 +257,146 @@ a class of silent corruption into a failed insert.
 - **`NOT VALID` constraints must actually get validated.** Their migration 19 adds one and nothing
   ever validates it, so it constrains new rows only. If we use that technique, a follow-up
   migration must run `VALIDATE CONSTRAINT` or we are lying to ourselves about our invariants.
+
+
+---
+
+## Addendum — table design pass
+
+A second pass answering "what about the design of tables". Method matters here: all 54 bucket
+migrations were applied **to a real Postgres in order** and the result `pg_dump`ed, so the DDL
+below is the actual end state at HEAD rather than a reading of the migration files. Index claims
+come from `pg_indexes` / `pg_constraint` and `EXPLAIN (ANALYZE, BUFFERS)` over 400k seeded rows.
+
+Three findings that only that method surfaces:
+
+1. **`moves` has no index supporting a running-balance lookup.** Migration 0 had
+   `(accounts_seq, asset, seq)`. Migration 37 dropped the `accounts_seq` column, Postgres
+   silently dropped the indexes with it, and nothing recreated them on `accounts_address`.
+   **Their point-in-time balance read is a scan-and-sort of the account's whole history** —
+   measured at 809 buffers with `Sort Key: asset, seq DESC`.
+2. **Zero foreign keys in the entire bucket schema.** Not one.
+3. **All four CHECK constraints are `NOT VALID` and none was ever validated.** They constrain
+   new rows only.
+
+The pattern behind most of their schema debt is a single mechanism: **dropping a column silently
+drops its indexes and constraints, and nothing in their process caught it.** Four separate
+regressions trace to migrations 37 and 46 alone. That is what
+[ADR-0006's snapshot test](../decisions/0006-schema-conventions.md) exists to prevent.
+
+### Verified against our schema, and the result was not what the headline implied
+
+The 809 → 4 buffer improvement is real *for them*, because their composite index is missing.
+**Ours already has the right index**, so the only thing left to gain was the heap fetch. Measured
+on our schema, 400k rows:
+
+| Index | Plan | Heap Fetches | Size |
+| --- | --- | --- | --- |
+| `(account_id, account_seq DESC)` | Index Scan | — | 16 MB |
+| `... INCLUDE (balance_after)` | Index **Only** Scan | 0 (settled) | 19 MB |
+| `... INCLUDE (balance_after)` | Index Only Scan | **1 (fresh row)** | 19 MB |
+
+The third row is the one that matters. Index-only scans need the visibility map bit, which is
+set by vacuum — so on a **freshly inserted row, which is exactly what the auth hot path reads**,
+the heap fetch happens anyway. `INCLUDE` is justified by as-of reporting over settled history,
+not by the hot path. Adopted with that rationale recorded in the schema, per
+[ADR-0006 §6](../decisions/0006-schema-conventions.md).
+
+The mirror image is why their covering index on `accounts_volumes` is a mistake: it duplicates
+the PK's key columns on an **UPDATE-heavy** table, paying two index writes per posting to save a
+heap fetch the visibility map will mostly deny it.
+
+### `logs` — the DDL we are designing ADR-0004 from
+
+```sql
+CREATE TABLE logs (
+    ledger           varchar NOT NULL,
+    id               numeric NOT NULL,     -- per-ledger sequence
+    type             log_type NOT NULL,
+    hash             bytea,
+    date             timestamp without time zone NOT NULL DEFAULT transaction_date(),
+    data             jsonb   NOT NULL,     -- full payload, for replay and reads
+    idempotency_key  varchar(255),
+    memento          bytea,                -- canonical hash input (migration 23)
+    idempotency_hash bytea,
+    schema_version   text
+);
+ALTER TABLE logs ADD CONSTRAINT logs_ledger PRIMARY KEY (ledger, id);
+CREATE UNIQUE INDEX logs_idempotency_key ON logs (ledger, idempotency_key);
+```
+
+**The `data` / `memento` split is the best idea in their schema.** `data` is the full payload for
+replay. `memento` is a *separate canonical byte form used only as hash input*, and it
+deliberately excludes derived fields — their comment: *"We don't want those fields to be part of
+the hash as they are not part of the decision-making process."*
+
+The chain therefore covers **the decision, not the derived state**, which means recomputing a
+balance never invalidates tamper evidence. Get this wrong and every backfill breaks the chain.
+Folded into [ADR-0004](../decisions/0004-event-log.md).
+
+The hash input also pins `"id":0` and `"hash":null` so the digest is position-independent. The
+predecessor lookup rides the PK as a backward index scan and is cheap — but it must see a stable
+predecessor, which is why every write takes `pg_advisory_xact_lock(ledger_id)` and serializes.
+
+### On our open ordering question — they have no answer
+
+Directly relevant to [ADR-0005](../decisions/0005-reproducible-as-of.md), and worth stating
+plainly: **Formance has no commit-ordered total order anywhere in their schema.**
+
+- `transaction_date()` seeds from `statement_timestamp()` — start-ordered. It guarantees
+  intra-transaction consistency (all rows of one operation share a timestamp) and nothing more.
+- `bigserial` does not help either: `nextval` is also called at statement time, so `seq` is
+  start-ordered too.
+- Their per-ledger sequences carry an explicit comment that they accept gaps: *"we can still
+  have 'holes' on ids since a sql transaction can be reverted after a usage of the sequence."*
+
+So `WHERE recorded_at <= T` is not reproducible for them either, and they do nothing about it.
+This raises confidence that ADR-0005 is a real problem rather than an over-reading, and lowers
+confidence that a clever solution exists — **the agent's own recommendation was our option (c):
+make "as of" mean "as of entry id N" and hand the lender an id, not a timestamp.**
+
+### Column-type choices — what cost them
+
+| Choice | Outcome |
+| --- | --- |
+| `numeric` for ids (`transactions.id`, `logs.id`) | Cross-type comparisons against `bigint` columns made an index unusable in a trigger; migration 44 (`fix-seq-scan-in-plpgsql`) exists solely to add a `::bigint` cast. They cannot fix the root cause — narrowing now needs a table lock. |
+| `postings varchar` holding JSON | The canonical record of money movement is a string. Four shadow jsonb columns and three GIN indexes exist to make it queryable. Repeated in `exporters.config`. |
+| `timestamp` (no zone) everywhere | UTC held by convention, not constraint. Migration 33 is `fix-invalid-date-format`. |
+| `numeric` for `amount` | Correct for *them* — arbitrary-precision multi-asset. Not for us; `bigint` minor units are cheaper and comparable. |
+| `volumes` composite type `(inputs, outputs)` | Genuinely elegant — the pair moves atomically. Simpler as two `bigint` columns for us. |
+| `input`/`output` kept separate, not one signed balance | **Worth stealing.** Makes the upsert commutative and additive in both directions, gives gross turnover free, and no row needs to know the sign convention. |
+
+### Naming and conventions
+
+Tables plural snake_case, no prefixes; cross-table references named `<plural_table>_<column>`
+(`accounts_address`, `transactions_id`) — unusual but unambiguous about the target, worth
+adopting. Constraints named clearly.
+
+**Indexes are named inconsistently and it cost them.** `accounts_ledger` and `logs_ledger` are
+composite PKs, not indexes on `ledger`. `accounts_metadata_idx` is on `accounts`, not
+`accounts_metadata` — and that name is exactly why a missing index on a hot write path went
+unnoticed for thirty migrations. `_idx` / `_index` / no-suffix / `2`-suffixes all coexist.
+Column names drift badly too: `date`, `timestamp`, `insertion_date`, `inserted_at`, `added_at`,
+`addedat`, `created_at` all appear, several meaning the same thing.
+
+→ [ADR-0006 §1](../decisions/0006-schema-conventions.md).
+
+### Their unfixed bugs, as a checklist of what to avoid
+
+1. `moves` lost its running-balance index to a column drop (migration 37).
+2. `accounts_metadata` has no btree index — every metadata write sequentially scans the whole
+   revision history. The transactions side was fixed; this side never was.
+3. No unique constraint on `(ledger, id, revision)` in either metadata table. Revision
+   uniqueness rests on an unsynchronised `max()+1` inside a trigger; two concurrent updates
+   produce duplicates.
+4. Four `NOT VALID` CHECK constraints, none validated.
+5. Zero foreign keys.
+6. Redundant indexes on the hottest tables — `moves_account_address` is a strict prefix of
+   `moves_range_dates`; `moves_ledger` and `moves_asset` are near-zero cardinality.
+7. `address_array` is orphaned: nullable, no default, its populating trigger dropped in migration
+   46, yet it still carries a GIN index *and* an expression index. Population depends entirely on
+   Go remembering.
+8. `logs_blocks` shipped with PK `(previous)` alone, so two ledgers in one bucket collided on
+   block 0 (fixed in migration 53). **Our `tenant_id` must be in every natural key.**
+9. Go struct tags contradict the schema — `varchar(256)` vs `varchar(255)`, `timestamptz` vs
+   `timestamp`, `unique` declared where no index exists.

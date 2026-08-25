@@ -79,6 +79,19 @@ our volume the serialization is free. **Take the chain, never build the blocks**
 this ADR, because it interacts with the ordering question in
 [ADR-0005](./0005-reproducible-as-of.md) and should be decided alongside it.
 
+When we do take it, **copy their `data` / `memento` split**, which the
+[table-design pass](../spikes/001-formance.md#logs--the-ddl-we-are-designing-adr-0004-from)
+identified as the best idea in their schema:
+
+- `payload jsonb` — the full event, for reads and replay.
+- `memento bytea` — a *separate canonical byte form used only as hash input*, deliberately
+  **excluding derived fields**. Their comment: *"We don't want those fields to be part of the
+  hash as they are not part of the decision-making process."*
+
+The chain then covers **the decision, not the derived state**, so recomputing a balance never
+invalidates tamper evidence. Get this wrong and every backfill breaks the chain. Their hash input
+also pins the row's own id and hash to fixed values so the digest is position-independent.
+
 **Metadata history.** Formance maintains `transactions_metadata` / `accounts_metadata` revision
 tables precisely because a mutable jsonb blob cannot answer "what did we believe at time T". Our
 `metadata jsonb` is mutable with no history. If any of it feeds collateral reporting — obligor,
