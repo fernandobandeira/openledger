@@ -33,16 +33,36 @@ from the other is wrong the first time someone books one.
 
 ### 3. The accounting equation does NOT prove completeness
 
-This is the finding that justifies the whole layer, and it is not obvious.
+This is the finding that justifies the whole layer, and an earlier version of this ADR **stated it
+wrongly** — in a way that mattered, because the wrong version pointed the defence at the wrong
+threat.
 
-A report that enumerates only *some* accounts still satisfies `A = L + E + (R − X)`, because the
-missing account drops out of **both** sides. Demonstrated: three tenants holding 10.00 of
-interchange each, a report that misses one shows **20.00 against a true 30.00**, and every check
-reads `BALANCED`.
+It said: *"a report that enumerates only some accounts still satisfies the equation, because the
+missing account drops out of both sides."* **That is false, and checkably so.** Omit one account
+and it drops out of exactly *one* side: dropping `interchange_revenue` from the golden trace gives
+assets 276 against L+E+R−X of −624. Omitting a single account is one of the few completeness
+failures the equation *does* catch, loudly.
 
-So completeness is a **separate invariant**, and it is enforced structurally: every account type
-has a `NOT NULL` financial-statement line, and reports enumerate from the chart outward, so there
-is no parameter in which to pass an incomplete list of accounts.
+The true proposition — and what the original demonstration actually showed — is that omitting a
+whole **balanced sub-book** is invisible: an entire tenant, an entire currency, an entire entity,
+any date range containing only whole transactions. Three tenants holding 10.00 of interchange each,
+a report that misses one shows **20.00 against a true 30.00**, and every check reads `BALANCED`,
+because what was dropped was itself balanced.
+
+That reframing changes the threat model. The risk is not a stray missing account; it is a
+**dropped sub-book** — an RLS predicate, a tenant filter, a `date_trunc` boundary, a timezone. The
+reference product says it already: *"the bug is never in storage, it's at every boundary that turns
+an instant into a bucket."*
+
+So completeness is a **separate invariant**. Every account type has a `NOT NULL` financial-statement
+line, and [`balance_sheet`](../../migrations/0002_chart_of_accounts.sql) enumerates **from the chart
+outward** — `FROM fs_lines`, left-joining the numbers on, so a line with no activity appears as a
+zero instead of vanishing.
+
+That last part was also aspirational until recently: `trial_balance` and `accounting_equation` both
+start `FROM ledger_entries` and enumerate *inward*, so an account with no entries is simply absent
+from them. The chart-outward report now exists; those two still enumerate inward and are the wrong
+thing to build a completeness claim on.
 
 ### 4. The equation is evaluated per currency
 
@@ -108,6 +128,10 @@ converted into a claim.)*
   shape this should take: a reserved role, distinct from the type.
 - **A hierarchical reporting axis.** `fs_line` is flat; nested subtotals need a tree.
 - **Multi-entity.** The theorem gives a balanced *consolidated* set, not a balanced *per-entity*
-  one. Intercompany due-from/due-to accounts are the primitive, and they are seeded but unused.
+  one. Intercompany due-from/due-to accounts are the primitive, and [the golden
+  trace](../../tests/golden_trace.sql) now runs on them: the facility draw, the network settlement
+  and the ACH collection are all cross-scope, and the two sides are asserted to eliminate exactly at
+  every step. What is still missing is **elimination in a report** — nothing nets them, so a
+  consolidated balance sheet presents intercompany balances gross.
 - Several accounting-practice claims consulted during this work **could not be verified** against
   primary sources with the tooling available. They are omitted rather than softened.

@@ -73,7 +73,7 @@ recomputation*, which is what Modern Treasury does when a cached balance drifts.
 ## Consequences
 
 - **The effective-axis aggregate is linear and currently unbounded** — roughly 0.10 µs per entry
-  in range, and directly measured at **105.91 ms** for a 1M-entry account. An earlier draft extrapolated ~220 ms from the per-entry rate while that direct measurement already existed; prefer the measurement.2 s at 10M. We have traded Formance's
+  in range, and directly measured at **105.91 ms** for a 1M-entry account. An earlier draft extrapolated ~220 ms from the per-entry rate while that direct measurement already existed; prefer the measurement. We have traded Formance's
   unbounded `UPDATE` on backdating for an unbounded `SCAN` on business-date reporting. Ours is at
   least on the read path, off the latency deadline, and does not mutate history.
 - **It must be bounded, and accounting already knows how: period close.** Materialize each

@@ -35,7 +35,9 @@ same transaction as whatever it causes.
 
 - `idempotency_key` + `idempotency_hash`, tenant-scoped with `NULLS NOT DISTINCT`.
 - `kind`, `source`, `payload jsonb`, `effective_at`, `recorded_at`.
-- Every `ledger_transactions` row references the event that caused it. So do rails that write no
+- Every `ledger_transactions` row *should* reference the event that caused it — but `event_id` is
+**nullable and unenforced**, and an event-less transaction inserts without complaint. Making it
+`NOT NULL` is the obvious fix and is not yet done. So do rails that write no
   transaction — holds, transfers, disputes.
 
 **The retry contract, stated once:** same key + same hash → replay the stored outcome. Same key +

@@ -71,28 +71,49 @@ the specialised backend.
 
 ## The reframe that lowers the bar
 
-`card_holds.expires_at` is already a column, and available credit is computed from `card_hold_groups.held_minor` — **not** from `expires_at`. So a hold that has expired but not yet been
-swept still counts against available credit.
+The deadline is already stored on the event (`card_auth_events.hold_expires_at`), and available
+credit is computed from `card_hold_groups.held_minor` — **not** from a timer. So a hold that has
+passed its deadline but has not yet been swept still counts against available credit.
 
 Every timer here **fails conservatively when it fires late**: a late expiry under-reports available
 credit, a late ACH finalization keeps a receivable open longer. Nothing produces a wrong ledger,
 only a temporarily pessimistic one. The deadline is durable in our own table regardless; the
 scheduler is an *actuator*, not a correctness-critical component.
 
-So we also add a **reconciliation sweep** — `WHERE expired_at IS NULL AND hold_expires_at < now()` over `card_hold_groups`, behind a
-partial index. It costs almost nothing and makes a lost job recoverable rather than silent.
+So we also add a **reconciliation sweep** — groups that are past their deadline and still holding:
 
-## Amendment — the schema moved
+```sql
+SELECT g.tenant_id, g.company_id, g.group_key
+FROM card_hold_groups g
+WHERE g.expired_at IS NULL AND g.held_minor > 0
+  AND EXISTS (
+      SELECT 1 FROM card_auth_event_group m
+      JOIN card_auth_events e ON e.tenant_id = m.tenant_id AND e.id = m.event_id
+      WHERE m.tenant_id = g.tenant_id AND m.group_key = g.group_key
+        AND m.superseded_at IS NULL
+        AND e.hold_expires_at < now());
+```
+
+`ix_hold_groups__held` already covers the outer predicate. It costs almost nothing and makes a lost
+job recoverable rather than silent.
+
+## Amendment — the schema moved, twice
 
 This ADR was written against `card_holds`, which had a `state` column. Migration 0003 replaced it
-with `card_auth_events` + `card_hold_groups`, so the prescribed sweep predicate no longer exists
-as written and has been updated above.
+with `card_auth_events` + `card_hold_groups`, so the prescribed sweep predicate no longer existed.
+
+The first repair was **also wrong**: it moved the predicate to `card_hold_groups` but kept
+`hold_expires_at`, a column that lives on `card_auth_events`. `ERROR: column "hold_expires_at" does
+not exist`. So this ADR contained two successive dead queries, in the section whose own conclusion
+is that dead queries are the problem.
 
 The *conclusion* survives, and for the same reason: an unswept expired hold still counts toward
 `held_minor` until the flag is set, so a lost timer job leaves the ledger temporarily
-**pessimistic**, never wrong. But the reframe rested on a specific predicate, and that predicate
-was dead for a while before anyone noticed — which is an argument for the schema snapshot test in
-[0006](./0006-schema-conventions.md) covering ADR-quoted SQL too.
+**pessimistic**, never wrong. But the reframe rested on a specific predicate, and that predicate was
+dead — twice, and the second time in the very amendment that fixed the first. The query above was
+executed against `migrations/0001`–`0003` before being written down, which is now the standard: the
+schema snapshot test in [0006](./0006-schema-conventions.md) must cover ADR-quoted SQL, because
+review demonstrably does not.
 
 ## Consequences
 

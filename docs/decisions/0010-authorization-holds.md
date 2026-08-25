@@ -14,8 +14,11 @@ The obvious model is a mutable `holds` row with a running amount. It does not su
 - **A clearing has no reliable key back to its authorization.** Network identifiers (ARN, RRN) do
   not agree across messages, so which authorization a clearing belongs to is an *inference*, and
   inferences get corrected.
-- **Six of eleven processors surveyed report an incremental authorization as a cumulative TOTAL**
-  rather than a delta.
+- **Processors disagree on whether an incremental authorization carries a delta or a cumulative
+  TOTAL.** [Spike 006](../../spikes/006-append-only-holds/README.md) surveys three; they do not
+  agree. (An earlier draft of this ADR said "six of eleven processors surveyed." No such survey
+  exists — not in the spike, and not published anywhere I could reach. The disagreement is real
+  and is the whole reason for the design below; the sample size was invented, and is struck.)
 - Messages arrive out of order, are re-delivered, and are sometimes never sent at all.
 
 [Spike 006](../../spikes/006-append-only-holds/README.md) has the survey.
@@ -53,8 +56,16 @@ onto the same 0 — legitimate over-capture, an adapter feeding a total into a d
 mis-grouped clearing — so the condition is also written down, as an alarmable state rather than a
 value swallowed at `SELECT` time.
 
-The per-group total is **materialised**. Deriving it on read was measured at 1131 ms over two years
-of history, against a 1500 ms real-time decisioning budget. Every processor surveyed ships one.
+The per-group total is **materialised**, because an authorization has a hard latency deadline —
+roughly a second, end to end — and deriving a hold by summing an unbounded event log is unbounded
+work.
+
+**That is an argument, not a measurement.** An earlier draft claimed "1131 ms over two years of
+history, against a 1500 ms budget." Neither number has a source: [spike
+006](../../spikes/006-append-only-holds/README.md) says in terms that the derivation "has not been
+benchmarked here," and every other budget figure in this repository says ~1 s, not 1500 ms. Both
+are struck. The materialised total stays on the reasoning above; the cost of the alternative is
+**unmeasured**, and is on the list.
 
 ## What the acceptance test found
 
@@ -88,9 +99,12 @@ failure available here. Neither was found by reading.
 ## Not decided here
 
 - **Hold expiry windows are policy, not protocol.** Our release timer is not the network's clearing
-  deadline: that clock drives dispute eligibility, does not extend on an increment, and is 5 days
-  card-present on Visa where our hold is typically 7. Both are stored; neither is derived from the
-  other.
+  deadline: that clock drives dispute eligibility and does not extend on an increment. Both are
+  stored; neither is derived from the other. The specific day counts previously quoted here rest on
+  a citation to a Visa rules table that **could not be verified** — the public PDF was not
+  extractable, and the table number spike 006 cites appears to govern authorization *response*
+  time rather than auth-to-clearing days. Treat the numbers as unconfirmed until a primary source
+  is in hand.
 - **STIP** — stand-in processing, where the network approves on our behalf while we are down —
   produces authorizations we never saw. Unmodelled.
 - **Fuzzy matching itself.** The schema records *which* method assigned a group (`lifecycle_id`,

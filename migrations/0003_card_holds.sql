@@ -1,6 +1,6 @@
 -- 0003 — authorization holds as an append-only event log.
 --
--- v4. Supersedes spikes/006-append-only-holds/holds.sql, whose mixed delta/absolute
+-- v5. Supersedes spikes/006-append-only-holds/holds.sql, whose mixed delta/absolute
 -- view was broken in four ways by adversarial review — one of them silently
 -- UNDER-reserving credit, which is the worst failure available here.
 --
@@ -68,11 +68,15 @@ CREATE TABLE card_auth_events (
     -- amount already applied. A processor re-sending the same total under a new
     -- message id is a routine re-delivery; before this it produced a delta of 0
     -- and died on this CHECK with an opaque constraint error.
+    -- A $0.00 authorization is a real message -- account verification / AVS /
+    -- card-on-file -- and so is a $0.00 capture. Both were refused outright, with
+    -- an opaque constraint error. An expiry_reversal is a positive delta on a
+    -- release by definition, so it is no longer exempt.
     CONSTRAINT ck_auth_events__sign CHECK (
-        kind IN ('advice','expiry_reversal') OR
-        (kind IN ('authorization','incremental')
-             AND (amount_delta > 0 OR (raw_is_total AND amount_delta = 0))) OR
-        (kind IN ('reversal','clearing','expiry')  AND amount_delta < 0))
+        kind = 'advice' OR
+        (kind = 'expiry_reversal' AND amount_delta > 0) OR
+        (kind IN ('authorization','incremental') AND amount_delta >= 0) OR
+        (kind IN ('reversal','clearing','expiry')  AND amount_delta <= 0))
 );
 
 CREATE UNIQUE INDEX uq_auth_events__msg
@@ -150,6 +154,27 @@ CREATE TABLE card_hold_groups (
     -- in the authorization decision, where the number IS available credit.
     currency    char(3) NOT NULL,
     total_minor bigint NOT NULL DEFAULT 0,
+    -- The cumulative AUTHORIZED subtotal: the running sum of increase-side deltas
+    -- only. A processor restating a cumulative total is restating THIS, not the
+    -- net total -- the net total also has clearings and reversals in it. Deriving
+    -- the delta from the net total made the result depend on arrival order: the
+    -- same three messages produced four different holds across six orders, with no
+    -- error and no drift. That falsifies the headline claim of this whole file.
+    authorized_minor bigint NOT NULL DEFAULT 0,
+    -- Which convention this group's increase-side messages use, fixed by the first
+    -- one. NULL until then.
+    --
+    -- MIXING THEM IS IRRECONCILABLE, and this is the honest limit of the
+    -- order-tolerance claim. {authorization +100.00 as a delta, incremental 120.00
+    -- as a cumulative total} yields 120.00 in one order and 220.00 in the other,
+    -- because a total arriving BEFORE the delta it restates cannot be identified as
+    -- already inclusive of it -- there is no information in the message that says
+    -- so. No derivation can fix that; only refusing the mix can.
+    --
+    -- Within one convention order-tolerance holds: pure deltas commute, and pure
+    -- totals resolve to the maximum total seen, with anything lower refused as
+    -- out-of-order rather than guessed.
+    total_convention text CHECK (total_convention IN ('delta','total')),
     -- GREATEST(total,0): an over-capture ($1 fuel auth clearing at $95) must
     -- contribute 0, never raise available credit. Increase ships the same clamp as
     -- pending_transaction.held_amount.
@@ -167,6 +192,11 @@ CREATE TABLE card_hold_groups (
     -- a mis-grouped clearing. Over-capture becomes a recorded, alarmable state
     -- rather than a value silently swallowed at SELECT time.
     overcaptured_at timestamptz,
+    -- Durable evidence, because overcaptured_at is deliberately non-latching and
+    -- was therefore ERASED by the next event that brought the total back up: a
+    -- 95.00 over-capture became invisible one message later. The low-water mark
+    -- cannot be erased, so "did this group ever over-capture" stays answerable.
+    low_water_minor bigint NOT NULL DEFAULT 0,
     last_event_seq  bigint NOT NULL DEFAULT 0,
     updated_at  timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT pk_hold_groups PRIMARY KEY (tenant_id, company_id, group_key)
@@ -183,7 +213,9 @@ CREATE FUNCTION record_auth_event(
     p_occurred timestamptz, p_method text DEFAULT 'lifecycle_id',
     p_raw jsonb DEFAULT '{}'::jsonb
 ) RETURNS bigint LANGUAGE plpgsql AS $$
-DECLARE v_delta bigint; v_current bigint; v_event uuid; v_ccy char(3);
+DECLARE v_delta bigint; v_current bigint; v_authorized bigint;
+        v_event uuid; v_ccy char(3); v_expired timestamptz;
+        v_conv text; v_incoming text; v_increases boolean;
 BEGIN
     IF p_group IS NOT NULL THEN
         -- Serialise the group. Converting a cumulative total into a delta requires
@@ -192,8 +224,31 @@ BEGIN
         -- derivation where it could not be controlled.
         INSERT INTO card_hold_groups (tenant_id,company_id,group_key,currency)
         VALUES (p_tenant,p_company,p_group,p_currency) ON CONFLICT DO NOTHING;
-        SELECT total_minor, currency INTO v_current, v_ccy FROM card_hold_groups
+        SELECT total_minor, authorized_minor, currency, expired_at, total_convention
+          INTO v_current, v_authorized, v_ccy, v_expired, v_conv
+          FROM card_hold_groups
          WHERE tenant_id=p_tenant AND company_id=p_company AND group_key=p_group FOR UPDATE;
+
+        -- DEDUP BEFORE VALIDATING. A processor retrying the same message id must be
+        -- a no-op, and the guards below would otherwise reject it: a re-sent
+        -- cumulative total is, by construction, lower than the total the group has
+        -- already reached, so it looks exactly like an out-of-order message.
+        PERFORM 1 FROM card_auth_events
+         WHERE tenant_id = p_tenant AND processor_msg_id = p_msg_id;
+        IF FOUND THEN
+            RETURN COALESCE(v_current, 0);
+        END IF;
+
+        -- one convention per group, fixed by the first increase-side message
+        v_increases := p_kind IN ('authorization','incremental','advice');
+        v_incoming  := CASE WHEN p_is_total THEN 'total' ELSE 'delta' END;
+        IF v_increases AND v_conv IS NOT NULL AND v_conv <> v_incoming THEN
+            RAISE EXCEPTION
+              'group % reports increases as %s, but this message is a %; a group '
+              'cannot mix the two -- route to the review queue',
+              p_group, v_conv, v_incoming
+              USING ERRCODE = 'data_exception';
+        END IF;
 
         IF v_ccy <> p_currency THEN
             RAISE EXCEPTION
@@ -210,17 +265,18 @@ BEGIN
     -- so refuse it explicitly rather than guess. v2 guessed, using occurred_at with
     -- an insertion-order tiebreak, and silently UNDER-reserved credit.
     IF p_is_total AND p_group IS NOT NULL
-       AND p_kind IN ('authorization','incremental')
-       AND p_amount < v_current THEN
+       AND p_kind IN ('authorization','incremental','advice')
+       AND p_amount < v_authorized THEN
         RAISE EXCEPTION
-          'out-of-order cumulative total for group %: received % but group is already at %; '
-          'route to the review queue rather than applying it',
-          p_group, p_amount, v_current
+          'out-of-order cumulative total for group %: received % but the group has '
+          'already authorized %; route to the review queue rather than applying it',
+          p_group, p_amount, v_authorized
           USING ERRCODE = 'data_exception';
     END IF;
 
+    -- A cumulative total restates the AUTHORIZED subtotal, never the net total.
     v_delta := CASE
-        WHEN p_is_total AND p_group IS NOT NULL THEN p_amount - v_current
+        WHEN p_is_total AND p_group IS NOT NULL THEN p_amount - v_authorized
         WHEN p_kind IN ('authorization','incremental')  THEN abs(p_amount)
         WHEN p_kind IN ('advice','expiry_reversal')     THEN p_amount
         ELSE -abs(p_amount) END;
@@ -241,6 +297,23 @@ BEGIN
 
     UPDATE card_hold_groups
        SET total_minor  = total_minor + v_delta,
+           -- only increase-side messages move the authorized subtotal
+           authorized_minor = authorized_minor
+               + CASE WHEN p_kind IN ('authorization','incremental','advice')
+                      THEN GREATEST(v_delta, 0) ELSE 0 END,
+           low_water_minor = LEAST(low_water_minor, total_minor + v_delta),
+           -- A new authorization or increment on an EXPIRED group means our
+           -- release was premature -- the hold is live again. expired_at was a
+           -- one-way latch that nothing ever cleared, so every event after an
+           -- expiry was silently voided: 300.00 genuinely held, reported as 0.00,
+           -- with zero drift. A late CLEARING must NOT resurrect it, so only the
+           -- increase side un-expires.
+           expired_at = CASE WHEN p_kind IN ('authorization','incremental','expiry_reversal')
+                                  AND v_delta > 0
+                             THEN NULL ELSE expired_at END,
+           total_convention = COALESCE(total_convention,
+               CASE WHEN p_kind IN ('authorization','incremental','advice')
+                    THEN CASE WHEN p_is_total THEN 'total' ELSE 'delta' END END),
            open_events  = open_events + 1,
            last_event_seq = last_event_seq + 1,
            -- Over-capture becomes a RECORDED state, not a value the clamp swallows.
@@ -257,6 +330,8 @@ BEGIN
 END $$;
 
 -- Expiry is a flag, never a computed delta (see card_hold_groups.expired_at).
+-- It is NOT terminal: a later authorization or increment on the same group clears
+-- it, because that means the release was premature.
 CREATE FUNCTION expire_hold_group(p_tenant text, p_company text, p_group text)
 RETURNS void LANGUAGE sql AS $$
     UPDATE card_hold_groups SET expired_at = now(), updated_at = now()
@@ -266,20 +341,38 @@ $$;
 
 -- Rebuild a group's materialised total from its log. Must be a shipped, exercised
 -- operation, not a theoretical one -- if it is never run, it does not work.
-CREATE FUNCTION recompute_hold_group(p_tenant text, p_group text) RETURNS bigint
-LANGUAGE plpgsql AS $$
-DECLARE v_total bigint; v_n int;
+CREATE FUNCTION recompute_hold_group(p_tenant text, p_company text, p_group text)
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE v_total bigint; v_auth bigint; v_n int;
 BEGIN
-    SELECT COALESCE(SUM(e.amount_delta),0), count(*) INTO v_total, v_n
+    -- Lock FIRST. This function took no lock at all: it read the sum under a READ
+    -- COMMITTED snapshot and then blind-wrote it, so a concurrent record_auth_event
+    -- that committed in between was erased -- a committed 200.00 incremental
+    -- vanished, and the caller had already made an authorization decision on it.
+    PERFORM 1 FROM card_hold_groups
+     WHERE tenant_id=p_tenant AND company_id=p_company AND group_key=p_group FOR UPDATE;
+
+    -- company_id is part of the group's identity. Filtering on (tenant, group_key)
+    -- alone let TWO COMPANIES sharing an inferred group_key -- and an RRN or
+    -- lifecycle id is a network value, not a per-company one -- overwrite each
+    -- other. A different company's clearing silently reduced acme's held amount by
+    -- 300.00, and repeated repair never converged.
+    SELECT COALESCE(SUM(e.amount_delta),0),
+           COALESCE(SUM(GREATEST(e.amount_delta,0))
+                    FILTER (WHERE e.kind IN ('authorization','incremental','advice')),0),
+           count(*)
+      INTO v_total, v_auth, v_n
       FROM card_auth_event_group m
       JOIN card_auth_events e ON e.tenant_id=m.tenant_id AND e.id=m.event_id
-     WHERE m.tenant_id=p_tenant AND m.group_key=p_group AND m.superseded_at IS NULL;
+     WHERE m.tenant_id=p_tenant AND m.group_key=p_group AND m.superseded_at IS NULL
+       AND e.company_id = p_company;
 
     UPDATE card_hold_groups
-       SET total_minor = v_total, open_events = v_n, updated_at = now(),
+       SET total_minor = v_total, authorized_minor = v_auth, open_events = v_n,
+           low_water_minor = LEAST(low_water_minor, v_total), updated_at = now(),
            overcaptured_at = CASE WHEN v_total < 0
                                   THEN COALESCE(overcaptured_at, now()) END
-     WHERE tenant_id=p_tenant AND group_key=p_group;
+     WHERE tenant_id=p_tenant AND company_id=p_company AND group_key=p_group;
     RETURN v_total;
 END $$;
 
@@ -288,8 +381,40 @@ END $$;
 CREATE FUNCTION regroup_auth_event(
     p_tenant text, p_event uuid, p_new_group text, p_by text, p_method text DEFAULT 'manual')
 RETURNS void LANGUAGE plpgsql AS $$
-DECLARE v_old text;
+DECLARE v_old text; v_company text; v_ccy char(3); v_dest record;
 BEGIN
+    SELECT e.company_id, e.currency INTO v_company, v_ccy
+      FROM card_auth_events e WHERE e.tenant_id=p_tenant AND e.id=p_event;
+    IF v_company IS NULL THEN
+        RAISE EXCEPTION 'no such auth event %', p_event USING ERRCODE='data_exception';
+    END IF;
+
+    -- The destination must be able to accept this event. record_auth_event refuses
+    -- a cross-currency join; this function -- the ROUTINE corrective operation --
+    -- did not, so moving a USD event into a EUR group produced a total that added
+    -- USD minor units to EUR minor units and raised USD available credit by 500.00.
+    -- Same vacuity 0002 removed from the accounting equation, through the back door.
+    SELECT * INTO v_dest FROM card_hold_groups
+     WHERE tenant_id=p_tenant AND company_id=v_company AND group_key=p_new_group
+     FOR UPDATE;
+
+    IF FOUND AND v_dest.currency <> v_ccy THEN
+        RAISE EXCEPTION
+          'cannot move a % event into group %, which holds %; a hold total is only '
+          'meaningful in one currency', v_ccy, p_new_group, v_dest.currency
+          USING ERRCODE='data_exception';
+    END IF;
+
+    -- ...and an EXPIRED group is a released hold. Attaching a live authorization to
+    -- one hid 900.00 from held_for_company, from the drift alarm, AND from the
+    -- unmatched queue -- the operator's own corrective action made it invisible.
+    IF FOUND AND v_dest.expired_at IS NOT NULL THEN
+        RAISE EXCEPTION
+          'cannot move an event into group %, which expired at %; re-open it or '
+          'choose another group', p_new_group, v_dest.expired_at
+          USING ERRCODE='data_exception';
+    END IF;
+
     SELECT group_key INTO v_old FROM card_auth_event_group
      WHERE tenant_id=p_tenant AND event_id=p_event AND superseded_at IS NULL;
 
@@ -298,23 +423,19 @@ BEGIN
     INSERT INTO card_auth_event_group (tenant_id,event_id,group_key,method,assigned_by)
     VALUES (p_tenant,p_event,p_new_group,p_method,p_by);
 
-    -- Materialise the destination if it does not exist yet. Splitting a
-    -- mis-grouped event into its OWN group is the routine case, and without this
-    -- the membership row existed while the group did not: held_for_company then
-    -- reported 50.00 where 80.00 was genuinely held. Under-reserving credit is the
-    -- worst failure available here, and card_hold_drift could not see it either --
-    -- the view started FROM card_hold_groups, so a missing group was invisible.
+    -- Materialise the destination if it does not exist yet. Splitting a mis-grouped
+    -- event into its OWN group is the routine case, and without this the membership
+    -- row existed while the group did not: held_for_company reported 50.00 where
+    -- 80.00 was genuinely held. Under-reserving credit is the worst failure
+    -- available here, and card_hold_drift could not see it either.
     INSERT INTO card_hold_groups (tenant_id, company_id, group_key, currency)
-    SELECT e.tenant_id, e.company_id, p_new_group, e.currency
-      FROM card_auth_events e
-     WHERE e.tenant_id = p_tenant AND e.id = p_event
+    VALUES (p_tenant, v_company, p_new_group, v_ccy)
     ON CONFLICT DO NOTHING;
 
-    -- Recompute BOTH affected groups from their events. Without this the
-    -- materialised total silently disagrees with the log -- caught by
-    -- card_hold_drift the first time it was tried.
-    PERFORM recompute_hold_group(p_tenant, g) FROM (SELECT unnest(ARRAY[v_old, p_new_group]) g) x
-     WHERE g IS NOT NULL;
+    -- Recompute BOTH affected groups from their events, company-scoped.
+    PERFORM recompute_hold_group(p_tenant, v_company, g)
+       FROM (SELECT unnest(ARRAY[v_old, p_new_group]) g) x
+      WHERE g IS NOT NULL;
 END $$;
 
 -- held is now an indexed sum over GROUPS, not over events.
@@ -353,6 +474,16 @@ FULL OUTER JOIN live l
   ON  l.tenant_id  = g.tenant_id
   AND l.company_id = g.company_id
   AND l.group_key  = g.group_key
-WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0);
+WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
+   -- ...or the group's declared currency disagrees with any of its live events.
+   -- The alarm compared total_minor and nothing else, so a group holding two
+   -- currencies -- the state regroup_auth_event used to be able to create --
+   -- reported no drift at all.
+   OR EXISTS (
+        SELECT 1 FROM card_auth_event_group m
+        JOIN card_auth_events e ON e.tenant_id=m.tenant_id AND e.id=m.event_id
+        WHERE m.tenant_id = g.tenant_id AND m.group_key = g.group_key
+          AND m.superseded_at IS NULL AND e.company_id = g.company_id
+          AND e.currency <> g.currency);
 
 COMMIT;

@@ -123,10 +123,12 @@ answer, which is worse than an error. Make the product pluggable; never the inva
 
 Two consequences follow, and both are counter-intuitive:
 
-**Balanced books do not mean correct reports.** A report that enumerates only some accounts still
-satisfies the accounting equation, because a missing account drops out of both sides — so revenue
-can be understated while every check passes. Completeness of the roll-up is a separate invariant,
-and the schema enforces it.
+**Balanced books do not mean correct reports.** A report that drops a whole *balanced slice* — a
+tenant, a currency, a date range of whole transactions — still satisfies the accounting equation,
+because what went missing was itself balanced. Revenue can be understated while every check passes.
+Completeness is a separate invariant: the balance sheet is built by enumerating the chart of
+accounts and joining numbers onto it, rather than by listing whatever accounts happen to have
+entries.
 
 **Each tenant's slice of the books must balance on its own.** A transaction touching one tenant's
 account and a shared one leaves that tenant's view unbalanced. So no transaction may span tenants;
