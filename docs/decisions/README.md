@@ -28,6 +28,8 @@ here, so the ADRs don't each stop to re-explain them.
 | [0006](./0006-schema-conventions.md) | Naming rules, a CI schema-snapshot test, keep FKs and enums | Dropping a column silently drops its indexes — Formance lost a hot-path index that way for thirty migrations | accepted |
 | [0007](./0007-open-source-positioning.md) | Reframe as a general open-source ledger; keep Postgres | The bottleneck is one contended row, not the hardware — and striping fixes it | **proposed** |
 | [0008](./0008-durable-timers.md) | Durable timers in Postgres, not Temporal | The need is durable *scheduling*, not workflow orchestration — and a job row commits in the same transaction as the ledger write, which Temporal cannot do | accepted |
+| [0009](./0009-chart-and-completeness.md) | Chart of accounts as data; completeness is a separate invariant | A report missing one account still satisfies the accounting equation — the missing account drops out of both sides | accepted |
+| [0010](./0010-authorization-holds.md) | A hold is a SUM over an append-only event log, not a mutable amount | Grouping a clearing to its authorization is a revisable inference, and six of eleven processors report an increment as a cumulative total | accepted |
 
 ## Non-negotiable
 
@@ -53,8 +55,7 @@ Undecided, listed plainly rather than buried:
   role that bypasses RLS, so RLS guards reads only. Not yet decided.
 - **Historical balances get slower as history grows, and nothing bounds it yet.** Reading "the
   balance right now" is a single index lookup (0.018 ms). Reading "the balance as of last June"
-  has to add up entries, which is linear — ~0.22 µs each, so ~7 ms at 30k entries but ~2 s at
-  10M. The fix is the accountants' one: close each period and store its closing balance, so a
+  has to add up entries, which is linear — ~0.10 µs each, so ~3 ms at 30k entries and a measured 105.91 ms at 1M. The fix is the accountants' one: close each period and store its closing balance, so a
   query only has to add up the current period. Designed but not built —
   [0003](./0003-bitemporal-balances.md) has the numbers.
 - **A licence has not been chosen.** There is no LICENSE file. The timer library is MPL-2.0, which

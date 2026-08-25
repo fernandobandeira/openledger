@@ -50,9 +50,11 @@ DECLARE t account_types;
 BEGIN
     SELECT * INTO t FROM account_types WHERE code = NEW.purpose;
     IF NEW.category <> t.category OR NEW.normal_balance <> t.normal_balance THEN
-        RAISE EXCEPTION 'account %/% declares %/% but type % is %/%',
-            NEW.owner_id, NEW.purpose, NEW.category, NEW.normal_balance,
-            t.code, t.category, t.normal_balance;
+        -- tenant, not owner_id: a house account has owner_id NULL, so the old
+        -- message identified the offender as "<NULL>/operating_cash".
+        RAISE EXCEPTION 'account %/%/% declares %/% but type % is %/%',
+            NEW.tenant_id, COALESCE(NEW.owner_id,'house'), NEW.purpose,
+            NEW.category, NEW.normal_balance, t.code, t.category, t.normal_balance;
     END IF;
     RETURN NEW;
 END $$;

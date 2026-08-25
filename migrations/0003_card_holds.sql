@@ -1,6 +1,6 @@
 -- 0003 — authorization holds as an append-only event log.
 --
--- v3. Supersedes spikes/006-append-only-holds/holds.sql, whose mixed delta/absolute
+-- v4. Supersedes spikes/006-append-only-holds/holds.sql, whose mixed delta/absolute
 -- view was broken in four ways by adversarial review — one of them silently
 -- UNDER-reserving credit, which is the worst failure available here.
 --
@@ -64,9 +64,14 @@ CREATE TABLE card_auth_events (
     -- sign is a property of the kind. 'advice' and 'expiry_reversal' are exempt:
     -- advice is bidirectional on some processors, and an expiry reversal is a
     -- positive delta on a release.
+    -- amount_delta = 0 is legal ONLY for a cumulative total that restates the
+    -- amount already applied. A processor re-sending the same total under a new
+    -- message id is a routine re-delivery; before this it produced a delta of 0
+    -- and died on this CHECK with an opaque constraint error.
     CONSTRAINT ck_auth_events__sign CHECK (
         kind IN ('advice','expiry_reversal') OR
-        (kind IN ('authorization','incremental') AND amount_delta > 0) OR
+        (kind IN ('authorization','incremental')
+             AND (amount_delta > 0 OR (raw_is_total AND amount_delta = 0))) OR
         (kind IN ('reversal','clearing','expiry')  AND amount_delta < 0))
 );
 
@@ -89,13 +94,22 @@ CREATE UNIQUE INDEX uq_auth_events__msg
 -- immutable financial fact; the inference about it is revisable and auditable.
 CREATE TABLE card_auth_event_group (
     tenant_id    text NOT NULL,
+    -- Identity is a uuidv7, NOT (event_id, assigned_at). now() is TRANSACTION
+    -- time, so it is constant across a transaction: an operator correcting the
+    -- same event twice in one transaction collided on the primary key. This is
+    -- the same lesson as ADR-0005 -- a timestamp is not an ordering key -- and
+    -- uuidv7 is time-ordered, so the trail still reads chronologically.
+    id           uuid NOT NULL DEFAULT uuidv7(),
     event_id     uuid NOT NULL,
     group_key    text NOT NULL,
     method       text NOT NULL CHECK (method IN ('lifecycle_id','rrn','fuzzy','manual')),
     assigned_at  timestamptz NOT NULL DEFAULT now(),
     assigned_by  text NOT NULL,
-    superseded_at timestamptz,           -- NULL = the current assignment
-    CONSTRAINT pk_event_group PRIMARY KEY (tenant_id, event_id, assigned_at),
+    -- NULL = the current assignment. Equal to assigned_at when an assignment is
+    -- superseded inside the transaction that created it: a zero-width interval,
+    -- correct because that assignment was never visible outside it.
+    superseded_at timestamptz,
+    CONSTRAINT pk_event_group PRIMARY KEY (tenant_id, id),
     CONSTRAINT fk_event_group__event FOREIGN KEY (tenant_id, event_id)
         REFERENCES card_auth_events (tenant_id, id)
 );
@@ -105,6 +119,8 @@ CREATE UNIQUE INDEX uq_event_group__current
     ON card_auth_event_group (tenant_id, event_id) WHERE superseded_at IS NULL;
 CREATE INDEX ix_event_group__group
     ON card_auth_event_group (tenant_id, group_key) WHERE superseded_at IS NULL;
+-- the audit trail for one event, in assignment order
+CREATE INDEX ix_event_group__event ON card_auth_event_group (tenant_id, event_id, id);
 
 -- The unmatched queue the spec calls for, as a view rather than a special value.
 CREATE VIEW card_auth_unmatched AS
@@ -128,6 +144,11 @@ CREATE TABLE card_hold_groups (
     tenant_id   text NOT NULL,
     company_id  text NOT NULL,
     group_key   text NOT NULL,
+    -- A group holds ONE currency. Without this, total_minor summed minor units
+    -- across denominations and reported 100.00 USD + 50.00 EUR as "held 15000" --
+    -- the same vacuity removed from the accounting equation in 0002, but sitting
+    -- in the authorization decision, where the number IS available credit.
+    currency    char(3) NOT NULL,
     total_minor bigint NOT NULL DEFAULT 0,
     -- GREATEST(total,0): an over-capture ($1 fuel auth clearing at $95) must
     -- contribute 0, never raise available credit. Increase ships the same clamp as
@@ -162,17 +183,25 @@ CREATE FUNCTION record_auth_event(
     p_occurred timestamptz, p_method text DEFAULT 'lifecycle_id',
     p_raw jsonb DEFAULT '{}'::jsonb
 ) RETURNS bigint LANGUAGE plpgsql AS $$
-DECLARE v_delta bigint; v_current bigint; v_event uuid;
+DECLARE v_delta bigint; v_current bigint; v_event uuid; v_ccy char(3);
 BEGIN
     IF p_group IS NOT NULL THEN
         -- Serialise the group. Converting a cumulative total into a delta requires
         -- reading the current total, so it must not race. This is where the
         -- order-dependence lives: at ingest, under a lock, rather than in the
         -- derivation where it could not be controlled.
-        INSERT INTO card_hold_groups (tenant_id,company_id,group_key)
-        VALUES (p_tenant,p_company,p_group) ON CONFLICT DO NOTHING;
-        SELECT total_minor INTO v_current FROM card_hold_groups
+        INSERT INTO card_hold_groups (tenant_id,company_id,group_key,currency)
+        VALUES (p_tenant,p_company,p_group,p_currency) ON CONFLICT DO NOTHING;
+        SELECT total_minor, currency INTO v_current, v_ccy FROM card_hold_groups
          WHERE tenant_id=p_tenant AND company_id=p_company AND group_key=p_group FOR UPDATE;
+
+        IF v_ccy <> p_currency THEN
+            RAISE EXCEPTION
+              'event in % cannot join group %, which holds %; a hold total is only '
+              'meaningful in one currency -- route to the review queue',
+              p_currency, p_group, v_ccy
+              USING ERRCODE = 'data_exception';
+        END IF;
     END IF;
 
     -- An absolute total that implies a NEGATIVE delta on an increase-only kind means
@@ -214,9 +243,13 @@ BEGIN
        SET total_minor  = total_minor + v_delta,
            open_events  = open_events + 1,
            last_event_seq = last_event_seq + 1,
-           -- over-capture becomes a RECORDED state, not a value the clamp swallows
-           overcaptured_at = CASE WHEN total_minor + v_delta < 0 AND overcaptured_at IS NULL
-                                  THEN now() ELSE overcaptured_at END,
+           -- Over-capture becomes a RECORDED state, not a value the clamp swallows.
+           -- It must NOT latch: the SUM is order-tolerant, so a group whose events
+           -- arrive out of order can dip negative in passing. A latching flag turns
+           -- every such delivery into a spurious over-capture alarm. The flag
+           -- describes the CURRENT total, and a transient dip therefore self-heals.
+           overcaptured_at = CASE WHEN total_minor + v_delta < 0
+                                  THEN COALESCE(overcaptured_at, now()) END,
            updated_at   = now()
      WHERE tenant_id=p_tenant AND company_id=p_company AND group_key=p_group
     RETURNING total_minor INTO v_current;
@@ -244,8 +277,8 @@ BEGIN
 
     UPDATE card_hold_groups
        SET total_minor = v_total, open_events = v_n, updated_at = now(),
-           overcaptured_at = CASE WHEN v_total < 0 AND overcaptured_at IS NULL
-                                  THEN now() ELSE overcaptured_at END
+           overcaptured_at = CASE WHEN v_total < 0
+                                  THEN COALESCE(overcaptured_at, now()) END
      WHERE tenant_id=p_tenant AND group_key=p_group;
     RETURN v_total;
 END $$;
@@ -265,6 +298,18 @@ BEGIN
     INSERT INTO card_auth_event_group (tenant_id,event_id,group_key,method,assigned_by)
     VALUES (p_tenant,p_event,p_new_group,p_method,p_by);
 
+    -- Materialise the destination if it does not exist yet. Splitting a
+    -- mis-grouped event into its OWN group is the routine case, and without this
+    -- the membership row existed while the group did not: held_for_company then
+    -- reported 50.00 where 80.00 was genuinely held. Under-reserving credit is the
+    -- worst failure available here, and card_hold_drift could not see it either --
+    -- the view started FROM card_hold_groups, so a missing group was invisible.
+    INSERT INTO card_hold_groups (tenant_id, company_id, group_key, currency)
+    SELECT e.tenant_id, e.company_id, p_new_group, e.currency
+      FROM card_auth_events e
+     WHERE e.tenant_id = p_tenant AND e.id = p_event
+    ON CONFLICT DO NOTHING;
+
     -- Recompute BOTH affected groups from their events. Without this the
     -- materialised total silently disagrees with the log -- caught by
     -- card_hold_drift the first time it was tried.
@@ -273,21 +318,41 @@ BEGIN
 END $$;
 
 -- held is now an indexed sum over GROUPS, not over events.
-CREATE FUNCTION held_for_company(p_tenant text, p_company text) RETURNS bigint
-LANGUAGE sql STABLE AS $$
+-- Currency is REQUIRED, deliberately without a default. Available credit is the
+-- number the authorization decision is made on; a defaulted currency here is
+-- precisely how a cross-currency total would go unnoticed again.
+CREATE FUNCTION held_for_company(p_tenant text, p_company text, p_currency char(3))
+RETURNS bigint LANGUAGE sql STABLE AS $$
     SELECT COALESCE(SUM(held_minor),0)::bigint FROM card_hold_groups
-     WHERE tenant_id = p_tenant AND company_id = p_company AND held_minor > 0;
+     WHERE tenant_id = p_tenant AND company_id = p_company
+       AND currency = p_currency AND held_minor > 0;
 $$;
 
 -- The alarm: the materialised total must always equal the sum of its events.
+--
+-- FULL OUTER, not LEFT. Starting from card_hold_groups made the alarm blind to
+-- the one failure that actually occurred: live membership rows pointing at a
+-- group that was never materialised. `stored IS NULL` is that case, and it is
+-- reported rather than skipped.
 CREATE VIEW card_hold_drift AS
-SELECT g.tenant_id, g.company_id, g.group_key, g.total_minor AS stored,
-       COALESCE(SUM(e.amount_delta),0) AS recomputed
+WITH live AS (
+    SELECT m.tenant_id, e.company_id, m.group_key,
+           SUM(e.amount_delta) AS recomputed
+      FROM card_auth_event_group m
+      JOIN card_auth_events e ON e.tenant_id = m.tenant_id AND e.id = m.event_id
+     WHERE m.superseded_at IS NULL
+     GROUP BY m.tenant_id, e.company_id, m.group_key
+)
+SELECT COALESCE(g.tenant_id,  l.tenant_id)  AS tenant_id,
+       COALESCE(g.company_id, l.company_id) AS company_id,
+       COALESCE(g.group_key,  l.group_key)  AS group_key,
+       g.total_minor          AS stored,      -- NULL = no materialised group
+       COALESCE(l.recomputed, 0) AS recomputed
 FROM card_hold_groups g
-LEFT JOIN card_auth_event_group m ON m.tenant_id=g.tenant_id
-     AND m.group_key=g.group_key AND m.superseded_at IS NULL
-LEFT JOIN card_auth_events e ON e.tenant_id=m.tenant_id AND e.id=m.event_id
-GROUP BY g.tenant_id, g.company_id, g.group_key, g.total_minor
-HAVING g.total_minor <> COALESCE(SUM(e.amount_delta),0);
+FULL OUTER JOIN live l
+  ON  l.tenant_id  = g.tenant_id
+  AND l.company_id = g.company_id
+  AND l.group_key  = g.group_key
+WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0);
 
 COMMIT;

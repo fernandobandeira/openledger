@@ -78,7 +78,7 @@ a source→destination posting, balanced by construction, so there is no constra
 That is a legitimate design — make the illegal state unrepresentable — but it means the claim
 "debits always equal credits" has no runtime check behind it. Here, entries are independent rows
 carrying a direction, so an unbalanced transaction *is* expressible and is therefore
-[refused by the database](../spikes/002-sqlc-vs-jet/README.md).
+[refused by the database](../tests/negative_controls.sql).
 
 **And the honest part:** this is a personal project. Building a ledger is how you find out what a
 ledger actually is — every correction in these docs came from measuring something we had asserted.
@@ -189,4 +189,5 @@ the whole problem and you are willing to operate a cluster for it, it is the bet
 | [`roadmap.md`](./roadmap.md) | What gets built, in what order, and why that order |
 | [`glossary.md`](./glossary.md) | Every domain term, with a real example |
 | [`reference-product.md`](./reference-product.md) | The embedded card ledger, in full |
+| [`../tests/`](../tests/) | The acceptance suites — the lifecycle they replay, and the breakages they refuse |
 | [`../spikes/`](../spikes/) | Timeboxed investigations — question, answer, and the code that proved it |

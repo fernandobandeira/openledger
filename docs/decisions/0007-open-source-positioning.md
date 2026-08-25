@@ -111,8 +111,11 @@ product layer without the core noticing.
 about what it does, because the naming misleads:
 
 - It **writes** only `card_holds` — never a ledger entry. Nothing is owed until clearing.
-- It **reads** one number from the ledger: the `customer_receivable` balance, a single index
-  lookup (0.018 ms).
+- It **reads** one number from the ledger: the `customer_receivable` balance. Unstriped that is a
+  single index lookup (0.018 ms). **Striped, it is a sum over the stripes** — measured 0.483 ms at
+  1 stripe, 1.747 ms at 16, 4.492 ms at 64. Still trivial against a ~1s deadline, but the read
+  grows with the tuning knob this same ADR recommends, so "one cheap read" is the wrong shape of
+  claim. The coupling is one *logical* read whose cost is a configuration choice.
 
 So the product layer's entire coupling to the ledger is *one read*. A deployment with no cards —
 a marketplace wallet, say — simply does not install layer 3, and nothing in layers 1 or 2 changes.

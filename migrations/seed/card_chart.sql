@@ -17,7 +17,6 @@ INSERT INTO account_types (code,category,normal_balance,description,fs_line,is_p
   ('customer_receivable','asset','debit','what a customer owes us','receivables',false,'per_shard'),
   ('operating_cash','asset','debit','our own bank balance','cash',true,'shared'),
   ('fbo_cash','asset','debit','customer funds held for benefit of','cash',true,'shared'),
-  ('ach_pull_unsettled','asset','debit','collected, inside the return window','other_assets',false,'none'),
   -- the case that proves normal_balance cannot be derived from category
   ('allowance_for_credit_losses','asset','credit','expected losses, contra to receivable','receivables',false,'none'),
   ('due_from_treasury','asset','debit','tenant-side claim on operator treasury','other_assets',false,'shared'),
@@ -26,6 +25,10 @@ INSERT INTO account_types (code,category,normal_balance,description,fs_line,is_p
   ('facility_borrowings','liability','credit','drawn on the warehouse line','borrowings',true,'shared'),
   ('accrued_interest_payable','liability','credit','interest accrued, not paid','payables',false,'shared'),
   ('platform_rev_share_payable','liability','credit','owed to the platform partner','payables',false,'per_shard'),
+  -- ACH-collected cash that can still come back R01. The docs always described this
+  -- as "a matching liability"; it was typed asset/debit, which would have presented a
+  -- NEGATIVE ASSET for the length of the return window. Found by the golden trace.
+  ('ach_pull_returnable','liability','credit','collected by ACH, still inside the return window','payables',false,'per_shard'),
   ('due_to_tenants','liability','credit','operator-side obligation to tenant scopes','payables',false,'shared'),
   ('paid_in_capital','equity','credit','equity funding','equity',false,'none'),
   ('interchange_revenue','revenue','credit','interchange we keep','revenue',false,'none'),
