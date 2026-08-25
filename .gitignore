@@ -35,3 +35,4 @@ vendor/
 
 # Spike codegen output — regenerate with `sqlc generate` in the spike dir
 /spikes/*/gen/
+spike003

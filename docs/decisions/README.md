@@ -14,3 +14,4 @@ Status: `proposed` · `accepted` · `superseded by NNNN` · `rejected`
 | [0004](./0004-event-log.md) | An append-only event log — the idempotency spine | accepted |
 | [0005](./0005-reproducible-as-of.md) | A reproducible as-of cursor | **proposed** — blocks M4 |
 | [0006](./0006-schema-conventions.md) | Schema conventions: naming, snapshot test, FKs, enums | accepted |
+| [0007](./0007-open-source-positioning.md) | Positioning: a general open-source ledger | **proposed** |
