@@ -1,6 +1,6 @@
 # 0005 — A reproducible as-of cursor
 
-**Status:** proposed — blocks roadmap M4
+**Status:** proposed — blocks roadmap M5
 **Date:** 2026-08-25
 
 ## Context
@@ -90,5 +90,5 @@ The watermark has to be built and tested against concurrent writers. Unverified:
    report in that window is pinned behind it.
 3. That the watermark advances past aborted transactions automatically. It should; confirm.
 
-**Do not build M4 on `recorded_at <= :as_of` meanwhile.** It is not reproducible, and code written
+**Do not build M5 on `recorded_at <= :as_of` meanwhile.** It is not reproducible, and code written
 against it will change.

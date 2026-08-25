@@ -120,10 +120,14 @@ product layer without the core noticing.
 **The authorization path is an optional module, not part of the ledger.** It is worth being exact
 about what it does, because the naming misleads:
 
-- It **writes** only `card_holds` — never a ledger entry. Nothing is owed until clearing.
+- It **writes** only the hold event log (`card_auth_events`, per
+  [ADR-0010](./0010-authorization-holds.md)) — never a ledger entry. Nothing is owed until
+  clearing.
 - It **reads** one number from the ledger: the `customer_receivable` balance. Unstriped that is a
-  single index lookup (0.018 ms). **Striped, it is a sum over the stripes** — measured 0.483 ms at
-  1 stripe, 1.747 ms at 16, 4.492 ms at 64. Still trivial against a ~1s deadline, but the read
+  single index lookup (0.018 ms). **Striped, it is a sum over the stripes**, so it grows with the
+  stripe count — the same knob this ADR recommends turning up. *The specific per-stripe timings
+  previously quoted here are struck: they appear nowhere else in the repository and no method was
+  recorded. Striping is not implemented, so there is nothing to measure yet.* Still trivial against a ~1s deadline, but the read
   grows with the tuning knob this same ADR recommends, so "one cheap read" is the wrong shape of
   claim. The coupling is one *logical* read whose cost is a configuration choice.
 
@@ -201,7 +205,7 @@ That is an argument against **distributed** sharding, where cross-shard transact
 expensive. It does not apply to N rows in one Postgres, and an earlier draft leaned on it too
 heavily.
 
-**Take from it anyway:** the two-phase transfer with timeout is a better-factored `card_holds`.
+**Take from it anyway:** the two-phase transfer with timeout is a better-factored hold.
 **Revisit if** a real user sustains thousands of clearings per second *after* striping — a good
 problem that will announce itself, and the core is a narrow enough interface to abstract then.
 
