@@ -172,17 +172,35 @@ entry itself**. Reading it is an index lookup; recomputing it from scratch verif
 there is no second copy that can drift.
 
 ```sql
--- current balance: one index lookup, O(1), no scan, no cache
+-- current balance: one index lookup, no scan, no cache.
+-- tenant_id is not optional -- it leads every index, and without it this
+-- plans as an index scan PLUS a sort.
 SELECT balance_after FROM ledger_entries
-WHERE account_id = :acct
+WHERE tenant_id = :tenant AND account_id = :acct
 ORDER BY account_seq DESC LIMIT 1;
 
--- balance as of any past moment: same lookup, one more predicate.
--- this is what makes lender reporting reproducible.
+-- balance as of a past RECORDING instant. Note the ORDER BY: it must match
+-- ix_entries__asof_recorded, not the balance index.
 SELECT balance_after FROM ledger_entries
-WHERE account_id = :acct AND recorded_at <= :as_of
-ORDER BY account_seq DESC LIMIT 1;
+WHERE tenant_id = :tenant AND account_id = :acct AND recorded_at <= :as_of
+ORDER BY recorded_at DESC, account_seq DESC LIMIT 1;
 ```
+
+**Two corrections, both measured on a 2M-entry account.**
+
+This block previously wrote the second query with `ORDER BY account_seq DESC` and called it *"the
+same lookup, one more predicate"*. It is not. Once `recorded_at` is a range predicate, that ordering
+cannot be served by `(tenant_id, account_id, recorded_at DESC, account_seq DESC)`, so the planner
+walks the balance index backwards discarding rows: **253 ms and 1,439,915 rows removed by filter,
+against 0.066 ms** for the version above. `ix_entries__asof_recorded` exists in `0001` and no query
+in the docs could use it.
+
+It also called this *"what makes lender reporting reproducible"*, which
+[ADR-0005](./decisions/0005-reproducible-as-of.md) says in terms it is **not**: `recorded_at`
+defaults to transaction *start* time and is not monotonic with commit order, so the same as-of query
+re-runs to a different answer. And per [ADR-0003](./decisions/0003-bitemporal-balances.md) this
+answers a *recording*-axis question only — a business-date balance must aggregate over
+`effective_at`, because a backdated entry lands with a later sequence number.
 
 ### Edge cases that decide whether you've built this before
 
@@ -240,12 +258,18 @@ structural: every perimeter account has exactly one external balance that must a
 ### `ledger_transactions` — the unit of atomicity. **Status never mutates.**
 
 ```
-id, idempotency_key UNIQUE, kind,
-status ('pending'|'posted'),
+tenant_id, id,              -- PRIMARY KEY (tenant_id, id)
+event_id,                   -- the event that caused this
+kind, status ('pending'|'posted'),
 effective_at, recorded_at   -- both timestamptz
 resolves_id, reverses_id,   -- a pending txn is resolved by a NEW txn
 external_ref jsonb, metadata
 ```
+
+**Idempotency is not here.** It lives on `ledger_events`, as
+`UNIQUE (tenant_id, idempotency_key)` — because most of the lifecycle (authorizations, declines,
+hold expiry, limit changes) writes no ledger transaction at all, so a key on this table could not
+cover it. See [ADR-0004](./decisions/0004-event-log.md). Every key here leads with `tenant_id`.
 
 Bitemporality is necessary, **not sufficient** — the bug is never in storage, it's at every
 boundary that turns an instant into a bucket. Every `date_trunc`, every `BETWEEN`, every "as of".
@@ -332,21 +356,21 @@ INDEX (company_id) WHERE state = 'open'   -- partial; makes SUM(held) an index s
 
 A hold is **partially consumed**, not open/closed:
 `held = SUM(GREATEST(amount_minor - cleared_minor, 0)) WHERE company_id = ? AND state = 'open'`.
+
+**Superseded.** This whole section describes a mutable `card_holds` row, which
+[ADR-0010](./decisions/0010-authorization-holds.md) replaced with an append-only event log:
+`card_auth_events` + `card_auth_event_group` + `card_hold_groups`, shipped in `migrations/0003` and
+attested by [`tests/card_holds.sql`](../tests/card_holds.sql). It is kept because the *problems* it
+enumerates are the real ones; the schema below is not what was built.
 `GREATEST` clamps over-capture: a $1 fuel auth clearing at $95 goes to 0, not −94.
 
-> ⚠️ **This table is being redesigned.** `auth_id UNIQUE` assumes one authorization is one row —
-> which **rejects an incremental authorization**, the hotel and fuel-pump case this document's own
-> edge-case table lists two sections above. It is also the only mutable table in an otherwise
-> append-only design.
->
-> [Spike 006](../spikes/006-append-only-holds/README.md) replaces it with immutable signed events
-> and a derived hold, where `held = SUM(GREATEST(group_total, 0))` covers increments, partial
-> capture, over-capture, reversal, expiry, clearing-before-auth and forced posts with one formula
-> — and is order-tolerant for free, because `SUM` commutes.
->
-> Not yet adopted: the spike depends on an identifier stable across an authorization and its
-> increments, and this document already warns that network ids *"don't reliably agree across
-> messages."* Under research.
+> ⚠️ **Superseded — this design was replaced.** `auth_id UNIQUE` assumes one authorization is one
+> row, which the domain does not support. [ADR-0010](./decisions/0010-authorization-holds.md)
+> replaced it with an append-only event log: `card_auth_events` (immutable facts),
+> `card_auth_event_group` (revisable grouping, bitemporal), and `card_hold_groups` (the
+> materialised per-group total). Shipped in `migrations/0003` and attested by
+> [`tests/card_holds.sql`](../tests/card_holds.sql). The table below is kept because the problems
+> it lists are real; the schema is not what was built.
 
 Other rails get the same shape: `ach_transfers`, `disputes`, `statements`. The ledger is the
 permanent record; these are what's still in flight.
@@ -393,8 +417,11 @@ Check the equation at any column — after 05: assets `500 + 0`, liabilities `0 
 equity `66 + 9.00 − 2.70`. Both sides 500.
 
 Also in the chart, untouched by a card trace: `fbo_cash`, `customer_wallet`,
-`outbound_transfer_in_transit`, `unapplied_receipts`, `allowance_for_credit_losses`,
-`fee_revenue`, `credit_loss_expense`.
+`allowance_for_credit_losses`, `fee_revenue`, `credit_loss_expense`, `due_from_treasury`,
+`due_to_tenants`, `retained_earnings`.
+
+`outbound_transfer_in_transit` and `unapplied_receipts` were listed here too and are **not in the
+chart** — they belong to a payouts flow that has not been designed.
 
 ### 01 — Authorization
 *Processor · `card_authorization` · SYNCHRONOUS, ~1s deadline*

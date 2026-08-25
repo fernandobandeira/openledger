@@ -36,7 +36,10 @@ failure four times from two migrations.
 
 **3. Keep foreign keys.** Formance has essentially none — nullable back-pointers with no
 referential integrity — which is defensible for an engine chasing unconstrained write throughput.
-It is the wrong trade here, and we keep them on the project's stated correctness priority, NOT on a measurement. Not FK validation, not
+It is the wrong trade here. We keep them on the project's stated correctness priority — and the
+cost is now measured rather than assumed: **~2.8x slower with foreign keys** (227/239/246 ms
+against 78/90/84 ms). An earlier version of this ADR said the cost "was sought and not found",
+which was not true: spike 003 never tested it. Not FK validation, not
 index maintenance, not I/O. The cost Formance dropped FKs to avoid is one we looked for and could
 not find. A general engine has *more* reason to keep them, because integrators will do things we
 never anticipated and a constraint is the only part of the design that survives an unanticipated

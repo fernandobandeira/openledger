@@ -54,8 +54,9 @@ shape — sleep on a timer, then run an activity — as its worked example of wh
 those commands between deploys makes replay non-deterministic. Every deploy during a 7-day hold
 window becomes a versioning exercise. A job row is inert JSON handed to whatever code is current.
 
-**The footprint is disproportionate.** Temporal's default deployment is six services; it needs two
-*additional* databases (persistence and visibility) with their own migrations; `numHistoryShards`
+**The footprint is disproportionate.** Temporal Server is four services (frontend, history, matching, worker); it needs its own
+persistence database with its own migrations, plus a separate visibility store that its docs
+*recommend* for production rather than require; `numHistoryShards`
 is fixed at deploy time and changing it requires a cluster rebuild; minor versions must be upgraded
 sequentially with a schema migration each; and self-hosted Temporal ships no RBAC or audit logging
 — notable for the component driving money-movement timers. Its tested Postgres matrix also stops at
@@ -66,7 +67,7 @@ an actual consumption cost here of about $14 — an OSS user should not have to 
 subscription to get hold expiry.
 
 **Precedent.** Rails 8 made Solid Queue — a database-backed queue — its default, moving *away*
-from Redis, and runs 20M jobs/day at 37signals. Removing the accessory service was worth more than
+from Redis, and runs 20M jobs/day for HEY at 37signals. Removing the accessory service was worth more than
 the specialised backend.
 
 ## The reframe that lowers the bar

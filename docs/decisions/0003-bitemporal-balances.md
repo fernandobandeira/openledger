@@ -27,7 +27,10 @@ is **wrong for business-date questions**, and by a lot:
 Balance as of Jan 25 by running-balance lookup: **180**. The truth: **130**. The backdated Jan 20
 entry has a *higher* sequence number than the Jan 30 entry, so `ORDER BY account_seq DESC LIMIT 1`
 lands on a balance that already includes Jan 30. Re-measured at scale with every entry backdated,
-the lookup was off by **2×**.
+the lookup was off — 180 against a true 130, i.e. **1.38x**, on a three-row example.
+(An earlier draft called this "re-measured at scale, off by 2x". There is no such measurement; the
+three-row example above is the only one. The *direction* of the error is the point and does not
+depend on the magnitude, but the magnitude was invented and is struck.)
 
 That matters because every stated purpose for as-of balances — statements, lender reporting, "as
 of June 30" — is a business-date question.
@@ -86,14 +89,14 @@ recomputation*, which is what Modern Treasury does when a cached balance drifts.
   originally justified by "thousands of rows, not millions". Spike 003 measured the *write* path
   only, and found that the accounts touched by every transaction are the shared ones — which are
   therefore also the accounts accumulating the most entries. The account most likely to be queried
-  "as of last quarter" is precisely the one with the largest scan. **Needs a spike before M4**,
+  "as of last quarter" is precisely the one with the largest scan. **Needs a spike before M5**,
   measuring the aggregate over an account with millions of entries, striped and unstriped.
 - **Reporting code must name its axis explicitly.** An unqualified "as of" in a function signature
   is a support ticket waiting to happen.
-- **Roadmap M4 must test the backdating case above**, not merely the happy path.
+- **Roadmap M5 must test the backdating case above**, not merely the happy path.
 
 ## Blocked on 0005
 
 `recorded_at` defaults to `now()`, which is *transaction start* time, so it is not monotonic with
 commit order — an "as of T" report can return different numbers when re-run.
-[0005](./0005-reproducible-as-of.md) takes that up, and it blocks M4.
+[0005](./0005-reproducible-as-of.md) takes that up, and it blocks M5.
