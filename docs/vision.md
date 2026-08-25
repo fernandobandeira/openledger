@@ -1,13 +1,12 @@
 # openledger
 
-An open-source **double-entry ledger**. Postgres for storage, Go for the service — one binary and
-a database you already know how to run.
+An open-source **double-entry ledger**. Postgres for storage, Go for the service.
 
-The bet is narrow: **most teams that need a real ledger do not need a fast one, but every one of
-them needs a correct one.** Correct means testable things — every cent accounted for, no manual
-fixes, and any number reproducible as of any date, forever. Those properties are cheap to build in
-and painful to retrofit. That is the argument for using a ledger instead of growing a `balances`
-table until it hurts.
+**The whole project is about correctness.** Not throughput, not deployment convenience — those are
+solved problems and the measurements say so. Correctness here means specific, testable claims:
+every cent accounted for, the books provably balanced at every instant, any number reproducible as
+of any date, and no manual fixes ever. Those properties are cheap to design in and painful to
+retrofit.
 
 ## If you have never built a ledger
 
@@ -42,11 +41,48 @@ may be days later, may be for a different amount (tips, fuel pumps), and may nev
 
 The [glossary](./glossary.md) defines the rest of the vocabulary these docs assume.
 
-## Who it is for
+## Why this exists when Formance already does
 
-A small team that needs a ledger and does not want to operate a new class of infrastructure to get
-one. Put it behind RDS or Aurora, get managed backups and point-in-time restore, stop thinking
-about it. That constraint drives more of the design than performance does.
+[Formance](https://github.com/formancehq/ledger) is the closest open-source equivalent, it is
+mature, and it has been run against real money. [Spike 001](../spikes/001-formance/README.md) read
+its source and all 54 of its migrations. **Take it seriously before building anything.**
+
+**What Formance does better, and it is not close:** production scar tissue. Fifty-four migrations
+with names like `27-fix-invalid-pcv` are a record of failures we have not had yet. It ships
+Numscript, a real DSL for posting rules — a problem we have open. It has replication to ClickHouse,
+import/export by replaying its log, and a multi-ledger deployment model. If you need a ledger in
+production this quarter, use Formance.
+
+**Three things it structurally does not do**, each verified in its source rather than inferred:
+
+**1. It has no accounting semantics.** There is no account category and no normal balance anywhere
+in the schema. A balance is `input - output`, so a liability reads negative. Its "chart of
+accounts" is an address *naming grammar*, and the rules type is literally `struct{}`. **You cannot
+get a trial balance or a balance sheet out of Formance without building a mapping layer beside
+it.** Here, accounts are typed, and the accounting equation `A = L + E + (R − X)` is
+[proven to hold at every step](../spikes/004-chart-of-accounts/README.md) of a full card lifecycle.
+
+**2. Its effective-date balance is mutable, and that cost it.** Formance keeps running balances on
+both time axes. The effective-axis one is *not* immutable — a backdated transaction triggers an
+unbounded `UPDATE` of every later row for that account. Their journal table carries
+`fillfactor = 80` purely because of it, and **six migrations exist solely to repair volume data**.
+[ADR-0003](./decisions/0003-bitemporal-balances.md) declines to build that: the running balance is
+immutable and lives on the insertion axis only; business-date balances aggregate on read.
+
+**3. It has no pending state.** No holds, no authorizations, no status — users model a hold by
+moving money to a hold account. For anything card-shaped that is the core of the domain, not a
+detail.
+
+One more worth knowing: **Formance does not enforce that transactions balance.** Its primitive is
+a source→destination posting, balanced by construction, so there is no constraint and no trigger.
+That is a legitimate design — make the illegal state unrepresentable — but it means the claim
+"debits always equal credits" has no runtime check behind it. Here, entries are independent rows
+carrying a direction, so an unbalanced transaction *is* expressible and is therefore
+[refused by the database](../spikes/002-sqlc-vs-jet/README.md).
+
+**And the honest part:** this is a personal project. Building a ledger is how you find out what a
+ledger actually is — every correction in these docs came from measuring something we had asserted.
+That is a sufficient reason on its own, and dressing it up as a market gap would be worse.
 
 ## The core, and the product built on it
 
