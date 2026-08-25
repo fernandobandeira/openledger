@@ -30,6 +30,22 @@ Three findings shape the decision:
    concurrent writers and then *declines*.
 3. **The levers interact, and one of them was mismeasured.** See "Scaling shape".
 
+## Amendment — correctness is the point, not the deployment pitch
+
+This ADR was originally framed around "a small team can drop this into AWS." That framing has been
+demoted. It is a real property and worth keeping, but it is not why the project exists and it
+should not drive design arguments.
+
+**The project's purpose is correctness**: provably balanced books, reproducible as-of numbers, and
+invariants enforced by the database rather than by discipline. Where a deployment argument and a
+correctness argument point in different directions, correctness wins. Nothing below changes as a
+*decision* — Postgres, striping, per-tenant house accounts and the TigerBeetle rejection all stand
+on their own evidence — but several of them were *argued* on deployment grounds, and those
+arguments are the weaker half.
+
+See [`vision.md`](../vision.md#why-this-exists-when-formance-already-does) for why this exists
+alongside Formance, which is the comparison that actually matters.
+
 ## Decision
 
 **Reframe as a general ledger. Keep Postgres. Change the argument, not the stack.**
