@@ -106,6 +106,16 @@ CREATE TABLE ledger_transactions (
     reverses_id     uuid,
     external_ref    jsonb NOT NULL DEFAULT '{}'::jsonb,
     metadata        jsonb NOT NULL DEFAULT '{}'::jsonb,
+    -- The database transaction that created this row. Entries may only be added
+    -- by that same transaction (ck_entries__sealed below).
+    --
+    -- Without this, append-only protected the ENTRY and not the JOURNAL: the app
+    -- role, holding nothing but its ordinary INSERT grant, could add a balanced,
+    -- correctly-dated, correctly-sequenced pair of legs to a transaction committed
+    -- and reported months earlier. February revenue went from 500.00 to 1,166.00
+    -- with the drift view, the accounting equation and the balance sheet all
+    -- green, because every constraint in this file was satisfied.
+    xact_id         bigint NOT NULL DEFAULT pg_current_xact_id()::text::bigint,
 
     CONSTRAINT pk_txn PRIMARY KEY (tenant_id, id),
     -- the target of fk_entries__txn_effective, below
@@ -215,14 +225,43 @@ CREATE TABLE ledger_account_balances (
     updated_at timestamptz NOT NULL DEFAULT now(),
 
     CONSTRAINT pk_balances PRIMARY KEY (tenant_id, account_id, currency),
-    CONSTRAINT fk_balances__account FOREIGN KEY (tenant_id, account_id)
-        REFERENCES ledger_accounts (tenant_id, id),
-    CONSTRAINT ck_balances__non_negative CHECK (input >= 0 AND output >= 0)
+    -- currency is IN the foreign key, as it is for entries. Without it the cache
+    -- -- the copy the hot path reads, and the only one the app role may write --
+    -- accepted a second row for the same account under 'usd' or 'JPY', splitting
+    -- one account's balance across two rows.
+    CONSTRAINT fk_balances__account FOREIGN KEY (tenant_id, account_id, currency)
+        REFERENCES ledger_accounts (tenant_id, id, currency),
+    CONSTRAINT ck_balances__non_negative CHECK (input >= 0 AND output >= 0),
+    CONSTRAINT ck_balances__currency_iso CHECK (currency ~ '^[A-Z]{3}$')
 );
 
 -- ------------------------------------------------------------ the invariant
 -- Balanced per currency, enforced by the DATABASE, deferred to COMMIT so a
 -- transaction can be built up entry by entry.
+
+-- A transaction's entry set is closed when its creating transaction commits.
+CREATE FUNCTION assert_entry_seals() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE v_xact bigint;
+BEGIN
+    SELECT xact_id INTO v_xact FROM ledger_transactions
+     WHERE tenant_id = NEW.tenant_id AND id = NEW.transaction_id;
+    -- If there is no such transaction, say nothing: fk_entries__txn is the right
+    -- error for that, and it is the one that names the cross-tenant guard.
+    IF v_xact IS NOT NULL
+       AND v_xact IS DISTINCT FROM pg_current_xact_id()::text::bigint THEN
+        RAISE EXCEPTION
+            'transaction % is already committed; its entries are sealed. Correct it '
+            'with a reversing transaction, not by appending legs', NEW.transaction_id
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER ck_entries__sealed
+    BEFORE INSERT ON ledger_entries
+    FOR EACH ROW EXECUTE FUNCTION assert_entry_seals();
+ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ck_entries__sealed;
 
 CREATE FUNCTION assert_transaction_balances() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -359,8 +398,14 @@ WITH j AS (
      ORDER BY tenant_id, account_id, currency, account_seq
 ), latest AS (
     SELECT DISTINCT ON (tenant_id, account_id, currency)
-           tenant_id, account_id, currency, recomputed AS journal_total
+           tenant_id, account_id, currency, recomputed AS journal_total,
+           account_seq AS journal_last_seq
       FROM j ORDER BY tenant_id, account_id, currency, account_seq DESC
+), gross AS (
+    SELECT e.tenant_id, e.account_id, e.currency,
+           COALESCE(SUM(e.amount_minor) FILTER (WHERE e.direction='debit'),0)  AS journal_debits,
+           COALESCE(SUM(e.amount_minor) FILTER (WHERE e.direction='credit'),0) AS journal_credits
+      FROM ledger_entries e GROUP BY e.tenant_id, e.account_id, e.currency
 )
 SELECT COALESCE(l.tenant_id,  b.tenant_id)  AS tenant_id,
        COALESCE(l.account_id, b.account_id) AS account_id,
@@ -368,15 +413,22 @@ SELECT COALESCE(l.tenant_id,  b.tenant_id)  AS tenant_id,
        fb.account_seq  AS first_bad_seq,   -- NULL = the running balances agree
        fb.stored,
        fb.recomputed,
-       l.journal_total,
+       l.journal_total, l.journal_last_seq, gr.journal_debits, gr.journal_credits,
        (b.input - b.output) AS cached,     -- ledger_account_balances
        CASE WHEN fb.account_seq IS NOT NULL THEN 'running balance diverges at seq '
                                                  || fb.account_seq
             WHEN b.account_id IS NULL       THEN 'no cached balance row'
             WHEN l.account_id IS NULL       THEN 'cached balance with no entries'
+            WHEN b.last_seq IS DISTINCT FROM l.journal_last_seq
+                                            THEN 'cached last_seq disagrees with the journal'
+            WHEN b.input IS DISTINCT FROM gr.journal_debits
+              OR b.output IS DISTINCT FROM gr.journal_credits
+                                            THEN 'cached gross turnover disagrees with the journal'
             ELSE 'cached balance disagrees with the journal'
        END AS problem
 FROM latest l
+LEFT JOIN gross gr ON gr.tenant_id=l.tenant_id AND gr.account_id=l.account_id
+                  AND gr.currency=l.currency
 FULL OUTER JOIN ledger_account_balances b
   ON b.tenant_id = l.tenant_id AND b.account_id = l.account_id AND b.currency = l.currency
 LEFT JOIN first_bad fb
@@ -384,6 +436,16 @@ LEFT JOIN first_bad fb
  AND fb.account_id = COALESCE(l.account_id, b.account_id)
  AND fb.currency   = COALESCE(l.currency, b.currency)
 WHERE fb.account_seq IS NOT NULL
-   OR (b.input - b.output) IS DISTINCT FROM l.journal_total;
+   OR (b.input - b.output) IS DISTINCT FROM l.journal_total
+   -- input and output are checked INDIVIDUALLY, not just their difference. The
+   -- reason they are stored separately is that gross turnover is then free -- and
+   -- gross turnover was the one thing nothing validated: adding 9,999,999.99 to
+   -- both sides left the difference intact and the alarm silent.
+   OR b.input  IS DISTINCT FROM gr.journal_debits
+   OR b.output IS DISTINCT FROM gr.journal_credits
+   -- last_seq drives the next account_seq. Poisoned downward it is a permanent
+   -- per-account denial of service (every later posting hits uq_entries__account_seq);
+   -- poisoned upward it silently corrupts balance_after. It was outside the alarm.
+   OR b.last_seq IS DISTINCT FROM l.journal_last_seq;
 
 COMMIT;

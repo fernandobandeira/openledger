@@ -1,26 +1,36 @@
 -- Reference chart of accounts for the card product. SEED DATA, not engine:
 -- a marketplace or wallet deployment ships a different one against the same core.
-INSERT INTO fs_lines (code, caption, statement, sort_order) VALUES
-  ('cash','Cash and cash equivalents','balance_sheet',100),
-  ('receivables','Accounts receivable','balance_sheet',200),
-  ('other_assets','Other assets','balance_sheet',300),
-  ('payables','Accounts payable and accrued','balance_sheet',400),
-  ('customer_funds','Customer funds payable','balance_sheet',500),
-  ('borrowings','Borrowings','balance_sheet',600),
-  ('equity','Shareholders equity','balance_sheet',700),
+INSERT INTO fs_lines (code, caption, statement, side, sort_order) VALUES
+  ('cash','Cash and cash equivalents','balance_sheet','asset',100),
+  -- Customer funds held FBO are RESTRICTED and must not share a caption with the
+  -- operator's own liquidity: Reg S-X 5-02.1 requires separate disclosure, and
+  -- ASC 230-10-45-4 (as amended by ASU 2016-18) requires restricted cash to be
+  -- identified. Mapped to 'cash', unrestricted liquidity was overstated by the
+  -- entire float -- the number a lender and a covenant both read.
+  ('restricted_cash','Restricted cash','balance_sheet','asset',150),
+  ('receivables','Accounts receivable','balance_sheet','asset',200),
+  ('other_assets','Other assets','balance_sheet','asset',300),
+  ('payables','Accounts payable and accrued','balance_sheet','liability_equity',400),
+  ('customer_funds','Customer funds payable','balance_sheet','liability_equity',500),
+  ('borrowings','Borrowings','balance_sheet','liability_equity',600),
+  ('equity','Shareholders equity','balance_sheet','liability_equity',700),
   -- Where a close would put prior periods' earnings. Nothing writes to it: there
   -- is no closing process yet, so un-closed earnings appear as the derived
   -- `current_year_earnings` line in the balance_sheet view instead.
-  ('retained_earnings','Retained earnings','balance_sheet',800),
-  ('revenue','Revenue','income_statement',100),
-  ('cost_of_revenue','Cost of revenue','income_statement',200),
-  ('interest','Interest expense','income_statement',300)
+  ('retained_earnings','Retained earnings','balance_sheet','liability_equity',800),
+  ('revenue','Revenue','income_statement','credit',100),
+  ('cost_of_revenue','Cost of revenue','income_statement','debit',200),
+  -- For a lender, provision for credit losses is its own caption on the face of
+  -- the income statement, not a component of cost of revenue. Buried there, credit
+  -- performance is invisible.
+  ('credit_losses','Provision for credit losses','income_statement','debit',250),
+  ('interest','Interest expense','income_statement','debit',300)
 ON CONFLICT DO NOTHING;
 
 INSERT INTO account_types (code,category,normal_balance,description,fs_line,is_perimeter,counterparty_scope) VALUES
   ('customer_receivable','asset','debit','what a customer owes us','receivables',false,'per_shard'),
   ('operating_cash','asset','debit','our own bank balance','cash',true,'shared'),
-  ('fbo_cash','asset','debit','customer funds held for benefit of','cash',true,'shared'),
+  ('fbo_cash','asset','debit','customer funds held for benefit of','restricted_cash',true,'shared'),
   -- the case that proves normal_balance cannot be derived from category
   ('allowance_for_credit_losses','asset','credit','expected losses, contra to receivable','receivables',false,'none'),
   ('due_from_treasury','asset','debit','tenant-side claim on operator treasury','other_assets',false,'shared'),
@@ -33,7 +43,15 @@ INSERT INTO account_types (code,category,normal_balance,description,fs_line,is_p
   -- as "a matching liability"; it was typed asset/debit, which would have presented a
   -- NEGATIVE ASSET for the length of the return window. Found by the golden trace.
   ('ach_pull_returnable','liability','credit','collected by ACH, still inside the return window','payables',false,'per_shard'),
-  ('due_to_tenants','liability','credit','operator-side obligation to tenant scopes','payables',false,'shared'),
+  -- per_shard, NOT shared. The operator holds ONE due_to_tenants account per
+  -- scope, so opposite-sign positions against DIFFERENT tenants collapse into one
+  -- number: owing t1 425.00 while t2 owes 425.00 printed a payables line of ZERO.
+  -- IAS 32.42 and ASC 210-20-45-1 permit offset only between the SAME two parties
+  -- with an enforceable right of setoff; t1 and t2 are not the same party.
+  -- NOTE: this field is currently declarative -- no view or function reads it, and
+  -- uq_accounts__house (tenant_id, purpose, currency) makes a per-counterparty
+  -- split impossible. Recorded as open in ADR-0009.
+  ('due_to_tenants','liability','credit','operator-side obligation to tenant scopes','payables',false,'per_shard'),
   ('paid_in_capital','equity','credit','equity funding','equity',false,'none'),
   -- prior periods' accumulated earnings. Unused until a close exists.
   ('retained_earnings','equity','credit','accumulated earnings of prior periods','retained_earnings',false,'none'),
@@ -41,5 +59,5 @@ INSERT INTO account_types (code,category,normal_balance,description,fs_line,is_p
   ('fee_revenue','revenue','credit','fees charged to customers','revenue',false,'none'),
   ('interest_expense','expense','debit','interest on the facility','interest',false,'none'),
   ('platform_rev_share_expense','expense','debit','interchange shared with the platform','cost_of_revenue',false,'none'),
-  ('credit_loss_expense','expense','debit','realised and provisioned losses','cost_of_revenue',false,'none')
+  ('credit_loss_expense','expense','debit','realised and provisioned losses','credit_losses',false,'none')
 ON CONFLICT DO NOTHING;

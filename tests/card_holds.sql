@@ -459,6 +459,85 @@ SELECT must_fail('a group holding two currencies', $q$
     SELECT no_drift('two currencies');
 $q$, 'disagrees with the event log');
 
+-- =========================================================== more refusals
+--
+-- Each of these was a live under-reservation found by adversarial review, and
+-- none was reachable from the suite as it stood: `advice` appeared nowhere in any
+-- test file, `expiry_reversal` only inside a sign-CHECK refusal, and `is_total`
+-- was never passed with a decrease-side kind.
+
+-- A cumulative total restates the AUTHORIZED subtotal. Applied to a clearing it
+-- computed `amount - authorized_minor` against a base the message has nothing to
+-- do with: a 100.00 authorization with a cumulative-cleared field of 30.00 held
+-- 30.00 where 70.00 was live, with no drift, because total_minor genuinely
+-- equalled the sum of the wrongly-derived deltas.
+SELECT must_fail('a clearing carrying a cumulative total', $q$
+    SELECT record_auth_event('t1','ct_clr','g_late','acme','card_6',
+            'clearing', 3000,'USD',true, now());
+$q$, 'only meaningful on an authorization');
+
+-- Expiry is a flag. The enum and the sign CHECK both admitted it as an EVENT
+-- carrying the remainder, which double-releases: once in the log, once in the
+-- flag, and a later re-open restores only what the flag suppressed.
+SELECT must_fail('an expiry EVENT alongside the expiry flag', $q$
+    SELECT record_auth_event('t1','ev_exp','g_late','acme','card_6',
+            'expiry', 100,'USD',false, now());
+$q$, 'expiry is a flag');
+
+-- The conversion needs the group whose subtotal it restates.
+SELECT must_fail('a cumulative total on an unmatched event', $q$
+    SELECT record_auth_event('t1','ct_orphan', NULL,'acme','card_6',
+            'authorization', 5000,'USD',true, now());
+$q$, 'unmatched event');
+
+-- `advice` is an increase-side kind everywhere -- it sets the convention and moves
+-- authorized_minor -- but was missing from the un-expire list, so an advice after
+-- expiry added exposure that held_for_company reported as 0 while
+-- record_auth_event returned the true total to its own caller. The two lists must
+-- be one list.
+SELECT record_auth_event('t1','adv_auth','g_advice','zeta','card_a',
+        'authorization', 30000,'USD',false, now());
+SELECT expire_hold_group('t1','zeta','g_advice');
+SELECT eq('expired', held_for_company('t1','zeta','USD'), 0);
+SELECT record_auth_event('t1','adv_ev','g_advice','zeta','card_a',
+        'advice', 5000,'USD',false, now());
+SELECT eq('an advice after expiry re-opens the hold too',
+          held_for_company('t1','zeta','USD'), 35000);
+
+-- A late clearing on an expired group is NORMAL and must not alarm; exposure
+-- added after a release must.
+SELECT expire_hold_group('t1','zeta','g_advice');
+SELECT record_auth_event('t1','adv_clr','g_advice','zeta','card_a',
+        'clearing', 1000,'USD',false, now());
+SELECT no_drift('a late clearing on an expired group');
+
+-- The repair must repair the state the alarm was extended to detect. It locked
+-- nothing when the row was absent and its UPDATE matched nothing, so it RETURNED
+-- the correct total while changing nothing -- the alarm fired, the operator ran
+-- the repair, and the drift stayed.
+SELECT record_auth_event('t1','rep_a','g_repair','acme','card_r',
+        'authorization', 8000,'USD',false, now());
+DELETE FROM card_hold_groups WHERE tenant_id='t1' AND group_key='g_repair';
+SELECT recompute_hold_group('t1','acme','g_repair');
+SELECT eq('a deleted group row is rebuilt from the log',
+          (SELECT total_minor FROM card_hold_groups WHERE group_key='g_repair'), 8000);
+SELECT no_drift('repairing a missing group');
+
+-- Re-delivery WITH better matching information is the case the unmatched queue
+-- exists to serve, and it was the one path that could never take effect: the
+-- event was already stored, so ingest returned before writing the assignment.
+SELECT record_auth_event('t1','redeliv', NULL,'acme','card_d',
+        'authorization', 7000,'USD',false, now());
+SELECT eq('unmatched on first delivery',
+          (SELECT count(*) FROM card_auth_unmatched WHERE processor_msg_id='redeliv'), 1);
+SELECT record_auth_event('t1','redeliv','g_redeliv','acme','card_d',
+        'authorization', 7000,'USD',false, now());
+SELECT eq('re-delivery with a group attaches it',
+          (SELECT total_minor FROM card_hold_groups WHERE group_key='g_redeliv'), 7000);
+SELECT eq('...and it leaves the unmatched queue',
+          (SELECT count(*) FROM card_auth_unmatched WHERE processor_msg_id='redeliv'), 0);
+SELECT no_drift('re-delivery with better matching');
+
 DO $$ BEGIN RAISE NOTICE 'ok  card hold flow attested'; END $$;
 
 ROLLBACK;
