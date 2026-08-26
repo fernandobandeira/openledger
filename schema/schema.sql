@@ -156,6 +156,21 @@ CREATE TABLE account_types (
     -- changes. The guard still bites in the direction it was built for: an expense
     -- type still cannot report under Revenue, and a revenue type still cannot
     -- report under a cost line.
+    --
+    -- AND IT CLOSED A SECOND SILENT CASE nobody had found. Under the old rule an
+    -- expense type with a CREDIT normal balance -- a vendor rebate, a supplier
+    -- allowance -- derived side='credit', and `revenue` was the ONLY line the key
+    -- then admitted for it. A 40.00 rebate booked that way printed revenue 290.00
+    -- against a true 250.00, cost of revenue 100.00 against 60.00, net income
+    -- CORRECT at 190.00, trial balance green. Same signature as the contra-revenue
+    -- bug, opposite direction, and it inflated revenue directly. Now refused.
+    --
+    -- The change is eight cells of the 130-cell cross-product and every
+    -- asset/liability/equity cell is identical, so the balance-sheet half is
+    -- provably untouched. A property falls out: every income-statement line is now
+    -- category-homogeneous, which matters because income_statement groups by
+    -- fs_line WITHOUT category and signs by the line's side -- a line hosting both
+    -- categories is exactly the state that made that netting meaningless.
     fs_side        text GENERATED ALWAYS AS (
         CASE WHEN category = 'revenue' THEN 'credit'
              WHEN category = 'expense' THEN 'debit'
@@ -745,7 +760,7 @@ FROM ledger_entries e
 JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
                           AND x.status = 'posted'
 JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
-                      AND a.currency  = e.currency
+                          AND a.currency  = e.currency
 JOIN account_types   t ON t.code = a.purpose
 GROUP BY a.tenant_id, a.id, a.owner_id, a.purpose, t.category, t.normal_balance, e.currency;
 
@@ -761,7 +776,7 @@ WITH dp AS (
     JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
                               AND x.status = 'posted'
     JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
-                      AND a.currency  = e.currency
+                          AND a.currency  = e.currency
     JOIN account_types   t ON t.code = a.purpose
     GROUP BY e.tenant_id, e.currency, t.fs_line
 ), scopes AS (SELECT DISTINCT tenant_id, currency FROM ledger_accounts)
@@ -790,12 +805,23 @@ ORDER BY tenant_id, currency, sort_order;
 -- CURRENCY IS PART OF THE ACCOUNT IDENTITY, so every join above re-asserts it.
 -- fk_entries__account is (tenant_id, account_id, currency); on the replication
 -- apply path that key is skipped, and an entry then existed in a currency its
--- account does not hold. trial_balance joined on (tenant_id, id) alone and
--- reported it; balance_sheet and income_statement derive their scopes FROM
--- ledger_accounts, so they could not see it at all. 50,000.00 EUR of balanced,
--- permanently unremovable entries appeared in one report and neither statement.
--- Joining on the currency too makes the three agree: the orphan is now absent
--- from all of them, which is a visible zero rather than a divergence.
+-- account does not hold. Joining on (tenant_id, id) alone gave TWO failures, and
+-- the second is the worse one:
+--
+--   * The tenant holds NO account in the orphan's currency. trial_balance
+--     reported it; balance_sheet and income_statement derive their scopes FROM
+--     ledger_accounts, so they could not see it. 50,000.00 EUR of balanced,
+--     permanently unremovable entries in one report and neither statement.
+--   * The tenant ALREADY holds accounts in that currency -- an ordinary
+--     multi-currency book. Then the scopes CTE admits it and ALL THREE REPORTS
+--     AGREE ON THE INFLATED NUMBER: revenue 250.06 printed as 50,250.06. There
+--     is no divergence to notice. Silent everywhere.
+--
+-- Currency is functionally dependent on (tenant_id, id) via pk_accounts, so the
+-- added predicate is a pure filter and cannot fan out -- verified, all three
+-- reports byte-identical on a legitimate 2-tenant 3-currency book. It also makes
+-- `dp` a subset of `scopes` structurally rather than by accident. What it does
+-- not do is surface the orphan: nothing compares the journal to the reports.
 --
 -- trial_balance starts FROM ledger_entries and
 -- enumerate INWARD, so an account with no entries is simply absent. This view is
@@ -816,7 +842,7 @@ WITH dp AS (
     JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
                               AND x.status = 'posted'
     JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
-                      AND a.currency  = e.currency
+                          AND a.currency  = e.currency
     JOIN account_types   t ON t.code = a.purpose
     GROUP BY e.tenant_id, e.currency, t.fs_line, t.category
 ), scopes AS (
