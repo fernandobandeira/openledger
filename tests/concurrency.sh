@@ -128,6 +128,21 @@ chk "...with exactly one racing conversion having moved anything" \
     "$(q "select count(*) from card_auth_events e join card_auth_event_group m on m.tenant_id=e.tenant_id and m.event_id=e.id where e.tenant_id='cc' and m.group_key='GT' and e.amount_delta > 0 and e.processor_msg_id <> 'tot_seed'")" 1
 chk "...with no drift" "$(q "select count(*) from card_hold_drift where tenant_id='cc'")" 0
 
+# ---------------------------------------------------------------- expiry idempotence
+# `expire_hold_group` carries `AND expired_at IS NULL`, and dropping it is
+# invisible inside a single transaction, because now() is transaction-start time.
+# Across two sessions it is not: a sweep that runs every minute would otherwise
+# reset the release time and the snapshot the post-expiry alarm measures against,
+# blinding it to everything added in between.
+psql "$URL" -q -v ON_ERROR_STOP=1 -c \
+  "DO \$d\$ BEGIN PERFORM record_auth_event('cc','ex_a','GEX','co1','c1','authorization',2000,'USD',false,now()); END \$d\$;"
+psql "$URL" -q -c "SELECT expire_hold_group('cc','co1','GEX')" -o /dev/null
+first_exp=$(q "select expired_at from card_hold_groups where tenant_id='cc' and group_key='GEX'")
+psql "$URL" -q -c "SELECT expire_hold_group('cc','co1','GEX')" -o /dev/null
+chk "re-expiring in a later transaction does not move the release time" \
+    "$(q "select expired_at from card_hold_groups where tenant_id='cc' and group_key='GEX'")" \
+    "$first_exp"
+
 # ---------------------------------------------------------------- workload C
 # Re-grouping races. All three of these were LIVE defects found by adversarial
 # review, and none is reachable from a single session.

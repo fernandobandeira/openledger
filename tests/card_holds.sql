@@ -683,6 +683,101 @@ SELECT eq('a missing group is materialised and repaired, not just returned',
           (SELECT total_minor FROM card_hold_groups WHERE group_key='g_missing'), 8000);
 SELECT no_drift('repairing a missing group');
 
+-- =========================================================== the alarm's branches
+--
+-- card_hold_drift has four branches and only two were tested. The control labelled
+-- "a group holding two currencies" was catching on the TOTAL-MISMATCH branch, not
+-- the currency one: its EUR event carried a non-zero delta, and its group row
+-- belonged to a different company, so the currency clause -- which is qualified
+-- `AND e.company_id = g.company_id` -- never evaluated at all.
+
+-- the CURRENCY branch, in isolation: same company, zero delta, so the totals agree
+-- and only a currency disagreement can fire.
+SELECT must_fail('a group holding two currencies, with totals agreeing', $q$
+    SELECT record_auth_event('t1','cb_usd','g_ccy','acme','card_c',
+            'authorization', 5000,'USD',false, now());
+    INSERT INTO card_auth_events (tenant_id,processor_msg_id,company_id,card_id,kind,
+                                  amount_delta,currency,raw_is_total,occurred_at)
+    VALUES ('t1','cb_eur0','acme','card_c','advice', 0,'EUR',false, now());
+    INSERT INTO card_auth_event_group (tenant_id,event_id,group_key,method,assigned_by)
+    SELECT 't1', id, 'g_ccy', 'manual', 'test'
+      FROM card_auth_events WHERE tenant_id='t1' AND processor_msg_id='cb_eur0';
+    DO $d$ BEGIN
+        IF EXISTS (SELECT 1 FROM card_hold_drift WHERE group_key='g_ccy') THEN
+            RAISE EXCEPTION 'CURRENCY DRIFT: %',
+                (SELECT stored||'/'||recomputed FROM card_hold_drift WHERE group_key='g_ccy');
+        END IF;
+    END $d$;
+$q$, 'currency drift');
+
+-- the POST-EXPIRY branch, as a POSITIVE control. It was only ever asserted by
+-- `no_drift(...) = 0`, an assertion of ABSENCE, which passes trivially when the
+-- branch is deleted.
+SELECT must_fail('exposure raised after a release', $q$
+    SELECT record_auth_event('t1','pe_auth','g_pe','acme','card_p',
+            'authorization', 6000,'USD',false, now());
+    SELECT expire_hold_group('t1','acme','g_pe');
+    UPDATE card_hold_groups SET authorized_minor = authorized_minor + 100
+     WHERE tenant_id='t1' AND group_key='g_pe';
+    DO $d$ BEGIN
+        IF EXISTS (SELECT 1 FROM card_hold_drift WHERE group_key='g_pe') THEN
+            RAISE EXCEPTION 'POST-EXPIRY DRIFT detected';
+        END IF;
+    END $d$;
+$q$, 'post-expiry drift');
+
+-- =========================================================== expire_hold_group
+--
+-- Three mutations survived: re-expiring an already-expired group, dropping its
+-- tenant filter (cross-tenant expiry), and dropping the snapshot columns the
+-- post-expiry alarm keys on.
+
+SELECT record_auth_event('t1','ex1','g_ex1','acme','card_e1',
+        'authorization', 9000,'USD',false, now());
+-- a tenant of its own: t2 already carries a hold from the multiplicities block
+SELECT record_auth_event('t3','ex2','g_ex1','acme','card_e2',
+        'authorization', 3000,'USD',false, now());
+SELECT expire_hold_group('t1','acme','g_ex1');
+SELECT eq('expiring in one tenant leaves the other alone',
+          held_for_company('t3','acme','USD'), 3000);
+SELECT eq('...and snapshots the subtotal the alarm keys on',
+          (SELECT expired_authorized FROM card_hold_groups
+            WHERE tenant_id='t1' AND group_key='g_ex1'), 9000);
+SELECT eq('...and the total',
+          (SELECT expired_total FROM card_hold_groups
+            WHERE tenant_id='t1' AND group_key='g_ex1'), 9000);
+
+-- Expiry is idempotent: a second call must not move the release time or the
+-- snapshot it took. "Exposure added since the release" is measured against both,
+-- so a re-expiry that resets them blinds the alarm to everything in between --
+-- and a sweep that runs every minute would reset them every minute.
+-- NOT ASSERTED HERE, deliberately. This whole file is one transaction and
+-- expire_hold_group stamps now(), which is transaction-start time, so a second
+-- call inside it is indistinguishable from the first whether the guard is present
+-- or not -- an assertion here would pass either way. It is asserted in
+-- tests/concurrency.sh, which has real sessions and real clock time.
+
+-- =========================================================== recompute fidelity
+--
+-- The repair was asserted only on total_minor, so it could recompute the
+-- authorized subtotal over ALL kinds, drop the LEAST on the low-water mark, or
+-- zero open_events, with the suite green.
+SELECT record_auth_event('t1','rf_auth','g_rf','acme','card_rf',
+        'authorization', 10000,'USD',false, now());
+SELECT record_auth_event('t1','rf_clr','g_rf','acme','card_rf',
+        'clearing', 12000,'USD',false, now());
+SELECT eq('over-captured: the low-water mark records it',
+          (SELECT low_water_minor FROM card_hold_groups WHERE group_key='g_rf'), -2000);
+SELECT record_auth_event('t1','rf_more','g_rf','acme','card_rf',
+        'authorization', 5000,'USD',false, now());
+SELECT recompute_hold_group('t1','acme','g_rf');
+SELECT eq('the repair keeps the authorized subtotal to increase-side kinds',
+          (SELECT authorized_minor FROM card_hold_groups WHERE group_key='g_rf'), 15000);
+SELECT eq('...preserves the low-water mark rather than overwriting it',
+          (SELECT low_water_minor FROM card_hold_groups WHERE group_key='g_rf'), -2000);
+SELECT eq('...and counts the live events',
+          (SELECT open_events FROM card_hold_groups WHERE group_key='g_rf'), 3);
+
 DO $$ BEGIN RAISE NOTICE 'ok  card hold flow attested'; END $$;
 
 ROLLBACK;
