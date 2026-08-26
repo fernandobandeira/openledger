@@ -52,7 +52,7 @@ chosen on measured headroom and a known bottleneck, not on an assumption.
 
 **Formance reached the same "no procedural logic in the database" position, expensively.** Their
 v1 put the ledger *in* plpgsql — triggers cascading from a log table into transactions, moves and
-balances. Their migration 37 drops roughly 26 stored functions and moves all of it into Go. Note
+balances. Their migration 37 drops 27 stored functions and moves all of it into Go. Note
 what they *kept*: the constraints. It is procedural logic they reversed, not database-enforced
 correctness.
 

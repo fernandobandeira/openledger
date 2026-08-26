@@ -33,8 +33,10 @@ put it behind a feature flag that's off in their own minimal configuration.
 payments, because a clearing carries the network's business date. On the **effective** axis a
 backdated entry invalidates every later running balance, so their trigger runs an unbounded
 `UPDATE … WHERE effective_date > new.effective_date`. Migration 10 sets `fillfactor = 80` on the
-journal purely because it became UPDATE-heavy, and **six migrations exist solely to repair volume
-data.**
+journal purely because it became UPDATE-heavy, Six migrations touch volume/pcv aggregation
+afterwards — **three of them repairing data** (19, 20, 28), two replacing functions, and one
+(`27-fix-invalid-pcv`) a no-op stub. An earlier version of this line said all six "exist solely to
+repair volume data"; fetched at the pinned commit, that is not what they do.
 
 **Our `balance_after` is their immutable one.** It is ordered by `account_seq`, assigned on
 insertion, so a backdated entry gets the *next* sequence number and its own balance; nothing
@@ -135,7 +137,7 @@ Applied to [`spikes/002-sqlc-vs-jet/schema.sql`](../002-sqlc-vs-jet/schema.sql) 
    difference as the norm, is our core domain. Corollary worth copying: because they have no partial
    state they have **no partial reversal** — corrections are ordinary new transactions. Right model;
    keep our `status`, adopt their conclusion.
-3. **Do not put ledger logic in plpgsql.** Migration 37 is the demolition of their v1: it drops ~26
+3. **Do not put ledger logic in plpgsql.** Migration 37 is the demolition of their v1: it drops **27**
    stored functions including `handle_log()`, `insert_transaction()`, `insert_move()`. The
    trigger-cascade design was ripped out and moved into Go. Keep logic in Go; the DB does
    constraints and locks.

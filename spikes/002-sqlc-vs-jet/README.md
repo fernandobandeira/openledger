@@ -49,7 +49,7 @@ Both objections that motivated go-jet dissolved on measurement:
 # The evidence
 
 Run against a real database, not read from docs. sqlc v1.31.1, pgx/v5, Postgres 18.6. The schema
-deliberately includes 9 enums, `int[]`, `text[]`, `jsonb`, `bigint` money, two partial unique
+deliberately includes 9 enums, `int[]`, `text[]`, `jsonb`, `bigint` money, four partial unique
 indexes, and a deferred constraint trigger.
 
 ## What established the driver-stack fork

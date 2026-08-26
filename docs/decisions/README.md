@@ -38,8 +38,11 @@ here, so the ADRs don't each stop to re-explain them.
 
 No decision may trade these away. They are what makes the numbers trustworthy:
 
-- **Append-only.** No `UPDATE`, no `DELETE` on entries — enforced by revoking the grants, not by
-  discipline.
+- **Append-only.** No `UPDATE`, no `DELETE`, no `TRUNCATE` on entries — enforced by triggers that
+  refuse the statement outright, not by discipline and **not by the grants**. A `REVOKE` is a
+  point-in-time change to a privilege; one `GRANT ALL` undoes it. This line said "enforced by
+  revoking the grants" while the two documents that own the claim
+  ([vision](../vision.md), [0011](./0011-what-the-database-enforces.md)) both said the opposite.
 - **Balanced per currency**, enforced by the database on every transaction.
 - **Bitemporal.** Every entry records both when it happened and when we learned about it.
 - **Event-logged.** Every accepted operation is recorded, whether or not it moves money.
@@ -59,6 +62,11 @@ Undecided, listed plainly rather than buried:
 - **`counterparty_scope` and `is_perimeter` are declarative.** Both are documented at length, both
   carry CHECK constraints, and no view or function reads either. The offsetting rule ADR-0009 §5
   states as a mechanism is not implemented.
+- **Row-level security does not exist yet.** `migrations/` contains no `CREATE POLICY` and no
+  `ENABLE ROW LEVEL SECURITY`, while [0001](./0001-go-and-postgres.md) asserts "tenant isolation
+  *is* row-level security" and spike 004 calls it a correctness constraint. `tenant_id` leading
+  every key is the *prerequisite*, and it is built; the policies are not. The bullet below
+  described only a design conflict, as though the feature were otherwise in place.
 - **Row-level security conflicts with bulk loading.** Postgres refuses `COPY FROM` on a table with
   RLS enabled — and `COPY` is what makes batched posting fast. Likely resolution: post through a
   role that bypasses RLS, so RLS guards reads only. Not yet decided.
@@ -94,9 +102,30 @@ Undecided, listed plainly rather than buried:
   nothing bounds how far back a backdated entry can restate a reported period.
 - **No number has been measured on RDS.** Everything so far is localhost, where a round trip is
   ten times cheaper. Nothing gets published until that is fixed.
+- **Two hold-flow findings are recorded rather than closed**, in
+  [0010](./0010-authorization-holds.md): a same-total race whose outcome depends on arrival order
+  (50.00 or 100.00 held), and a regroup that can deadlock against an unsorted multi-group caller.
+  Both fail closed — availability, not correctness — and neither has a fix in the schema.
 - **Posting rules.** A deployment declares its own accounts; it must also declare how a business
   event becomes entries. Adyen proves those templates balance at design time. We have not designed
   ours.
+
+## Decided, but recorded only in the migrations
+
+These are real decisions with real reasoning; none has an ADR, which makes the header above
+("everything we've decided, on one page") an overstatement. Listed here until they get one:
+
+- **All four reports filter `status = 'posted'`.** Without it a pending authorization was
+  recognised as revenue and its posted resolution counted it again — 500.00 of interchange twice.
+  The reasoning is in `migrations/0002`.
+- **Balances are stored debit-positive**, and `trial_balance` splits `balance_minor`
+  (presentation, normal-balance-signed) from `balance_debit_positive` (arithmetic). Every report
+  does its addition in the second and its display in the first.
+- **`webhook_deliveries` is a separate table** from `ledger_events`: HTTP-layer redelivery is a
+  different concern from ledger identity, and collapsing them makes a retried webhook look like a
+  business event.
+- **PostgreSQL 18 is a floor, not a preference.** `uuidv7()` is the default on four tables and does
+  not exist before 18. The roadmap targets RDS for M4/M6, which must therefore run 18.
 
 ## On sourcing
 

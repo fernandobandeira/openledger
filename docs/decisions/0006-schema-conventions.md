@@ -66,9 +66,11 @@ introduced it is a review failure.
 **6. Covering indexes only on append-only tables.** `INCLUDE` gives a true index-only scan only
 when the visibility map bit is set, which requires a vacuum and holds reliably only on tables that
 are never updated. Measured: our balance-lookup index reaches zero heap fetches on settled data at
-+19% index size — but on a **freshly inserted row, which is exactly what the hot path reads**, the
-bit isn't set yet and it still costs a heap fetch. **So `INCLUDE` here is justified by the
-reporting workload, not the hot path.** Recorded so nobody later "optimises the hot path" with
++19% index size when freshly built (11 MB against 9736 kB) — but on a **freshly inserted row, which is exactly what the hot path reads**, the
+bit isn't set yet and it still costs a heap fetch. And +19% is the *build-time* cost: after a
+200,000-row append-only load the live index is **20 MB against 11 MB rebuilt**, because its `DESC`
+ordering puts every insert at the leftmost page and gives up the rightmost-split fast path. **So
+`INCLUDE` here is justified by the reporting workload, not the hot path.** Recorded so nobody later "optimises the hot path" with
 covering indexes that do nothing. The inverse is why Formance's equivalent index is a mistake: it
 sits on an UPDATE-heavy table, paying two index writes per posting for a heap fetch it mostly
 won't get.
@@ -89,6 +91,9 @@ same mistake twice. Our `jsonb` stays `jsonb`.
 ## Consequences
 
 - The schema is renamed to the convention and carries its measured index rationale in comments.
+  This held for `0001` and had drifted in `0002`/`0003`, where nine objects were still on Postgres
+  default names (`fs_lines_pkey`, `account_types_fs_line_fkey`, and seven more). All nine are now
+  named. `NOT NULL` constraints keep their generated names — nothing references them.
 - CI needs the snapshot-diff step before M1 lands. It is worth more than any test we would write
   by hand.
 - **`timestamptz` everywhere, never `timestamp`.** Formance uses `timestamp without time zone`

@@ -43,8 +43,12 @@ reported by a mapping that misses one tenant          20.00
 accounting equation                                   BALANCED
 ```
 
-**Revenue understated by a third, equation perfectly happy** — because omitting an account removes
-it from *both* sides. This is the audit finding to engineer against: a tenant is onboarded, its
+**Revenue understated by a third, equation perfectly happy** — but *not* for the reason this line
+gave for several rounds. It said omitting an account "removes it from both sides", which
+[ADR-0009](../../docs/decisions/0009-chart-and-completeness.md) shows is false and checkably so:
+drop `interchange_revenue` from the shipped trace and assets read 276 against L+E+R-X of -624. What
+happens here is narrower — the demo omits a whole *tenant*, and a tenant's sub-book balances on its
+own, so both sides move together. The numbers stand; the stated mechanism was wrong. This is the audit finding to engineer against: a tenant is onboarded, its
 account row is created, the reporting mapping misses it, and nothing imbalances.
 
 Fixed by [`completeness.sql`](./completeness.sql): every account type carries a `NOT NULL`

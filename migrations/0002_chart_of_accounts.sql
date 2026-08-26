@@ -14,9 +14,10 @@ BEGIN;
 -- makes omission structurally impossible: reports enumerate from the chart
 -- outward, so there is no parameter in which to pass an incomplete account list.
 CREATE TABLE fs_lines (
-    code       text PRIMARY KEY,
+    code       text CONSTRAINT pk_fs_lines PRIMARY KEY,
     caption    text NOT NULL,
-    statement  text NOT NULL CHECK (statement IN ('balance_sheet','income_statement')),
+    statement  text NOT NULL CONSTRAINT ck_fs_lines__statement
+                   CHECK (statement IN ('balance_sheet','income_statement')),
     -- Which side of the statement this line sits on, declared rather than
     -- inferred. balance_sheet used to derive it from whatever happened to be
     -- posted (`bool_or(category = 'asset')`), so a line with NO activity evaluated
@@ -28,6 +29,12 @@ CREATE TABLE fs_lines (
     -- counted on NEITHER side and vanished. Verified: 90% of a balance sheet
     -- missing, reporting balanced = true.
     side       text NOT NULL,
+    -- `current_year_earnings` is SYNTHESISED by the balance_sheet view for
+    -- un-closed earnings. A chart that also declares a real line by that code
+    -- produces two rows with the same caption and no way to tell them apart --
+    -- one an account subtotal, one a derived plug.
+    CONSTRAINT ck_fs_lines__code_reserved
+        CHECK (code <> 'current_year_earnings'),
     CONSTRAINT ck_fs_lines__side_matches_statement CHECK (
         (statement = 'balance_sheet'    AND side IN ('asset','liability_equity')) OR
         (statement = 'income_statement' AND side IN ('credit','debit'))),
@@ -35,13 +42,13 @@ CREATE TABLE fs_lines (
 );
 
 CREATE TABLE account_types (
-    code           text PRIMARY KEY,
+    code           text CONSTRAINT pk_account_types PRIMARY KEY,
     category       ledger_category       NOT NULL,
     -- NOT derivable from category: a loss allowance is an asset with a CREDIT
     -- normal balance. Storing both is the only correct option.
     normal_balance ledger_normal_balance NOT NULL,
     description    text NOT NULL,
-    fs_line        text NOT NULL REFERENCES fs_lines(code),
+    fs_line        text NOT NULL CONSTRAINT fk_types__fs_line REFERENCES fs_lines(code),
     -- mirrors exactly one external balance and must reconcile against it
     is_perimeter   boolean NOT NULL DEFAULT false,
     -- Can a set of these accounts be summed for reporting? Only if all members
@@ -49,6 +56,7 @@ CREATE TABLE account_types (
     -- for amounts due to and from the same party; where the shard key IS the
     -- counterparty, opposite-sign members must be presented gross.
     counterparty_scope text NOT NULL DEFAULT 'none'
+        CONSTRAINT ck_types__counterparty_scope
         CHECK (counterparty_scope IN ('none','shared','per_shard'))
 );
 
@@ -299,6 +307,18 @@ BEGIN
     IF p_tenant IS NOT NULL
        AND NOT EXISTS (SELECT 1 FROM ledger_accounts la WHERE la.tenant_id = p_tenant) THEN
         RAISE EXCEPTION 'unknown tenant %; it holds no accounts', p_tenant;
+    END IF;
+
+    -- ...and an EMPTY ledger is not a balanced one. On a freshly migrated and
+    -- seeded database this function returned ZERO ROWS: a caller doing
+    -- `bool_and(balanced)` over them gets NULL, not false, and a report that
+    -- printed nothing at all read as a report that found nothing wrong. That is
+    -- the same shape as the truncation finding -- silence mistaken for assent.
+    IF NOT EXISTS (SELECT 1 FROM ledger_accounts) THEN
+        RAISE EXCEPTION
+            'no accounts exist, so there is nothing to balance; an empty report is '
+            'not a balanced one'
+            USING ERRCODE = 'data_exception';
     END IF;
 
     RETURN QUERY

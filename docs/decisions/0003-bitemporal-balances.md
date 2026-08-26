@@ -50,8 +50,10 @@ rather than a join.
 
 **Why not maintain a second running balance on the effective axis?** Because a backdated insert
 would have to `UPDATE` every later row for that account — unbounded write amplification on a table
-whose whole value is immutability. Formance built exactly that and needed six migrations purely to
-repair the resulting data. **Why not forbid backdating?** It breaks on late clearing and
+whose whole value is immutability. Formance built exactly that and needed six volume/pcv migrations
+afterwards — of which **three actually repair data** (19, 20, 28), two only replace the aggregation
+functions, and one is a no-op stub whose entire body is `raise notice 'Migration superseded by next
+migration'`. Six was this document's number, and it was too generous to itself. **Why not forbid backdating?** It breaks on late clearing and
 chargebacks.
 
 So: aggregate-on-read is chosen **because immutability is worth more than read latency**.

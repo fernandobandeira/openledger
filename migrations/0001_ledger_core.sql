@@ -128,15 +128,24 @@ CREATE TABLE ledger_transactions (
         REFERENCES ledger_transactions (tenant_id, id),
     -- A transaction cannot reverse or resolve ITSELF, and cannot be both a
     -- resolution and a reversal. All three committed before these existed.
+    -- The two IS DISTINCT FROM conjuncts are the whole rule. An earlier version
+    -- also compared against a nil-uuid sentinel, which was redundant AND rejected a
+    -- transaction whose id happened to be the nil uuid even when it referenced
+    -- nothing at all.
     CONSTRAINT ck_txn__no_self_reference
-        CHECK (id <> COALESCE(reverses_id, resolves_id, '00000000-0000-0000-0000-000000000000'::uuid)
-               AND id IS DISTINCT FROM reverses_id AND id IS DISTINCT FROM resolves_id),
+        CHECK (id IS DISTINCT FROM reverses_id AND id IS DISTINCT FROM resolves_id),
     CONSTRAINT ck_txn__not_both
         CHECK (NOT (reverses_id IS NOT NULL AND resolves_id IS NOT NULL))
 );
 
 -- A transaction may be reversed once, and resolved once. We refuse to mutate, so
 -- we cannot use the UPDATE ... WHERE reverted_at IS NULL guard.
+-- One event, at most one transaction. Without this the "idempotency spine" does
+-- not by itself prevent double-posting: two transactions were produced from one
+-- event row. (An event may still cause NONE -- most of the lifecycle does.)
+CREATE UNIQUE INDEX uq_txn__one_per_event
+    ON ledger_transactions (tenant_id, event_id) WHERE event_id IS NOT NULL;
+
 CREATE UNIQUE INDEX uq_txn__one_reversal
     ON ledger_transactions (tenant_id, reverses_id) WHERE reverses_id IS NOT NULL;
 CREATE UNIQUE INDEX uq_txn__one_resolution
@@ -277,6 +286,88 @@ CREATE TRIGGER ck_events__recorded_at BEFORE INSERT ON ledger_events
     FOR EACH ROW EXECUTE FUNCTION assign_recorded_at();
 ALTER TABLE ledger_events ENABLE ALWAYS TRIGGER ck_events__recorded_at;
 
+-- ---- an account's identity is immutable ------------------------------------
+-- purpose, currency and tenant_id were already frozen -- by uq_accounts__owned,
+-- uq_accounts__house and the composite FKs entries carry. WHO THE ACCOUNT BELONGS
+-- TO was not. One UPDATE moved 110,000 of receivable from a named company to
+-- owner_id NULL: every balance identical, the trial balance still balanced,
+-- ledger_balance_drift silent -- because none of them read the owner. A receivable
+-- owed by nobody is not a receivable, and there is no journal entry to reverse
+-- because nothing was posted.
+--
+-- `metadata` stays mutable on purpose: it is annotation, not identity.
+CREATE FUNCTION assert_account_identity_stable() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    -- purpose, category and normal_balance are deliberately NOT here: 0002 owns
+    -- those, and its guard is entry-aware -- an account with no history yet may
+    -- still be re-typed, and its message names the entry count that blocks it.
+    -- Duplicating them here would shadow that message with a worse one and leave
+    -- the richer guard permanently unreachable.
+    IF (NEW.tenant_id, NEW.id, NEW.owner_type, NEW.owner_id, NEW.currency,
+        NEW.created_at)
+       IS DISTINCT FROM
+       (OLD.tenant_id, OLD.id, OLD.owner_type, OLD.owner_id, OLD.currency,
+        OLD.created_at) THEN
+        RAISE EXCEPTION
+            'account %/% cannot be re-owned: who it belongs to, and in what '
+            'currency, is what its posted history means. Open a new account and '
+            'transfer the balance',
+            OLD.tenant_id, OLD.id
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER ck_accounts__identity_stable BEFORE UPDATE ON ledger_accounts
+    FOR EACH ROW EXECUTE FUNCTION assert_account_identity_stable();
+ALTER TABLE ledger_accounts ENABLE ALWAYS TRIGGER ck_accounts__identity_stable;
+
+-- ---- a correction must point at something it can actually correct -----------
+-- Both columns had a foreign key, so the target had to EXIST. Nothing required it
+-- to be in a state the correction makes sense against. Measured: a posted
+-- transaction "resolved" by another posted one, and a pending one "reversed" --
+-- 49,223 of NEGATIVE revenue, with ledger_balance_drift at 0 and the accounting
+-- equation balanced, because both halves were internally consistent journal
+-- entries. The referential integrity was real; the semantic linkage was assumed.
+--
+-- AFTER INSERT is sufficient because a transaction's status can never change:
+-- ck_txn__immutable refuses every UPDATE, and pending -> posted is a NEW ROW that
+-- points back through resolves_id. That is the whole reason this check is
+-- decidable at insert time.
+CREATE FUNCTION assert_correction_target() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE v_status ledger_txn_status;
+BEGIN
+    IF NEW.resolves_id IS NOT NULL THEN
+        SELECT status INTO v_status FROM ledger_transactions
+         WHERE tenant_id = NEW.tenant_id AND id = NEW.resolves_id;
+        IF v_status <> 'pending' THEN
+            RAISE EXCEPTION
+                'transaction % cannot resolve %, which is %: resolution moves a '
+                'PENDING transaction to its final state', NEW.id, NEW.resolves_id, v_status
+                USING ERRCODE = '23514';
+        END IF;
+    END IF;
+
+    IF NEW.reverses_id IS NOT NULL THEN
+        SELECT status INTO v_status FROM ledger_transactions
+         WHERE tenant_id = NEW.tenant_id AND id = NEW.reverses_id;
+        IF v_status <> 'posted' THEN
+            RAISE EXCEPTION
+                'transaction % cannot reverse %, which is %: only a POSTED '
+                'transaction has entries to reverse', NEW.id, NEW.reverses_id, v_status
+                USING ERRCODE = '23514';
+        END IF;
+    END IF;
+    RETURN NULL;
+END $$;
+
+CREATE TRIGGER ck_txn__correction_target AFTER INSERT ON ledger_transactions
+    FOR EACH ROW WHEN (NEW.resolves_id IS NOT NULL OR NEW.reverses_id IS NOT NULL)
+    EXECUTE FUNCTION assert_correction_target();
+ALTER TABLE ledger_transactions ENABLE ALWAYS TRIGGER ck_txn__correction_target;
+
 -- ---- the transaction record itself is immutable -----------------------------
 -- Two escapes closed at once. The "fewer than two entries" DELETE guard gated on
 -- the parent still existing, so deleting the legs AND the transaction row in one
@@ -344,6 +435,24 @@ END $$;
 CREATE FUNCTION assign_entry_seq() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
+    -- Take the lock rather than assume the caller did. The comment here used to say
+    -- the sequence was derived "under the row lock the balance upsert already
+    -- holds" -- but that was an unwritten caller protocol, not a property of this
+    -- code: nothing requires a caller to touch ledger_account_balances before
+    -- inserting entries. Two concurrent posters that were each legal in isolation
+    -- collided on uq_entries__account_seq with a 23505, which is indistinguishable
+    -- from a genuine idempotency conflict and which no serialization-failure retry
+    -- loop will retry.
+    --
+    -- Creating the row here is safe and idempotent: it is the same upsert the
+    -- posting path performs, minus the amounts.
+    INSERT INTO ledger_account_balances (tenant_id, account_id, currency)
+    VALUES (NEW.tenant_id, NEW.account_id, NEW.currency)
+    ON CONFLICT DO NOTHING;
+    PERFORM 1 FROM ledger_account_balances
+     WHERE tenant_id = NEW.tenant_id AND account_id = NEW.account_id
+       AND currency = NEW.currency FOR UPDATE;
+
     SELECT COALESCE(MAX(account_seq), 0) + 1 INTO NEW.account_seq
       FROM ledger_entries
      WHERE tenant_id = NEW.tenant_id AND account_id = NEW.account_id
@@ -369,6 +478,25 @@ BEGIN
         'a reversing transaction', TG_OP, OLD.id
         USING ERRCODE = '23514';
 END $$;
+
+-- The idempotency spine is a record too. ledger_events was the one table with an
+-- assign-on-insert trigger and NO immutability guard, so recorded_at was assigned
+-- and then freely re-writable -- along with payload, kind, effective_at and
+-- idempotency_hash itself, the column whose entire job is "same key + DIFFERENT
+-- hash -> reject". Rewrite the hash and the next replay of that key returns the
+-- wrong stored result.
+CREATE FUNCTION assert_event_immutable() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION
+        '% is an event log and is immutable: % on % refused',
+        TG_TABLE_NAME, TG_OP, OLD.id
+        USING ERRCODE = '23514';
+END $$;
+
+CREATE TRIGGER ck_events__immutable BEFORE UPDATE OR DELETE ON ledger_events
+    FOR EACH ROW EXECUTE FUNCTION assert_event_immutable();
+ALTER TABLE ledger_events ENABLE ALWAYS TRIGGER ck_events__immutable;
 
 CREATE TRIGGER ck_entries__immutable BEFORE UPDATE OR DELETE ON ledger_entries
     FOR EACH ROW EXECUTE FUNCTION assert_entry_immutable();
@@ -520,15 +648,17 @@ GRANT SELECT, INSERT, UPDATE ON ledger_account_balances TO openledger_app;
 -- The ledger is append-only. The balances table is a derived cache and may be
 -- updated; the journal may not.
 --
--- These REVOKEs are defensive, and their limits are worth stating plainly, because
--- an earlier comment here overstated them. A REVOKE is a point-in-time change to a
--- privilege, NOT a standing prohibition: a later `GRANT ALL` re-grants everything,
--- including TRUNCATE, and verified -- `SET ROLE openledger_app; TRUNCATE
--- ledger_entries;` then empties the journal. Nothing in SQL can stop that.
+-- These REVOKEs are defensive, and their limits are worth stating plainly. A REVOKE
+-- is a point-in-time change to a privilege, NOT a standing prohibition: a later
+-- `GRANT ALL` re-grants everything, including TRUNCATE.
 --
--- So the property comes from the NARROW GRANT above and from never widening it.
--- These lines make the intent explicit and make an accidental widening obvious in
--- review; they are not a backstop against a deliberate one.
+-- An earlier version of this comment then said "nothing in SQL can stop that."
+-- THAT WAS FALSE, and a reviewer demonstrated the fix in four lines: a statement
+-- trigger. It holds against every escape named here -- a careless GRANT ALL, the
+-- replica role, CASCADE, and the table owner. TRUNCATE was worth defending
+-- specifically because it empties the journal while leaving ledger_transactions
+-- intact, and the drift view then reports NOTHING: there is nothing left to
+-- disagree with. Every report came back BALANCED over an empty ledger.
 -- TRUNCATE is included deliberately. It is not covered by DELETE, it fires no row
 -- trigger, and it was verified reachable: after a careless `GRANT ALL`, the shipped
 -- REVOKEs left TRUNCATE in place and `SET ROLE openledger_app; TRUNCATE
@@ -542,6 +672,25 @@ GRANT SELECT, INSERT, UPDATE ON ledger_account_balances TO openledger_app;
 -- per-table, not per-hierarchy, and SQL cannot make them otherwise; the least this
 -- file can do is not hand out the privilege that reaches it.
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+
+CREATE FUNCTION refuse_truncate() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'the ledger cannot be truncated: % is history', TG_TABLE_NAME
+        USING ERRCODE = '23514';
+END $$;
+
+CREATE TRIGGER ck_entries__no_truncate BEFORE TRUNCATE ON ledger_entries
+    FOR EACH STATEMENT EXECUTE FUNCTION refuse_truncate();
+ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ck_entries__no_truncate;
+CREATE TRIGGER ck_txn__no_truncate BEFORE TRUNCATE ON ledger_transactions
+    FOR EACH STATEMENT EXECUTE FUNCTION refuse_truncate();
+ALTER TABLE ledger_transactions ENABLE ALWAYS TRIGGER ck_txn__no_truncate;
+CREATE TRIGGER ck_events__no_truncate BEFORE TRUNCATE ON ledger_events
+    FOR EACH STATEMENT EXECUTE FUNCTION refuse_truncate();
+ALTER TABLE ledger_events ENABLE ALWAYS TRIGGER ck_events__no_truncate;
+CREATE TRIGGER ck_accounts__no_truncate BEFORE TRUNCATE ON ledger_accounts
+    FOR EACH STATEMENT EXECUTE FUNCTION refuse_truncate();
+ALTER TABLE ledger_accounts ENABLE ALWAYS TRIGGER ck_accounts__no_truncate;
 
 REVOKE UPDATE, DELETE, TRUNCATE ON ledger_entries      FROM openledger_app;
 REVOKE UPDATE, DELETE, TRUNCATE ON ledger_transactions FROM openledger_app;
@@ -567,6 +716,22 @@ REVOKE        DELETE, TRUNCATE ON ledger_account_balances FROM openledger_app;
 --
 -- It also returned one row PER ENTRY (1,000 entries, 1,000 identical rows), so
 -- the "free" alarm materialised the whole table.
+-- The two journal tables must also agree with EACH OTHER. ck_txn__has_entries is
+-- a DEFERRED constraint trigger, so it can only speak at COMMIT of the statement
+-- that emptied a transaction -- and `TRUNCATE ledger_entries` is not such a
+-- statement. Truncating the entries left 11 transactions standing with zero
+-- entries, all three currencies reporting `balanced = t`, and every drift view at
+-- zero rows: there was nothing left to disagree with. TRUNCATE is now refused
+-- outright, and this is the standing cross-check that would have SEEN it.
+CREATE VIEW ledger_transaction_drift AS
+SELECT t.tenant_id, t.id, t.status, t.kind, t.effective_at,
+       count(e.id) AS entries
+  FROM ledger_transactions t
+  LEFT JOIN ledger_entries e
+    ON e.tenant_id = t.tenant_id AND e.transaction_id = t.id
+ GROUP BY t.tenant_id, t.id, t.status, t.kind, t.effective_at
+HAVING count(e.id) < 2;
+
 CREATE VIEW ledger_balance_drift AS
 WITH j AS (
     SELECT e.tenant_id, e.account_id, e.currency, e.account_seq,

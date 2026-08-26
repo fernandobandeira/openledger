@@ -111,10 +111,11 @@ SELECT eqv('effective axis, as of 31 May: revenue (the post-dated one lands)',
     (SELECT revenue FROM accounting_equation('bt','2026-05-31','effective')), 527);
 
 -- ============================================================ the recorded axis
--- What we KNEW on 28 February: January + March = 500. The February transaction had
--- not arrived yet. This is the number a reproducible report must return forever.
--- Jan (recorded Jan) + May (recorded Feb) = 107. March was not recorded until
--- March, and February did not arrive until April -- neither is known yet.
+-- What we KNEW on 28 February: nothing. Every fixture row was inserted by this
+-- file in one session, so the engine assigned all of them today's recorded_at --
+-- which is the point of the axis: you cannot backdate what you knew. An earlier
+-- version of this comment predicted 500, written before recorded_at stopped being
+-- client-supplied. The assertion below has always said 0.
 SELECT eqv('recorded axis, as of 28 Feb: nothing had been recorded yet',
     (SELECT revenue FROM accounting_equation('bt','2026-02-28','recorded')), 0);
 SELECT eqv('recorded axis, as of 31 Mar: still nothing',

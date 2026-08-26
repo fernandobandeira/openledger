@@ -51,8 +51,8 @@ SELECT 'p1','company','acme',code,category,normal_balance,'USD'
 -- suite; this is one synthetic 200k-leg transaction.
 ALTER TABLE ledger_entries      DISABLE TRIGGER ck_entries__balances;
 ALTER TABLE ledger_transactions DISABLE TRIGGER ck_txn__has_entries;
--- recorded_at is assigned by the engine now, and account_seq must come from the
--- balance upsert. Both are correct and both make a 200k-row synthetic fixture
+-- recorded_at and account_seq are both assigned by the engine now (the sequence
+-- from the journal, never from the cache). Both are correct and both make a 200k-row synthetic fixture
 -- impossible, so they are off for the load only. This file asserts PLAN SHAPE;
 -- the invariants have their own suites.
 ALTER TABLE ledger_entries DISABLE TRIGGER ck_entries__recorded_at;

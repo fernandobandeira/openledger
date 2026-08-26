@@ -39,7 +39,8 @@ No Go service yet.
 
 ## Local development
 
-Requires Go 1.26+, Docker, and `psql`.
+Requires Go 1.26+, Docker, and `psql`. **PostgreSQL 18 or later** — `uuidv7()` is the default on
+four tables and does not exist before 18.
 
 ```sh
 make up        # start postgres on :5433
