@@ -31,9 +31,15 @@ SQL implementation and its harness were deleted, and why is [ADR-0012](./docs/de
 in a browser. Sizing, architecture, the auth hot path, the data model, state machines, and a
 row-by-row trace of one $500 purchase through every account it touches.
 
+It is the design **as first drawn**, and it is the clearest thing here on sizing, on the
+authorization deadline and on the shape of the lifecycle. Three of its decisions have since been
+made differently — the durable timer, the hold model, and how append-only is enforced — and
+[docs/README.md](./docs/README.md) lists every divergence
+before you hit one. Read the board first; read that list second, not later.
+
 | | |
 | --- | --- |
-| [docs/design-board.html](./docs/design-board.html) | **The design.** Read this first. |
+| [docs/design-board.html](./docs/design-board.html) | **The design, as first drawn.** Read this first — then the divergence list in [docs/README.md](./docs/README.md). |
 | [docs/glossary.md](./docs/glossary.md) | Every term, for someone who has never built a ledger |
 | [docs/vision.md](./docs/vision.md) | Why this exists when Formance already does |
 | [docs/roadmap.md](./docs/roadmap.md) | What gets built next, and why in that order |

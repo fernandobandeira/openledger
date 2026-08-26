@@ -408,9 +408,31 @@
   :focus-visible { outline: 2px solid var(--red); outline-offset: 2px; }
 
   footer { border-top: 1px solid var(--rule); padding-top: 1rem; color: var(--ink-faint); font-size: .82rem; font-family: var(--mono); }
+
+  .supersede {
+    border: 1px solid var(--red); border-left-width: 4px; border-radius: 3px;
+    padding: .85rem 1rem; margin: 0 0 1.75rem; background: var(--card);
+    font-size: .88rem; line-height: 1.55;
+  }
+  .supersede strong { color: var(--red); }
+  .supersede code { font-family: var(--mono); font-size: .92em; }
 </style>
 
 <div class="wrap">
+
+<div class="supersede">
+  <strong>This is the design as first drawn.</strong> It is still the clearest statement in the
+  repository of the sizing, the authorization deadline and the shape of the lifecycle. But it is not
+  the record of what was decided — <code>docs/decisions/</code> is, and three of the decisions below
+  went the other way. <strong>Temporal</strong> (named on eight lines below this box) lost to River on Postgres
+  in ADR-0008. The mutable <code>card_holds</code> row with a running <code>cleared_minor</code> in §04
+  is rejected by name in ADR-0010, which derives the hold from an append-only event log instead,
+  because a clearing has no reliable key back to its authorization. And §04's claim that append-only
+  is enforced by revoking <code>UPDATE</code> is refuted in ADR-0012: a revoke binds the application
+  role and nothing else. Four smaller divergences, and three account names in the §06 trace that are
+  not in the shipped chart, are listed in <code>docs/README.md</code>. Read that list before you rely
+  on anything here.
+</div>
 
 <header class="mast">
   <div class="eyebrow">System design board · embedded B2B spend management</div>
@@ -426,7 +448,7 @@
     <span class="fact">Own the auth decision</span>
     <span class="fact">Delegated KYB/KYC</span>
     <span class="fact">Small team, boring tech</span>
-    <span class="fact">Postgres · Temporal</span>
+    <span class="fact">Postgres · Temporal <em>(→ River, ADR-0008)</em></span>
   </div>
 </header>
 

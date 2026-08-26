@@ -62,7 +62,7 @@ ALTER TABLE account_types ALTER COLUMN fs_line SET NOT NULL;
 UPDATE account_types SET is_perimeter = true WHERE code = 'network_settlement_payable';
 
 -- Can a shard set be summed for reporting? Only if all shards face ONE counterparty.
--- IAS 1.32 / ASC 210-20-45-1: netting requires amounts due to and from the SAME party.
+-- IAS 32.42 / ASC 210-20-45-1: netting requires amounts due to and from the SAME party.
 -- If the shard key IS the counterparty, opposite-sign shards must be shown GROSS.
 ALTER TABLE account_types ADD COLUMN counterparty_scope text NOT NULL DEFAULT 'none'
     CHECK (counterparty_scope IN ('none','shared','per_shard'));

@@ -150,7 +150,7 @@ CREATE TABLE account_types (
     -- mirrors exactly one external balance and must reconcile against it
     is_perimeter   boolean NOT NULL DEFAULT false,
     -- Can a set of these accounts be summed for reporting? Only if all members
-    -- face ONE counterparty. IAS 1.32 / ASC 210-20-45-1 permit offsetting only
+    -- face ONE counterparty. IAS 32.42 / ASC 210-20-45-1 permit offsetting only
     -- for amounts due to and from the same party; where the shard key IS the
     -- counterparty, opposite-sign members must be presented gross.
     counterparty_scope text NOT NULL DEFAULT 'none'
@@ -466,8 +466,8 @@ CREATE TABLE card_auth_events (
 
     CONSTRAINT pk_auth_events PRIMARY KEY (tenant_id, id),
     -- ISO 4217 is uppercase. 0001 enforces this on entries and accounts and 0003
-    -- enforced it nowhere, so 'usd' created a SECOND hold group: held_for_company
-    -- for 'USD' reported 1000 while 500 more was live under 'usd'. Same failure the
+    -- enforced it nowhere, so 'usd' created a SECOND hold group: the
+    -- hold total for 'USD' reported 1000 while 500 more was live under 'usd'. Same failure the
     -- 0001 comment describes, in the number the authorization decision is made on.
     CONSTRAINT ck_auth_events__currency_iso CHECK (currency ~ '^[A-Z]{3}$'),
     -- sign is a property of the kind. 'advice' is exempt because it is bidirectional
@@ -497,8 +497,8 @@ CREATE TABLE card_auth_events (
         (kind = 'expiry_reversal' AND amount_delta = 0) OR
         (kind IN ('authorization','incremental') AND amount_delta >= 0) OR
         -- 'expiry' is absent deliberately: expiry is a FLAG. The enum value stays
-        -- (removing one is a rewrite) and no row may carry it. record_auth_event
-        -- refuses it too, but that gated only the function -- an operator backfill
+        -- (removing one is a rewrite) and no row may carry it. The pre-0012 writer
+        -- function refused it too, but that gated only the function -- an operator backfill
         -- or a second adapter produced the double release the header argues
         -- against, five lines above the constraint that used to permit it.
         (kind IN ('reversal','clearing')  AND amount_delta <= 0))
@@ -750,9 +750,11 @@ WITH dp AS (
     --
     -- HONEST LIMIT: this is still enumeration from data, one level further out.
     -- There is no tenant registry and no currency registry, so a scope with no
-    -- accounts at all remains invisible, and `p_tenant` below is exactly the
-    -- "parameter in which to pass an incomplete list" that ADR-0009 says should
-    -- not exist. Completeness here is guaranteed WITHIN a scope, not across them.
+    -- accounts at all remains invisible. balance_sheet is a plain view and takes no
+    -- parameters; the moment a tenant parameter is added to it -- the obvious next
+    -- step -- that parameter is exactly the "parameter in which to pass an incomplete
+    -- list" ADR-0009 says should not exist. Completeness here is guaranteed WITHIN a
+    -- scope, not across them.
     SELECT DISTINCT tenant_id, currency FROM ledger_accounts
 ), lines AS (
     SELECT s.tenant_id, s.currency, f.code AS fs_line, f.caption, f.sort_order, f.side,
@@ -1018,14 +1020,12 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
           AND m.superseded_at IS NULL AND e.company_id = g.company_id
           AND e.currency <> g.currency)
    -- ...or an event was attached to a group AFTER it expired. held_minor is
-   -- GENERATED to 0 once expired_at is set, so exposure attached later is
-   -- invisible to held_for_company while total_minor and the log still agree --
-   -- the alarm compared exactly those two and therefore reported nothing. The
-   -- clamp is the thing hiding the number, so the alarm has to look past it.
-   -- Exposure added to a group AFTER it was expired. held_minor is GENERATED to 0
-   -- once expired_at is set, so anything attached later is invisible to
-   -- held_for_company while total_minor and the log still agree -- the two columns
-   -- the alarm compares. Keyed on the monotonic counter, not on now().
+   -- GENERATED to 0 once expired_at is set, so exposure attached later is invisible
+   -- to any sum over held_minor -- which is the number the authorization decision is
+   -- made on -- while total_minor and the log still agree, and those two are exactly
+   -- what the alarm compared, so it reported nothing. The clamp is the thing hiding
+   -- the number, so the alarm has to look past it. Keyed on the monotonic counter,
+   -- not on now().
    OR (g.expired_at IS NOT NULL
        AND (g.authorized_minor > COALESCE(g.expired_authorized, g.authorized_minor)
          OR g.total_minor      > COALESCE(g.expired_total,      g.total_minor)))
@@ -1046,7 +1046,7 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
    -- low_water_minor is written only as `LEAST(low_water_minor, ...)`, so it is
    -- monotone non-increasing THROUGH THESE FUNCTIONS, and group rows cannot be
    -- deleted. It is NOT unerasable: the app role holds UPDATE on this table --
-   -- granted so record_auth_event can maintain it -- and one statement sets both
+   -- granted so the writer can maintain it -- and one statement sets both
    -- low_water_minor and overcaptured_at back to a clean state with drift silent,
    -- because drift reads neither column: it cannot be erased by the WRITER, which is
    -- not the same as cannot be erased.
@@ -1092,7 +1092,7 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
    -- the group's cleared amount.
    --
    -- That falsifies the precise restatement ADR-0010 wrote to close the declined
-   -- over-capture report -- "an over-capture never makes held_for_company smaller
+   -- over-capture report -- "an over-capture never makes the reported hold smaller
    -- than the un-cleared exposure of that group" -- in a state the system itself
    -- flags as an over-capture.
    --

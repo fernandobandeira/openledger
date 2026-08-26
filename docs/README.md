@@ -15,8 +15,10 @@ state machines, and a row-by-row trace of one $500 purchase. Everything else her
 | [roadmap.md](./roadmap.md) | What gets built next, and why in that order. |
 
 > **Where the board and the decisions differ.** The board is the design as first drawn, and three
-> decisions have moved since. It says **Temporal** in seven places — [0008](./decisions/0008-durable-timers.md)
-> chose River on Postgres. Its §04 models a hold as a **mutable `card_holds` row** with a running
+> decisions have moved since. It still names **Temporal** in eight places (the masthead; the
+> architecture diagram twice, in its text and in its `aria-label`, so a screen reader is told it too;
+> the lifecycle prose; the `expires_at` comment; the state-machine boundary; and twice in the §06
+> trace), where [0008](./decisions/0008-durable-timers.md) chose River on Postgres. Its §04 models a hold as a **mutable `card_holds` row** with a running
 > `cleared_minor`, keyed on `auth_id`; [0010](./decisions/0010-authorization-holds.md) rejects that by
 > name and derives the hold as a sum over an append-only event log, because a clearing has no reliable
 > key back to its authorization. And its §04 says append-only is enforced by revoking `UPDATE` —
