@@ -550,5 +550,49 @@ chk "...and no duplicate-key errors" \
 chk "...and the alarm sees the running balance they did not maintain" \
     "$(q "select count(*) from ledger_balance_drift where tenant_id='sq'")" 2
 
+# ---------------------------------------------------------------- workload L
+# THE MESSAGE IS THE FIRST LOCK. The fresh-ingest path took the card_hold_groups
+# row FOR UPDATE at the top of its block -- before the function could know whether
+# the message already existed -- while the attach path locks the event first. So
+# ingest ran group-then-message and attach ran message-then-group, and two
+# ORDINARY single-group ingests deadlocked: measured 10 of 10 trials with the
+# group pre-created and committed, so it is a plain row lock and not a race to
+# create anything.
+#
+# `INSERT ... ON CONFLICT DO NOTHING` on uq_auth_events__msg IS a lock
+# acquisition -- the lesson this file states for regroup_auth_event and did not
+# apply to ingest. An advisory lock on the message identity restores one order
+# everywhere, which is the remedy ADR-0010 already names for the sibling case.
+#
+# Session B is an adapter batch: an unmatched delivery (taking the message id and
+# NO group lock), then an ordinary matched message wanting the group. Session A is
+# a matcher re-delivering that first message, now matchable, in between.
+psql "$URL" -q -v ON_ERROR_STOP=1 -c \
+  "DO \$d\$ BEGIN PERFORM record_auth_event('ml','ml_seed','GL','co1','c1','authorization',1000,'USD',false,now()); END \$d\$;"
+ml_dl_before=$(q "select deadlocks from pg_stat_database where datname=current_database()")
+ml_fail=0
+for i in $(seq 1 6); do
+    fifo="$TMPD/f_ml$i"; rm -f "$fifo"; mkfifo "$fifo"
+    ( psql "$URL" -qAt -f "$fifo" >"$TMPD/ml_b$i.out" 2>&1 ) &
+    exec 7>"$fifo"
+    echo "BEGIN;" >&7
+    echo "SELECT record_auth_event('ml','ml_u$i',NULL,'co1','c1','authorization',10,'USD',false,now());" >&7
+    sleep 0.3
+    ( psql "$URL" -qAt -c "SELECT record_auth_event('ml','ml_u$i','GL','co1','c1','authorization',10,'USD',false,now())" \
+        >"$TMPD/ml_a$i.out" 2>&1 ) &
+    ml_pid=$!
+    sleep 0.3
+    echo "SELECT record_auth_event('ml','ml_m$i','GL','co1','c1','incremental',10,'USD',false,now());" >&7
+    echo "COMMIT;" >&7; exec 7>&-
+    wait "$ml_pid" 2>/dev/null
+done
+sleep 0.5
+ml_dl_after=$(q "select deadlocks from pg_stat_database where datname=current_database()")
+chk "adapter batch against a matcher on one group: deadlocks" \
+    "$(( ml_dl_after - ml_dl_before ))" 0
+chk "...and every message landed exactly once" \
+    "$(q "select count(*) from card_auth_events where tenant_id='ml' and processor_msg_id like 'ml_u%'")" 6
+chk "...with no drift" "$(q "select count(*) from card_hold_drift where tenant_id='ml'")" 0
+
 echo "   ok  SUITE-COMPLETE concurrency"
 exit "$fail"

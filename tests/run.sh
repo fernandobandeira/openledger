@@ -246,13 +246,13 @@ echo "── tests/concurrency.sh"
 cout=$(./tests/concurrency.sh "$URL" 2>&1) || fail=1
 echo "$cout"
 cn=$(echo "$cout" | grep -cE '^ +ok  ') || true
-if [ "$cn" -lt 52 ]; then
-    echo "   FAIL tests/concurrency.sh made $cn assertions, below its floor of 52"
+if [ "$cn" -lt 55 ]; then
+    echo "   FAIL tests/concurrency.sh made $cn assertions, below its floor of 55"
     fail=1
 fi
 csites=$(sites_for tests/concurrency.sh)
-if [ "$csites" -lt 52 ]; then
-    echo "   FAIL tests/concurrency.sh contains $csites assertion call sites, below 52"
+if [ "$csites" -lt 55 ]; then
+    echo "   FAIL tests/concurrency.sh contains $csites assertion call sites, below 55"
     fail=1
 fi
 if ! echo "$cout" | grep -q "SUITE-COMPLETE concurrency"; then
