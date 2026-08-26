@@ -82,7 +82,7 @@ single-contended-row case it characterised:
 | one contended row, batched (25) | 3,420 |
 | no global contention, striped + single-call | 7,897 |
 
-So (a) costs roughly 8× unbatched and 2× batched — and it is worse than those numbers look,
+So (a) costs roughly 10× unbatched and 2.3× batched (7,897 against ~800, and against 3,420) — and it is worse than those numbers look,
 because the lock is **global**. Every lever [0007](./0007-open-source-positioning.md) rests on
 works by reducing contention on *account* rows; none of them touch a lock taken by every writer
 regardless of what it posts to. Adopting (a) would make 0007's throughput story inoperative.

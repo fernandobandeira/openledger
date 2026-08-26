@@ -21,7 +21,7 @@ here, so the ADRs don't each stop to re-explain them.
 
 > **The SQL implementation and its test suites are gone.** Several entries below refer to
 > `tests/…` files, adversarial rounds and mutation runs. Those existed, they found the defects
-> recorded here, and [0012](./0012-no-triggers.md) deleted them along with the 27 triggers and 26
+> recorded here, and [0012](./0012-where-logic-lives.md) deleted them along with the 27 triggers and 26
 > PL/pgSQL functions they were written to attest. The **findings** are the output of this project
 > and they stand; the code that produced them does not. What remains is
 > [`schema/schema.sql`](../../schema/schema.sql) — declarative only, and it loads.
@@ -30,7 +30,7 @@ here, so the ADRs don't each stop to re-explain them.
 
 | # | We decided | Because | Status |
 | --- | --- | --- | --- |
-| [0001](./0001-go-and-postgres.md) | Go + Postgres, no ORM | Postgres has measured headroom of 17–40× what we sized for. (This cell used to open "the load-bearing logic is SQL, so the host language's job is narrow" — [0012](./0012-no-triggers.md) reverses that: the logic goes in Go, and Postgres keeps only what is declarative.) | accepted |
+| [0001](./0001-go-and-postgres.md) | Go + Postgres, no ORM | Postgres has measured headroom of 17–40× what we sized for. (This cell used to open "the load-bearing logic is SQL, so the host language's job is narrow" — [0012](./0012-where-logic-lives.md) reverses that: the logic goes in Go, and Postgres keeps only what is declarative.) | accepted |
 | [0002](./0002-data-access-layer.md) | Native pgx + sqlc, over go-jet | go-jet can silently scan a money column as zero with no error, and its codegen needs a live database | accepted |
 | [0003](./0003-bitemporal-balances.md) | Running balance for "now", aggregate-on-read for "as of a business date" | A backdated entry lands with a *later* sequence number, so a running balance answers business-date questions wrongly | accepted |
 | [0004](./0004-event-log.md) | Add an append-only `ledger_events` table | Most accepted operations write no ledger transaction, so idempotency can't live on the transactions table | accepted |
@@ -40,8 +40,8 @@ here, so the ADRs don't each stop to re-explain them.
 | [0008](./0008-durable-timers.md) | Durable timers in Postgres, not Temporal | The need is durable *scheduling*, not workflow orchestration — and a job row commits in the same transaction as the ledger write, which Temporal cannot do | accepted |
 | [0009](./0009-chart-and-completeness.md) | Chart of accounts as data; completeness is a separate invariant | A dropped *balanced sub-book* satisfies the accounting equation while the report is incomplete. (This cell used to say a missing account "drops out of both sides" — [0009](./0009-chart-and-completeness.md) strikes that as false: one account drops out of exactly ONE side, and the equation catches it loudly.) | accepted |
 | [0010](./0010-authorization-holds.md) | A hold is a SUM over an append-only event log, not a mutable amount | Grouping a clearing to its authorization is a revisable inference, and processors disagree on whether an increment carries a delta or a cumulative total | accepted |
-| [0011](./0011-what-the-database-enforces.md) | The dozen guards added under adversarial review, and what the database still cannot enforce | A column with a DEFAULT is not a constraint — `recorded_at`, `account_seq` and `xact_id` all had one, and each turned out forgeable by an INSERT | **enforcement half superseded by [0012](./0012-no-triggers.md)** |
-| [0012](./0012-no-triggers.md) | **Zero triggers, zero PL/pgSQL. The ledger goes in Go; Postgres keeps only what is declarative** | The schema had quietly become the ledger — 27 triggers and 26 functions against 11 lines of Go — and ten review rounds went into hardening a validation harness that had turned into an unintended product | accepted |
+| [0011](./0011-what-the-database-enforces.md) | The dozen guards added under adversarial review, and what the database still cannot enforce | A column with a DEFAULT is not a constraint — `recorded_at`, `account_seq` and `xact_id` all had one, and each turned out forgeable by an INSERT | **enforcement half superseded by [0012](./0012-where-logic-lives.md)** |
+| [0012](./0012-where-logic-lives.md) | **The ledger goes in Go. Postgres holds the shape, and a trigger needs a written justification** | The schema had quietly become the ledger — 27 triggers and 26 functions against 11 lines of Go — and ten review rounds went into hardening a validation harness that had turned into an unintended product | accepted |
 
 ## Non-negotiable
 
@@ -63,6 +63,17 @@ No decision may trade these away. They are what makes the numbers trustworthy:
 ## Still open
 
 Undecided, listed plainly rather than buried:
+
+- **How schema changes get applied is undecided.** `schema/schema.sql` is loaded by `make schema`
+  with plain `psql`, which is fine for a design artefact and is not a migration story. A ledger
+  cannot take a schema change by hand, and the choice interacts with two decisions already made:
+  [0002](./0002-data-access-layer.md) picked native pgx (several tools are `database/sql`-only), and
+  [0012](./0012-where-logic-lives.md) made the schema a single declarative file (which pairs naturally
+  with a desired-state tool like Atlas, and that pairing may be a trap). Spike 007 is comparing
+  goose, golang-migrate, tern, Atlas and sqldef against a change that needs
+  `CREATE INDEX CONCURRENTLY` — i.e. one that must not run inside a transaction. **This gap was
+  introduced by 0012**, which replaced an ordered `migrations/` directory with a flat file and did
+  not say what replaces the ordering.
 
 - **[0005](./0005-reproducible-as-of.md) is `proposed`**, not accepted — and the hole it names is
   live and reproduced: the same recorded-axis report, re-run either side of one concurrent commit,

@@ -67,8 +67,10 @@ different row locks instead of queueing on one. It is the difference between ~80
 currently exists only as folklore. Design it in: an account declares a stripe count, writes pick a
 stripe, balance reads `SUM`.
 
-**2. House accounts become per-tenant.** A unique index currently guarantees exactly one shared
-revenue account per *deployment*. Correct for one product; wrong for a shared ledger, where it
+**2. House accounts become per-tenant.** This was written when a unique index guaranteed exactly
+one shared revenue account per *deployment*. It shipped: `uq_accounts__house` is
+`(tenant_id, purpose, currency) WHERE owner_type = 'house'`, so the guarantee is now per tenant —
+as the top of this ADR already says. Left in past tense because the reasoning is what matters. Correct for one product; wrong for a shared ledger, where it
 makes every tenant contend with every other. (See the correction below — this is a modelling fix
 and a prerequisite for tenant isolation, **not** the throughput mechanism it was first claimed to
 be.)
@@ -127,9 +129,11 @@ product layer without the core noticing.
 **The authorization path is an optional module, not part of the ledger.** It is worth being exact
 about what it does, because the naming misleads:
 
-- It **writes** only the hold event log (`card_auth_events`, per
-  [ADR-0010](./0010-authorization-holds.md)) — never a ledger entry. Nothing is owed until
-  clearing.
+- It **writes no ledger entry** — only the hold tables (`card_auth_events`, its group membership,
+  and the materialised `card_hold_groups`), per [ADR-0010](./0010-authorization-holds.md). Nothing
+  is owed until clearing. (This bullet used to say it writes "only the hold event log"; the
+  authorization path touches three tables. The load-bearing half — never a ledger entry — is the
+  one that matters and is correct.)
 - It **reads** one number from the ledger: the `customer_receivable` balance. Unstriped that is a
   single index lookup (often quoted at 0.018 ms; that figure has no harness in this repo, and every
   other site in the tree now says so). **Striped, it is a sum over the stripes**, so it grows with the

@@ -17,7 +17,9 @@ code is its own Go module so its dependencies never leak into the root `go.mod`.
 | [004](./004-chart-of-accounts/) | What does a general ledger ship when the chart of accounts is business-specific? | Ship the chart as **data** plus constraints that make the accounting identity a theorem. But the identity does **not** prove completeness — that needs its own guard. | **closed** |
 
 Outcomes fed the decision log from [ADR-0002](../docs/decisions/0002-data-access-layer.md) through
-[ADR-0011](../docs/decisions/0011-what-the-database-enforces.md) — spike 004 fed 0009, spike 005 fed 0008, and spike 006 fed 0010.
+[ADR-0010](../docs/decisions/0010-authorization-holds.md) — spike 004 fed 0009, spike 005 fed 0008,
+and spike 006 fed 0010. (This line used to say "through ADR-0011". ADR-0011 mentions no spike and
+took no spike input: it came out of adversarial review of the schema, not out of this directory.)
 
 ## Artifacts worth knowing about
 

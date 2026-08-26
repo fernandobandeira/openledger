@@ -50,9 +50,11 @@ open-source project than stack weight did for a small team.
 **The sizing argument is superseded.** This ADR originally justified Postgres by *knowing* the
 workload (under 1 TPS). [0007](./0007-open-source-positioning.md) removes that knowledge.
 The conclusion holds on better grounds: [spike 003](../../spikes/003-throughput-ceiling/README.md)
-measured **~800 clearings/s unsharded, and 6,524-6,970 striped**, with durability on. (The ~7,900
-figure quoted elsewhere is striping *plus* single-call posting, which this file states correctly
-further down and stated loosely here.) Postgres is now
+measured **~800 clearings/s unsharded, and 6,212-7,405 striped at 64**, with durability on. The
+~7,900 figure quoted elsewhere is striping *plus* single-call posting — a different configuration,
+not a better measurement of the same one. (An earlier version of this paragraph said that
+distinction was "stated correctly further down". It was not stated anywhere else in this file.)
+Postgres is now
 chosen on measured headroom and a known bottleneck, not on an assumption.
 
 **Formance reached the same "no procedural logic in the database" position, expensively.** Their
@@ -65,13 +67,19 @@ correctness.
 source/destination pair — balanced *by construction*, so no CHECK is needed anywhere. Our entries
 are independent rows carrying a direction, so we *can* express an unbalanced transaction and
 therefore *must* prevent it. We do both: the write API accepts balanced pairs only (making the
-illegal state unrepresentable), and a deferred constraint trigger is the backstop. Spike 003 ran
-its entire benchmark with that trigger active and never found it to be the bottleneck. At the top
-of its ladder — 6,524 clearings/s at 64 stripes and c=32, on a
-2 GB table — the spike is explicit that the curve "plateaus **because the machine ran out of cores
-rather than because of a lock**. The ceiling moved from the design to the hardware." Striping alone
-at 64 measures 6,524–6,970. Contention binds at the bottom of that ladder, not the top; the trigger
-was never the constraint anywhere on it.
+illegal state unrepresentable). **[0012](./0012-where-logic-lives.md) removed the trigger backstop
+entirely** — the write path is the only enforcement now, and the schema keeps only declarative
+constraints. Spike 003 ran its entire benchmark with the trigger active and never found it to be
+the bottleneck, which is the part of this paragraph that still matters: at the top of its ladder —
+6,524 clearings/s at 64 stripes and c=32 — the spike is explicit that the curve "plateaus
+**because the machine ran out of cores rather than because of a lock**. The ceiling moved from the
+design to the hardware."
+
+*Two numbers in this paragraph used to be wrong.* The 6,524 figure carries no table-size qualifier
+in spike 003; it is the ordinary small-table fixture. The 2 GB measurement for striped-64 is
+**6,212** (−8% against 43 MB). And "striping alone at 64 measures 6,524–6,970" excluded two
+striped-64 values in the same spike — 6,212 at 2 GB and 7,405 with 32 tenants. The range is
+6,212–7,405.
 
 ## Resolved — Temporal is gone
 

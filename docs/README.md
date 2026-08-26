@@ -43,6 +43,6 @@ make test      # go test ./...
 `schema/schema.sql` is a **design artefact, not a product**: it exists to show that the shape these
 documents describe is expressible in PostgreSQL with nothing but tables, `CHECK`s, foreign keys and
 unique indexes — no triggers and no PL/pgSQL. See
-[decisions/0012](./decisions/0012-no-triggers.md) for why that matters, and what it replaced.
+[decisions/0012](./decisions/0012-where-logic-lives.md) for why that matters, and what it replaced.
 
 The ledger itself is not built yet. `go test ./...` currently covers nothing.

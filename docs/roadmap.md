@@ -30,7 +30,7 @@ that swallows the next increment, an authorization writing no ledger entry while
 the recorded and effective axes as genuinely separate questions — all of it came from building the
 thing and attacking it.
 
-**It has been deleted.** [ADR-0012](./decisions/0012-no-triggers.md) explains why: the validation
+**It has been deleted.** [ADR-0012](./decisions/0012-where-logic-lives.md) explains why: the validation
 code had grown into an unintended product — 27 triggers, 26 PL/pgSQL functions and 10,000 lines of
 SQL and bash against eleven lines of Go — and by the last rounds the review was finding defects in
 the harness rather than in the design. A dead `WHERE` disjunct, a catalog census that repaired the
@@ -170,7 +170,7 @@ Two traps from Formance's bug history:
   003 found that sorting within a single clearing does *not* order locks across a batch —
   throughput collapsed 10× into deadlocks.
 
-**Was partly done, and the harness is gone** ([ADR-0012](./decisions/0012-no-triggers.md)). It ran N writers against
+**Was partly done, and the harness is gone** ([ADR-0012](./decisions/0012-where-logic-lives.md)). It ran N writers against
 overlapping account sets, half of them posting the legs in reverse order, and asserts zero
 deadlocks, gapless per-account sequences, every transaction balanced, and both drift views empty.
 It also hammers one hold group through `record_auth_event`, which is where the ingest lock either
