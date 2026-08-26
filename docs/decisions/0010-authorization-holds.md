@@ -5,8 +5,9 @@
 
 ## Context
 
-An authorization writes nothing to the ledger. Nothing is owed when the terminal beeps, so there
-is no transaction to record — but the money is not spendable either, and the next authorization
+An authorization writes nothing **to the posted ledger**. Nothing is owed when the terminal beeps,
+so there is no transaction to record — but the money is not spendable either, and the next
+authorization
 has roughly a second to decide whether it fits. Something has to hold the amount.
 
 The obvious model is a mutable `holds` row with a running amount. It does not survive the domain:
@@ -23,6 +24,83 @@ The obvious model is a mutable `holds` row with a running amount. It does not su
 
 [Spike 006](../../spikes/006-append-only-holds/README.md) has the survey.
 [`schema/schema.sql`](../../schema/schema.sql) is the implementation.
+
+## What the field actually does — and where this ADR was overstating
+
+[Spike 008](../../spikes/008-processor-hold-semantics/README.md) read thirteen card processors and
+ledger APIs from their own published references, 51 URLs verified. Four claims in this ADR needed
+narrowing, three gaps in the model came out of it, and the rest held.
+
+**1. "An authorization writes no ledger entry" is a product choice, not a domain law.** It is true
+of every *posted* balance surveyed, and false as a blanket statement. Roughly half of these systems
+write a durable, balance-affecting row at authorization time, into the same log as postings — Stripe
+emits an `issuing_authorization_hold` balance transaction, Treasury Prime writes a `hold` Transaction
+row, Highnote posts the approved amount to an `AUTHORIZATION` ledger, Adyen posts a
+Received→Reserved register movement, Column has *you* write a book transfer in `hold` state. The
+other half keep it outside the ledger as we do — Increase's `PendingTransaction`, Marqeta's
+`available_balance`, Lithic's `amounts.hold`, Unit's `Authorization` object. **We are with a real
+minority, deliberately.** The claim that survives without qualification is the narrow one: *an
+authorization posts nothing to a balance anyone is owed against.*
+
+**2. The over-capture clamp was cited to the wrong vendor.** `migrations/0003` said Increase ships
+the same clamp as `pending_transaction.held_amount`. It does not — `held_amount` differs from
+`amount` *"if the amount is positive"*, because a **pending credit** must not raise spending power.
+That is a direction guard, not an over-capture floor. **The real corroboration is Lithic:** *"if
+there is an over-reversal, Lithic will cap the `amounts.hold.amount` to \$0."* `GREATEST(total, 0)`
+is right; the citation was wrong.
+
+**3. Expiry as a flag makes us alone in the field.** Treasury Prime writes `hold_release`, Highnote
+runs an expiration job that emits a REVERSAL, Moov writes `issuing-auth-release`, Adyen writes an
+`expired` register row, Galileo writes a signed backout, Stripe writes
+`issuing_authorization_release`. **Every processor surveyed models expiry as an event.** TigerBeetle
+is the one ally, and it is not a card model. Our reason stands — an event carrying `−remaining` is a
+read-modify-write smuggled into an append-only log, and it does not commute under out-of-order
+delivery — but this ADR must state the divergence rather than imply agreement.
+
+**4. `total_convention` fixed by the first increase-side message discards free disambiguation.**
+Stripe, Increase, Galileo and Treasury Prime all ship **both** conventions in one message — Stripe's
+`pending_request.amount` (delta) beside `authorization.amount` (total); Increase's
+`card_increment.amount` beside `updated_authorization_amount`; Galileo's cumulative in the primary
+fields with *"the incremental amount … in the local amount fields"*. An adapter should prefer an
+explicit total field over inferring a convention for the group.
+
+**And the convention question itself is fully vindicated.** There is no industry norm: Adyen and
+Pismo send deltas, Lithic and Galileo and Column and Unit send restated totals, Treasury Prime sends
+neither (release-old plus hold-at-new-total) — and **Marqeta's own reference contradicts itself on
+one page**, describing `authorization.advice` as *"Decreases the amount"* in two tables and
+*"Replaces the amount"* in a third. Storing `raw_amount` and `raw_is_total` verbatim is the only
+defensible response to that.
+
+### Three things this model cannot express
+
+Recorded here rather than fixed, because each needs a design decision:
+
+- **A single-message transaction.** `auth_event_kind` has no value that posts at authorization, but
+  Lithic's `FINANCIAL_AUTHORIZATION` *"triggers immediate financial impact"*, Marqeta's
+  `auth_plus_capture` is a *"Final transaction type"* with ledger impact, and Treasury Prime's
+  `auth-clear-request` debits *"with no prior hold"*. Any PIN-debit or ATM volume breaks the model.
+- **An end-of-sequence indicator.** Lithic: *"the clearing is not marked as `FINAL`, so additional
+  clearing may still arrive."* Galileo: *"an indicator in the clearing message says that there are no
+  more clearings to come."* Both terminate a group without waiting for expiry. We can only expire.
+- **A hold that differs from the authorized amount.** Lithic's hold-adjustment rules change *"only
+  the hold … the cardholder and merchant amounts continue to reflect the original authorization
+  amount"*, and Stripe holds a **\$100 default** on a \$1 fuel status check. `held_minor` is derived
+  from the sum of authorization deltas and cannot diverge from it.
+
+### What the survey confirmed
+
+Grouping as a revisable inference is vindicated almost verbatim by Highnote: *"Do not rely solely on
+network reference IDs to correlate authorization and clearing events. Network identifiers are not
+guaranteed to be consistent across the lifecycle of a transaction"* — and they ship an unmatched
+queue rather than guessing, exactly as `card_auth_unmatched` does. Out-of-order clearing is a
+**named, routine sequence** in their message table, not an edge case. Negative available credit as a
+legal state is backed independently by Unit, Adyen, Galileo, Pismo and Stripe. And closing the hold
+while raising posted must be one transaction — Galileo says it outright: *"the ledger is locked
+during the time that the backout and settlement/completion are posted."*
+
+Two places we are ahead: **nobody enforces debits-equal-credits at the storage layer** (Modern
+Treasury asserts it at the API with a 422; Fragment makes it a schema-compile-time error), and
+**not one of the thirteen publishes a trial balance.**
 
 ## Decision
 
