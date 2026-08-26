@@ -146,6 +146,23 @@ CREATE FUNCTION expect_state(p_step text, p_expect text[]) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE r record; msg text := '';
 BEGIN
+    -- The expectation key is (tenant, purpose, currency), and uq_accounts__owned
+    -- permits two accounts of one purpose in a tenant under different owners. Those
+    -- would SUM into a single row here, so a leg mis-routed between them would be
+    -- invisible. Rather than widen every expectation, refuse the ambiguity: if it
+    -- ever arises, this assertion stops describing the books and must be rewritten.
+    IF EXISTS (
+        SELECT 1 FROM trial_balance
+         GROUP BY tenant_id, purpose, currency HAVING count(DISTINCT account_id) > 1) THEN
+        RAISE EXCEPTION
+            'step % -- two accounts share (tenant, purpose, currency), so expect_state '
+            'can no longer identify them: %', p_step,
+            (SELECT string_agg(tenant_id||'/'||purpose||'/'||currency, ', ')
+               FROM (SELECT tenant_id, purpose, currency FROM trial_balance
+                      GROUP BY tenant_id, purpose, currency
+                     HAVING count(DISTINCT account_id) > 1) q);
+    END IF;
+
     -- Force the DEFERRED balance trigger to fire NOW. Without this the whole file
     -- runs inside one transaction that ends in ROLLBACK, so the trigger would
     -- never fire at all and "balanced per currency" would go entirely unchecked --
