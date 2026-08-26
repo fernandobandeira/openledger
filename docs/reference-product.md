@@ -28,13 +28,13 @@ record for **customer funds**, a **lender's collateral**, and the **financial st
 different masters, one table. Product surface assumed: charge card + wallet + AP/AR,
 warehouse-funded receivables, we own the authorization decision, delegated KYB/KYC.
 
-**An authorization moves no money and writes no ledger entry.** It records a hold and starts an
-expiry timer; the ledger first hears about the purchase at **clearing**, which is also when
-interchange is recognized. That is **our choice, not the field's** — Stripe, Adyen, Highnote,
-Treasury Prime, Column, Galileo and Pismo all post a row at authorization time, while Increase,
-Marqeta, Lithic and Unit keep it outside the ledger as we do
-([spike 008](../spikes/008-processor-hold-semantics/README.md),
-[ADR-0010](./decisions/0010-authorization-holds.md)).
+**An authorization moves no money and writes no *posted* ledger entry.** It records a hold and starts
+an expiry timer; the ledger first hears about the purchase at **clearing**, which is also when
+interchange is recognized. That is **our choice, not the field's** — about half the systems surveyed
+write a durable, balance-affecting row at authorization time and about half keep it outside the
+ledger as we do. [Spike 008](../spikes/008-processor-hold-semantics/README.md) has the split per
+vendor; it is not repeated here, because a list in two places drifts out of step with itself.
+See also [ADR-0010](./decisions/0010-authorization-holds.md).
 
 ## The chart of accounts
 

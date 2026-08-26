@@ -533,8 +533,7 @@ CREATE TABLE card_auth_events (
     -- and died on this CHECK with an opaque constraint error.
     -- A $0.00 authorization is a real message -- account verification / AVS /
     -- card-on-file -- and so is a $0.00 capture. Both were refused outright, with
-    -- an opaque constraint error. An expiry_reversal is a positive delta on a
-    -- release by definition, so it is no longer exempt.
+    -- an opaque constraint error.
     CONSTRAINT ck_auth_events__sign CHECK (
         kind = 'advice' OR
         -- expiry_reversal carries ZERO. Expiry is a flag that never subtracted
