@@ -31,7 +31,7 @@ monolith's** but for pg_dump 18's random `\restrict` nonce. The boundary was dra
 not drawn in the database; splitting the file is not the hard part.
 
 **Because `sqlx` can hold two migration sets, and the second one has no ordering.** 0.9.0 ships
-`dangerous_set_table_name()` and `create_schema()` (`sqlx-core-0.9.0/src/migrate/migrator.rs:110,122`),
+`dangerous_set_table_name()` and `create_schema()` (`sqlx-core-0.9.0/src/migrate/migrator.rs:111,124`),
 so per-module version tables work first time — `core_mig._sqlx_migrations` and
 `card_mig._sqlx_migrations`, both at version 1, both applied. What it does **not** ship is any
 dependency declaration between sets: no `dependencies`, no `run_before`. Ordering becomes the order

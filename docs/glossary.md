@@ -35,7 +35,7 @@ you have to store both.
 **Category** — one of exactly five: asset, liability, equity, revenue, expense. This is what rolls
 up into financial statements.
 
-**Chart of accounts** — the list of account *types* a business uses. Ours has 19
+**Chart of accounts** — the list of account *types* a business uses. Ours has 20
 (`customer_receivable`, `interchange_revenue`, …). Not the same as the accounts themselves: one
 type can have thousands of instances, one per customer.
 

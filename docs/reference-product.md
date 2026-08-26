@@ -37,7 +37,7 @@ See also [ADR-0008](./decisions/0008-authorization-holds.md).
 
 ## The chart of accounts
 
-Nineteen account types, seeded by [`schema/chart.sql`](../schema/chart.sql) — **seed data, not
+Twenty account types, seeded by [`schema/chart.sql`](../schema/chart.sql) — **seed data, not
 engine**: a marketplace or wallet deployment ships a different chart against the same core. Each
 type declares its `category` (which rolls up the financial statements), its `normal_balance` (which
 side it sits on), and the `fs_line` it maps to (the caption it appears under). Completeness comes
@@ -58,6 +58,7 @@ from enumerating this table rather than from listing whatever accounts have entr
 | `platform_rev_share_payable` | liability | credit | payables | | per_shard |
 | `ach_pull_returnable` | liability | credit | payables | | per_shard |
 | `due_to_tenants` | liability | credit | payables | | per_shard |
+| `outbound_transfer_in_transit` | liability | credit | customer_funds | | per_shard |
 | `paid_in_capital` | equity | credit | equity | | none |
 | `retained_earnings` | equity | credit | retained_earnings | | none |
 | `interchange_revenue` | revenue | credit | revenue | | none |

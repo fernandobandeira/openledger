@@ -43,7 +43,7 @@ INSERT INTO account_types (code,category,normal_balance,description,fs_line,is_p
   ('customer_wallet','liability','credit','customer funds we owe back','customer_funds',false,'per_shard'),
   -- THE CLEARING ACCOUNT. glossary.md defines one as "a designed staging account
   -- money passes THROUGH on its way somewhere, expected to return to zero", and
-  -- until now the chart had none -- 19 types and nowhere to stage a movement. The
+  -- until now the chart had none -- nineteen types and nowhere to stage a movement. The
   -- cost of that gap was visible: docs/diagrams/03-state-machines.svg drew an
   -- outbound transfer as DR fbo_cash / CR fbo_cash, a posting that moves no money,
   -- because there was no account to pass it through. A wallet withdrawal is
@@ -51,7 +51,12 @@ INSERT INTO account_types (code,category,normal_balance,description,fs_line,is_p
   -- DR here / CR customer_wallet on return -- so the liability to the customer is
   -- continuous and the cash leaves exactly once. LIABILITY, not asset: until the
   -- money lands we still owe it.
-  ('outbound_transfer_in_transit','liability','credit','left the wallet, has not settled','payables',false,'per_shard'),
+  -- fs_line is customer_funds, NOT payables. The money is still the customer's
+  -- until it lands; presenting it under operator trade payables during the
+  -- in-transit window understates "Customer funds payable" and overstates what the
+  -- operator owes its own suppliers -- the mirror image of the harm the Reg S-X
+  -- 5-02.1 note at the top of this file exists to prevent on the asset side.
+  ('outbound_transfer_in_transit','liability','credit','left the wallet, has not settled','customer_funds',false,'per_shard'),
   ('network_settlement_payable','liability','credit','owed to the card network','payables',true,'shared'),
   ('facility_borrowings','liability','credit','drawn on the warehouse line','borrowings',true,'shared'),
   ('accrued_interest_payable','liability','credit','interest accrued, not paid','payables',false,'shared'),

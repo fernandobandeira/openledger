@@ -72,11 +72,11 @@ per-currency-balanced transactions *regardless of denomination* — so a currenc
 
 **Netting is a presentation rule with a standard behind it.** IAS 32.42 and ASC 210-20-45-1 permit
 offsetting only for amounts due to and from the **same party**, which is why the scope has to be
-declared on the type rather than inferred from the split. *Both citations are **unverified** under
-this tree's sourcing rule: the IFRS and FASB texts are not freely fetchable, so there is no URL to put
-next to them. An earlier draft cited this rule as IAS 1.32 in four files and IAS 32.42 in three; 1.32
-is the general prohibition on offsetting, and 32.42 is the one that carries the
-legally-enforceable-right-of-set-off test, so 32.42 is what the tree now says throughout.*
+declared on the type rather than inferred from the split. *Unverified, like every accounting-standard
+citation here — see [the sourcing rule](./README.md#on-sourcing). An earlier draft cited this as
+IAS 1.32 in four files and IAS 32.42 in three; 1.32 is the general prohibition on offsetting and
+32.42 carries the legally-enforceable-right-of-set-off test, so 32.42 is what the tree says
+throughout.*
 
 **Prior art, checked rather than assumed.** Xero's published [OpenAPI
 spec](https://raw.githubusercontent.com/XeroAPI/Xero-OpenAPI/master/xero_accounting.yaml) carries

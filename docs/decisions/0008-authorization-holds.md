@@ -118,7 +118,7 @@ WHERE g.expired_at IS NULL AND g.held_minor > 0
         AND e.hold_expires_at < now());
 ```
 
-`ix_hold_groups__held` earns this — `(tenant_id, company_id) WHERE held_minor > 0`. The sweep filters
+`ix_auth_events__hold_expiry` earns this — an earlier version of this row credited `ix_hold_groups__held`, whose partial predicate matched **100.0% of 20,733 groups** and which the sweep's plan never touches; it serves the authorization read instead — `(tenant_id, company_id) WHERE held_minor > 0`. The sweep filters
 on the partial predicate with no tenant or company equality: the `WHERE` clause is the useful half.
 
 **The sweep is inert today, and executing it will not tell you that.** It parses and runs, and matches
