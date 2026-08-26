@@ -239,6 +239,74 @@ CREATE TABLE ledger_account_balances (
 -- Balanced per currency, enforced by the DATABASE, deferred to COMMIT so a
 -- transaction can be built up entry by entry.
 
+-- recorded_at is the INSERTION axis. It is now assigned, never accepted.
+--
+-- effective_at was made honest by putting it inside a composite key. recorded_at
+-- -- the other half of the bitemporal claim, the axis every "reproducible as of
+-- any date, forever" statement rests on -- had a DEFAULT and nothing else. It was
+-- client-supplied, unconstrained, and not even consistent between the two legs of
+-- one transaction. Three consequences, all reproduced:
+--
+--   * an already-issued recorded-axis report could be rewritten months later by
+--     inserting a new transaction that CLAIMS to predate it -- no seal broken, no
+--     UPDATE, no DELETE, and zero drift
+--   * one transaction's legs could carry different recorded_at, so a recorded-axis
+--     report of a perfectly balanced journal came back UNBALANCED
+--   * and made silent: two honest sales, each with one leg slipped forward, gave a
+--     GREEN recorded-axis report that was 50% wrong
+--
+-- now() is transaction-start time, so all legs of a transaction now share one
+-- value by construction, and no caller can choose it. What this does NOT fix is
+-- monotonicity with COMMIT order -- see ADR-0005, still proposed. Until that
+-- lands, balance_after cannot answer a recorded-axis as-of question either; the
+-- aggregate can.
+CREATE FUNCTION assign_recorded_at() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.recorded_at := now();
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER ck_entries__recorded_at BEFORE INSERT ON ledger_entries
+    FOR EACH ROW EXECUTE FUNCTION assign_recorded_at();
+ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ck_entries__recorded_at;
+CREATE TRIGGER ck_txn__recorded_at BEFORE INSERT ON ledger_transactions
+    FOR EACH ROW EXECUTE FUNCTION assign_recorded_at();
+ALTER TABLE ledger_transactions ENABLE ALWAYS TRIGGER ck_txn__recorded_at;
+CREATE TRIGGER ck_events__recorded_at BEFORE INSERT ON ledger_events
+    FOR EACH ROW EXECUTE FUNCTION assign_recorded_at();
+ALTER TABLE ledger_events ENABLE ALWAYS TRIGGER ck_events__recorded_at;
+
+-- ---- the transaction record itself is immutable -----------------------------
+-- Two escapes closed at once. The "fewer than two entries" DELETE guard gated on
+-- the parent still existing, so deleting the legs AND the transaction row in one
+-- statement erased 50,000 of revenue with every check green. And xact_id -- the
+-- seal's whole basis -- was an ordinary mutable column: one UPDATE re-opened a
+-- committed, already-reported transaction and appended to it.
+CREATE FUNCTION assert_transaction_immutable() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'transaction % is history and cannot be deleted; reverse it instead',
+            OLD.id USING ERRCODE = '23514';
+    END IF;
+    -- metadata and external_ref are annotation; everything else is the record
+    IF ROW(NEW.tenant_id, NEW.id, NEW.event_id, NEW.kind, NEW.status, NEW.effective_at,
+           NEW.recorded_at, NEW.resolves_id, NEW.reverses_id, NEW.xact_id)
+       IS DISTINCT FROM
+       ROW(OLD.tenant_id, OLD.id, OLD.event_id, OLD.kind, OLD.status, OLD.effective_at,
+           OLD.recorded_at, OLD.resolves_id, OLD.reverses_id, OLD.xact_id) THEN
+        RAISE EXCEPTION
+            'transaction % is immutable; only metadata and external_ref may change',
+            OLD.id USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER ck_txn__immutable BEFORE UPDATE OR DELETE ON ledger_transactions
+    FOR EACH ROW EXECUTE FUNCTION assert_transaction_immutable();
+ALTER TABLE ledger_transactions ENABLE ALWAYS TRIGGER ck_txn__immutable;
+
 -- A transaction's entry set is closed when its creating transaction commits.
 CREATE FUNCTION assert_entry_seals() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -257,6 +325,35 @@ BEGIN
     END IF;
     RETURN NEW;
 END $$;
+
+-- account_seq must be the sequence number the balance upsert just issued. It was
+-- client-supplied with only positivity and uniqueness enforced, so an app-role
+-- INSERT could leave a 48-wide gap and later FILL it with a backdated, balanced,
+-- same-account round trip -- taking gross turnover from 100 to 100,000,000 with
+-- the journal and the cache written together, so all three copies agreed and the
+-- drift view stayed silent. The alarm detects DISAGREEMENT; it cannot detect
+-- FABRICATION. Sequencing has to be enforced where it is issued.
+CREATE FUNCTION assert_entry_seq() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE v_last bigint;
+BEGIN
+    SELECT last_seq INTO v_last FROM ledger_account_balances
+     WHERE tenant_id = NEW.tenant_id AND account_id = NEW.account_id
+       AND currency = NEW.currency;
+    -- No cache row means no sequence has been issued for this account yet; the
+    -- posting path always creates it in the same statement that returns the seq.
+    IF v_last IS NOT NULL AND NEW.account_seq <> v_last THEN
+        RAISE EXCEPTION
+            'account_seq % was not issued by the balance upsert (which is at %); '
+            'post through the upsert rather than choosing a sequence',
+            NEW.account_seq, v_last USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER ck_entries__seq BEFORE INSERT ON ledger_entries
+    FOR EACH ROW EXECUTE FUNCTION assert_entry_seq();
+ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ck_entries__seq;
 
 CREATE TRIGGER ck_entries__sealed
     BEFORE INSERT ON ledger_entries
@@ -326,6 +423,26 @@ CREATE CONSTRAINT TRIGGER ck_entries__balances
 -- as its publisher, or replication is a laundering channel for corrupt rows.
 ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ck_entries__balances;
 
+-- ...and the FOREIGN KEYS, which were not. `ENABLE ALWAYS` was applied to the two
+-- hand-written constraint triggers and to nothing else, so under
+-- session_replication_role='replica' all three composite FKs were skipped:
+-- verified, a transaction spanning two tenants, with both legs carrying a currency
+-- their account does not hold, dated 27 years before their own transaction --
+-- every guard the composite keys exist to provide, on the replication apply path.
+-- Referential integrity is implemented as system triggers, so it takes the same
+-- treatment.
+DO $$
+DECLARE t record;
+BEGIN
+    FOR t IN SELECT tgname, tgrelid::regclass AS tbl FROM pg_trigger
+              WHERE tgisinternal AND tgrelid IN ('ledger_entries'::regclass,
+                                                 'ledger_transactions'::regclass,
+                                                 'ledger_account_balances'::regclass)
+    LOOP
+        EXECUTE format('ALTER TABLE %s ENABLE ALWAYS TRIGGER %I', t.tbl, t.tgname);
+    END LOOP;
+END $$;
+
 -- A transaction with NO entries is vacuously balanced, so the row trigger above
 -- never fires for it. Verified: a `posted` clearing with zero entries committed,
 -- consuming an idempotency key. Oracle GL refuses the same thing -- "journal
@@ -369,12 +486,15 @@ GRANT SELECT, INSERT, UPDATE ON ledger_account_balances TO openledger_app;
 -- The ledger is append-only. The balances table is a derived cache and may be
 -- updated; the journal may not.
 --
--- These REVOKEs are defensive, not the mechanism: the GRANT above never granted
--- UPDATE or DELETE in the first place, so removing them changes nothing today
--- (verified by mutation). They exist so that a later careless GRANT ALL does not
--- silently make the journal mutable. The property is real -- granting UPDATE and
--- then dropping these lines IS caught by the test suite -- but it comes from the
--- narrow GRANT, not from these lines.
+-- These REVOKEs are defensive, and their limits are worth stating plainly, because
+-- an earlier comment here overstated them. A REVOKE is a point-in-time change to a
+-- privilege, NOT a standing prohibition: a later `GRANT ALL` re-grants everything,
+-- including TRUNCATE, and verified -- `SET ROLE openledger_app; TRUNCATE
+-- ledger_entries;` then empties the journal. Nothing in SQL can stop that.
+--
+-- So the property comes from the NARROW GRANT above and from never widening it.
+-- These lines make the intent explicit and make an accidental widening obvious in
+-- review; they are not a backstop against a deliberate one.
 -- TRUNCATE is included deliberately. It is not covered by DELETE, it fires no row
 -- trigger, and it was verified reachable: after a careless `GRANT ALL`, the shipped
 -- REVOKEs left TRUNCATE in place and `SET ROLE openledger_app; TRUNCATE

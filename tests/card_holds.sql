@@ -570,6 +570,119 @@ SELECT eq('...and the authorized subtotal tracks the restatement',
           (SELECT authorized_minor FROM card_hold_groups WHERE group_key='g_base'), 12000);
 SELECT no_drift('the conversion base');
 
+-- =========================================================== the attach path
+--
+-- The re-delivery block is the ONLY path that attaches an event to a group without
+-- going through fresh ingest, and it used to sit before every guard and consult
+-- none of them. Three under-reservations came out of that one placement, and the
+-- suite's single re-delivery test used the one shape where the missing guards did
+-- not matter: same currency, same company, not expired, delta convention.
+--
+-- The strongest single assertion here is the last one: what ingest RETURNS to its
+-- caller must equal what held_for_company reports. Those two numbers disagreeing by
+-- the entire exposure is what several of these defects looked like from outside.
+
+-- an expiry_reversal -- the message whose meaning is "your release was premature" --
+-- re-delivered onto an expired group must re-open it, not be swallowed by the clamp
+SELECT record_auth_event('t1','ar_auth','g_ar','zeta','card_ar',
+        'authorization', 10000,'USD',false, now());
+SELECT expire_hold_group('t1','zeta','g_ar');
+SELECT record_auth_event('t1','ar_rev', NULL,'zeta','card_ar',
+        'expiry_reversal', 10000,'USD',false, now());
+SELECT eq('an expiry_reversal re-delivered with its group re-opens the hold',
+          (SELECT record_auth_event('t1','ar_rev','g_ar','zeta','card_ar',
+                   'expiry_reversal', 10000,'USD',false, now())), 20000);
+SELECT eq('...and what ingest returned is what the company actually holds',
+          held_for_company('t1','zeta','USD'), 20000);
+SELECT no_drift('re-delivery onto an expired group');
+
+-- ...and the same message on the FRESH-INGEST path. The two paths have separate
+-- un-expire lists, so a test that only covers one leaves the other deletable --
+-- which it was: dropping expiry_reversal from the main list changed nothing.
+SELECT record_auth_event('t1','fr_auth','g_fr','zeta','card_fr',
+        'authorization', 4000,'USD',false, now());
+SELECT expire_hold_group('t1','zeta','g_fr');
+SELECT eq('expired', (SELECT held_minor FROM card_hold_groups WHERE group_key='g_fr'), 0);
+SELECT record_auth_event('t1','fr_rev','g_fr','zeta','card_fr',
+        'expiry_reversal', 1000,'USD',false, now());
+SELECT eq('an expiry_reversal on first delivery re-opens the hold',
+          (SELECT held_minor FROM card_hold_groups WHERE group_key='g_fr'), 5000);
+
+-- a cumulative RESTATEMENT is itself the liveness signal: its delta is zero
+SELECT record_auth_event('t1','sr_auth','g_sr','hotel','card_sr',
+        'authorization', 30000,'USD',true, now());
+SELECT expire_hold_group('t1','hotel','g_sr');
+SELECT record_auth_event('t1','sr_again','g_sr','hotel','card_sr',
+        'authorization', 30000,'USD',true, now());
+SELECT eq('a cumulative restatement re-opens an expired hold (its delta is 0)',
+          held_for_company('t1','hotel','USD'), 30000);
+
+-- ...and the alarm must see exposure raised after a release by REMOVING a
+-- decrease-side event, which never moves the authorized subtotal
+SELECT must_fail('splitting a clearing out of an expired group', $q$
+    SELECT record_auth_event('t1','xc_auth','g_xc','acme','card_xc',
+            'authorization', 10000,'USD',false, now());
+    SELECT record_auth_event('t1','xc_clr','g_xc','acme','card_xc',
+            'clearing', 8000,'USD',false, now());
+    SELECT expire_hold_group('t1','acme','g_xc');
+    SELECT regroup_auth_event('t1',
+            (SELECT id FROM card_auth_events WHERE processor_msg_id='xc_clr'),
+            'g_xc2','operator');
+    SELECT no_drift('exposure raised after a release');
+$q$, 'disagrees with the event log');
+
+-- a $0.00 status advice must not fix the group's convention: doing so refused the
+-- processor's own opening authorization forever
+SELECT record_auth_event('t1','adv0','g_adv0','acme','card_a0',
+        'advice', 0,'USD',false, now());
+SELECT eq('a $0.00 advice leaves the convention unset',
+          (SELECT count(*) FROM card_hold_groups
+            WHERE group_key='g_adv0' AND total_convention IS NULL), 1);
+SELECT record_auth_event('t1','adv0_auth','g_adv0','acme','card_a0',
+        'authorization', 10000,'USD',true, now());
+SELECT eq('...so the opening cumulative total is still accepted',
+          (SELECT held_minor FROM card_hold_groups WHERE group_key='g_adv0'), 10000);
+
+-- the re-delivery path must honour the currency and convention guards
+SELECT must_fail('re-delivery attaching a EUR event to a USD group', $q$
+    SELECT record_auth_event('t1','rd_eur', NULL,'acme','card_rd',
+            'authorization', 5000,'EUR',false, now());
+    SELECT record_auth_event('t1','rd_eur','g_late','acme','card_rd',
+            'authorization', 5000,'EUR',false, now());
+$q$, 'cannot join group');
+
+SELECT must_fail('re-delivery attaching a delta to a totals group', $q$
+    SELECT record_auth_event('t1','rd_delta', NULL,'acme','card_rd',
+            'incremental', 5000,'USD',false, now());
+    SELECT record_auth_event('t1','rd_delta','g_tip','acme','card_rd',
+            'incremental', 5000,'USD',false, now());
+$q$, 'cannot mix the two');
+
+-- ...and must not attach an event under a company it does not belong to
+SELECT must_fail('re-delivery under a different company', $q$
+    SELECT record_auth_event('t1','rd_co', NULL,'acme','card_rd',
+            'authorization', 5000,'USD',false, now());
+    SELECT record_auth_event('t1','rd_co','g_co','globex','card_rd',
+            'authorization', 5000,'USD',false, now());
+$q$, 'already exists for company');
+
+-- 'expiry' as an EVENT must be refused by the CONSTRAINT, not only the function --
+-- an operator backfill or a second adapter bypasses the function entirely
+SELECT must_fail('an expiry event written directly', $q$
+    INSERT INTO card_auth_events (tenant_id,processor_msg_id,company_id,card_id,kind,
+                                  amount_delta,currency,occurred_at)
+    VALUES ('t1','direct_expiry','acme','card_x','expiry', -100,'USD', now());
+$q$, 'ck_auth_events__sign');
+
+-- the repair must work in the state the alarm exists to detect: no group row
+SELECT record_auth_event('t1','mr_auth','g_missing','acme','card_mr',
+        'authorization', 8000,'USD',false, now());
+DELETE FROM card_hold_groups WHERE tenant_id='t1' AND group_key='g_missing';
+SELECT recompute_hold_group('t1','acme','g_missing');
+SELECT eq('a missing group is materialised and repaired, not just returned',
+          (SELECT total_minor FROM card_hold_groups WHERE group_key='g_missing'), 8000);
+SELECT no_drift('repairing a missing group');
+
 DO $$ BEGIN RAISE NOTICE 'ok  card hold flow attested'; END $$;
 
 ROLLBACK;

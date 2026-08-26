@@ -51,6 +51,12 @@ SELECT 'p1','company','acme',code,category,normal_balance,'USD'
 -- suite; this is one synthetic 200k-leg transaction.
 ALTER TABLE ledger_entries      DISABLE TRIGGER ck_entries__balances;
 ALTER TABLE ledger_transactions DISABLE TRIGGER ck_txn__has_entries;
+-- recorded_at is assigned by the engine now, and account_seq must come from the
+-- balance upsert. Both are correct and both make a 200k-row synthetic fixture
+-- impossible, so they are off for the load only. This file asserts PLAN SHAPE;
+-- the invariants have their own suites.
+ALTER TABLE ledger_entries DISABLE TRIGGER ck_entries__recorded_at;
+ALTER TABLE ledger_entries DISABLE TRIGGER ck_entries__seq;
 
 INSERT INTO ledger_events (tenant_id,kind,source,idempotency_key,idempotency_hash,payload,effective_at)
 VALUES ('p1','bulk','internal','bulk',sha256('bulk'),'{}',now());
@@ -66,6 +72,8 @@ SELECT 'p1', t.id, a.id, 'debit', 1, 'USD', g, g,
  CROSS JOIN (SELECT id FROM ledger_accounts WHERE tenant_id='p1') a;
 ALTER TABLE ledger_entries      ENABLE ALWAYS TRIGGER ck_entries__balances;
 ALTER TABLE ledger_transactions ENABLE ALWAYS TRIGGER ck_txn__has_entries;
+ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ck_entries__recorded_at;
+ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ck_entries__seq;
 ANALYZE ledger_entries;
 
 -- 1. the current balance: one lookup, no sort. tenant_id is not optional -- it

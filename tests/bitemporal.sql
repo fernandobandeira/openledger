@@ -12,9 +12,12 @@
 -- were each individually deletable with the whole suite still green. Nothing here
 -- asserted the design's most-cited property.
 --
--- The fixture below deliberately separates the axes: three transactions whose
--- business dates run Jan, Feb, Mar, RECORDED in the order Jan, Mar, Feb. The
--- February one is the backdated arrival.
+-- The fixture separates the axes by BUSINESS date. It cannot separate them by
+-- recording date any more, and that is deliberate: recorded_at is now assigned by
+-- the engine and cannot be supplied, because a client-settable insertion axis let
+-- an already-issued recorded-axis report be rewritten months later by a
+-- transaction claiming to predate it -- with zero drift. Everything here is
+-- therefore recorded NOW, and the business dates run Jan through May.
 
 \set ON_ERROR_STOP on
 \o /dev/null
@@ -45,15 +48,15 @@ SELECT 'bt2','house',NULL,code,category,normal_balance,'USD'
 
 -- post(tenant, key, effective_at, recorded_at, amount)
 CREATE FUNCTION bpost(p_tenant text, p_key text, p_eff timestamptz,
-                      p_rec timestamptz, p_amt bigint) RETURNS void
+                      p_amt bigint) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE v_event uuid; v_txn uuid; r record; v_seq bigint; v_bal bigint;
 BEGIN
     INSERT INTO ledger_events (tenant_id,kind,source,idempotency_key,idempotency_hash,payload,effective_at)
     VALUES (p_tenant,'bt','internal',p_key,sha256(convert_to(p_key,'UTF8')),'{}',p_eff)
     RETURNING id INTO v_event;
-    INSERT INTO ledger_transactions (tenant_id,event_id,kind,status,effective_at,recorded_at)
-    VALUES (p_tenant,v_event,'bt','posted',p_eff,p_rec) RETURNING id INTO v_txn;
+    INSERT INTO ledger_transactions (tenant_id,event_id,kind,status,effective_at)
+    VALUES (p_tenant,v_event,'bt','posted',p_eff) RETURNING id INTO v_txn;
 
     FOR r IN SELECT a.id AS account_id, v.d::ledger_direction AS dir
                FROM (VALUES ('customer_receivable','debit'),('interchange_revenue','credit')) v(p,d)
@@ -70,25 +73,24 @@ BEGIN
         RETURNING b.last_seq, b.input-b.output INTO v_seq, v_bal;
 
         INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
-                                    currency,account_seq,balance_after,effective_at,recorded_at)
-        VALUES (p_tenant,v_txn,r.account_id,r.dir,p_amt,'USD',v_seq,v_bal,p_eff,p_rec);
+                                    currency,account_seq,balance_after,effective_at)
+        VALUES (p_tenant,v_txn,r.account_id,r.dir,p_amt,'USD',v_seq,v_bal,p_eff);
     END LOOP;
 END $$;
 
--- business date Jan, recorded Jan
-SELECT bpost('bt','jan', '2026-01-15','2026-01-15', 100);
+SELECT bpost('bt','jan', '2026-01-15', 100);
 -- business date MARCH, recorded FEBRUARY -- ahead of its own recording? no:
 -- recorded later than the January one, business date later too. The normal case.
-SELECT bpost('bt','mar', '2026-03-15','2026-03-15', 400);
+SELECT bpost('bt','mar', '2026-03-15', 400);
 -- THE BACKDATED ARRIVAL: business date FEBRUARY, learned about in APRIL. It lands
 -- with a HIGHER account_seq than the March entry, which is the whole point.
-SELECT bpost('bt','feb', '2026-02-15','2026-04-01', 20);
+SELECT bpost('bt','feb', '2026-02-15', 20);
 -- ...and the mirror case: a POST-dated arrival. Business date May, learned about
 -- in February. On the recorded axis it is already known on 28 Feb; on the
 -- effective axis it has not happened yet. The two axes therefore diverge in BOTH
 -- directions, which a fixture that only backdates cannot show.
-SELECT bpost('bt','may', '2026-05-15','2026-02-01', 7);
-SELECT bpost('bt2','other','2026-01-15','2026-01-15', 7777);
+SELECT bpost('bt','may', '2026-05-15', 7);
+SELECT bpost('bt2','other','2026-01-15', 7777);
 
 -- the sequence really is out of business-date order
 SELECT eqv('the backdated entry has the highest account_seq',
@@ -113,22 +115,22 @@ SELECT eqv('effective axis, as of 31 May: revenue (the post-dated one lands)',
 -- not arrived yet. This is the number a reproducible report must return forever.
 -- Jan (recorded Jan) + May (recorded Feb) = 107. March was not recorded until
 -- March, and February did not arrive until April -- neither is known yet.
-SELECT eqv('recorded axis, as of 28 Feb: revenue',
-    (SELECT revenue FROM accounting_equation('bt','2026-02-28','recorded')), 107);
-SELECT eqv('recorded axis, as of 31 Mar: revenue (March arrives)',
-    (SELECT revenue FROM accounting_equation('bt','2026-03-31','recorded')), 507);
-SELECT eqv('recorded axis, as of 30 Apr: revenue (the backdated one arrives)',
-    (SELECT revenue FROM accounting_equation('bt','2026-04-30','recorded')), 527);
+SELECT eqv('recorded axis, as of 28 Feb: nothing had been recorded yet',
+    (SELECT revenue FROM accounting_equation('bt','2026-02-28','recorded')), 0);
+SELECT eqv('recorded axis, as of 31 Mar: still nothing',
+    (SELECT revenue FROM accounting_equation('bt','2026-03-31','recorded')), 0);
+SELECT eqv('recorded axis, as of now: everything',
+    (SELECT revenue FROM accounting_equation('bt', now(), 'recorded')), 527);
 
 -- THE POINT, as an assertion: on the same instant the two axes disagree, and each
 -- holds something the other does not. Effective knows February (backdated, not yet
 -- recorded on 28 Feb); recorded knows May (post-dated, already recorded).
-SELECT eqv('effective knows the backdated February that recorded does not',
+SELECT eqv('the axes disagree on 28 Feb by everything that had HAPPENED but not been RECORDED',
     (SELECT revenue FROM accounting_equation('bt','2026-02-28','effective'))
-  - (SELECT revenue FROM accounting_equation('bt','2026-02-28','recorded')), 13);
-SELECT eqv('...and they converge once everything has both happened and arrived',
-    (SELECT revenue FROM accounting_equation('bt','2026-05-31','effective'))
-  - (SELECT revenue FROM accounting_equation('bt','2026-05-31','recorded')), 0);
+  - (SELECT revenue FROM accounting_equation('bt','2026-02-28','recorded')), 120);
+SELECT eqv('...and agree once the as-of is past both the business date and the recording',
+    (SELECT revenue FROM accounting_equation('bt', now(), 'effective'))
+  - (SELECT revenue FROM accounting_equation('bt', now(), 'recorded')), 0);
 
 -- ...and both still balance at every instant.
 DO $$
@@ -162,7 +164,7 @@ SELECT eqv('...and so does the other one',
 SELECT eqv('p_tenant filters, effective axis',
     (SELECT revenue FROM accounting_equation('bt','2026-05-31','effective')), 527);
 SELECT eqv('p_tenant filters, recorded axis',
-    (SELECT revenue FROM accounting_equation('bt','2026-05-31','recorded')), 527);
+    (SELECT revenue FROM accounting_equation('bt', now(), 'recorded')), 527);
 SELECT eqv('...and the other tenant is genuinely there',
     (SELECT revenue FROM accounting_equation('bt2','2026-05-31','effective')), 7777);
 SELECT eqv('unfiltered covers both scopes',

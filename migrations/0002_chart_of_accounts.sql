@@ -22,7 +22,15 @@ CREATE TABLE fs_lines (
     -- posted (`bool_or(category = 'asset')`), so a line with NO activity evaluated
     -- to NULL and landed on the liability/equity side -- inferring the chart from
     -- the data, in the one report whose whole purpose is the opposite.
-    side       text NOT NULL CHECK (side IN ('asset','liability_equity','credit','debit')),
+    -- side must belong to the statement. The CHECK used to admit all four values on
+    -- either statement, and balance_sheet_balances counts only 'asset' and
+    -- 'liability_equity' -- so a balance-sheet line carrying side 'debit' was
+    -- counted on NEITHER side and vanished. Verified: 90% of a balance sheet
+    -- missing, reporting balanced = true.
+    side       text NOT NULL,
+    CONSTRAINT ck_fs_lines__side_matches_statement CHECK (
+        (statement = 'balance_sheet'    AND side IN ('asset','liability_equity')) OR
+        (statement = 'income_statement' AND side IN ('credit','debit'))),
     sort_order int  NOT NULL DEFAULT 1000
 );
 
@@ -174,6 +182,35 @@ CREATE TRIGGER ck_fs_lines__stable
     FOR EACH ROW EXECUTE FUNCTION assert_fs_line_stable();
 ALTER TABLE fs_lines ENABLE ALWAYS TRIGGER ck_fs_lines__stable;
 
+-- An account type's CATEGORY must agree with the statement line it reports under.
+-- Nothing tied them: pointing a `revenue` type at a cost-of-revenue line put 6,000
+-- of revenue on the expense side of the income statement -- revenue understatement,
+-- the harm ADR-0009 is entirely about -- with every check green. The stability
+-- triggers all guard CHANGES to the mapping; none guarded its creation.
+CREATE FUNCTION assert_type_matches_fs_line() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE f fs_lines;
+BEGIN
+    SELECT * INTO f FROM fs_lines WHERE code = NEW.fs_line;
+    IF f.code IS NULL THEN RETURN NEW; END IF;   -- the FK will speak
+    IF (NEW.category IN ('asset','liability','equity')) <> (f.statement = 'balance_sheet')
+       OR (NEW.category = 'asset'            AND f.side <> 'asset')
+       OR (NEW.category IN ('liability','equity') AND f.side <> 'liability_equity')
+       OR (NEW.category = 'revenue'          AND f.side <> 'credit')
+       OR (NEW.category = 'expense'          AND f.side <> 'debit') THEN
+        RAISE EXCEPTION
+            'account type % is %, which cannot report under statement line % (% / %)',
+            NEW.code, NEW.category, f.code, f.statement, f.side
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER ck_types__matches_fs_line
+    BEFORE INSERT OR UPDATE ON account_types
+    FOR EACH ROW EXECUTE FUNCTION assert_type_matches_fs_line();
+ALTER TABLE account_types ENABLE ALWAYS TRIGGER ck_types__matches_fs_line;
+
 -- ------------------------------------------------------------ reporting
 
 CREATE VIEW trial_balance AS
@@ -259,7 +296,16 @@ BEGIN
     END IF;
 
     RETURN QUERY
-    WITH e AS (
+    WITH scopes AS (
+        -- Enumerated from the ACCOUNTS, like balance_sheet. Returning zero rows for
+        -- a scope that exists is the empty-balanced-report failure by another door:
+        -- a VALID tenant with a VALID axis and an as-of before its first entry
+        -- returned nothing, and `bool_and(balanced)` over zero rows is NULL while
+        -- the idiomatic `for rows.Next() { if !balanced }` loop passes. A scope with
+        -- no activity yet is a scope reporting zeros, not a scope that is absent.
+        SELECT DISTINCT a.tenant_id, a.currency FROM ledger_accounts a
+         WHERE p_tenant IS NULL OR a.tenant_id = p_tenant
+    ), e AS (
         SELECT en.tenant_id, en.currency, t.category,
                -- debit-positive, always
                SUM(CASE WHEN en.direction = 'debit' THEN en.amount_minor
@@ -275,14 +321,17 @@ BEGIN
     ), c AS (
         -- assets and expenses are debit-normal CATEGORIES, presented as-is;
         -- liabilities, equity and revenue are credit-normal, negated once here,
-        -- for presentation only.
-        SELECT e.tenant_id, e.currency,
+        -- for presentation only. LEFT JOIN from scopes so a scope with no activity
+        -- in range reports zeros rather than vanishing.
+        SELECT s.tenant_id, s.currency,
                 COALESCE(SUM(dp) FILTER (WHERE category='asset'),0)::bigint       AS a,
                (-COALESCE(SUM(dp) FILTER (WHERE category='liability'),0))::bigint AS l,
                (-COALESCE(SUM(dp) FILTER (WHERE category='equity'),0))::bigint    AS q,
                (-COALESCE(SUM(dp) FILTER (WHERE category='revenue'),0))::bigint   AS r,
                 COALESCE(SUM(dp) FILTER (WHERE category='expense'),0)::bigint     AS x
-        FROM e GROUP BY e.tenant_id, e.currency
+        FROM scopes s
+        LEFT JOIN e ON e.tenant_id = s.tenant_id AND e.currency = s.currency
+        GROUP BY s.tenant_id, s.currency
     )
     SELECT c.tenant_id, c.currency, c.a, c.l, c.q, c.r, c.x,
            c.a, (c.l + c.q + c.r - c.x), c.a = (c.l + c.q + c.r - c.x)

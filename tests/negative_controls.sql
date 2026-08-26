@@ -76,8 +76,20 @@ CREATE FUNCTION entry(p_tenant text, p_txn uuid, p_acct uuid, p_dir text,
 LANGUAGE plpgsql AS $$
 DECLARE v_seq bigint;
 BEGIN
-    SELECT COALESCE(p_seq, COALESCE(MAX(account_seq),0)+1) INTO v_seq
-      FROM ledger_entries WHERE tenant_id=p_tenant AND account_id=p_acct;
+    -- The sequence must come FROM the balance upsert, not from MAX()+1 -- the
+    -- schema now enforces that, because a client-chosen seq was how a gap got
+    -- created and later filled with fabricated turnover. p_seq is still honoured
+    -- so the negative controls can supply a deliberately bad one.
+    INSERT INTO ledger_account_balances AS b (tenant_id,account_id,currency,input,output,last_seq)
+    VALUES (p_tenant,p_acct,p_ccy,
+            CASE WHEN p_dir='debit'  THEN p_amt ELSE 0 END,
+            CASE WHEN p_dir='credit' THEN p_amt ELSE 0 END, 1)
+    ON CONFLICT (tenant_id,account_id,currency) DO UPDATE
+       SET input=b.input+EXCLUDED.input, output=b.output+EXCLUDED.output,
+           last_seq=b.last_seq+1
+    RETURNING b.last_seq INTO v_seq;
+    v_seq := COALESCE(p_seq, v_seq);
+
     INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
                                 currency,account_seq,balance_after,effective_at)
     VALUES (p_tenant,p_txn,p_acct,p_dir::ledger_direction,p_amt,p_ccy,v_seq,
@@ -88,18 +100,6 @@ BEGIN
             COALESCE((SELECT effective_at FROM ledger_transactions
                        WHERE tenant_id=p_tenant AND id=p_txn), now()));
 
-    -- Maintain the cache. Without this every account with entries already produced
-    -- a `no cached balance row` in ledger_balance_drift, so any control asserting
-    -- `EXISTS (SELECT 1 FROM ledger_balance_drift)` was satisfied BEFORE its tamper
-    -- -- vacuous, and proven so: deleting the tampering statement left the suite
-    -- green. Every drift control below now starts from a clean baseline.
-    INSERT INTO ledger_account_balances AS b (tenant_id,account_id,currency,input,output,last_seq)
-    VALUES (p_tenant,p_acct,p_ccy,
-            CASE WHEN p_dir='debit'  THEN p_amt ELSE 0 END,
-            CASE WHEN p_dir='credit' THEN p_amt ELSE 0 END, v_seq)
-    ON CONFLICT (tenant_id,account_id,currency) DO UPDATE
-       SET input=b.input+EXCLUDED.input, output=b.output+EXCLUDED.output,
-           last_seq=EXCLUDED.last_seq;
 END $$;
 
 -- The baseline must be CLEAN before any drift control runs, or those controls
@@ -211,12 +211,16 @@ $q$, 'does not balance');
 RESET ROLE;
 
 -- 1e. a transaction cannot reverse itself
+-- Set at INSERT, not by UPDATE: ledger_transactions is immutable now, so an
+-- UPDATE would trip that guard instead and test a different rule.
 SELECT must_fail('self-reversal', $q$
-    DO $d$ DECLARE t uuid := txn('t1','n1e'); BEGIN
-        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  10);
-        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 10);
-        UPDATE ledger_transactions SET reverses_id = id WHERE id = t;
-    END $d$;
+    INSERT INTO ledger_events (tenant_id,kind,source,idempotency_key,idempotency_hash,
+                               payload,effective_at)
+    VALUES ('t1','neg','internal','n1e',sha256('n1e'),'{}',now());
+    INSERT INTO ledger_transactions (tenant_id,id,event_id,kind,status,effective_at,reverses_id)
+    SELECT 't1','0e0e0e0e-0000-7000-8000-00000000000e',id,'neg','posted',now(),
+           '0e0e0e0e-0000-7000-8000-00000000000e'
+      FROM ledger_events WHERE tenant_id='t1' AND idempotency_key='n1e';
 $q$, 'ck_txn__no_self_reference');
 
 -- 2. THE ONE THE OLD SUITE MISSED. Perfectly balanced, both legs revenue-typed,
@@ -246,9 +250,18 @@ $q$, 'fk_entries__txn"');   -- trailing quote: fk_entries__txn is a PREFIX of
                            -- fk_entries__txn_effective, so a bare substring match
                            -- passed even with the cross-tenant FK dropped
 
--- 4. an entry carrying a currency its account does not hold
-SELECT must_fail('entry currency <> account currency', $q$
+-- 4. an entry carrying a currency its account does not hold. TWO constraints now
+--    enforce this -- the cache's FK carries currency as well -- so it is asserted
+--    on both paths rather than whichever happens to fire first.
+SELECT must_fail('a cached balance in a currency its account does not hold', $q$
     SELECT entry('t1', txn('t1','n4'), acct('t1','customer_receivable'), 'debit', 500, 'EUR');
+$q$, 'fk_balances__account');
+
+SELECT must_fail('entry currency <> account currency', $q$
+    INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
+                                currency,account_seq,balance_after,effective_at)
+    SELECT 't1', txn('t1','n4b'), acct('t1','customer_receivable'), 'debit', 500, 'EUR', 1, 500,
+           now();
 $q$, 'fk_entries__account');
 
 -- 5. balanced in TOTAL, unbalanced per currency. The identity A = L + E + (R - X)
@@ -402,11 +415,20 @@ SELECT must_fail('lowercase currency code', $q$
     VALUES ('t1','house',NULL,'fbo_cash','asset','debit','usd');
 $q$, 'currency_iso');
 
--- 10i. account_seq orders history; a negative one reorders an account's past
-SELECT must_fail('negative account_seq', $q$
+-- 10i. account_seq orders history. A client-chosen one is refused outright now --
+--      it must be the number the balance upsert issued -- which subsumes the
+--      positivity CHECK on the posting path. Both are asserted: the trigger on the
+--      path callers use, and the CHECK on a direct write that skips it.
+SELECT must_fail('an account_seq the balance upsert did not issue', $q$
     DO $d$ DECLARE t uuid := txn('t1','n10i'); BEGIN
-        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  5, 'USD', -9999);
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  5, 'USD', 4242);
     END $d$;
+$q$, 'was not issued by the balance upsert');
+
+SELECT must_fail('a negative account_seq', $q$
+    INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
+                                currency,account_seq,balance_after,effective_at)
+    SELECT 't1', txn('t1','n10i2'), acct('t1','fee_revenue'), 'credit', 5,'USD', -9999, -5, now();
 $q$, 'seq_positive');
 
 -- 10j. an entry may not disagree with its transaction about when it happened
