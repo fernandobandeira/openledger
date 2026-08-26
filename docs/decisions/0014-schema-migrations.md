@@ -8,15 +8,43 @@ with one flat file and did not say what replaced the ordering.
 
 ## The decision
 
-**[goose](https://github.com/pressly/goose), driven from Go, never from the CLI.**
+**[goose](https://github.com/pressly/goose), driven from Go, as its own command — not at
+application startup and not from goose's CLI.**
 
+- `openledger migrate` is a subcommand of the same binary, so a deployment runs the **same image**
+  with a different command. It applies migrations and exits.
+- It runs as a **pre-deploy job** — a Kubernetes `Job`, a Helm `pre-upgrade` hook, an ECS one-off
+  task — that must succeed before the new pods roll. The ledger process never migrates.
 - `schema/schema.sql` becomes `migrations/00001_baseline.sql`, **with its own `BEGIN;`/`COMMIT;`
   removed** — see below; that was a real defect, not a style point.
 - Migrations are embedded with `//go:embed` and applied by
-  `goose.NewProvider(dialect, db, fsys, goose.WithSessionLocker(...))` at startup.
+  `goose.NewProvider(dialect, db, fsys, goose.WithSessionLocker(...))`.
 - `-- +goose NO TRANSACTION` marks the migrations that must run outside a transaction.
 - **No down migrations.**
 - sqlc reads `migrations/`. There is exactly one copy of the schema.
+
+## Why a separate command, and why that does not flip the tool
+
+Migrating at application startup couples two things that fail differently: a bad migration should
+stop a deploy, not crash-loop a ledger. A pre-deploy job also means the schema change happens
+**once, before** any new code sees the database, which is the only ordering that makes an
+expand/contract migration safe.
+
+[Spike 007](../../spikes/007-schema-migrations/README.md) named this as the condition that would
+flip the choice to **tern**: *"if an operator runs migrations once, out of band, tern's blocking
+lock never contends and its `*pgx.Conn` API wins outright."* **It does not flip, for two reasons.**
+
+**The `database/sql` concession costs nothing here.** It was the one real mark against goose, and a
+separate command is exactly what neutralises it: `pgx/stdlib` now lives in a process that opens one
+connection, applies DDL and exits. [0002](./0002-data-access-layer.md) chose native pgx to protect
+the *query path* — batching, `CopyFrom`, binary parameters, scanning money without silent zeroes.
+None of that is in play in a DDL runner. The dependency lands where it does not matter.
+
+**And a pre-deploy job is an intention, not a guarantee of one migrator.** A Kubernetes `Job` retries
+on `backoffLimit`; a Helm hook can be re-run after a timeout; a CD tool can sync twice; a rolled-back
+release redeploys over one still finishing. The lock still has work to do, and a try-lock that polls
+is strictly better behaviour than a blocking lock that deadlocks — which is the same reason it was
+chosen in the first place.
 
 ## Why goose, and it is not the reason you would guess
 
@@ -96,9 +124,31 @@ says the service owns.
   migrations run over `pgx/stdlib` — one `sql.Open("pgx", dsn)` at startup, closed after migrating,
   with the hot path staying on `pgxpool`. [0002](./0002-data-access-layer.md) is untouched but this
   is a real concession, and **tern would have avoided it entirely**.
-- **The lock has a ceiling.** goose polls every 5 s, 60 times — five minutes. A baseline slower than
-  that makes the *other* instances give up. `lock.WithLockTimeout` must be set deliberately before
-  the RDS milestone. Read from source, not exercised.
+- **The lock has a ceiling.** goose polls every 5 s, 60 times — five minutes. A migration slower
+  than that makes a *second* migrator give up rather than wait. With a pre-deploy job that is the
+  right failure — a job that gives up is visible and re-runnable — but it must be set deliberately
+  rather than inherited. Read from source, not exercised.
+- **A killed migrator leaves an INVALID index behind, and the retry does not heal it.** This is the
+  failure mode a pre-deploy job makes *more* likely, because pods get evicted, `activeDeadlineSeconds`
+  fires, and nodes drain. Reproduced against PostgreSQL 18: kill the backend mid-build and
+
+  ```
+  ix_t_v  indisvalid=false  indisready=true
+  $ CREATE INDEX CONCURRENTLY ix_t_v ON t (v);
+  ERROR:  relation "ix_t_v" already exists
+  ```
+
+  The planner then ignores the index — the database is *correct and silently slow*, and if it were
+  a UNIQUE index it would be enforcing nothing. **So every `CONCURRENTLY` migration is written in
+  the idempotent form**, which was verified to recover cleanly:
+
+  ```sql
+  -- +goose NO TRANSACTION
+  DROP INDEX CONCURRENTLY IF EXISTS uq_accounts__house_striped;
+  CREATE UNIQUE INDEX CONCURRENTLY uq_accounts__house_striped ON ...;
+  ```
+
+  A job that can be re-run is only useful if the migration it runs can be re-run.
 - **Every migration touching a populated table needs a `CONCURRENTLY` decision**, expressed as a
   directive. `NO TRANSACTION` gives up atomicity for that migration, so those should carry one step
   each — splitting is cheaper than debugging a half-applied migration.
