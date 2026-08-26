@@ -273,6 +273,30 @@ BEGIN
           USING ERRCODE = 'data_exception';
     END IF;
 
+    -- THE MESSAGE IS THE FIRST LOCK, ON EVERY PATH.
+    --
+    -- `INSERT ... ON CONFLICT DO NOTHING` on uq_auth_events__msg IS a lock
+    -- acquisition -- the lesson this file states for regroup_auth_event and did
+    -- not apply here. On the fresh path the group lock is taken at the top of the
+    -- block below, BEFORE the function can know whether the message already
+    -- exists, so ingest takes group-then-message while the attach path (fixed in
+    -- an earlier round to lock the event first) takes message-then-group.
+    --
+    -- Two ordinary single-group ingests then deadlock. Measured 10 of 10 trials
+    -- with the group pre-created and committed, so it is a plain row lock and not
+    -- a race to create anything: an adapter batch holding the message id of an
+    -- unmatched delivery and wanting a group, against a matcher holding that group
+    -- and wanting the message. Neither the recorded multi-group known issue nor
+    -- the retraction of "concurrent ingest on a single group cannot deadlock"
+    -- covers it -- that retraction blamed the foreign key's implicit FOR KEY SHARE
+    -- in the attach path, which is a different lock in a different function.
+    --
+    -- An advisory lock on the message identity restores one order everywhere. It
+    -- is the remedy ADR-0010 already names for the sibling case ("the fix belongs
+    -- in a batch API or in an advisory lock over the same key space"), it is
+    -- transaction-scoped, and it costs one hash.
+    PERFORM pg_advisory_xact_lock(hashtextextended(p_tenant || ':' || p_msg_id, 0));
+
     -- DEDUP BEFORE ANY GROUP IS MATERIALISED.
     --
     -- The group row was created from CALLER PARAMETERS at the top of this function,
@@ -346,7 +370,14 @@ BEGIN
                   p_msg_id, v_live, p_group
                   USING ERRCODE = 'data_exception';
             END IF;
-            SELECT total_minor INTO v_current FROM card_hold_groups
+            -- held_minor, not total_minor. See the fresh-ingest RETURN below for
+            -- why: the raw total goes negative on an over-capture, and this is the
+            -- number an adapter computes `available = limit - returned` from. That
+            -- comment was written when the fix reached ONE of the three RETURN
+            -- sites -- and said so, in the words "was only exercising it on one
+            -- branch" -- while these two kept returning the raw total. A routine
+            -- re-delivery of a cleared message handed the caller -9400.
+            SELECT held_minor INTO v_current FROM card_hold_groups
              WHERE tenant_id=p_tenant AND company_id=p_company AND group_key=v_live;
             RETURN COALESCE(v_current, 0);
         END IF;
@@ -484,7 +515,8 @@ BEGIN
             END IF;
             PERFORM recompute_hold_group(p_tenant, p_company, p_group);
         END;
-        SELECT total_minor INTO v_current FROM card_hold_groups
+        -- ...and the attach path, the third of the three.
+        SELECT held_minor INTO v_current FROM card_hold_groups
          WHERE tenant_id=p_tenant AND company_id=p_company AND group_key=p_group;
         RETURN COALESCE(v_current, 0);
     END IF;
@@ -869,6 +901,19 @@ BEGIN
             p_tenant, p_company, p_currency
             USING ERRCODE = 'data_exception';
     END IF;
+    -- ...and 'usd' is the identical failure, refused on the WRITE path and not
+    -- here. This file records that lowercase 'usd' already caused the defect once:
+    -- it created a SECOND hold group, and held_for_company for 'USD' reported 1000
+    -- while 500 more was live under 'usd'. The CHECK that closed it guards
+    -- card_hold_groups.currency. THIS is the read the authorization decision
+    -- actually calls, and it took anything and answered 0.
+    IF p_currency !~ '^[A-Z]{3}$' THEN
+        RAISE EXCEPTION
+            'held_for_company was asked for currency %, which is not an ISO code. '
+            'A non-canonical currency matches no group and returns a silent zero',
+            p_currency
+            USING ERRCODE = 'data_exception';
+    END IF;
     -- The markers are load-bearing: tests/query_plans.sql extracts exactly this
     -- region out of pg_proc and EXPLAINs it, so the plan guard reads the shipped
     -- query rather than a hand-retyped copy of it. A retyped copy could not see
@@ -965,7 +1010,8 @@ WITH live AS (
            COALESCE(-SUM(e.amount_delta) FILTER (
                WHERE e.amount_delta < 0 AND e.kind <> 'clearing'), 0) AS bloodless_decreases,
            COALESCE(SUM(GREATEST(e.amount_delta,0)) FILTER (
-               WHERE e.kind IN ('authorization','incremental','advice')), 0) AS increases
+               WHERE e.kind IN ('authorization','incremental','advice')), 0) AS increases,
+           COALESCE(-SUM(e.amount_delta) FILTER (WHERE e.kind = 'clearing'), 0) AS cleared
       FROM card_auth_event_group m
       JOIN card_auth_events e ON e.tenant_id = m.tenant_id AND e.id = m.event_id
      WHERE m.superseded_at IS NULL
@@ -1000,6 +1046,9 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
    -- invisible to held_for_company while total_minor and the log still agree --
    -- the alarm compared exactly those two and therefore reported nothing. The
    -- clamp is the thing hiding the number, so the alarm has to look past it.
+   -- (An earlier version of this comment said the branch was "keyed on the
+   -- monotonic counter, not on now()". It is keyed on the expired_* snapshots.
+   -- `last_event_seq` is read by nothing at all -- see the open list.)
    -- Exposure added to a group AFTER it was expired. held_minor is GENERATED to 0
    -- once expired_at is set, so anything attached later is invisible to
    -- held_for_company while total_minor and the log still agree -- the two columns
@@ -1011,8 +1060,45 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
    -- compared totals and currency and never this, so a group holding one
    -- raw_is_total=false event and one raw_is_total=true event -- the state the
    -- header calls IRRECONCILABLE -- reported nothing at all.
-   -- ...or the group has been reversed for more than was ever authorized, which
-   -- no arrival order can explain and no clearing accounts for.
+   -- ...or the group dipped further negative than its clearings can account for.
+   --
+   -- THE FIRST VERSION OF THIS ALARM WENT SILENT AT THE MOMENT THE MONEY WAS HIDDEN.
+   -- It compared `bloodless_decreases > increases`, which is true in the precursor
+   -- state -- two reversals against one authorization -- and FALSE the instant the
+   -- next genuine incremental is absorbed by the residue, because that increase
+   -- raises `increases` by exactly the amount it swallowed. The guard was defeated
+   -- by the event it exists to protect against, and could only ever report the
+   -- state where the money was not yet lost.
+   --
+   -- low_water_minor is the right input: it is written only as
+   -- `LEAST(low_water_minor, ...)`, so it is monotone non-increasing, it cannot be
+   -- erased, and group rows cannot be deleted. A dip below what clearings explain
+   -- LATCHES. A genuine over-capture (a $1 authorization clearing at $95: low water
+   -- -9400 against 9500 cleared) does not fire, and an out-of-order clearing that
+   -- lands before its authorization does not either, because that dip never
+   -- exceeds what the clearing itself accounts for.
+   --
+   -- AND IT SELF-HEALS, WHICH IS A REAL LIMIT AND NOT A FIXABLE ONE. The instant a
+   -- genuine incremental is absorbed by the residue, `increases` rises by exactly
+   -- the amount swallowed and this predicate goes false. A reviewer reported that
+   -- as an under-reservation: 100.00 live, 0.00 held, drift silent.
+   --
+   -- I tried to latch it on low_water_minor -- monotone, unerasable -- comparing
+   -- the dip against what clearings could explain. That FALSE-POSITIVES on the
+   -- central claim of this whole design: a group whose messages arrive
+   -- decrease-first dips below any clearing that has landed yet, which is exactly
+   -- the order tolerance the file exists to provide. `tests/card_holds.sql`
+   -- permutation 4,3,2,1 catches it immediately.
+   --
+   -- The reason no predicate works is that THE LOG CANNOT DECIDE THE QUESTION. A
+   -- reversal that arrives before its authorization and a reversal that should
+   -- never have been sent are the same three columns. Deciding it needs the
+   -- processor's own reversal-to-authorization linkage, which this design
+   -- deliberately does not model -- 0010 argues that grouping is a revisable
+   -- inference precisely because that linkage is unreliable. So the alarm reports
+   -- the precursor state, `low_water_minor` keeps the durable evidence that the
+   -- group was ever there, and the ambiguity is recorded in ADR-0010 rather than
+   -- papered over with a guard that would fire on honest traffic.
    OR l.bloodless_decreases > l.increases
    OR (l.any_total AND l.any_delta)
    OR g.total_convention IS DISTINCT FROM
@@ -1028,6 +1114,28 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
 -- cannot read card_hold_drift or the unmatched queue cannot act on either.
 GRANT SELECT ON card_hold_drift, card_auth_unmatched TO openledger_app;
 GRANT SELECT ON card_auth_events, card_auth_event_group, card_hold_groups TO openledger_app;
+-- ...and the DML the ingest functions perform on the caller's behalf. The app role
+-- could not call record_auth_event AT ALL -- `permission denied for table
+-- card_hold_groups` from inside the function -- because 0003 granted SELECT only
+-- and the functions are not SECURITY DEFINER. 0001 establishes openledger_app as
+-- THE application role and hunts dead grants ("0001's GRANT INSERT ON
+-- ledger_accounts was dead"); this was the same defect one migration later, and
+-- the alternative was a card adapter running as the table owner.
+--
+-- No UPDATE or DELETE on card_auth_events: it is an event log, and its
+-- immutability trigger refuses both anyway. UPDATE on card_auth_event_group is
+-- what supersede needs; there is no DELETE, and no TRUNCATE anywhere.
+-- UPDATE on the event log is granted ONLY so the role can take a row lock:
+-- Postgres requires it for every `SELECT ... FOR` locking clause, including
+-- FOR KEY SHARE, and regroup_auth_event locks the event first on purpose -- that
+-- ordering is what stopped a matcher and an operator deadlocking over the same
+-- event. The grant does not make the log mutable: ck_auth_events__immutable is
+-- ENABLE ALWAYS and refuses every UPDATE and DELETE whoever issues it, which the
+-- controls in tests/card_holds.sql assert for this role specifically. The
+-- privilege is the lock; the trigger is the immutability.
+GRANT INSERT, UPDATE ON card_auth_events      TO openledger_app;
+GRANT INSERT, UPDATE ON card_auth_event_group TO openledger_app;
+GRANT INSERT, UPDATE ON card_hold_groups      TO openledger_app;
 
 CALL enforce_triggers_on_replicas();
 

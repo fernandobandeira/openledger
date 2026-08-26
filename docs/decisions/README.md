@@ -267,6 +267,27 @@ Two rules follow, and they are cheap:
   `spikes/` is executed by CI, so "measured" there means "was measured once, against something".
   The live attestation is `tests/`.
 
+## On grading the graders
+
+Seven rounds have each found a way to make `tests/run.sh` print PASS over a suite that proves
+nothing, and each fix added a guard that reads **something the thing it polices controls** — the
+floor reads output the file prints, the call-site count reads the file's own source, the sentinel
+reads a string the file emits, and the canary reads whether a suite that can recognise it went red.
+Every one was forged in the next round, in between one and five lines.
+
+So the threat model is written down now rather than implied. **These guards defend against erosion —
+a control quietly deleted, a helper weakened, a file truncated, a floor with slack — and they do not
+defend against a determined author.** Nothing checked into a repository can: whoever edits the tests
+can edit the thing that checks them. The durable answers are outside the file — review, and CI
+running a pinned configuration the branch cannot edit. Neither exists yet, which is why "there is no
+CI" sits in *Still open* and is the highest-leverage item there.
+
+The one guard in this tree that a test file cannot forge is not in the tests. `assert_type_matches_fs_line`
+refused two mutants at **seed time**: the wrong chart could not be loaded, so the wrong system could
+not be built, and no test had to notice. That is the shape worth generalising — **prefer a constraint
+that makes a state unreachable to a check that looks for it afterwards.** Everything in `tests/` is a
+second choice, and the ones worth the most are the ones that could have been constraints.
+
 ## On mutation testing
 
 Six rounds of adversarial review have used the same measure: change the schema so it is wrong, and

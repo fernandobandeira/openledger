@@ -1464,6 +1464,96 @@ SELECT eq('...without moving the authorized subtotal',
 SELECT eq('no drift on g_advneg -- a negative advice',
           (SELECT count(*) FROM card_hold_drift WHERE group_key='g_advneg'), 0);
 
+-- ================= round 7: three RETURN sites, and a read that took anything
+
+-- WHAT INGEST RETURNS, ON ALL THREE PATHS. The fix for this reached one of the
+-- three RETURN sites -- and its own comment said so, in the words "was only
+-- exercising it on one branch" -- while the two re-delivery paths kept handing
+-- back the raw total. A routine re-delivery of a cleared message returned -9400
+-- while held_for_company reported 0: 94.00 of phantom credit for an adapter
+-- computing `available = limit - returned`. Processor re-delivery is not an edge
+-- case; the whole dedup design exists because it is routine.
+SELECT record_auth_event('t1','r7_ra','g_r7ret','omega','card_r7','authorization',100,'USD',false,now());
+SELECT eq('fresh ingest of an over-capture returns the clamped hold',
+          record_auth_event('t1','r7_rb','g_r7ret','omega','card_r7','clearing',9500,'USD',false,now()), 0);
+SELECT eq('...and RE-DELIVERING that same message returns it too',
+          record_auth_event('t1','r7_rb','g_r7ret','omega','card_r7','clearing',9500,'USD',false,now()), 0);
+-- ...and the third path: an unmatched message later attached to a group
+SELECT record_auth_event('t1','r7_rc','g_r7att','omega','card_r7','authorization',100,'USD',false,now());
+SELECT record_auth_event('t1','r7_rd', NULL,'omega','card_r7','clearing',9500,'USD',false,now());
+SELECT eq('...and so does the attach path',
+          record_auth_event('t1','r7_rd','g_r7att','omega','card_r7','clearing',9500,'USD',false,now()), 0);
+SELECT eq('...all three agreeing with what the company actually holds',
+          held_for_company('t1','omega','USD'),
+          (SELECT COALESCE(SUM(held_minor),0)::bigint FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='omega' AND currency='USD' AND held_minor > 0));
+
+-- A NON-CANONICAL CURRENCY ON THE READ PATH. 'usd' is refused when a group is
+-- written and was accepted here, matching no row and answering 0 -- the identical
+-- failure the NULL guard beside it calls "the most dangerous possible answer",
+-- and this file records that lowercase 'usd' already caused it once in the other
+-- direction.
+SELECT must_fail('asking what is held in a currency that is not an ISO code', $q$
+    DO $d$ BEGIN PERFORM held_for_company('t1','omega','usd'); END $d$;
+$q$, 'not an ISO code');
+
+-- THE APP ROLE MUST BE ABLE TO INGEST. It could not: SELECT-only grants on the
+-- three card tables and no SECURITY DEFINER meant record_auth_event failed with
+-- `permission denied for table card_hold_groups` from inside the function. Every
+-- other privilege control in this suite asserts what the role must NOT do.
+DO $$
+DECLARE v_held bigint;
+BEGIN
+    SET LOCAL ROLE openledger_app;
+    v_held := record_auth_event('t1','r7_app','g_r7app','papp','c_app',
+                                'authorization', 2500,'USD',false, now());
+    IF v_held <> 2500 THEN
+        RAISE EXCEPTION 'the app role ingested but got % back', v_held;
+    END IF;
+    -- the regroup needs the event id, and reading it back is part of what an
+    -- operator tool does, so the role must be able to do that too
+    PERFORM regroup_auth_event('t1',
+        (SELECT id FROM card_auth_events
+          WHERE tenant_id='t1' AND processor_msg_id='r7_app'),
+        'g_r7app2','operator');
+    PERFORM recompute_hold_group('t1','papp','g_r7app2');
+    PERFORM expire_hold_group('t1','papp','g_r7app2');
+    RESET ROLE;
+    RAISE NOTICE 'ok  the app role can ingest, regroup, repair and expire';
+END $$;
+RESET ROLE;
+-- ...and the UPDATE privilege that buys is a LOCK, not mutability. The event log
+-- stays immutable for this role, by trigger rather than by grant.
+SELECT must_fail('the app role rewriting a stored auth event', $q$
+    SET LOCAL ROLE openledger_app;
+    UPDATE card_auth_events SET amount_delta = 1 WHERE processor_msg_id='r7_app';
+$q$, 'is an event log and is immutable');
+-- ...and DELETE is not granted at all, so that one never reaches the trigger.
+-- Two independent defences, and the control says which is answering.
+SELECT must_fail('the app role deleting a stored auth event', $q$
+    SET LOCAL ROLE openledger_app;
+    DELETE FROM card_auth_events WHERE processor_msg_id='r7_app';
+$q$, 'permission denied for table card_auth_events');
+RESET ROLE;
+
+-- THE ALARM'S CONVENTION BRANCH, as a POSITIVE control. Its sibling
+-- (`any_total AND any_delta`) has one, built out-of-band on purpose because the
+-- state is unreachable through the API. This branch is the same shape and did not
+-- get the same treatment, so it could be deleted with the suite green -- after
+-- which a group whose stored convention disagrees with its log refuses every
+-- genuine message from its own processor forever, and refused messages are never
+-- stored, so they never reach the review queue either.
+SELECT record_auth_event('t1','r7_cv','g_r7conv','omega','card_cv','authorization',3000,'USD',false,now());
+SELECT must_fail('a stored convention that disagrees with the log', $q$
+    UPDATE card_hold_groups SET total_convention='total'
+     WHERE tenant_id='t1' AND company_id='omega' AND group_key='g_r7conv';
+    DO $d$ BEGIN
+        IF EXISTS (SELECT 1 FROM card_hold_drift WHERE group_key='g_r7conv') THEN
+            RAISE EXCEPTION 'STORED CONVENTION DISAGREES WITH THE LOG';
+        END IF;
+    END $d$;
+$q$, 'stored convention disagrees with the log');
+
 -- ...and again at the end, because a SET LOCAL in a DO block that SUCCEEDS
 -- persists for the rest of the transaction. MODE GUARD. `SET LOCAL session_replication_role = 'replica'` prepended to this
 -- file's BEGIN made the whole suite run on the replication apply path, where a
