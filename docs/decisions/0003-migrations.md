@@ -118,15 +118,31 @@ atomicity from `psql --single-transaction`, which is the caller's business rathe
 
   The planner then ignores the index — the database is *correct and silently slow*, and if it were a
   UNIQUE index it would be enforcing nothing. **So every `CONCURRENTLY` migration is written in the
-  idempotent form**, verified to recover cleanly:
+  idempotent form — as TWO migrations, each holding exactly one statement:**
 
   ```sql
-  -- no-transaction
-  DROP INDEX CONCURRENTLY IF EXISTS uq_accounts__house_striped;
-  CREATE UNIQUE INDEX CONCURRENTLY uq_accounts__house_striped ON ...;
+  -- 00007_drop_striped_index.sql        -- 00008_build_striped_index.sql
+  -- no-transaction                      -- no-transaction
+  DROP INDEX CONCURRENTLY IF EXISTS      CREATE UNIQUE INDEX CONCURRENTLY
+    uq_accounts__house_striped;            uq_accounts__house_striped ON ...;
   ```
 
-  A job that can be re-run is only useful if the migration it runs can be re-run.
+  **They cannot share a file, and an earlier version of this ADR said they could.** That pair was
+  verified against goose in [spike 007](../../spikes/007-schema-migrations/README.md) and carried
+  into an `sqlx` decision without being re-run. Under `sqlx` 0.9.0 it fails:
+
+  ```
+  Err(ExecuteMigration(Database([25001] DROP INDEX CONCURRENTLY cannot run inside a
+  transaction block), 4))
+  ```
+
+  `-- no-transaction` parses correctly; **the transport is the problem.** `execute_migration` sends
+  the whole file as one *simple query* (`sqlx-postgres-0.9.0/src/migrate.rs:315-323`), and PostgreSQL
+  runs a multi-statement simple query in an **implicit transaction block**. Proved with a control:
+  two statements where the second divides by zero leave the first's table absent afterwards. Either
+  statement alone applies fine. A job that can be re-run is only useful if the migration it runs can
+  be re-run — and this is the second time a form was carried across a tool change without being
+  re-run against the new tool.
 - **Every migration touching a populated table needs a `CONCURRENTLY` decision**, expressed as a
   directive. `-- no-transaction` gives up atomicity for that migration, so those carry one step each:
   splitting is cheaper than debugging a half-applied migration.

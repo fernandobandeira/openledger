@@ -84,6 +84,13 @@ balance. That single read is the product layer's entire coupling to the core, wh
 product a plug-in rather than a fork. **Keep the interface exactly that narrow; it is the seam to
 protect in M1.**
 
+**That is true of the code and was false of the schema**, and [0009](./0009-module-boundaries.md)
+closes the gap. Measured: not one foreign key crosses the card/core boundary in either direction, and
+a Cargo-feature build with the card crate out of the graph **compiles clean against a database that
+has never seen the card DDL**. But the card tables still ship inside the core baseline migration, so
+a wallet-only user gets them. 0009 moves them to their own Postgres schema; until it is applied, this
+paragraph describes the code only.
+
 ## Alternatives
 
 | | Why not |

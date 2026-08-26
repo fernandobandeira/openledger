@@ -18,7 +18,7 @@ they are kept as the record of what was asked and answered, not as a guide to ho
 | [005](./005-durable-timers/) | Can Postgres replace Temporal for durable timers? | Yes — the need is durable *scheduling*, not workflow orchestration, and idempotency already comes from the event log. | **closed — driver superseded.** It verified **River**, which is Go. [Spike 010](./010-go-or-rust/) re-ran the same four properties against `graphile_worker` 0.13.5 and they hold; the *conclusion* stands, the driver in its text does not. |
 | [004](./004-chart-of-accounts/) | What does a general ledger ship when the chart of accounts is business-specific? | Ship the chart as **data** plus constraints that make the accounting identity a theorem. But the identity does **not** prove completeness — that needs its own guard. | **closed** |
 
-**Ten spikes.** The four below were missing from the table above when it claimed to be complete —
+**Eleven spikes.** The four below were missing from the table above when it claimed to be complete —
 including the two that reversed [ADR-0004](../docs/decisions/0004-where-logic-lives.md) and produced
 [ADR-0003](../docs/decisions/0003-migrations.md), and the one that changed the language.
 
@@ -29,6 +29,7 @@ including the two that reversed [ADR-0004](../docs/decisions/0004-where-logic-li
 | [009](./009-how-other-ledgers-enforce/) | Do real ledgers use triggers, and where does the balance invariant live? | Triggers are widely used for immutability and hash chaining; **nobody** enforces debits-equal-credits in the database | [0004](../docs/decisions/0004-where-logic-lives.md), [0005](../docs/decisions/0005-event-log-and-write-path.md) |
 
 | [010](./010-go-or-rust/) | Go or Rust, now that the write primitive is a type? | **Rust.** 5 of 5 seeded bugs caught by the compiler against Go's 0 of 5 — and two of the five were guarantees an accepted ADR had already claimed in writing and did not have | [0001](../docs/decisions/0001-rust-and-postgres.md), [0003](../docs/decisions/0003-migrations.md) |
+| [011](./011-optional-modules/) | How does an optional module that owns tables get shipped? | Not one foreign key crosses the card/core boundary. Of eight systems read from source, the two that separate cleanly give each component its own **database**, and the only working uninstall belongs to the one with no migration files | [0009](../docs/decisions/0009-module-boundaries.md) |
 
 Outcomes fed every ADR in the log except [0002](../docs/decisions/0002-scaling.md) and
 [0006](../docs/decisions/0006-time-and-as-of.md), which were argued from the schema and from
