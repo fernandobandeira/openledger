@@ -51,9 +51,7 @@ silently return empty when historization is off — wrong rather than loud. The 
   bottleneck; striping removes it. They stay anyway: correct data model, per-tenant reconciliation,
   prerequisite for RLS.
 
-## The layering, stated precisely
-
-| | what it is | needs a scheduler? | writes the ledger? |
+| layer | what it is | needs a scheduler? | writes the ledger? |
 | --- | --- | --- | --- |
 | **1. Ledger core** | accounts, transactions, entries, balances, event log | **no** | it *is* the ledger |
 | **2. Rails** | card, ACH, wallet — each with its own state machine and deadlines | yes ([0008](./0008-durable-timers.md)) | yes, on the events it decides are financial |
@@ -72,9 +70,9 @@ fork, so keep the interface exactly that narrow. **The seam to protect in M1.**
 
 | | Why not |
 | --- | --- |
-| **Shard by tenant** | Only if you outgrow one instance — treasury accounts cannot be split, so shards span them. |
 | **Stay a card ledger** | Same engine either way; forking one per product is the cost we avoid. |
-| **TigerBeetle** | Excellent, and still wrong here — its own section, below. |
+| **Shard by tenant** | Only if you outgrow one instance — treasury accounts cannot be split, so shards span them. |
+| **TigerBeetle** | Excellent, and still wrong here — see below. |
 
 ## Why not TigerBeetle
 
@@ -95,8 +93,7 @@ sustains thousands of clearings/s after striping.
   tenant-local, treasury is not; splitting one in two, joined by intercompany due-from/due-to
   accounts, restores locality.
 - **The striped balance read grows with the stripe count**, the auth path's one read included; see
-  [0003](./0003-bitemporal-balances.md) for the as-of version. The roadmap gains striping, M1's
-  schema with it.
+  [0003](./0003-bitemporal-balances.md) for the as-of version. The roadmap gains striping with it.
 - **Three things are unmeasured**: the auth path (a latency deadline, not a throughput target — it
   needs its own spike), anything over a network (the largest caveat, and why nothing is published
-  until M4 measures on RDS), and replication (single node; sync replication will cost every commit).
+  until M4 measures on RDS), and replication (one node; synchronous replication costs every commit).
