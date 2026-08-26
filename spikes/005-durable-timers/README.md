@@ -4,10 +4,8 @@
 
 The project needs timers that survive restarts: a card authorization *hold* must expire after
 ~7 days, an ACH return window closes ~2 banking days after funds land, statements close monthly.
-[ADR-0001](../../docs/decisions/0001-rust-and-postgres.md) planned to use **Temporal** for these —
-but Temporal is a server cluster with its own datastore, which contradicts
-[ADR-0002](../../docs/decisions/0002-scaling.md)'s pitch of *one binary and a
-database you already run*.
+The ADR that then stood planned to use **Temporal** for these — but Temporal is a server cluster
+with its own datastore, against this project's one binary and one database.
 
 ## The answer
 
@@ -69,10 +67,11 @@ Every property the ledger needs, confirmed:
 
 ## What it costs
 
-**Operationally, nothing.** River is a library, not a server — no `cmd/`, it runs inside our
-binary. It adds 5 tables and 7 migrations to the same database. It is built on **pgx v5**, already
-our driver under [ADR-0001](../../docs/decisions/0001-rust-and-postgres.md), and generates its own
-SQL with **sqlc**, already our codegen.
+**Operationally, nothing.** River is a library, not a server — it runs inside our binary and adds
+5 tables and 7 migrations to the same database. *(River is Go, and so was this spike's stack. The
+four properties measured here were re-run against `graphile_worker` 0.13.5 on `sqlx` in
+[spike 010](../010-go-or-rust/README.md) and all four hold; the conclusion carried over, the driver
+did not.)*
 
 **What we give up**, honestly: workflow-as-code (a multi-step process reads as sequential Go with
 state persisted automatically), signals and queries into running workflows, versioning of

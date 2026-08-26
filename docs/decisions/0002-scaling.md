@@ -5,8 +5,17 @@
 
 ## The decision
 
-**Stay on one PostgreSQL instance, and treat the hot account — not the hardware — as the thing that
-runs out.** Four things follow:
+**This is a general ledger with a card product as its reference implementation, not a card ledger** —
+and it stays on one PostgreSQL instance, treating the hot account rather than the hardware as the
+thing that runs out.
+
+The core is accounts, transactions, entries, balances, the two time axes and the event log. Cards,
+spend controls and credit lines are built *on* it; a marketplace wallet simply does not install them.
+**The core ships first and the card rail comes after it** — [0008](./0008-authorization-holds.md) is
+scoped as future work on that basis. That line is what decides what is configurable: the product
+layer is meant to be replaceable, the core is not.
+
+Four things follow from the scaling half:
 
 1. **Hot-account striping is a first-class feature.** One logical account is stored as N physical
    balance rows, summed to read it, so N writers take N row locks instead of queueing on one. An
@@ -42,7 +51,9 @@ Spike 003, durable settings, stock Postgres, one 16-core machine:
 | + coalesced batching | 3,420 |
 | + **striping** 64 ways **and** single-call posting, *instead of* batching | **7,897** (2 GB table; 7,816 at 43 MB) |
 
-- **The baseline is already 17–40× the volume the reference product needs**, untuned.
+- **The baseline is already 16–40× the volume the reference product needs**, untuned — that is
+  ~800/s against the 20–50 TPS peak derived above, and it is the only multiplier in this repository
+  you can check without leaving the page.
 - **The bottleneck is one row, not the machine.** A single *customer* account costs 12%; the shared
   **hot account** — settlement, fee revenue, the one nearly every transaction touches — is the whole
   ceiling, plateauing at four concurrent writers and then *declining*. pgledger's published numbers
@@ -77,6 +88,7 @@ protect in M1.**
 
 | | Why not |
 | --- | --- |
+| **Stay a card ledger** | Same engine either way. Forking one ledger per product is the cost this avoids, and the card rail's entire coupling to the core is one read. |
 | **Shard by tenant** | Only if you outgrow one instance — treasury accounts cannot be split, so shards would span them. |
 | **A second datastore for the hot path** | Adds a consistency boundary to remove a bottleneck that striping removes without one. |
 | **TigerBeetle** | Excellent, and still wrong here — below. |

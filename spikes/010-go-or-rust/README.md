@@ -23,11 +23,11 @@ sqlx 0.9.0 · goose v3.27.3 · river v0.45.0 · graphile_worker 0.13.5 · refine
 
 **Rust.** It won the type-system crux **5 of 5** with no tooling at all, where Go's compiler and
 `go vet` caught **0 of 5** and the `exhaustive` linter caught 2 — and two of those five were
-guarantees ADRs 0002 and 0013 had already claimed in writing and did not have.
+guarantees two then-accepted ADRs had already claimed in writing and did not have.
 
 The spike's own first recommendation was *stay on Go*, on the strength of Q4. That recommendation
 did not survive checking Q4 properly: the finding is not "Rust lacks a try-lock migrator", it is
-that **only one Rust migrator locks at all**, and the deployment model 0014 already chose — a
+that **only one Rust migrator locks at all**, and the deployment model the migrations ADR already chose — a
 single-runner pre-deploy job — is the one where that matters least. Fifteen verified lines close it.
 The record of the Go case is kept below in full, because the reasons it nearly won are the things
 Rust now has to be watched for.
@@ -43,7 +43,8 @@ These are the reason this spike was worth running, and none of them is about Rus
 
 ### 1. [0001](../../docs/decisions/0001-rust-and-postgres.md) recommended the trap it rejected go-jet for
 
-0002 rejects go-jet because it "can silently scan a money column as zero with no error", then four
+The data-access ADR that then stood rejected go-jet because it "can silently scan a money column as
+zero with no error", then four
 bullets later recommends `pgx.RowToStructByNameLax` as the escalation path for dynamic queries.
 `Lax` **is** that trap. Company with a 1,000.00 limit and 950.00 posted — 50.00 of headroom. Drop
 `posted_minor` from the SELECT list in a refactor, keep the field on the struct:
@@ -58,13 +59,15 @@ B-1b Lax    / posted_minor DROPPED   err=<nil>
 B-1c Strict / posted_minor DROPPED   err=cannot find field posted_minor in returned row
 ```
 
-`go build` exit 0, `go vet` exit 0. The sentence is struck; the strict form is what 0002 now says.
+`go build` exit 0, `go vet` exit 0. The sentence was struck before that ADR was folded into
+[0001](../../docs/decisions/0001-rust-and-postgres.md), which now carries the finding.
 **`Lax` is one switch that makes every money field on a struct silently zeroable.**
 
 ### 2. [0005](../../docs/decisions/0005-event-log-and-write-path.md)'s headline claim was false in Go
 
-0013: *"An unbalanced transaction is therefore **unconstructible**, not refused."* The type was built
-as 0013 describes — four unexported fields, one validating constructor. From an outside package:
+The write-path ADR, now [0005](../../docs/decisions/0005-event-log-and-write-path.md): *"An
+unbalanced transaction is therefore **unconstructible**, not refused."* The type was built exactly as
+it describes — four unexported fields, one validating constructor. From an outside package:
 
 ```
 === go build exit=0   === go vet exit=0
@@ -77,7 +80,7 @@ go  PostTransaction(zero postings) -> err=post: bump balance: ERROR: new row for
 
 **An empty composite literal is legal outside the package even when every field is unexported**, and
 the zero value fills the rest. The fabricated postings reached the write path and were stopped by a
-**database CHECK** — the mechanism 0013 exists to say we are not relying on. Rust refuses all three:
+**database CHECK** — the mechanism that ADR exists to say we are not relying on. Rust refuses all three:
 
 ```
 fab1: error: cannot construct `posting::Posting` with struct literal syntax due to private fields
@@ -105,7 +108,7 @@ error[E0004]: non-exhaustive patterns: `AuthEventKind::ExpiryReversal` not cover
 
 Go builds, vets clean, and returns the zero value with `err == nil` — the flag silently uncleared.
 
-**Trying hard to make Go win.** `nishanths/exhaustive` is the mitigation 0001 gestures at. It
+**Trying hard to make Go win.** `nishanths/exhaustive` is the mitigation the Go ADR gestured at. It
 **does not install** under Go 1.26 (`go install …@latest` fails: the tool pins
 `golang.org/x/tools v0.15.0`, which no longer compiles — `invalid array length -delta * delta`).
 Last release **v0.12.0, 2023-11-11**. Built via a shim module forcing `x/tools v0.49.0`, it works
@@ -125,7 +128,8 @@ configuration, while in Go the idiomatic form is `switch` and it is checked only
 third-party binary that has not shipped in nearly three years.
 
 **When the enum grows, Go wins a round.** `ALTER TYPE auth_event_kind ADD VALUE
-'financial_authorization'` (a real gap — 0010 names Lithic's `FINANCIAL_AUTHORIZATION`): `sqlc
+'financial_authorization'` (a real gap — [0008](../../docs/decisions/0008-authorization-holds.md)
+names Lithic's `FINANCIAL_AUTHORIZATION`): `sqlc
 generate` propagates it into the type and `exhaustive` then forces you to visit the switch. Rust has
 no codegen, so the hand-written enum does not grow and `cargo build` stays clean.
 
@@ -159,12 +163,14 @@ Re-run `sqlc generate` and it *does* catch it (`mismatched types pgtype.Numeric 
 sqlc's check is as strong as sqlx's, one step later, and only if the DDL file tracks production.**
 That last clause is CI's job. Same shape for a dropped column.
 
-Two sqlc landmines confirmed live, one understated by 0002: **`overrides` apply to `NOT NULL`
-columns only**, so the generated struct carries `ID uuid.UUID` beside `EventID pgtype.UUID`. 0002
+Two sqlc landmines confirmed live, one understated by the data-access ADR: **`overrides` apply to
+`NOT NULL` columns only**, so the generated struct carries `ID uuid.UUID` beside `EventID
+pgtype.UUID`. It
 says a miss is silent; it is also *partial*, which is harder to spot.
 
 **Diesel is out.** `diesel print-schema` against the real schema produced **0 of 5 views** and **0
-`joinable!` entries**, because every foreign key here is composite. The reporting layer 0009 builds
+`joinable!` entries**, because every foreign key here is composite. The reporting layer
+[0007](../../docs/decisions/0007-schema-conventions-and-chart.md) builds
 its completeness argument on is invisible to it.
 
 ## Q3 — durable jobs: the expected disqualifier, which was not one
@@ -232,7 +238,8 @@ and Atlas both poll a try-lock; the Rust ecosystem largely does not attempt the 
 **How much this should weigh is less than it first appears.** [0003](../../docs/decisions/0003-migrations.md)
 already chose to run migrations as a **dedicated pre-deploy job, not from application startup** —
 which is a single runner by construction. The three-concurrent-migrators test models the topology
-0014 rejected. The lock is a guard against a botched deploy (a retried Job overlapping a pod that
+[0003](../../docs/decisions/0003-migrations.md) rejected. The lock is a guard against a botched
+deploy (a retried Job overlapping a pod that
 lost its lease, a node failure mid-run), not a load-bearing mechanism in the chosen design. It is
 still wanted, which is why goose has one.
 

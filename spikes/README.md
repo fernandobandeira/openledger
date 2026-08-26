@@ -4,30 +4,35 @@ A spike is **timeboxed investigation to kill a specific uncertainty**, not explo
 directory per spike, holding the question, the findings, and any throwaway code together. Each
 README leads with its answer — you should be able to get the value without reading the evidence.
 
-Code here is throwaway: not built by CI, not imported by `/internal` or `/cmd`. Each spike with
-code is its own Go module so its dependencies never leak into the root `go.mod`.
+Code here is throwaway: not built by CI and not part of the workspace. Each spike with code is
+self-contained, so its dependencies never leak into the root `Cargo.toml`. Spikes 001–007 predate
+[ADR-0001](../docs/decisions/0001-rust-and-postgres.md)'s move from Go to Rust and their code is Go;
+they are kept as the record of what was asked and answered, not as a guide to how to build this.
 
 | # | Question | What we learned | Status |
 | --- | --- | --- | --- |
 | [001](./001-formance/) | What can we take from Formance's production ledger? | Their running-balance problem was the **mutable business-date** one, not running balances in general. Ours is the immutable kind, so it stands. | **closed** |
-| [002](./002-sqlc-vs-jet/) | sqlc or go-jet? | **sqlc**, reversing the ADR's own proposal. Arrays were fine under both, so the pre-registered rule never fired; go-jet's silent-zero scan trap decided it. | **closed** |
+| [002](./002-sqlc-vs-jet/) | sqlc or go-jet? | **sqlc**, reversing the ADR's own proposal. Arrays were fine under both, so the pre-registered rule never fired; go-jet's silent-zero scan trap decided it. | **closed — moot.** Both are Go generators; [spike 010](./010-go-or-rust/) moved the language, and `sqlx` replaced both. The silent-zero finding outlived the question and is now [0001](../docs/decisions/0001-rust-and-postgres.md)'s central argument. |
 | [003](./003-throughput-ceiling/) | Where does the Postgres design top out, and what moves it? | **~800/s → 8,200/s** by removing contention on one shared row. Striping is the mechanism; dropping the running balance is not worth it. | **closed** |
 | [006](./006-append-only-holds/) | Should holds be a mutable row or an append-only event log? | Append-only, and `SUM` being commutative makes it order-tolerant for free. The spike's "one formula covers every edge case" did **not** survive contact: the shipped design in `schema/schema.sql` has no `group_key` column on the event at all (grouping is its own bitemporal table) and needs a materialised total, a delta/total convention, and expiry snapshots besides. | **closed** — superseded by [ADR-0008](../docs/decisions/0008-authorization-holds.md) |
-| [005](./005-durable-timers/) | Can Postgres replace Temporal for durable timers? | Yes — verified with River; the need is durable *scheduling*, not workflow orchestration, and idempotency already comes from the event log. | **closed** |
+| [005](./005-durable-timers/) | Can Postgres replace Temporal for durable timers? | Yes — the need is durable *scheduling*, not workflow orchestration, and idempotency already comes from the event log. | **closed — driver superseded.** It verified **River**, which is Go. [Spike 010](./010-go-or-rust/) re-ran the same four properties against `graphile_worker` 0.13.5 and they hold; the *conclusion* stands, the driver in its text does not. |
 | [004](./004-chart-of-accounts/) | What does a general ledger ship when the chart of accounts is business-specific? | Ship the chart as **data** plus constraints that make the accounting identity a theorem. But the identity does **not** prove completeness — that needs its own guard. | **closed** |
 
-**Nine spikes, and this index listed six of them.** 007, 008 and 009 were missing — including the
-two that reversed [ADR-0004](../docs/decisions/0004-where-logic-lives.md) and produced
-[ADR-0003](../docs/decisions/0003-migrations.md).
+**Ten spikes.** The four below were missing from the table above when it claimed to be complete —
+including the two that reversed [ADR-0004](../docs/decisions/0004-where-logic-lives.md) and produced
+[ADR-0003](../docs/decisions/0003-migrations.md), and the one that changed the language.
 
 | | question | outcome | fed |
 | --- | --- | --- | --- |
-| [007](./007-schema-migrations/) | How do schema changes get applied? | goose, from Go, as a pre-deploy job. A *blocking* advisory lock deadlocks against `CREATE INDEX CONCURRENTLY`; goose polls a try-lock | [0003](../docs/decisions/0003-migrations.md) |
+| [007](./007-schema-migrations/) | How do schema changes get applied? | As a pre-deploy job, never at startup. A *blocking* advisory lock deadlocks against `CREATE INDEX CONCURRENTLY`; a polled try-lock does not. It concluded **goose**, which is Go — [spike 010](./010-go-or-rust/) found no Rust migrator polls a try-lock either, so [0003](../docs/decisions/0003-migrations.md) keeps the argument and writes the lock itself | [0003](../docs/decisions/0003-migrations.md) |
 | [008](./008-processor-hold-semantics/) | What do card processors actually do? | No convention for delta-vs-total; grouping is a revisable inference; our "authorization writes no ledger entry" is a minority choice, not a domain law | [0008](../docs/decisions/0008-authorization-holds.md) |
 | [009](./009-how-other-ledgers-enforce/) | Do real ledgers use triggers, and where does the balance invariant live? | Triggers are widely used for immutability and hash chaining; **nobody** enforces debits-equal-credits in the database | [0004](../docs/decisions/0004-where-logic-lives.md), [0005](../docs/decisions/0005-event-log-and-write-path.md) |
 
-Outcomes fed the decision log from [ADR-0001](../docs/decisions/0001-rust-and-postgres.md) through
-[ADR-0003](../docs/decisions/0003-migrations.md).
+| [010](./010-go-or-rust/) | Go or Rust, now that the write primitive is a type? | **Rust.** 5 of 5 seeded bugs caught by the compiler against Go's 0 of 5 — and two of the five were guarantees an accepted ADR had already claimed in writing and did not have | [0001](../docs/decisions/0001-rust-and-postgres.md), [0003](../docs/decisions/0003-migrations.md) |
+
+Outcomes fed every ADR in the log except [0002](../docs/decisions/0002-scaling.md) and
+[0006](../docs/decisions/0006-time-and-as-of.md), which were argued from the schema and from
+PostgreSQL's own behaviour rather than from a spike.
 
 ## Artifacts worth knowing about
 

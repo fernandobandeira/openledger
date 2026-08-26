@@ -41,6 +41,17 @@ INSERT INTO account_types (code,category,normal_balance,description,fs_line,is_p
   ('allowance_for_credit_losses','asset','credit','expected losses, contra to receivable','receivables',false,'none'),
   ('due_from_treasury','asset','debit','tenant-side claim on operator treasury','other_assets',false,'shared'),
   ('customer_wallet','liability','credit','customer funds we owe back','customer_funds',false,'per_shard'),
+  -- THE CLEARING ACCOUNT. glossary.md defines one as "a designed staging account
+  -- money passes THROUGH on its way somewhere, expected to return to zero", and
+  -- until now the chart had none -- 19 types and nowhere to stage a movement. The
+  -- cost of that gap was visible: docs/diagrams/03-state-machines.svg drew an
+  -- outbound transfer as DR fbo_cash / CR fbo_cash, a posting that moves no money,
+  -- because there was no account to pass it through. A wallet withdrawal is
+  -- DR customer_wallet / CR here on submit, DR here / CR fbo_cash on settle, and
+  -- DR here / CR customer_wallet on return -- so the liability to the customer is
+  -- continuous and the cash leaves exactly once. LIABILITY, not asset: until the
+  -- money lands we still owe it.
+  ('outbound_transfer_in_transit','liability','credit','left the wallet, has not settled','payables',false,'per_shard'),
   ('network_settlement_payable','liability','credit','owed to the card network','payables',true,'shared'),
   ('facility_borrowings','liability','credit','drawn on the warehouse line','borrowings',true,'shared'),
   ('accrued_interest_payable','liability','credit','interest accrued, not paid','payables',false,'shared'),

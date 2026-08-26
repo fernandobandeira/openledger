@@ -84,7 +84,8 @@ instance 2: err=... (42701)
 
 The 5 s / 10 s are the try-lock poll interval. **The CLI has no lock flag at all.** And
 `goose_db_version` has **no unique index on `version_id`** — nothing but the lock prevents a double
-apply. That is why ADR-0003 says *from Go, never from the CLI*.
+apply. That is why [ADR-0003](../../docs/decisions/0003-migrations.md) drives migrations from the
+service binary rather than from any tool's CLI.
 
 ---
 

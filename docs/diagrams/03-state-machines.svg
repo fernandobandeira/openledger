@@ -65,12 +65,12 @@
       </g>
       <text class="t-sub" x="95"  y="171" text-anchor="middle">txn · pending</text>
       <text class="t-sub" x="95"  y="188" text-anchor="middle">DR wallet</text>
-      <text class="t-sub" x="95"  y="204" text-anchor="middle">CR fbo_cash</text>
+      <text class="t-sub" x="95"  y="204" text-anchor="middle">CR in_transit</text>
       <text class="t-sub" x="555" y="171" text-anchor="middle">txn · posted</text>
-      <text class="t-sub" x="555" y="188" text-anchor="middle">DR fbo_cash</text>
+      <text class="t-sub" x="555" y="188" text-anchor="middle">DR in_transit</text>
       <text class="t-sub" x="555" y="204" text-anchor="middle">CR fbo_cash</text>
       <text class="t-sub" x="785" y="171" text-anchor="middle">txn · reversing</text>
-      <text class="t-sub" x="785" y="188" text-anchor="middle">DR fbo_cash</text>
+      <text class="t-sub" x="785" y="188" text-anchor="middle">DR in_transit</text>
       <text class="t-sub" x="785" y="204" text-anchor="middle">CR wallet</text>
 
       <g class="s-cool" stroke-width="1.4" fill="none" stroke-dasharray="4 3">
@@ -86,5 +86,5 @@
 
       <text class="t-lbl" x="20" y="252">State transitions emit ledger transactions. The ledger never mutates.</text>
       <text class="t-sub" x="20" y="272">The domain object's status column changes four times. The ledger only ever gets appended to — three times.</text>
-      <text class="t-sub" x="20" y="288">Durable-job boundary (ADR-0008: River on Postgres, not Temporal): the job is the state machine; "write the ledger transaction" is an idempotent step.</text>
+      <text class="t-sub" x="20" y="288">Durable-job boundary (ADR-0008: a job queue in Postgres, not Temporal): the job is the state machine; "write the ledger transaction" is an idempotent step.</text>
     </svg>

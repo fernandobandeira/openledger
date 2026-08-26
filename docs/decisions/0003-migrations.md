@@ -130,8 +130,11 @@ atomicity from `psql --single-transaction`, which is the caller's business rathe
 - **Every migration touching a populated table needs a `CONCURRENTLY` decision**, expressed as a
   directive. `-- no-transaction` gives up atomicity for that migration, so those carry one step each:
   splitting is cheaper than debugging a half-applied migration.
-- **`sqlx`'s migration table has no unique index on the version**, so nothing but our lock prevents a
-  double apply. Read from source, not exercised.
+- **The lock is not the only thing preventing a double apply**, and an earlier version of this line
+  said it was. `sqlx-postgres/src/migrate.rs:130-131` declares the version table as
+  `version BIGINT PRIMARY KEY`, and a primary key is a unique index — a second apply of the same
+  version fails on it. That is a backstop, not a substitute: it stops the *duplicate row*, not two
+  migrators running DDL against each other, which is what the lock is for.
 - `make schema` becomes a development shortcut, not the deployment path.
 - One thing this decision *stopped* costing: the previous tool needed a `database/sql` handle, so
   migrations ran over a second driver stack. `sqlx` migrates over the same pool the ledger uses.

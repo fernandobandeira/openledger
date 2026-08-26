@@ -40,7 +40,7 @@ simply does not compile — Go dereferences the nil and panics. *The panic is th
 loud and it aborts the transaction. The silent zero is the one that reconciles.*
 
 **PostgreSQL, because the headroom is measured, not assumed.** Spike 003 recorded **~800 clearings/s
-unsharded and 6,212–7,405 striped at 64**, durability on, one 16-core machine — 17–40× the volume the
+unsharded and 6,970–7,897 striped at 64**, durability on, one 16-core machine — **16–40×** the volume the
 reference product needs. At the top of the ladder the curve "plateaus **because the machine ran out of
 cores rather than because of a lock**. The ceiling moved from the design to the hardware."
 
