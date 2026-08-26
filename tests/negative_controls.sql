@@ -46,6 +46,7 @@ FROM (VALUES
   ('t1','house',NULL,'interchange_revenue','USD'),
   ('t1','house',NULL,'fee_revenue','USD'),
   ('t1','house',NULL,'due_from_treasury','USD'),
+  ('t1','house',NULL,'fbo_cash','USD'),
   ('t1','house',NULL,'credit_loss_expense','USD'),
   ('t1','house',NULL,'allowance_for_credit_losses','USD'),
   ('t1','house',NULL,'interchange_revenue_eur','EUR'),
@@ -933,6 +934,104 @@ SELECT must_fail('replica: mutating a committed transaction', $q$
     END $d$;
 $q$, 'is immutable');
 RESET ROLE;
+
+-- ---------------------------------------------------------------- undefended guards
+--
+-- Mutation testing found several guards that are the SOLE defence of a property
+-- and are themselves undefended: no-op them and nothing fails. Each now has a
+-- control that makes it the reason a test fails.
+
+-- ck_types__matches_fs_line is the only thing standing between a revenue type and
+-- an expense caption -- the harm ADR-0009 is entirely about. Every seed-chart side
+-- mutation was caught BY THIS TRIGGER at migration time, so the trigger defended
+-- the chart and nothing defended the trigger.
+SELECT must_fail('a revenue type on an expense line', $q$
+    INSERT INTO account_types (code,category,normal_balance,description,fs_line)
+    VALUES ('probe_rev','revenue','credit','x','cost_of_revenue');
+$q$, 'cannot report under statement line');
+SELECT must_fail('an asset type on an income-statement line', $q$
+    INSERT INTO account_types (code,category,normal_balance,description,fs_line)
+    VALUES ('probe_ast','asset','debit','x','revenue');
+$q$, 'cannot report under statement line');
+SELECT must_fail('a liability type on the asset side', $q$
+    INSERT INTO account_types (code,category,normal_balance,description,fs_line)
+    VALUES ('probe_liab','liability','credit','x','cash');
+$q$, 'cannot report under statement line');
+SELECT must_fail('an expense type on the credit side', $q$
+    INSERT INTO account_types (code,category,normal_balance,description,fs_line)
+    VALUES ('probe_exp','expense','debit','x','revenue');
+$q$, 'cannot report under statement line');
+SELECT must_fail('a statement line whose side does not belong to its statement', $q$
+    INSERT INTO fs_lines (code,caption,statement,side,sort_order)
+    VALUES ('probe_line','x','balance_sheet','credit',9999);
+$q$, 'ck_fs_lines__side_matches_statement');
+
+-- ...and the side half of the stability guard, which was separately dead
+SELECT must_fail('flipping a live statement line''s side', $q$
+    UPDATE fs_lines SET side='liability_equity' WHERE code='receivables';
+$q$, 'cannot move statement line');
+
+-- enforce_triggers_on_replicas() is the round-3 critical fix and shipped with no
+-- test: no-op its body, or delete any CALL, and nothing failed. Assert the state
+-- it exists to produce.
+DO $$
+DECLARE n int;
+BEGIN
+    SELECT count(*) INTO n FROM pg_trigger tg
+      JOIN pg_class c ON c.oid = tg.tgrelid
+      JOIN pg_namespace ns ON ns.oid = c.relnamespace
+     WHERE ns.nspname = 'public' AND tg.tgisinternal AND tg.tgenabled = 'O';
+    IF n > 0 THEN
+        RAISE EXCEPTION
+            '% internal trigger(s) are still ENABLE ORIGIN, so their foreign keys '
+            'are skipped on the replication apply path: %', n,
+            (SELECT string_agg(c.relname||'.'||tg.tgname, ', ') FROM pg_trigger tg
+               JOIN pg_class c ON c.oid=tg.tgrelid
+               JOIN pg_namespace ns ON ns.oid=c.relnamespace
+              WHERE ns.nspname='public' AND tg.tgisinternal AND tg.tgenabled='O');
+    END IF;
+    RAISE NOTICE 'ok  every foreign key is enforced on the replication apply path';
+END $$;
+
+-- assign_recorded_at could be no-op'd undetected, because DEFAULT now() masks it.
+-- The property is that a SUPPLIED value is overwritten.
+DO $$
+DECLARE t uuid; v_rec timestamptz;
+BEGIN
+    INSERT INTO ledger_events (tenant_id,kind,source,idempotency_key,idempotency_hash,
+                               payload,effective_at,recorded_at)
+    VALUES ('t1','neg','internal','rec_probe',sha256(convert_to('rec_probe','UTF8')),
+            '{}',now(),'1999-01-01');
+    SELECT recorded_at INTO v_rec FROM ledger_events
+     WHERE tenant_id='t1' AND idempotency_key='rec_probe';
+    IF v_rec < '2020-01-01' THEN
+        RAISE EXCEPTION 'a supplied recorded_at survived on ledger_events: %', v_rec;
+    END IF;
+
+    t := txn('t1','rec_probe2');
+    PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  40);
+    PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 40);
+    SET CONSTRAINTS ALL IMMEDIATE;
+    SET CONSTRAINTS ALL DEFERRED;
+    SELECT min(recorded_at) INTO v_rec FROM ledger_entries WHERE transaction_id = t;
+    IF v_rec < '2020-01-01' THEN
+        RAISE EXCEPTION 'a supplied recorded_at survived on ledger_entries: %', v_rec;
+    END IF;
+    RAISE NOTICE 'ok  a supplied recorded_at is overwritten, not honoured';
+END $$;
+
+-- the alarm's 'cached balance with no entries' branch was unreachable from the
+-- suite, so FULL OUTER could be demoted to LEFT undetected
+SELECT must_fail('a cached balance for an account with no journal', $q$
+    INSERT INTO ledger_account_balances (tenant_id,account_id,currency,input,output,last_seq)
+    VALUES ('t1', acct('t1','fbo_cash'), 'USD', 7777, 0, 1);
+    DO $d$ BEGIN
+        IF EXISTS (SELECT 1 FROM ledger_balance_drift
+                    WHERE problem LIKE '%no entries%') THEN
+            RAISE EXCEPTION 'ORPHAN CACHE DETECTED';
+        END IF;
+    END $d$;
+$q$, 'orphan cache detected');
 
 DO $$ BEGIN RAISE NOTICE 'ok  every breakage above was refused, for the stated reason'; END $$;
 

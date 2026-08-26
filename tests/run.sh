@@ -38,11 +38,31 @@ if [ -n "$missing" ]; then
     echo "FAIL"; exit 1
 fi
 
+# ...and a FLOOR on how much each file asserts. The manifest checks existence, not
+# content: deleting bitemporal.sql fails the build, and truncating it to zero bytes
+# did not. Same class of failure, one keystroke apart.
+floor_for() {
+    case "$1" in
+        *bitemporal.sql)        echo 18 ;;
+        *card_holds.sql)        echo 60 ;;
+        *golden_trace.sql)      echo 18 ;;
+        *negative_controls.sql) echo 60 ;;
+        *query_plans.sql)       echo  4 ;;
+        *)                      echo  1 ;;
+    esac
+}
+
 fail=0
 for f in tests/*.sql; do
     echo "── $f"
-    if ! psql "$URL" -v ON_ERROR_STOP=1 -q -f "$f" 2>&1 \
-         | sed 's/^psql:[^ ]* //;s/^NOTICE:  //;s/^/   /'; then
+    out=$(psql "$URL" -v ON_ERROR_STOP=1 -q -f "$f" 2>&1) || fail=1
+    echo "$out" | sed 's/^psql:[^ ]* //;s/^NOTICE:  //;s/^/   /'
+    # psql prefixes diagnostics with "psql:<file>:<line>: " -- the same trap that
+    # made concurrency.sh's error counter permanently zero.
+    n=$(echo "$out" | grep -cE '(^|: )NOTICE:  +(ok|refused)') || true
+    floor=$(floor_for "$f")
+    if [ "$n" -lt "$floor" ]; then
+        echo "   FAIL $f made $n assertions, below its floor of $floor"
         fail=1
     fi
 done
