@@ -32,12 +32,20 @@ trap cleanup EXIT
 
 fail=0
 
-# canary <name> <suite> <file-to-break> <sed-expression>
+# canary <name> <suite> <file-to-break> <sed-expression> <expected-failure-text>
 #   The sed expression must make the schema WRONG in a way the named suite has a
 #   control for. If the suite still passes, either that control or the helper it
 #   reports through has stopped working.
+#
+#   THE LAST ARGUMENT IS WHY THIS IS AN ORACLE AND NOT A COIN FLIP. Checking only
+#   that a suite goes RED is checkable by the suite: a gutted file that recognises
+#   the canary's schema -- the mutations are a fixed, public set -- can raise on
+#   cue and stay green everywhere else. Demonstrated: a 157-line stub with a
+#   `prosrc LIKE '%RETURN NULL%'` tripwire passed the whole build with the entry
+#   seal dead. Requiring the suite's own control MESSAGE means the stub has to
+#   reproduce the control, which is the control.
 canary() {
-    local name="$1" suite="$2" target="$3" expr="$4"
+    local name="$1" suite="$2" target="$3" expr="$4" want="$5"
     local db="ol_canary_$$_${name}"
     DBS="$DBS $db"
     rm -rf "$WORK/m"; cp -r migrations "$WORK/m"
@@ -62,13 +70,19 @@ canary() {
             fail=1; return
         fi
     done
-    if psql "$url" -v ON_ERROR_STOP=1 -q -f "tests/$suite" >/dev/null 2>&1; then
+    local out
+    if out=$(psql "$url" -v ON_ERROR_STOP=1 -q -f "tests/$suite" 2>&1); then
         echo "   FAIL canary '$name': $suite PASSED against a schema that is deliberately"
         echo "        broken. Either its control for this is gone, or the helper it reports"
         echo "        through no longer raises."
         fail=1
+    elif ! printf '%s' "$out" | grep -qF "$want"; then
+        echo "   FAIL canary '$name': $suite went red, but not for its own reason."
+        echo "        wanted: $want"
+        echo "        got:    $(printf '%s' "$out" | grep -iE 'ERROR|FAIL' | head -1)"
+        fail=1
     else
-        echo "   ok  canary '$name' -- $suite goes red on a broken schema"
+        echo "   ok  canary '$name' -- $suite goes red, and for its own reason"
     fi
 }
 
@@ -80,18 +94,70 @@ canary() {
 # negative_controls went red because there were no tables -- the canary reported
 # `ok` while testing nothing. The load check above is what caught it.
 canary truncatable negative_controls.sql 0001_ledger_core.sql \
-    "s|    RAISE EXCEPTION 'the ledger cannot be truncated|    RETURN NULL;\\n    RAISE EXCEPTION 'the ledger cannot be truncated|"
+    "s|    RAISE EXCEPTION 'the ledger cannot be truncated|    RETURN NULL;\\n    RAISE EXCEPTION 'the ledger cannot be truncated|" \
+    "NOT CAUGHT -- truncating the entries"
 
 # 2. Pending transactions are reported as if posted. golden_trace asserts the
 #    lifecycle through eq-style DO blocks, not through must_fail -- a different
 #    helper, deliberately.
 canary pending_counted golden_trace.sql 0002_chart_of_accounts.sql \
-    "s|AND x.status = 'posted'|AND true|g"
+    "s|AND x.status = 'posted'|AND true|g" \
+    "a PENDING transaction was recognised as revenue"
 
 # 3. A cumulative total becomes re-groupable, which under-reserves credit.
 #    card_holds reports through its own must_fail and eq.
 canary regroup_total card_holds.sql 0003_card_holds.sql \
-    "s|    IF v_is_total THEN|    IF false THEN|"
+    "s|    IF v_is_total THEN|    IF false THEN|" \
+    "NOT CAUGHT -- re-grouping a cumulative-total event"
+
+# ...and the three suites the canary did not cover, because an uncovered suite can
+# be gutted without touching canary.sh at all.
+canary recorded_axis bitemporal.sql 0002_chart_of_accounts.sql \
+    "s|en.recorded_at  <= p_as_of|en.recorded_at  < p_as_of|" \
+    "recorded axis, as of now: everything"
+
+canary balance_index query_plans.sql 0001_ledger_core.sql \
+    "s|ix_entries__balance_lookup|ix_entries__balance_lookup_renamed|g" \
+    "index(es) gone"
+
+# ...and concurrency.sh, which is a shell script rather than a psql file, and which
+# is the ONLY evidence for four locks. It gets the same treatment: break a lock,
+# require its own named assertion to be the thing that fails.
+canary_sh() {
+    local name="$1" target="$2" expr="$3" want="$4"
+    local db="ol_canary_$$_${name}"
+    DBS="$DBS $db"
+    rm -rf "$WORK/m"; cp -r migrations "$WORK/m"
+    sed -i "$expr" "$WORK/m/$target"
+    if cmp -s "migrations/$target" "$WORK/m/$target"; then
+        echo "   FAIL canary '$name' did not change $target -- it is testing nothing"
+        fail=1; return
+    fi
+    psql "$ADMIN" -v ON_ERROR_STOP=1 -q -c "CREATE DATABASE $db" >/dev/null
+    local url="$BASE/$db?sslmode=disable"
+    for f in "$WORK"/m/*.sql "$WORK"/m/seed/*.sql; do
+        if ! psql "$url" -v ON_ERROR_STOP=1 -q -f "$f" >"$WORK/apply.err" 2>&1; then
+            echo "   FAIL canary '$name': the mutated schema does not load: $(head -1 "$WORK/apply.err")"
+            fail=1; return
+        fi
+    done
+    local out
+    if out=$(./tests/concurrency.sh "$url" 2>&1); then
+        echo "   FAIL canary '$name': concurrency.sh PASSED against a broken lock"
+        fail=1
+    elif ! printf '%s' "$out" | grep -qF "$want"; then
+        echo "   FAIL canary '$name': concurrency.sh went red, but not for its own reason."
+        echo "        wanted: $want"
+        echo "        got:    $(printf '%s' "$out" | grep -iE 'FAIL' | head -1)"
+        fail=1
+    else
+        echo "   ok  canary '$name' -- concurrency.sh goes red, and for its own reason"
+    fi
+}
+
+canary_sh ingest_lock 0003_card_holds.sql \
+    "s|         WHERE tenant_id=p_tenant AND company_id=p_company AND group_key=p_group FOR UPDATE;|         WHERE tenant_id=p_tenant AND company_id=p_company AND group_key=p_group;|" \
+    "concurrent identical totals converge on that total"
 
 echo "   ok  SUITE-COMPLETE canary"
 exit "$fail"

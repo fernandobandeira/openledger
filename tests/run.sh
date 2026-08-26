@@ -1,4 +1,27 @@
 #!/usr/bin/env bash
+# WHAT THESE GUARDS ARE FOR, AND WHAT THEY ARE NOT.
+#
+# Seven rounds of adversarial review have each found a way to make this script
+# print PASS over a suite that proves nothing, and each fix added a guard that
+# reads something the thing it polices controls: the floor reads output the file
+# prints, the call-site count reads the file's own source, the sentinel reads a
+# string the file emits, and the canary reads whether a suite the file could
+# recognise went red. Every one of those was then forged in the next round, with
+# between one and five lines.
+#
+# So state the threat model rather than pretending the ladder ends. **These guards
+# defend against EROSION -- a control quietly deleted, a helper weakened, a file
+# truncated, a floor with slack in it -- and they do not defend against a
+# determined author.** Nothing checked into a repository can: whoever edits the
+# tests can edit the thing that checks the tests. The durable answers are outside
+# this file: review, and CI running a pinned configuration the branch cannot edit.
+#
+# The one guard in this tree that a test file CANNOT forge is not in this file at
+# all. `assert_type_matches_fs_line` in migrations/0002 refused two mutants at
+# SEED time -- the wrong chart could not be loaded, so the wrong system could not
+# be built, and no test had to notice. That is the shape worth generalising:
+# prefer a constraint that makes a state unreachable over a check that looks for
+# it afterwards. Every guard below is a second choice.
 # Builds a throwaway database, applies every migration plus the card chart, and
 # runs the SQL test files against it. A fresh database each time is not fastidious:
 # the invariant suite asserts on GLOBAL state (drift, the equation over all
@@ -70,6 +93,68 @@ if [ -n "$missing" ]; then
     echo "── MISSING SUITE(S):$missing"
     echo "FAIL"; exit 1
 fi
+# ...AND THE MANIFEST IS A CLOSED SET, not a whitelist. `tests/*.sql` is applied in
+# shell glob order, so a file sorting before the real ones -- `aaa_fixture.sql` --
+# runs first with full privileges and can `CREATE OR REPLACE` a deliberately broken
+# function back to correct IN THE DATABASE before any suite reads it. One new file
+# plus one migration edit shipped a live defect with the build green, and the
+# canary never noticed, because it does not run the extra file.
+unexpected=""
+for f in tests/*.sql; do
+    b=$(basename "$f")
+    case " $EXPECTED_SUITES " in
+        *" $b "*) ;;
+        *) unexpected="$unexpected $b" ;;
+    esac
+done
+if [ -n "$unexpected" ]; then
+    echo "── UNEXPECTED FILE(S) IN tests/:$unexpected"
+    echo "   Every .sql in tests/ is applied, in glob order, with the same privileges"
+    echo "   as the suites. Add it to EXPECTED_SUITES or remove it."
+    echo "FAIL"; exit 1
+fi
+# ...and canary.sh must define its two drivers exactly once each. Appending one
+# line -- `canary () { echo "   ok  canary ..."; }` -- reproduced the genuine
+# output byte for byte and satisfied the call-site floor.
+if [ "$(grep -cE '^canary(_sh)?\(\) \{' tests/canary.sh)" -ne 2 ] \
+   || [ "$(grep -cE '^[[:space:]]*canary(_sh)?[[:space:]]*\(\)' tests/canary.sh)" -ne 2 ]; then
+    echo "── tests/canary.sh must define canary() and canary_sh() exactly once each"
+    echo "   Redefining either one shadows the oracle with an echo."
+    echo "FAIL"; exit 1
+fi
+# ...AND THE MANIFEST IS A CLOSED SET, not a whitelist. `tests/*.sql` is applied in
+# shell glob order, so a file sorting before the real ones -- `aaa_fixture.sql` --
+# runs first with full privileges and can `CREATE OR REPLACE` a deliberately broken
+# function back to correct IN THE DATABASE before any suite reads it. One new file
+# plus one migration edit shipped a live defect with the build green, and the
+# canary never noticed because it does not run the extra file.
+unexpected=""
+for f in tests/*.sql; do
+    b=$(basename "$f")
+    case " $EXPECTED_SUITES " in
+        *" $b "*) ;;
+        *) unexpected="$unexpected $b" ;;
+    esac
+done
+if [ -n "$unexpected" ]; then
+    echo "── UNEXPECTED FILE(S) IN tests/:$unexpected"
+    echo "   Every .sql in tests/ is applied, in glob order. A file that is not in"
+    echo "   the manifest runs anyway, before or after the suites, with the same"
+    echo "   privileges. Add it to EXPECTED_SUITES or remove it."
+    echo "FAIL"; exit 1
+fi
+# ...and canary.sh must define its driver exactly once. Redefining `canary()` as an
+# echo -- one line, appended -- reproduced its output byte for byte and satisfied
+# the call-site floor.
+if [ "$(grep -cE '^canary(_sh)?\(\) \{' tests/canary.sh)" -ne 2 ]; then
+    echo "── tests/canary.sh does not define exactly one canary() and one canary_sh()"
+    echo "FAIL"; exit 1
+fi
+if grep -qE '^[[:space:]]*canary(_sh)?[[:space:]]*\(\)' tests/canary.sh \
+   && [ "$(grep -cE '^[[:space:]]*canary(_sh)?[[:space:]]*\(\)' tests/canary.sh)" -ne 2 ]; then
+    echo "── tests/canary.sh redefines its driver"
+    echo "FAIL"; exit 1
+fi
 
 # ...and a FLOOR on how much each file asserts. The manifest checks existence, not
 # content: deleting bitemporal.sql fails the build, and truncating it to zero bytes
@@ -90,11 +175,21 @@ fi
 # grep matches meant a file of 200 lines reading `-- must_fail(  fake site` and
 # one loop raising 200 notices satisfied the manifest, both floors and the
 # sentinel: 1,756 lines of controls replaced by 204 lines of nothing, build green.
+# Comments are stripped WHEREVER THEY START, not only at the beginning of a line.
+# Stripping only leading comments left `SELECT 1 WHERE false; -- must_fail(`
+# counting as a call site, which is enough to gut a suite: 25 lines of that plus a
+# notice loop satisfied every floor.
+uncommented() {
+    case "$1" in
+        *.sh) sed 's/#.*//' "$1" ;;
+        *)    sed 's/--.*//' "$1" ;;
+    esac
+}
 sites_for() {
     case "$1" in
-        *canary.sh) grep -v '^[[:space:]]*#' "$1" | grep -cE '^canary ' ;;
-        *.sh) grep -v '^[[:space:]]*#' "$1" | grep -cE 'chk "|echo "   ok' ;;
-        *)    grep -v '^[[:space:]]*--' "$1" \
+        *canary.sh) uncommented "$1" | grep -cE '^canary(_sh)? [a-z_]+ ' ;;
+        *.sh) uncommented "$1" | grep -cE 'chk "|echo "   ok' ;;
+        *)    uncommented "$1" \
                 | grep -cE "must_fail\(|SELECT eq\(|SELECT eqv\(|no_drift\(|expect_state\(|plan_uses\(|on_origin\(|RAISE NOTICE 'ok" ;;
     esac
 }
@@ -107,7 +202,7 @@ sites_for() {
 floor_for() {
     case "$1" in
         *bitemporal.sql)        echo 23 ;;
-        *card_holds.sql)        echo 169 ;;
+        *card_holds.sql)        echo 178 ;;
         *golden_trace.sql)      echo 35 ;;
         *negative_controls.sql) echo 149 ;;
         *query_plans.sql)       echo  9 ;;
