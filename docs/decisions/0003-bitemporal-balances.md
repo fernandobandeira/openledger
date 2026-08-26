@@ -66,6 +66,33 @@ chargebacks.
 
 So: aggregate-on-read is chosen **because immutability is worth more than read latency**.
 
+### Measured, on their code: 740×
+
+[Spike 001](../../spikes/001-formance/README.md) copied Formance's effective-volume trigger pair
+verbatim into a fresh schema — the `BEFORE INSERT` that computes a move's business-date running
+balance and the `AFTER INSERT` that rewrites every later move's — and inserted N moves into one
+account, once in effective-date order and once fully backdated.
+
+| moves | in insertion order | fully backdated |
+| --- | --- | --- |
+| 200 | — | 679 ms |
+| 400 | — | 5,162 ms |
+| 1,000 | **114 ms** | **84,342 ms** |
+
+**740× on a thousand rows, and worse than quadratic** — 200→400 is 7.6×, 400→1,000 is 16× — because
+each `UPDATE` rewrites an ever-larger set and the HOT-update budget from `fillfactor = 80` runs out.
+That fill factor is migration 10 in their history; this is what it was paying for.
+
+This ADR previously argued the shape from their migration list. Now it has the number, and the
+number is the argument.
+
+**And their own best point-in-time path does not use the stored column.** `/volumes?pit=`
+re-aggregates `sum(case when not is_source then amount else 0 end)` from `moves`; only
+`/aggregate/balances?pit=` reads `post_commit_effective_volumes`. So Formance ships **two
+implementations of the same number with different failure modes** — and their better one is
+aggregate-on-read, which is what this ADR chose. We are not merely avoiding their mistake; we
+converged on their own fallback.
+
 ### This is not a contradiction of Formance's finding
 
 Spike 001 found Formance demoting their running balance because of backdating, which reads as
