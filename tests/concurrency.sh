@@ -92,33 +92,40 @@ chk "accounting equation holds"     "$(q "select bool_and(balanced) from account
 # ---------------------------------------------------------------- workload D
 # THE INGEST LOCK, actually raced.
 #
-# Workload B calls record_auth_event with is_total => false, so the surviving
-# `UPDATE ... SET total_minor = total_minor + v_delta` is row-atomic on its own and
-# removing FOR UPDATE changes nothing. Mutation testing showed exactly that:
-# deleting the lock the header calls the fix for this file's root cause passed the
-# whole suite.
+# Workload B uses is_total => false, where the surviving `UPDATE ... SET total =
+# total + delta` is row-atomic on its own, so removing FOR UPDATE changes nothing.
+# A cumulative total is the case that needs the lock: the conversion READS
+# authorized_minor and writes a delta derived from it.
 #
-# A CUMULATIVE TOTAL is the case that needs it: the conversion READS
-# authorized_minor and then writes a delta derived from it -- a read-modify-write.
-# Without the lock two sessions read the same base and both apply their own delta,
-# so the group over-counts. Every worker sends the same ladder of totals; whoever
-# loses a race is refused as out-of-order, which is the designed behaviour.
+# A LADDER OF RISING TOTALS DOES NOT DETECT IT EITHER, which is why this workload
+# was rewritten. A lost update there makes the base too LOW, the delta too large,
+# and the next rung then refuses anything below the inflated subtotal -- the ladder
+# self-corrects and the final total converges on the top rung whether or not the
+# lock is there. Verified: with FOR UPDATE deleted, the old workload still printed
+# `ok cumulative totals converge on the highest total = 1500`.
+#
+# So every worker sends THE SAME total, under a different message id, at once.
+# With the lock: the first converts 100 -> 5000 and every other sees
+# authorized_minor already at 5000, computes a delta of zero, and is a no-op.
+# Without it: several read 100 concurrently and each apply 4900.
 psql "$URL" -q -v ON_ERROR_STOP=1 -c \
   "DO \$d\$ BEGIN PERFORM record_auth_event('cc','tot_seed','GT','co1','c1','authorization',100,'USD',true,now()); END \$d\$;"
-ladder() {
+same_total() {
     : > "$TMP/d$1.sql"
-    for i in $(seq 2 "$PER"); do
-        echo "SELECT record_auth_event('cc','t${1}_${i}','GT','co1','c1','incremental',$(( i * 100 )),'USD',true,now());" >> "$TMP/d$1.sql"
+    for i in $(seq 1 "$PER"); do
+        echo "SELECT record_auth_event('cc','t${1}_${i}','GT','co1','c1','incremental',5000,'USD',true,now());" >> "$TMP/d$1.sql"
     done
     psql "$URL" -qAt -f "$TMP/d$1.sql" >/dev/null 2>"$TMP/d$1.err"
 }
-for w in $(seq 1 "$WORKERS"); do ladder "$w" & done
+for w in $(seq 1 "$WORKERS"); do same_total "$w" & done
 wait
-top=$(( PER * 100 ))
-chk "cumulative totals converge on the highest total" \
-    "$(q "select total_minor from card_hold_groups where tenant_id='cc' and group_key='GT'")" "$top"
-chk "...and the authorized subtotal matches it" \
-    "$(q "select authorized_minor from card_hold_groups where tenant_id='cc' and group_key='GT'")" "$top"
+chk "concurrent identical totals converge on that total" \
+    "$(q "select total_minor from card_hold_groups where tenant_id='cc' and group_key='GT'")" 5000
+chk "...and the authorized subtotal matches" \
+    "$(q "select authorized_minor from card_hold_groups where tenant_id='cc' and group_key='GT'")" 5000
+# the seed is excluded: it legitimately converts 0 -> 100
+chk "...with exactly one racing conversion having moved anything" \
+    "$(q "select count(*) from card_auth_events e join card_auth_event_group m on m.tenant_id=e.tenant_id and m.event_id=e.id where e.tenant_id='cc' and m.group_key='GT' and e.amount_delta > 0 and e.processor_msg_id <> 'tot_seed'")" 1
 chk "...with no drift" "$(q "select count(*) from card_hold_drift where tenant_id='cc'")" 0
 
 # ---------------------------------------------------------------- workload C
