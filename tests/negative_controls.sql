@@ -1502,9 +1502,28 @@ $q$, 'unknown tenant');
 -- code without the caption left the half that does the harm open: a chart line
 -- under any other code could take that caption and be accepted, and a reader
 -- grouping by caption then sees a real liability folded into a derived plug.
+-- ...and the same caption with ONE TRAILING SPACE, which defeated both guards:
+-- a reader cannot see it, so the constraint must not either.
+SELECT must_fail('the derived plug''s caption, with a trailing space', $q$
+    INSERT INTO fs_lines (code,caption,statement,side,sort_order)
+    VALUES ('plug_ws','Undistributed earnings (since inception) ','balance_sheet','liability_equity',9001);
+$q$, 'ck_fs_lines__caption_clean');
+SELECT must_fail('the derived plug''s caption, in a different case', $q$
+    INSERT INTO fs_lines (code,caption,statement,side,sort_order)
+    VALUES ('plug_case','UNDISTRIBUTED EARNINGS (SINCE INCEPTION)','balance_sheet','liability_equity',9002);
+$q$, 'ck_fs_lines__caption_reserved');
+SELECT must_fail('a duplicate caption distinguished only by trailing space', $q$
+    INSERT INTO fs_lines (code,caption,statement,side,sort_order)
+    VALUES ('cash_ws','Cash and cash equivalents ','balance_sheet','asset',9003);
+$q$, 'ck_fs_lines__caption_clean');
+SELECT must_fail('a duplicate caption distinguished only by case', $q$
+    INSERT INTO fs_lines (code,caption,statement,side,sort_order)
+    VALUES ('cash_case','cash and cash equivalents','balance_sheet','asset',9004);
+$q$, 'uq_fs_lines__caption');
+
 SELECT must_fail('a chart line wearing the derived plug''s caption', $q$
     INSERT INTO fs_lines (code,caption,statement,side,sort_order)
-    VALUES ('suspense_plug','Current year earnings','balance_sheet','liability_equity',9000);
+    VALUES ('suspense_plug','Undistributed earnings (since inception)','balance_sheet','liability_equity',9000);
 $q$, 'ck_fs_lines__caption_reserved');
 
 -- uq_fs_lines__caption itself had no control either -- its own comment says
@@ -1799,12 +1818,19 @@ END $$;
 -- fs_lines set byte-identical -- turned the build red. It fired on something no
 -- consumer of the view could observe. The view is ordered now, and this reads the
 -- order the view actually returns.
+-- ...and the rewrite of THIS assertion did not fix it either. Wrapping the view
+-- in a JOIN discards the view's ORDER BY, so it walked the join's order and
+-- printed ok against a schema whose balance sheet came out alphabetical --
+-- assets and liabilities interleaved. Read the view ALONE, in the order it
+-- delivers, and look sort_order up per row.
 DO $$
 DECLARE v_prev int := -1; r record;
 BEGIN
-    FOR r IN SELECT bs.fs_line, f.sort_order FROM balance_sheet bs
-             JOIN fs_lines f ON f.code = bs.fs_line
-             WHERE bs.tenant_id='t1' AND bs.currency='USD' AND bs.fs_line <> 'current_year_earnings'
+    FOR r IN SELECT bs.fs_line,
+                    (SELECT f.sort_order FROM fs_lines f WHERE f.code = bs.fs_line) AS sort_order
+               FROM balance_sheet bs
+              WHERE bs.tenant_id='t1' AND bs.currency='USD'
+                AND bs.fs_line <> 'current_year_earnings'
     LOOP
         IF r.sort_order < v_prev THEN
             RAISE EXCEPTION 'balance-sheet line % breaks the chart''s declared order', r.fs_line;
@@ -1812,6 +1838,24 @@ BEGIN
         v_prev := r.sort_order;
     END LOOP;
     RAISE NOTICE 'ok  the balance sheet comes out in the chart''s declared order';
+END $$;
+
+-- ...and the income statement, which had no ordering assertion at all, so its
+-- ORDER BY was unprotected outright.
+DO $$
+DECLARE v_prev int := -1; r record;
+BEGIN
+    FOR r IN SELECT i.fs_line,
+                    (SELECT f.sort_order FROM fs_lines f WHERE f.code = i.fs_line) AS sort_order
+               FROM income_statement i
+              WHERE i.tenant_id='t1' AND i.currency='USD'
+    LOOP
+        IF r.sort_order < v_prev THEN
+            RAISE EXCEPTION 'income-statement line % breaks the chart''s declared order', r.fs_line;
+        END IF;
+        v_prev := r.sort_order;
+    END LOOP;
+    RAISE NOTICE 'ok  the income statement comes out in the chart''s declared order';
 END $$;
 
 -- ================= round 6: the DELETE half, and a report gone currency-blind
@@ -1889,6 +1933,47 @@ BEGIN
                         '-- the float is presented as ordinary accruals', v_line;
     END IF;
     RAISE NOTICE 'ok  customer funds payable keeps its own statement line';
+END $$;
+
+-- EVERY trigger, not just the foreign keys. The census here checked
+-- `tgisinternal` only, so the ENABLE ALWAYS on four USER triggers could each be
+-- deleted with the suite green -- including ck_types__matches_fs_line, whose own
+-- comment says removing it "put 6,000 of revenue on the expense side of the
+-- income statement, with every check green", and all three recorded_at
+-- assignments, which reopen on the replication apply path every consequence 0001
+-- lists as closed. One assertion covers the whole set and cannot drift as
+-- triggers are added.
+DO $$
+DECLARE v_bad text;
+BEGIN
+    SELECT string_agg(c.relname || '.' || t.tgname, ', ') INTO v_bad
+      FROM pg_trigger t
+      JOIN pg_class c ON c.oid = t.tgrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND t.tgenabled <> 'A';
+    IF v_bad IS NOT NULL THEN
+        RAISE EXCEPTION 'trigger(s) not ENABLE ALWAYS, so the replication apply path '
+                        'skips them: %', v_bad;
+    END IF;
+    RAISE NOTICE 'ok  every trigger in the schema is ENABLE ALWAYS, user and internal';
+END $$;
+
+-- ...and truncating the CACHE is deliberately allowed, because it is rebuildable
+-- and the alarm is loud about it. The enumeration is four tables of five, and the
+-- fifth is the copy the hot path reads, so state the exclusion rather than leave
+-- it looking like an oversight.
+DO $$
+DECLARE v_n int;
+BEGIN
+    TRUNCATE ledger_account_balances;
+    SELECT count(*) INTO v_n FROM ledger_balance_drift WHERE problem LIKE '%no cached%';
+    IF v_n = 0 THEN
+        RAISE EXCEPTION 'the cache was truncated and the alarm said nothing';
+    END IF;
+    RAISE NOTICE 'ok  truncating the balance cache is allowed and loud (% rows)', v_n;
+    RAISE EXCEPTION 'rollback the cache truncation';
+EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM <> 'rollback the cache truncation' THEN RAISE; END IF;
 END $$;
 
 SELECT on_origin('the end of the file');

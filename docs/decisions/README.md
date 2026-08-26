@@ -68,6 +68,35 @@ Undecided, listed plainly rather than buried:
   balanced, both drift views empty, and 40,000.00 of asset owed by nobody. Each sub-book is
   internally consistent; nothing compares the two sides. This is the same limit as the entry below,
   stated in the units it costs.
+- **The balance sheet nets counterparties the chart declares un-nettable, and the schema cannot
+  express the fix.** `balance_sheet` groups by `fs_line` and never reads `counterparty_scope`, so
+  owing t1 425.00 while t2 owes 425.00 prints a payables line of **zero** — both sides understated,
+  `trial_balance` holding the correct gross figures, the two reports disagreeing, and every check
+  green. That is the exact harm the seed says sharding the account per counterparty fixed; it did
+  not, because the netting happens in the *report*, one level above the account. And an account's
+  statement line is fixed by its type, so t2's opposite-sign position has no line to move to even
+  if the column were read. IAS 32.42 / ASC 210-20-45-1 permit offset only between the same two
+  parties.
+- **The balance sheet has no period, and the income statement has no parameter.** With no close,
+  the synthesised earnings plug sums revenue and expense over *all posted history* — it was
+  captioned "Current year earnings" and reported 34,000.00 against a true current year of 4,000.00
+  on a three-year book, growing without bound. The caption now says
+  "Undistributed earnings (since inception)", which is honest but is not the fix; the fix is the
+  period close, designed and unbuilt. `retained_earnings` ships in the chart and stays at zero
+  forever because nothing routes to it.
+- **The balance cache includes `pending`; every report excludes it.** `ledger_account_balances` is
+  described as the O(1) current-balance read and `ledger_balance_drift` as the alarm "over all
+  THREE copies of every balance" — all three copies count pending transactions, and no report
+  does. A customer served from the cache can be shown 500.00 while the balance sheet shows 0.00,
+  with both drift views empty, because nothing compares the alarm's population to the reports'.
+  Arguably available-versus-posted by design; nothing says so, and no view surfaces the pending
+  population.
+- **No report accepts both time axes, and the three statements accept neither.**
+  `accounting_equation` takes one axis; `trial_balance`, `balance_sheet` and `income_statement` are
+  parameterless. So an issued statement cannot be reproduced after any backdated posting — legal,
+  append-only, every check green. This is *separate* from [0005](./0005-reproducible-as-of.md): a
+  perfect commit cursor still would not reproduce an issued effective-period report through a
+  single-axis parameter.
 - **`counterparty_scope` and `is_perimeter` are declarative.** Both are documented at length, both
   carry CHECK constraints, and no view or function reads either. The offsetting rule ADR-0009 §5
   states as a mechanism is not implemented. A consequence worth stating: because nothing reads

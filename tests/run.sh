@@ -60,6 +60,12 @@ done
 # `exit 0` while this script still printed PASS. It carries the only evidence for
 # four guards that exist solely for concurrency.
 [ -x tests/concurrency.sh ] || missing="$missing concurrency.sh"
+# ...and canary.sh, which was added BECAUSE the helpers inside a suite are
+# forgeable -- and was then left outside every guard this script applies to the
+# files it distrusts. `exit 0` in it printed PASS, which is verbatim the defect
+# fixed one file above for concurrency.sh. The outermost oracle needs the same
+# floor, sentinel and call-site count as everything else.
+[ -x tests/canary.sh ] || missing="$missing canary.sh"
 if [ -n "$missing" ]; then
     echo "── MISSING SUITE(S):$missing"
     echo "FAIL"; exit 1
@@ -86,6 +92,7 @@ fi
 # sentinel: 1,756 lines of controls replaced by 204 lines of nothing, build green.
 sites_for() {
     case "$1" in
+        *canary.sh) grep -v '^[[:space:]]*#' "$1" | grep -cE '^canary ' ;;
         *.sh) grep -v '^[[:space:]]*#' "$1" | grep -cE 'chk "|echo "   ok' ;;
         *)    grep -v '^[[:space:]]*--' "$1" \
                 | grep -cE "must_fail\(|SELECT eq\(|SELECT eqv\(|no_drift\(|expect_state\(|plan_uses\(|on_origin\(|RAISE NOTICE 'ok" ;;
@@ -102,7 +109,7 @@ floor_for() {
         *bitemporal.sql)        echo 23 ;;
         *card_holds.sql)        echo 169 ;;
         *golden_trace.sql)      echo 35 ;;
-        *negative_controls.sql) echo 142 ;;
+        *negative_controls.sql) echo 149 ;;
         *query_plans.sql)       echo  9 ;;
         *)                      echo  1 ;;
     esac
@@ -162,6 +169,21 @@ fi
 # the suite says about itself; canary.sh breaks the schema on purpose and requires
 # the suite to notice. See its header for what that is worth.
 echo "── tests/canary.sh"
-if ! ./tests/canary.sh "$ADMIN"; then fail=1; fi
+kout=$(./tests/canary.sh "$ADMIN" 2>&1) || fail=1
+echo "$kout"
+kn=$(echo "$kout" | grep -cE '^ +ok  canary ') || true
+if [ "$kn" -lt 3 ]; then
+    echo "   FAIL tests/canary.sh ran $kn canaries, below its floor of 3"
+    fail=1
+fi
+ksites=$(sites_for tests/canary.sh)
+if [ "$ksites" -lt 3 ]; then
+    echo "   FAIL tests/canary.sh contains $ksites canary call sites, below 3"
+    fail=1
+fi
+if ! echo "$kout" | grep -q "SUITE-COMPLETE canary"; then
+    echo "   FAIL tests/canary.sh did not run to its last line"
+    fail=1
+fi
 
 [ "$fail" -eq 0 ] && echo "PASS" || { echo "FAIL"; exit 1; }
