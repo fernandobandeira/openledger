@@ -30,8 +30,17 @@ CREATE TABLE fs_lines (
     -- seeing 2,680.00 of current year earnings against a true 2,240.00. These are
     -- the schema's stated substitute for a test ("nothing in the suite reads a
     -- caption"), so they have to hold against the whitespace a human cannot see.
+    -- `btrim(x)` with one argument strips SPACES ONLY. An earlier version of this
+    -- used it and claimed to compare "as a reader sees it"; a tab, a newline, a
+    -- non-breaking space or a zero-width space walked straight through, and
+    -- 44,000.00 of customer suspense sat on a line byte-different and
+    -- pixel-identical to the derived earnings plug -- 46,240.00 presented under one
+    -- caption against a true 2,240.00, with every report green. A guard tested
+    -- through one member of a class it claims to cover in full.
     caption    text NOT NULL CONSTRAINT ck_fs_lines__caption_clean
-                   CHECK (caption = btrim(caption) AND caption <> ''),
+                   CHECK (caption = btrim(caption, E' \t\n\r\u00a0\u200b\u2007\u202f')
+                          AND caption <> ''
+                          AND caption !~ '[\u0000-\u001f\u00a0\u200b-\u200f\u2028\u2029\u202f\ufeff]'),
     statement  text NOT NULL CONSTRAINT ck_fs_lines__statement
                    CHECK (statement IN ('balance_sheet','income_statement')),
     -- Which side of the statement this line sits on, declared rather than
@@ -60,7 +69,8 @@ CREATE TABLE fs_lines (
     -- saw 268,000.00 of current year earnings against a true 224,000.00, with
     -- `balanced = t` and both drift views empty.
     CONSTRAINT ck_fs_lines__caption_reserved
-        CHECK (lower(btrim(caption)) <> 'undistributed earnings (since inception)'),
+        CHECK (lower(btrim(caption, E' \t\n\r\u00a0\u200b\u2007\u202f'))
+                 <> 'undistributed earnings (since inception)'),
     CONSTRAINT ck_fs_lines__side_matches_statement CHECK (
         (statement = 'balance_sheet'    AND side IN ('asset','liability_equity')) OR
         (statement = 'income_statement' AND side IN ('credit','debit'))),
@@ -68,7 +78,8 @@ CREATE TABLE fs_lines (
 );
 
 -- ...and uniqueness on what the reader distinguishes, not on bytes.
-CREATE UNIQUE INDEX uq_fs_lines__caption ON fs_lines (lower(btrim(caption)));
+CREATE UNIQUE INDEX uq_fs_lines__caption
+    ON fs_lines (lower(btrim(caption, E' \t\n\r\u00a0\u200b\u2007\u202f')));
 
 CREATE TABLE account_types (
     code           text CONSTRAINT pk_account_types PRIMARY KEY,

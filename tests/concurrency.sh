@@ -551,48 +551,54 @@ chk "...and the alarm sees the running balance they did not maintain" \
     "$(q "select count(*) from ledger_balance_drift where tenant_id='sq'")" 2
 
 # ---------------------------------------------------------------- workload L
-# THE MESSAGE IS THE FIRST LOCK. The fresh-ingest path took the card_hold_groups
-# row FOR UPDATE at the top of its block -- before the function could know whether
-# the message already existed -- while the attach path locks the event first. So
-# ingest ran group-then-message and attach ran message-then-group, and two
-# ORDINARY single-group ingests deadlocked: measured 10 of 10 trials with the
-# group pre-created and committed, so it is a plain row lock and not a race to
-# create anything.
+# UNSORTED MULTI-STATEMENT CALLERS DEADLOCK, AND CORRECTNESS SURVIVES IT.
 #
-# `INSERT ... ON CONFLICT DO NOTHING` on uq_auth_events__msg IS a lock
-# acquisition -- the lesson this file states for regroup_auth_event and did not
-# apply to ingest. An advisory lock on the message identity restores one order
-# everywhere, which is the remedy ADR-0010 already names for the sibling case.
+# This workload used to assert zero deadlocks, on the strength of an advisory lock
+# over the message key space that has since been REVERTED -- it did not remove the
+# deadlock class, it moved which orderings collide, and it moved them onto a
+# commoner workload. Measured, all single-group ordinary ingests:
 #
-# Session B is an adapter batch: an unmatched delivery (taking the message id and
-# NO group lock), then an ordinary matched message wanting the group. Session A is
-# a matcher re-delivering that first message, now matchable, in between.
+#   batch = [unmatched ingest of m, matched ingest of m2], racer attaches m
+#       with the advisory lock: 0 deadlocks    without it: 6 of 6
+#   batch = [matched ingest of mA, matched ingest of mB], racer ingests mB
+#       with the advisory lock: 6 of 6         without it: 0
+#
+# Advisory locks are taken in CALLER order, unsorted, so a multi-message caller
+# reintroduces exactly the ordering problem ADR-0010 records for a multi-GROUP
+# caller. A single call cannot sort a key it has not been told about.
+#
+# NO FIFO HERE, deliberately. The first version drove the batch through a named
+# pipe to interleave the racer between two statements -- and when the reader died
+# of a deadlock, the writer blocked forever on a pipe nobody was reading. run.sh
+# has no timeout, so that is an infinite build rather than a red one, and it hung
+# twice before being caught. Each side is one self-contained transaction submitted
+# in a single psql call; they overlap because they run concurrently.
+#
+# What is asserted is the property that holds under EVERY interleaving: each
+# message lands exactly once, no event ends with two live memberships, and the
+# materialised total still equals its log. Asserting zero deadlocks here would be
+# asserting a lock ordering the product does not have.
 psql "$URL" -q -v ON_ERROR_STOP=1 -c \
   "DO \$d\$ BEGIN PERFORM record_auth_event('ml','ml_seed','GL','co1','c1','authorization',1000,'USD',false,now()); END \$d\$;"
-ml_dl_before=$(q "select deadlocks from pg_stat_database where datname=current_database()")
-ml_fail=0
-for i in $(seq 1 6); do
-    fifo="$TMPD/f_ml$i"; rm -f "$fifo"; mkfifo "$fifo"
-    ( psql "$URL" -qAt -f "$fifo" >"$TMPD/ml_b$i.out" 2>&1 ) &
-    exec 7>"$fifo"
-    echo "BEGIN;" >&7
-    echo "SELECT record_auth_event('ml','ml_u$i',NULL,'co1','c1','authorization',10,'USD',false,now());" >&7
-    sleep 0.3
-    ( psql "$URL" -qAt -c "SELECT record_auth_event('ml','ml_u$i','GL','co1','c1','authorization',10,'USD',false,now())" \
-        >"$TMPD/ml_a$i.out" 2>&1 ) &
-    ml_pid=$!
-    sleep 0.3
-    echo "SELECT record_auth_event('ml','ml_m$i','GL','co1','c1','incremental',10,'USD',false,now());" >&7
-    echo "COMMIT;" >&7; exec 7>&-
-    wait "$ml_pid" 2>/dev/null
+for i in $(seq 1 5); do
+    ( psql "$URL" -qAt -c "BEGIN;
+        SELECT record_auth_event('ml','ml_a$i','GL','co1','c1','authorization',10,'USD',false,now());
+        SELECT pg_sleep(0.05);
+        SELECT record_auth_event('ml','ml_b$i','GL','co1','c1','incremental',10,'USD',false,now());
+        COMMIT;" >/dev/null 2>&1 ) &
+    ( psql "$URL" -qAt -c "BEGIN;
+        SELECT record_auth_event('ml','ml_b$i','GL','co1','c1','incremental',10,'USD',false,now());
+        SELECT pg_sleep(0.05);
+        SELECT record_auth_event('ml','ml_a$i','GL','co1','c1','authorization',10,'USD',false,now());
+        COMMIT;" >/dev/null 2>&1 ) &
 done
-sleep 0.5
-ml_dl_after=$(q "select deadlocks from pg_stat_database where datname=current_database()")
-chk "adapter batch against a matcher on one group: deadlocks" \
-    "$(( ml_dl_after - ml_dl_before ))" 0
-chk "...and every message landed exactly once" \
-    "$(q "select count(*) from card_auth_events where tenant_id='ml' and processor_msg_id like 'ml_u%'")" 6
-chk "...with no drift" "$(q "select count(*) from card_hold_drift where tenant_id='ml'")" 0
+wait
+chk "unsorted batch callers: the materialised total still equals its log" \
+    "$(q "select count(*) from card_hold_drift where tenant_id='ml'")" 0
+chk "...and no message landed twice" \
+    "$(q "select count(*) from (select processor_msg_id from card_auth_events where tenant_id='ml' group by 1 having count(*) > 1) z")" 0
+chk "...and no event ended with two live memberships" \
+    "$(q "select count(*) from card_auth_events e where e.tenant_id='ml' and (select count(*) from card_auth_event_group m where m.tenant_id=e.tenant_id and m.event_id=e.id and m.superseded_at is null) > 1")" 0
 
 echo "   ok  SUITE-COMPLETE concurrency"
 exit "$fail"

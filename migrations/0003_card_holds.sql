@@ -273,29 +273,39 @@ BEGIN
           USING ERRCODE = 'data_exception';
     END IF;
 
-    -- THE MESSAGE IS THE FIRST LOCK, ON EVERY PATH.
+    -- ON LOCK ORDERING, AND AN ATTEMPT THAT MADE IT WORSE.
     --
-    -- `INSERT ... ON CONFLICT DO NOTHING` on uq_auth_events__msg IS a lock
-    -- acquisition -- the lesson this file states for regroup_auth_event and did
-    -- not apply here. On the fresh path the group lock is taken at the top of the
-    -- block below, BEFORE the function can know whether the message already
-    -- exists, so ingest takes group-then-message while the attach path (fixed in
-    -- an earlier round to lock the event first) takes message-then-group.
+    -- The fresh path takes the group row FOR UPDATE before it can know whether the
+    -- message already exists, so ingest runs group-then-message while the attach
+    -- path runs message-then-group. Two ordinary single-group ingests can deadlock
+    -- on that: measured 10 of 10 trials with the group pre-created and committed,
+    -- so it is a plain row lock and not a race to create anything.
     --
-    -- Two ordinary single-group ingests then deadlock. Measured 10 of 10 trials
-    -- with the group pre-created and committed, so it is a plain row lock and not
-    -- a race to create anything: an adapter batch holding the message id of an
-    -- unmatched delivery and wanting a group, against a matcher holding that group
-    -- and wanting the message. Neither the recorded multi-group known issue nor
-    -- the retraction of "concurrent ingest on a single group cannot deadlock"
-    -- covers it -- that retraction blamed the foreign key's implicit FOR KEY SHARE
-    -- in the attach path, which is a different lock in a different function.
+    -- An advisory lock on the message identity was added here to make the message
+    -- the first lock everywhere. IT WAS REVERTED, because it does not remove the
+    -- class -- it moves which orderings collide, and it moved them onto a commoner
+    -- workload. Measured, single-group ordinary ingests throughout:
     --
-    -- An advisory lock on the message identity restores one order everywhere. It
-    -- is the remedy ADR-0010 already names for the sibling case ("the fix belongs
-    -- in a batch API or in an advisory lock over the same key space"), it is
-    -- transaction-scoped, and it costs one hash.
-    PERFORM pg_advisory_xact_lock(hashtextextended(p_tenant || ':' || p_msg_id, 0));
+    --   batch = [unmatched ingest of m, matched ingest of m2], racer attaches m
+    --       with the advisory lock: 0 deadlocks    without it: 6 of 6
+    --   batch = [matched ingest of mA, matched ingest of mB], racer ingests mB
+    --       with the advisory lock: 6 of 6         without it: 0
+    --
+    -- The second is a webhook batch carrying an authorization and its increment,
+    -- racing a redelivery of the increment. That is the plainest traffic this
+    -- product has, and the lock made it fail every time -- aborting the adapter's
+    -- whole transaction, which is the cost the lock was supposed to remove.
+    --
+    -- The reason is this file's own recorded lesson one level down: advisory locks
+    -- are taken in CALLER ORDER, unsorted, so a multi-message caller reintroduces
+    -- exactly the ordering problem ADR-0010 records for a multi-GROUP caller. A
+    -- single call cannot sort a key it has not been told about. The class belongs
+    -- to unsorted multi-statement callers, the fix belongs in a batch API, and it
+    -- is recorded in ADR-0010 rather than half-closed here.
+    --
+    -- What DOES hold under every one of these interleavings, and is what
+    -- tests/concurrency.sh asserts: correctness. Every deadlock aborts cleanly,
+    -- each message lands exactly once, and card_hold_drift stays empty.
 
     -- DEDUP BEFORE ANY GROUP IS MATERIALISED.
     --
@@ -747,7 +757,16 @@ BEGIN
            overcaptured_at = CASE WHEN v_total < 0
                                   THEN COALESCE(overcaptured_at, now()) END
      WHERE tenant_id=p_tenant AND company_id=p_company AND group_key=p_group;
-    RETURN v_total;
+
+    -- ...and the FOURTH return site. Three separate fixes and twenty lines of
+    -- comment established that a returned hold must be the clamped held_minor and
+    -- never the raw total, because the raw total goes negative on an over-capture
+    -- and an adapter computing `available = limit - returned` gains phantom
+    -- credit. This one was still returning v_total: -9400, verbatim the number the
+    -- other three were fixed to stop producing. It is a repair entry point rather
+    -- than the hot path, but it is public and it returns a bigint that looks like
+    -- a hold.
+    RETURN GREATEST(v_total, 0);
 END $$;
 
 -- Re-grouping: the corrective operation the spec's unmatched queue requires.
@@ -1070,9 +1089,17 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
    -- by the event it exists to protect against, and could only ever report the
    -- state where the money was not yet lost.
    --
-   -- low_water_minor is the right input: it is written only as
-   -- `LEAST(low_water_minor, ...)`, so it is monotone non-increasing, it cannot be
-   -- erased, and group rows cannot be deleted. A dip below what clearings explain
+   -- low_water_minor is written only as `LEAST(low_water_minor, ...)`, so it is
+   -- monotone non-increasing THROUGH THESE FUNCTIONS, and group rows cannot be
+   -- deleted. It is NOT unerasable: the app role holds UPDATE on this table --
+   -- granted so record_auth_event can maintain it -- and one statement sets both
+   -- low_water_minor and overcaptured_at back to a clean state with drift silent,
+   -- because drift reads neither column. An earlier version of this comment said
+   -- "it cannot be erased", which is true of the code and false of the table.
+   -- It is also ORDER-DEPENDENT: across 720 permutations of one six-message set,
+   -- total_minor, authorized_minor and held_minor each took ONE value and
+   -- low_water_minor took TWELVE -- which is the mechanical reason the latching
+   -- alarm attempted here false-positived on permutation 4,3,2,1. A dip below what clearings explain
    -- LATCHES. A genuine over-capture (a $1 authorization clearing at $95: low water
    -- -9400 against 9500 cleared) does not fire, and an out-of-order clearing that
    -- lands before its authorization does not either, because that dip never
@@ -1099,7 +1126,28 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
    -- the precursor state, `low_water_minor` keeps the durable evidence that the
    -- group was ever there, and the ambiguity is recorded in ADR-0010 rather than
    -- papered over with a guard that would fire on honest traffic.
+   --
+   -- AND A CLEARING BLINDED IT COMPLETELY. `total_minor` is
+   -- `increases - cleared - bloodless`, so a group can sit BELOW ZERO from a
+   -- bloodless reversal while `bloodless <= increases` -- and then the predicate
+   -- above never fires, not in the precursor state and not after. Measured:
+   -- authorization 100.00, clearing 100.00 (which POSTS), spurious reversal
+   -- 100.00, then a genuine incremental 100.00. True exposure 200.00 (100 posted +
+   -- 100 un-cleared), reported 100.00, drift 0 rows at every step. Scaled three
+   -- times over: 300.00 under-reserved, and the hidden residue is bounded only by
+   -- the group's cleared amount.
+   --
+   -- That falsifies the precise restatement ADR-0010 wrote to close the declined
+   -- over-capture report -- "an over-capture never makes held_for_company smaller
+   -- than the un-cleared exposure of that group" -- in a state the system itself
+   -- flags as an over-capture.
+   --
+   -- The second disjunct is strictly stronger than the first (bloodless >
+   -- increases implies total < 0 and bloodless > 0), so it loses nothing, and the
+   -- genuine $1-authorization-clearing-at-$95 over-capture still does not fire,
+   -- because it has no bloodless decrease at all.
    OR l.bloodless_decreases > l.increases
+   OR (g.total_minor < 0 AND l.bloodless_decreases > 0)
    OR (l.any_total AND l.any_delta)
    OR g.total_convention IS DISTINCT FROM
         (CASE WHEN l.any_total AND l.any_delta THEN g.total_convention

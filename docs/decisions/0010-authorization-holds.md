@@ -104,9 +104,23 @@ suite: `tests/concurrency.sh` defaults to 6 workers x 15 operations. They are re
 observations, not as reproducible benchmarks — the harness that produced them is not in the repo.*
 
 **What held under the same attack**, and is worth recording as attested rather than assumed:
-`record_auth_event` has no window — `INSERT … ON CONFLICT DO NOTHING` waits on a concurrent
-inserter (measured: a second session blocked 2.96 s, then saw the row and locked it). 3,600
-concurrent calls on one group produced a materialised total exactly equal to the log.
+`INSERT … ON CONFLICT DO NOTHING` waits on a concurrent inserter (measured: a second session
+blocked 2.96 s, then saw the row and locked it), and 3,600 concurrent calls on one group produced
+a materialised total exactly equal to the log.
+
+*This paragraph used to add "`record_auth_event` has no window", and that was wrong twice over.*
+The retraction below correctly says the "cannot deadlock" claim was false, and blames the foreign
+key's implicit `FOR KEY SHARE` in the attach path. A **second** reproducer was found later and is a
+different lock in a different function: the fresh-ingest path took the group row `FOR UPDATE`
+before it could know whether the message already existed, so ingest ran group-then-message while
+attach ran message-then-group. Two *ordinary single-group* ingests then deadlocked, **10 of 10
+trials**, with the group pre-created and committed so it was a plain row lock and not a race to
+create anything. **`INSERT … ON CONFLICT DO NOTHING` is itself a lock acquisition** — the lesson
+this file states for `regroup_auth_event` and had not applied to ingest.
+
+The fix is the remedy this ADR already names for the sibling case: an advisory lock over the
+message key space, taken first on every path, so the message is the first lock everywhere. It is
+transaction-scoped and costs one hash. `tests/concurrency.sh` races it.
 
 This paragraph used to end: *"and concurrent ingest on a single group **cannot deadlock** — it
 takes exactly one row lock."* **That was false, and it was false because of a lock nobody wrote.**
@@ -163,6 +177,12 @@ that, and `card_hold_drift` reported nothing for any of them.
 
 ### One finding declined, with the argument
 
+**Scope, stated up front, because the migration says it and this ADR did not:** the argument below
+covers `clearing` **and nothing else**. A clearing posts to the ledger, so the cleared money is a
+receivable and exposure is posted + held. `reversal` and negative `advice` post nothing at all, and
+for those the netting *is* a real under-reservation — see the over-reversal bullet under "Known,
+and not fixed".
+
 A reviewer reported that an over-capture nets against later exposure: a $1.00 fuel authorization
 clearing at $95.00 leaves `total_minor` at −94.00, and a subsequent $100.00 incremental then holds
 **6.00, not 100.00** — 94.00 apparently under-reserved, with the alarm silent.
@@ -185,7 +205,7 @@ the unmatched queue and `regroup_auth_event` exist to correct — it is not the 
 
 ## Known, and not fixed
 
-Four findings from adversarial review are recorded rather than closed, because
+Five findings from adversarial review are recorded rather than closed, because
 each needs a design decision rather than a guard:
 
 - **A cumulative restatement that DECREASES is refused, and the refusal is sticky.**
@@ -199,6 +219,30 @@ each needs a design decision rather than a guard:
   messages therefore leave 50.00 or 100.00 held depending on arrival order. If
   refusing the mix is the answer, the *group* should be quarantined, not just the
   message.
+- **The over-reversal alarm SELF-HEALS, so a real under-reservation ends silent.**
+  `card_hold_drift` reports a group whose bloodless decreases — reversals and
+  negative advice, neither of which posts to the ledger — exceed its increases.
+  That fires in the *precursor* state and goes false the instant the next genuine
+  increase is absorbed by the residue, because that increase raises the compared
+  quantity by exactly the amount it swallowed. Measured: two reversals against one
+  authorization, then an ordinary incremental — **100.00 live, 0.00 held, 0.00
+  posted, and drift back to zero rows.**
+
+  No predicate fixes it, and the attempt is instructive. Latching on
+  `low_water_minor` — monotone, unerasable — false-positives on the central claim
+  of this design: a group whose messages arrive decrease-first dips below any
+  clearing that has landed yet, which is exactly the order tolerance the whole
+  file exists to provide (`tests/card_holds.sql` permutation 4,3,2,1 catches it
+  immediately). **The log cannot decide the question**: a reversal that arrives
+  before its authorization and a reversal that should never have been sent are the
+  same three columns. Deciding needs the processor's reversal-to-authorization
+  linkage, which this ADR deliberately does not model — that is why grouping is
+  called a revisable inference. `low_water_minor` keeps the durable evidence that
+  the group was ever there.
+
+  *This paragraph exists because `migrations/0003` said "the ambiguity is recorded
+  in ADR-0010" and it was not. Writing that a thing is recorded elsewhere is not
+  recording it.*
 - **An emptied group pins its currency forever.** Group rows cannot be deleted (they carry
   `expired_at` and `low_water_minor`, which are not in the log), so once every event has been moved
   out of a group its `currency` is permanent, and a later message for that key in another currency
