@@ -189,11 +189,15 @@ BEGIN
 
     -- ...and the check actually ran. An empty report is trivially "balanced" --
     -- the exact failure this project cites Formance for.
-    IF (SELECT count(*) FROM accounting_equation()) <> 
-       (SELECT count(DISTINCT (tenant_id, currency)) FROM ledger_entries) THEN
-        RAISE EXCEPTION 'step % -- equation covered % scope(s) but % have entries',
+    -- Compared against ACCOUNTS, not entries: the equation now enumerates scopes
+    -- from the chart, so a scope that exists but has not posted yet reports zeros
+    -- rather than vanishing. That is the fix for "an as-of before any activity
+    -- returned an empty, trivially-balanced report".
+    IF (SELECT count(*) FROM accounting_equation()) <>
+       (SELECT count(DISTINCT (tenant_id, currency)) FROM ledger_accounts) THEN
+        RAISE EXCEPTION 'step % -- equation covered % scope(s) but % exist',
             p_step, (SELECT count(*) FROM accounting_equation()),
-            (SELECT count(DISTINCT (tenant_id, currency)) FROM ledger_entries);
+            (SELECT count(DISTINCT (tenant_id, currency)) FROM ledger_accounts);
     END IF;
 
     -- Intercompany elimination: the two sides of every cross-scope movement must
