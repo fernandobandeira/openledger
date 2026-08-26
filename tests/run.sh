@@ -33,6 +33,11 @@ missing=""
 for want in $EXPECTED_SUITES; do
     [ -f "tests/$want" ] || missing="$missing $want"
 done
+# concurrency.sh was outside the manifest AND outside the floor -- the one file
+# that cannot be a .sql, and the only one whose body could be replaced with
+# `exit 0` while this script still printed PASS. It carries the only evidence for
+# four guards that exist solely for concurrency.
+[ -x tests/concurrency.sh ] || missing="$missing concurrency.sh"
 if [ -n "$missing" ]; then
     echo "── MISSING SUITE(S):$missing"
     echo "FAIL"; exit 1
@@ -65,10 +70,30 @@ for f in tests/*.sql; do
         echo "   FAIL $f made $n assertions, below its floor of $floor"
         fail=1
     fi
+    # ...AND the file must have run to its last line. The floor counts OUTPUT, not
+    # assertions: prepending a loop that raises N fake `ok` notices and then a
+    # backslash-q satisfied the manifest, the floor and the build -- for all five
+    # files. Truncation with noise is one keystroke past the truncation the floor
+    # was written to catch, and a sentinel on the last line is what tells them apart.
+    base=$(basename "$f" .sql)
+    if ! echo "$out" | grep -q "SUITE-COMPLETE $base"; then
+        echo "   FAIL $f did not run to its last line -- no completion sentinel"
+        fail=1
+    fi
 done
 
 # The concurrency suite needs many sessions, so it cannot be a .sql file.
 echo "── tests/concurrency.sh"
-if ! ./tests/concurrency.sh "$URL"; then fail=1; fi
+cout=$(./tests/concurrency.sh "$URL" 2>&1) || fail=1
+echo "$cout"
+cn=$(echo "$cout" | grep -cE '^ +ok  ') || true
+if [ "$cn" -lt 20 ]; then
+    echo "   FAIL tests/concurrency.sh made $cn assertions, below its floor of 20"
+    fail=1
+fi
+if ! echo "$cout" | grep -q "SUITE-COMPLETE concurrency"; then
+    echo "   FAIL tests/concurrency.sh did not run to its last line"
+    fail=1
+fi
 
 [ "$fail" -eq 0 ] && echo "PASS" || { echo "FAIL"; exit 1; }

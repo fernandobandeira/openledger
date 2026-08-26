@@ -146,3 +146,5 @@ BEGIN
 END $$;
 
 ROLLBACK;
+
+DO $$ BEGIN RAISE NOTICE 'ok  SUITE-COMPLETE query_plans'; END $$;

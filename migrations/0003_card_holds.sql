@@ -415,9 +415,15 @@ BEGIN
             INSERT INTO card_auth_event_group (tenant_id,event_id,group_key,method,assigned_by)
             VALUES (p_tenant, v_event, p_group, p_method, 'ingest:redelivery');
 
-            -- keyed on the STORED kind and delta, not the caller's
+            -- Keyed on the STORED kind and delta, not the caller's. No
+            -- `OR v_evt_is_total` here, unlike the fresh-ingest copy of this
+            -- predicate: a cumulative total is refused outright when it names no
+            -- group, so a STORED is_total event always already has a membership
+            -- and can never reach this path. Carrying the disjunct anyway left an
+            -- unreachable branch that mutation testing cannot distinguish from a
+            -- tested one.
             IF v_evt_kind IN ('authorization','incremental','advice','expiry_reversal')
-               AND (v_evt_delta > 0 OR v_evt_is_total) THEN
+               AND v_evt_delta > 0 THEN
                 UPDATE card_hold_groups
                    SET expired_at = NULL, expired_authorized = NULL, expired_total = NULL
                  WHERE tenant_id=p_tenant AND company_id=p_company AND group_key=p_group;
@@ -621,6 +627,14 @@ BEGIN
                                    WHEN v_any_total THEN 'total'
                                    WHEN v_any_delta THEN 'delta' END,
            low_water_minor = LEAST(low_water_minor, v_total),
+           -- Both snapshots ratchet DOWN while the group is expired, and both have
+           -- to: regrouping an event OUT of an expired group lowers this group's
+           -- subtotal through here, and nowhere else. Left un-ratcheted,
+           -- expired_authorized then sat ABOVE the live subtotal, so re-attaching
+           -- that exposure later never exceeded it and the post-expiry branch --
+           -- which is `authorized_minor > expired_authorized` -- stayed silent.
+           expired_authorized = CASE WHEN expired_at IS NOT NULL
+                                THEN LEAST(expired_authorized, v_auth) ELSE expired_authorized END,
            expired_total = CASE WHEN expired_at IS NOT NULL
                                 THEN LEAST(expired_total, v_total) ELSE expired_total END,
            updated_at = now(),

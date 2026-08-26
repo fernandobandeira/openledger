@@ -946,7 +946,28 @@ BEGIN
         RAISE EXCEPTION 'under replica, a client-supplied account_seq survived: %', v_seq;
     END IF;
     RAISE NOTICE 'ok  replica: a client-supplied account_seq is still discarded (got %)', v_seq;
+    -- ...and PUT IT BACK. `SET LOCAL` in a DO block that SUCCEEDS persists for the
+    -- rest of the transaction, and `RESET ROLE` does not touch it -- they are
+    -- different settings. This block was the leak: every control after it, more
+    -- than two hundred lines of them, ran on the replication apply path ONLY.
+    -- Decisive proof, from the reviewer: `ALTER TABLE account_types ENABLE REPLICA
+    -- TRIGGER ck_types__matches_fs_line` -- which makes the trigger fire on the
+    -- replica path and NOWHERE ELSE -- passed the entire suite.
+    RESET session_replication_role;
 END $$;
+
+CREATE FUNCTION on_origin(p_where text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('session_replication_role') <> 'origin' THEN
+        RAISE EXCEPTION
+            'session_replication_role is % at %: every control from here on runs '
+            'on the replication apply path only, and the ordinary write path is '
+            'untested', current_setting('session_replication_role'), p_where;
+    END IF;
+    RAISE NOTICE 'ok  still on the ordinary write path at %', p_where;
+END $$;
+
+SELECT on_origin('the end of the replica block');
 
 SELECT must_fail('replica: mutating a committed transaction', $q$
     SET LOCAL session_replication_role = 'replica';
@@ -1211,6 +1232,9 @@ SELECT must_fail('asking an empty ledger whether it balances', $q$
     END $d$;
 $q$, 'unknown tenant');
 
+SELECT on_origin('the end of the file');
+
 DO $$ BEGIN RAISE NOTICE 'ok  every breakage above was refused, for the stated reason'; END $$;
+DO $$ BEGIN RAISE NOTICE 'ok  SUITE-COMPLETE negative_controls'; END $$;
 
 ROLLBACK;

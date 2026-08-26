@@ -257,7 +257,61 @@ race_guard xe "SELECT record_auth_event('xe','m-seed','gX','co1','c1','authoriza
     m-live gX "expired at" "regroup into an expiring group"
 chk "no hidden exposure after the races" "$(q "select count(*) from card_hold_drift where tenant_id in ('xg','xe')")" 0
 
+# ---------------------------------------------------------------- workload E
+# THE REPAIR RACING INGEST. `recompute_hold_group` takes `PERFORM 1 ... FOR UPDATE`
+# between materialising the group and summing its log. That line was load-bearing
+# and completely untested -- no workload here ever ran the repair against a
+# concurrent write -- and it took three tries to test it, so the two failures are
+# worth more than the fix.
+#
+# A HAND-SEQUENCED RACE WITH THE INGEST FIRST PROVES NOTHING. The repair's own
+# `INSERT ... ON CONFLICT DO NOTHING` already waits on a concurrent ingest holding
+# that row's lock, so with the FOR UPDATE deleted the repair still blocked, still
+# summed after the commit, and still printed the right total. It looked like a
+# passing test of a lock that was not there.
+#
+# NEITHER DOES HAMMERING. Repairs and ingests in parallel on the same group killed
+# the mutant one run in three -- and seeding a bigger log to widen the window made
+# it WORSE, zero in six, because extra repairs just queue on the row lock. A
+# control that fires a third of the time is not a control.
+#
+# The losing interleaving is specific: the repair sums, an ENTIRE ingest commits,
+# and only then does the repair's UPDATE land and overwrite it. So make the sum
+# slow enough to aim at. At 50,000 events in one group it takes ~90 ms, which is
+# an eternity from a shell: start the repair, wait 30 ms, run one ingest to
+# completion inside the gap.
+#   with FOR UPDATE: the repair holds the row from the start, the ingest waits,
+#                    and applies its delta on top of the repaired total
+#   without it:      the ingest commits inside the gap and the repair's UPDATE
+#                    erases it -- verified, 500100 becomes 500000
+psql "$URL" -q -v ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO card_auth_events (tenant_id,processor_msg_id,company_id,card_id,kind,
+                              amount_delta,raw_amount,raw_is_total,currency,occurred_at)
+SELECT 'rc','seed_'||i,'co1','c1','incremental',10,10,false,'USD',now()
+  FROM generate_series(1,50000) i;
+INSERT INTO card_hold_groups (tenant_id,company_id,group_key,currency)
+VALUES ('rc','co1','GR','USD') ON CONFLICT DO NOTHING;
+INSERT INTO card_auth_event_group (tenant_id,event_id,group_key,method,assigned_by)
+SELECT 'rc', id, 'GR', 'manual', 'seed' FROM card_auth_events WHERE tenant_id='rc';
+SELECT recompute_hold_group('rc','co1','GR');
+SQL
+chk "the seeded group sums to its log" \
+    "$(q "select total_minor from card_hold_groups where tenant_id='rc' and group_key='GR'")" 500000
+
+( psql "$URL" -qAt -c "SELECT recompute_hold_group('rc','co1','GR')" >"$TMPD/rc.out" 2>&1 ) &
+rc_pid=$!
+sleep 0.03
+psql "$URL" -qAt -c "SELECT record_auth_event('rc','rc_live','GR','co1','c1','incremental',100,'USD',false,now())" \
+    >"$TMPD/rc_ing.out" 2>&1
+wait "$rc_pid" 2>/dev/null
+chk "the repair does not erase an event committed while it was summing" \
+    "$(q "select total_minor from card_hold_groups where tenant_id='rc' and group_key='GR'")" 500100
+chk "...and the log agrees" \
+    "$(q "select coalesce(sum(e.amount_delta),0) from card_auth_event_group m join card_auth_events e on e.tenant_id=m.tenant_id and e.id=m.event_id where m.tenant_id='rc' and m.group_key='GR' and m.superseded_at is null")" 500100
+chk "...with no drift" "$(q "select count(*) from card_hold_drift where tenant_id='rc'")" 0
+
 # ...and once more, now that every workload has written its .err files.
 chk "failed statements (all workloads)" "$(count_errs)" 0
 
+echo "   ok  SUITE-COMPLETE concurrency"
 exit "$fail"

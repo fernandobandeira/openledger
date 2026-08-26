@@ -204,3 +204,5 @@ BEGIN
 END $$;
 
 ROLLBACK;
+
+DO $$ BEGIN RAISE NOTICE 'ok  SUITE-COMPLETE bitemporal'; END $$;

@@ -755,11 +755,18 @@ $q$, 'currency drift');
 -- the POST-EXPIRY branch, as a POSITIVE control. It was only ever asserted by
 -- `no_drift(...) = 0`, an assertion of ABSENCE, which passes trivially when the
 -- branch is deleted.
-SELECT must_fail('exposure raised after a release', $q$
+--
+-- ...and it must ISOLATE that branch. The first version of this control raised
+-- authorized_minor, which ALSO makes the stored total disagree with the log --
+-- so the alarm fired on the stored-vs-log branch and the post-expiry disjunct
+-- could be deleted with this test still passing. Lower the SNAPSHOT instead: the
+-- stored figures still match the log exactly, and only `authorized_minor >
+-- expired_authorized` can speak.
+SELECT must_fail('exposure above the authorized snapshot', $q$
     SELECT record_auth_event('t1','pe_auth','g_pe','acme','card_p',
             'authorization', 6000,'USD',false, now());
     SELECT expire_hold_group('t1','acme','g_pe');
-    UPDATE card_hold_groups SET authorized_minor = authorized_minor + 100
+    UPDATE card_hold_groups SET expired_authorized = expired_authorized - 100
      WHERE tenant_id='t1' AND group_key='g_pe';
     DO $d$ BEGIN
         IF EXISTS (SELECT 1 FROM card_hold_drift WHERE group_key='g_pe') THEN
@@ -767,6 +774,41 @@ SELECT must_fail('exposure raised after a release', $q$
         END IF;
     END $d$;
 $q$, 'post-expiry drift');
+
+-- ...and the other disjunct, which the control above cannot reach either
+SELECT must_fail('exposure above the total snapshot', $q$
+    SELECT record_auth_event('t1','pe_auth2','g_pe2','acme','card_p2',
+            'authorization', 6000,'USD',false, now());
+    SELECT expire_hold_group('t1','acme','g_pe2');
+    UPDATE card_hold_groups SET expired_total = expired_total - 100
+     WHERE tenant_id='t1' AND group_key='g_pe2';
+    DO $d$ BEGIN
+        IF EXISTS (SELECT 1 FROM card_hold_drift WHERE group_key='g_pe2') THEN
+            RAISE EXCEPTION 'POST-EXPIRY DRIFT detected';
+        END IF;
+    END $d$;
+$q$, 'post-expiry drift');
+
+-- Both snapshots must RATCHET DOWN when a recompute lowers the group. The only
+-- way to lower an expired group's subtotal is to move an event out of it, which
+-- goes through recompute_hold_group and nowhere else -- so with the ratchet
+-- deleted the snapshots sit above the live figures and the branch above can never
+-- fire again for that group.
+SELECT record_auth_event('t1','rt_a','g_ratchet','acme','card_rt',
+        'authorization', 5000,'USD',false, now());
+SELECT record_auth_event('t1','rt_b','g_ratchet','acme','card_rt',
+        'incremental', 2000,'USD',false, now());
+SELECT expire_hold_group('t1','acme','g_ratchet');
+SELECT regroup_auth_event('t1',
+        (SELECT id FROM card_auth_events WHERE processor_msg_id='rt_b'),
+        'g_ratchet_dest','operator');
+SELECT eq('regrouping out of an expired group ratchets the authorized snapshot',
+          (SELECT expired_authorized FROM card_hold_groups
+            WHERE tenant_id='t1' AND group_key='g_ratchet'), 5000);
+SELECT eq('...and the total snapshot',
+          (SELECT expired_total FROM card_hold_groups
+            WHERE tenant_id='t1' AND group_key='g_ratchet'), 5000);
+SELECT no_drift('ratcheting an expired group down');
 
 -- =========================================================== expire_hold_group
 --
@@ -918,3 +960,5 @@ $q$, 'reports increases as');
 DO $$ BEGIN RAISE NOTICE 'ok  card hold flow attested'; END $$;
 
 ROLLBACK;
+
+DO $$ BEGIN RAISE NOTICE 'ok  SUITE-COMPLETE card_holds'; END $$;
