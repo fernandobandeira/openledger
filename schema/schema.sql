@@ -966,9 +966,75 @@ ALTER TABLE card_auth_events ENABLE ALWAYS TRIGGER ck_auth_events__no_truncate;
 --     DEFAULT (a DEFAULT is overridable, and that was a measured defect here: a
 --     client-settable insertion axis let an already-issued report be rewritten by a
 --     transaction claiming to predate it). Formance kept its assignment triggers and
---     we did not; the difference is that they accept multiple writers and we are
---     betting on one. If that bet ever breaks, this is the first thing to revisit.
+--     we did not. The difference is NOT that we assume one writer -- Formance ships
+--     zero GRANTs and zero REVOKEs in its entire repository and does not assume that
+--     either. It is that their guarantee is a TYPE: a Posting{Source,Destination}
+--     cannot express one leg, so any Go caller gets a balanced pair or nothing.
+--     Ours has to be the same shape. Until it is, NOTHING enforces balance at all --
+--     `ledger_entries` stores independent rows carrying a direction, so an
+--     unbalanced transaction is fully expressible today. See ADR-0013.
 --   * chart integrity -- two foreign keys, above. Strictly better than the triggers
 --     they replaced: declarative, visible in \d, and impossible to forget.
+
+
+-- ----------------------------------------------------------------------
+-- THE APPLICATION ROLE
+--
+-- Named as half the append-only mechanism four times in the comments above, and
+-- for one commit it did not exist -- the role and its grants lived in the deleted
+-- migrations/0001 and were not carried over. A mechanism a document names and the
+-- schema does not implement is worse than no mechanism, because it reads as
+-- covered. Restored here, and stated for what it is.
+--
+-- The role gets SELECT and INSERT on the journal and NOTHING ELSE. No UPDATE, no
+-- DELETE, no TRUNCATE -- so for this role the two triggers below are redundant, and
+-- that is the point: they exist for the owner, not for the app.
+--
+-- A GRANT IS NOT A CONSTRAINT, and this schema should not pretend otherwise. It is
+-- a point-in-time privilege state that one `GRANT ALL` undoes, it binds no
+-- superuser, and it binds nothing at all on a database restored by someone who did
+-- not run this file. It is the cheap outer layer. Formance -- Go, PostgreSQL, in
+-- production -- ships ZERO grants and zero revokes in its entire repository and
+-- relies on its write API being the only caller; pgledger relies on the same
+-- convention with the same absence. Neither has an append-only guarantee against a
+-- direct INSERT, and that is a choice, not an oversight.
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'openledger_app') THEN
+        CREATE ROLE openledger_app NOLOGIN;
+    END IF;
+END $$;
+
+GRANT USAGE ON SCHEMA public TO openledger_app;
+
+-- The journal: read and append.
+GRANT SELECT, INSERT ON ledger_accounts, ledger_events, ledger_transactions,
+                        ledger_entries TO openledger_app;
+-- ...and the materialised balance cache, which is meant to be rewritten.
+GRANT SELECT, INSERT, UPDATE ON ledger_account_balances TO openledger_app;
+
+-- The card tables: the hold flow appends events and rewrites its own materialised
+-- group rows. UPDATE on card_auth_events is deliberate and narrow -- it is what
+-- lets a caller take a row lock with SELECT ... FOR UPDATE; the append-only trigger
+-- is what stops that privilege becoming mutability.
+GRANT SELECT, INSERT ON card_auth_events, card_auth_event_group TO openledger_app;
+GRANT SELECT, INSERT, UPDATE ON card_auth_event_group TO openledger_app;
+GRANT SELECT, INSERT, UPDATE ON card_hold_groups TO openledger_app;
+GRANT SELECT, INSERT ON webhook_deliveries TO openledger_app;
+
+-- Reports are readable; the chart is not writable.
+GRANT SELECT ON account_types, fs_lines TO openledger_app;
+GRANT SELECT ON trial_balance, balance_sheet, income_statement TO openledger_app;
+
+-- ...and belt and braces on the journal, because a later `GRANT ALL ON ALL TABLES`
+-- is one statement and this is the line that survives it in review.
+REVOKE UPDATE, DELETE, TRUNCATE ON ledger_entries          FROM openledger_app;
+REVOKE UPDATE, DELETE, TRUNCATE ON ledger_transactions     FROM openledger_app;
+REVOKE        DELETE, TRUNCATE ON ledger_events            FROM openledger_app;
+REVOKE        DELETE, TRUNCATE ON ledger_account_balances  FROM openledger_app;
+REVOKE UPDATE, DELETE, TRUNCATE ON card_auth_events        FROM openledger_app;
+
+-- PostgreSQL 15+ already removes CREATE on public from PUBLIC. Kept because it is
+-- free and because a database created before 15 and upgraded does not get it.
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 
 COMMIT;
