@@ -126,7 +126,7 @@ who's causing the load.
 
 **Skew** — how unevenly traffic is spread across customers. Uniform = everyone equal; skewed = one
 customer is most of your volume, which is what real platforms look like. It matters because giving
-each tenant its own accounts gives 8× under uniform load but only 1.07× at 90/10 skew — the big
+each tenant its own accounts gives 9.1× under uniform load but only 1.07× at 90/10 skew — the big
 tenant's own account just becomes the new hot row. Striping is immune to this.
 
 **Coalescing / batching** — combining many postings to one account into a single write. Worth
