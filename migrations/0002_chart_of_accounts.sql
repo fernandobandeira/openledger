@@ -22,7 +22,16 @@ CREATE TABLE fs_lines (
     -- passed every trigger and every test: the split was real in the chart and
     -- invisible in the report. Nothing in the suite reads a caption, so this is
     -- the constraint rather than a test.
-    caption    text NOT NULL CONSTRAINT uq_fs_lines__caption UNIQUE,
+    -- A CAPTION IS COMPARED AS A READER SEES IT, not as a byte string. Both
+    -- guards below were defeated by ONE TRAILING SPACE: 'Current year earnings '
+    -- passed the reservation, and 'Cash and cash equivalents ' passed the UNIQUE,
+    -- putting 44,000.00 of customer suspense under a line visually identical to
+    -- the derived earnings plug -- balanced, both drift views empty, and a reader
+    -- seeing 2,680.00 of current year earnings against a true 2,240.00. These are
+    -- the schema's stated substitute for a test ("nothing in the suite reads a
+    -- caption"), so they have to hold against the whitespace a human cannot see.
+    caption    text NOT NULL CONSTRAINT ck_fs_lines__caption_clean
+                   CHECK (caption = btrim(caption) AND caption <> ''),
     statement  text NOT NULL CONSTRAINT ck_fs_lines__statement
                    CHECK (statement IN ('balance_sheet','income_statement')),
     -- Which side of the statement this line sits on, declared rather than
@@ -51,12 +60,15 @@ CREATE TABLE fs_lines (
     -- saw 268,000.00 of current year earnings against a true 224,000.00, with
     -- `balanced = t` and both drift views empty.
     CONSTRAINT ck_fs_lines__caption_reserved
-        CHECK (caption <> 'Current year earnings'),
+        CHECK (lower(btrim(caption)) <> 'undistributed earnings (since inception)'),
     CONSTRAINT ck_fs_lines__side_matches_statement CHECK (
         (statement = 'balance_sheet'    AND side IN ('asset','liability_equity')) OR
         (statement = 'income_statement' AND side IN ('credit','debit'))),
     sort_order int  NOT NULL DEFAULT 1000
 );
+
+-- ...and uniqueness on what the reader distinguishes, not on bytes.
+CREATE UNIQUE INDEX uq_fs_lines__caption ON fs_lines (lower(btrim(caption)));
 
 CREATE TABLE account_types (
     code           text CONSTRAINT pk_account_types PRIMARY KEY,
@@ -446,7 +458,21 @@ WITH dp AS (
 )
 SELECT tenant_id, currency, fs_line, caption, sort_order, amount_minor, side FROM lines
 UNION ALL
-SELECT s.tenant_id, s.currency, 'current_year_earnings', 'Current year earnings', 9000,
+-- "UNDISTRIBUTED", NOT "CURRENT YEAR". This plug sums revenue and expense over
+-- ALL POSTED HISTORY, with no date bound -- there is no period close, so there is
+-- no year to be current within. Calling it "Current year earnings" made a ledger
+-- holding three years of activity present 34,000.00 under that caption against a
+-- true current year of 4,000.00: an 8.5x overstatement that grows without bound
+-- with the age of the book, with `balanced = t` and both drift views empty.
+-- `retained_earnings` sits in the chart at sort_order 800 and stays at zero
+-- forever, because nothing routes to it.
+--
+-- The honest fix is a period close, which is designed and unbuilt (ADR-0009, and
+-- "Still open" in the decision log). Until then the caption says what the number
+-- is. `income_statement` has the same shape and no parameter at all: it reports
+-- every posted entry ever, so it is a since-inception statement too.
+SELECT s.tenant_id, s.currency, 'current_year_earnings',
+       'Undistributed earnings (since inception)', 9000,
        (-COALESCE(SUM(d.v), 0))::bigint, 'liability_equity'
 FROM scopes s
 LEFT JOIN dp d ON d.tenant_id = s.tenant_id AND d.currency = s.currency
