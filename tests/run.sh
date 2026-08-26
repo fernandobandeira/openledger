@@ -202,10 +202,10 @@ sites_for() {
 floor_for() {
     case "$1" in
         *bitemporal.sql)        echo 23 ;;
-        *card_holds.sql)        echo 178 ;;
-        *golden_trace.sql)      echo 35 ;;
-        *negative_controls.sql) echo 149 ;;
-        *query_plans.sql)       echo  9 ;;
+        *card_holds.sql)        echo 181 ;;
+        *golden_trace.sql)      echo 36 ;;
+        *negative_controls.sql) echo 155 ;;
+        *query_plans.sql)       echo 11 ;;
         *)                      echo  1 ;;
     esac
 }
@@ -246,13 +246,13 @@ echo "── tests/concurrency.sh"
 cout=$(./tests/concurrency.sh "$URL" 2>&1) || fail=1
 echo "$cout"
 cn=$(echo "$cout" | grep -cE '^ +ok  ') || true
-if [ "$cn" -lt 50 ]; then
-    echo "   FAIL tests/concurrency.sh made $cn assertions, below its floor of 50"
+if [ "$cn" -lt 52 ]; then
+    echo "   FAIL tests/concurrency.sh made $cn assertions, below its floor of 52"
     fail=1
 fi
 csites=$(sites_for tests/concurrency.sh)
-if [ "$csites" -lt 50 ]; then
-    echo "   FAIL tests/concurrency.sh contains $csites assertion call sites, below 50"
+if [ "$csites" -lt 52 ]; then
+    echo "   FAIL tests/concurrency.sh contains $csites assertion call sites, below 52"
     fail=1
 fi
 if ! echo "$cout" | grep -q "SUITE-COMPLETE concurrency"; then
@@ -267,13 +267,13 @@ echo "── tests/canary.sh"
 kout=$(./tests/canary.sh "$ADMIN" 2>&1) || fail=1
 echo "$kout"
 kn=$(echo "$kout" | grep -cE '^ +ok  canary ') || true
-if [ "$kn" -lt 3 ]; then
-    echo "   FAIL tests/canary.sh ran $kn canaries, below its floor of 3"
+if [ "$kn" -lt 6 ]; then
+    echo "   FAIL tests/canary.sh ran $kn canaries, below its floor of 6"
     fail=1
 fi
 ksites=$(sites_for tests/canary.sh)
-if [ "$ksites" -lt 3 ]; then
-    echo "   FAIL tests/canary.sh contains $ksites canary call sites, below 3"
+if [ "$ksites" -lt 6 ]; then
+    echo "   FAIL tests/canary.sh contains $ksites canary call sites, below 6"
     fail=1
 fi
 if ! echo "$kout" | grep -q "SUITE-COMPLETE canary"; then

@@ -252,6 +252,13 @@ BEGIN
     -- from the chart, so a scope that exists but has not posted yet reports zeros
     -- rather than vanishing. That is the fix for "an as-of before any activity
     -- returned an empty, trivially-balanced report".
+    --
+    -- HONEST LIMIT: with no as-of passed, accounting_equation()'s scope set IS
+    -- `SELECT DISTINCT tenant_id, currency FROM ledger_accounts`, so this
+    -- comparison is an identity and cannot detect the failure the sentence above
+    -- names -- that needs an as-of, and lives in tests/bitemporal.sql. What it
+    -- does still catch is the function losing a scope through its JOINs, which is
+    -- how it was written and is worth keeping.
     IF (SELECT count(*) FROM accounting_equation()) <>
        (SELECT count(DISTINCT (tenant_id, currency)) FROM ledger_accounts) THEN
         RAISE EXCEPTION 'step % -- equation covered % scope(s) but % exist',
@@ -673,17 +680,57 @@ BEGIN
     -- check behind `IF v_cash <> 0 AND ...` and never executed it. State the
     -- property unconditionally instead: whatever unrestricted cash reports, it must
     -- not contain the float.
-    IF v_cash <> 0 AND v_cash >= v_fbo
-       AND EXISTS (SELECT 1 FROM balance_sheet bs
-                    WHERE bs.tenant_id='t1' AND bs.currency='USD' AND bs.fs_line='cash'
-                      AND bs.amount_minor = v_cash + v_fbo) THEN
-        RAISE EXCEPTION 'the FBO float is inside the unrestricted cash caption';
-    END IF;
+    -- Two rewrites of this were dead: the first guarded the real check behind a
+    -- condition t1 never meets, and the second reduced to `v_cash = v_cash + v_fbo`
+    -- because v_cash is read from the very row it compares against. State the
+    -- property directly and unconditionally: the float is on the restricted line
+    -- and is NOT inside the unrestricted one, whatever either happens to hold.
     IF v_cash = v_fbo AND v_fbo <> 0 THEN
         RAISE EXCEPTION 'unrestricted cash equals the float exactly -- it is the float';
     END IF;
+    IF (SELECT fs_line FROM account_types WHERE code='fbo_cash') = 'cash' THEN
+        RAISE EXCEPTION 'customer float is mapped to the unrestricted cash line';
+    END IF;
     RAISE NOTICE 'ok  customer float presents as restricted cash (%), not as cash (%)',
         v_restricted, v_cash;
+END $$;
+
+-- ...and EVERY account type reports under the line the chart says, not only the
+-- ones this trace happens to post to. Two seed mutants survived every assertion
+-- here: `platform_rev_share_payable` re-pointed to `customer_funds` presented
+-- money owed a platform partner as RESTRICTED CUSTOMER FUNDS, and
+-- `credit_loss_expense` re-pointed to `cost_of_revenue` erased the "Provision for
+-- credit losses" caption entirely. Both are liability-to-liability and
+-- expense-to-expense, so every chart trigger is satisfied; the first nets to zero
+-- in expect_state, and the second is never posted to at all. These are the
+-- disclosures the seed cites Reg S-X and lender reporting for, so assert the
+-- mapping itself rather than only the totals that happen to move.
+DO $$
+DECLARE r record; bad text := '';
+BEGIN
+    FOR r IN SELECT * FROM (VALUES
+        ('customer_receivable','receivables'),   ('operating_cash','cash'),
+        ('fbo_cash','restricted_cash'),          ('customer_wallet','customer_funds'),
+        ('network_settlement_payable','payables'),('facility_borrowings','borrowings'),
+        ('accrued_interest_payable','payables'), ('platform_rev_share_payable','payables'),
+        ('ach_pull_returnable','payables'),      ('due_to_tenants','payables'),
+        ('due_from_treasury','other_assets'),    ('paid_in_capital','equity'),
+        ('retained_earnings','retained_earnings'),('interchange_revenue','revenue'),
+        ('fee_revenue','revenue'),               ('interest_expense','interest'),
+        ('platform_rev_share_expense','cost_of_revenue'),
+        ('credit_loss_expense','credit_losses'),
+        ('allowance_for_credit_losses','receivables')
+    ) AS q(code, want)
+    LOOP
+        IF (SELECT fs_line FROM account_types WHERE code = r.code) IS DISTINCT FROM r.want THEN
+            bad := bad || format('%s -> %s (wanted %s) ', r.code,
+                    (SELECT fs_line FROM account_types WHERE code = r.code), r.want);
+        END IF;
+    END LOOP;
+    IF bad <> '' THEN
+        RAISE EXCEPTION 'account type(s) report under the wrong statement line: %', bad;
+    END IF;
+    RAISE NOTICE 'ok  every account type reports under the line the chart declares';
 END $$;
 
 -- ...and the two captions are distinguishable at all. Nothing anywhere read one.

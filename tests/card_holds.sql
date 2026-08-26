@@ -1464,6 +1464,47 @@ SELECT eq('...without moving the authorized subtotal',
 SELECT eq('no drift on g_advneg -- a negative advice',
           (SELECT count(*) FROM card_hold_drift WHERE group_key='g_advneg'), 0);
 
+-- A NEGATIVE ADVICE MUST NOT FIX THE CONVENTION. `v_increases` exempts advice
+-- unless its amount is positive, and the file's own comment says why: "an advice
+-- of zero or negative amount says nothing about which convention the processor
+-- uses". The zero case is controlled; the NEGATIVE case was not, so making advice
+-- always count as an increase left the suite green -- and then a legitimate
+-- cumulative-total authorization is REFUSED OUTRIGHT, holding 0 against 95.00
+-- live.
+SELECT record_auth_event('t1','r7_na','g_r7adv','omega','card_na','advice',-2000,'USD',false,now());
+DO $$ BEGIN
+    IF (SELECT total_convention FROM card_hold_groups
+         WHERE tenant_id='t1' AND company_id='omega' AND group_key='g_r7adv') IS NOT NULL THEN
+        RAISE EXCEPTION 'a NEGATIVE advice fixed the group''s convention';
+    END IF;
+    RAISE NOTICE 'ok  a negative advice does not decide the convention either';
+END $$;
+SELECT eq('...so the processor''s own cumulative total is still accepted',
+          record_auth_event('t1','r7_nb','g_r7adv','omega','card_na',
+                            'authorization', 9500,'USD',true, now()), 7500);
+
+-- overcaptured_at's VALUE, not merely its nullness. Every existing control tests
+-- IS NULL / IS NOT NULL, so dropping the COALESCE that preserves the FIRST
+-- over-capture instant -- losing "since when" -- was invisible.
+SELECT record_auth_event('t1','r7_oa','g_r7oc2','omega','card_oc2','authorization',100,'USD',false,now());
+SELECT record_auth_event('t1','r7_ob','g_r7oc2','omega','card_oc2','clearing',9500,'USD',false,now());
+DO $$
+DECLARE v_first timestamptz; v_second timestamptz;
+BEGIN
+    SELECT overcaptured_at INTO v_first FROM card_hold_groups
+     WHERE tenant_id='t1' AND company_id='omega' AND group_key='g_r7oc2';
+    UPDATE card_hold_groups SET overcaptured_at = v_first - interval '1 hour'
+     WHERE tenant_id='t1' AND company_id='omega' AND group_key='g_r7oc2';
+    PERFORM record_auth_event('t1','r7_oc','g_r7oc2','omega','card_oc2','clearing',100,'USD',false,now());
+    SELECT overcaptured_at INTO v_second FROM card_hold_groups
+     WHERE tenant_id='t1' AND company_id='omega' AND group_key='g_r7oc2';
+    IF v_second IS DISTINCT FROM v_first - interval '1 hour' THEN
+        RAISE EXCEPTION 'the over-capture instant moved: % -> % (it records SINCE WHEN)',
+            v_first - interval '1 hour', v_second;
+    END IF;
+    RAISE NOTICE 'ok  over-capture records the FIRST instant, not the latest';
+END $$;
+
 -- ================= round 7: three RETURN sites, and a read that took anything
 
 -- WHAT INGEST RETURNS, ON ALL THREE PATHS. The fix for this reached one of the
@@ -1483,10 +1524,16 @@ SELECT record_auth_event('t1','r7_rc','g_r7att','omega','card_r7','authorization
 SELECT record_auth_event('t1','r7_rd', NULL,'omega','card_r7','clearing',9500,'USD',false,now());
 SELECT eq('...and so does the attach path',
           record_auth_event('t1','r7_rd','g_r7att','omega','card_r7','clearing',9500,'USD',false,now()), 0);
-SELECT eq('...all three agreeing with what the company actually holds',
+-- ...and against a number computed a DIFFERENT way. Comparing held_for_company
+-- against a hand-typed copy of its own body -- same predicate, same cast -- was a
+-- restatement, not a check. Sum the LOG instead, over live memberships, which is
+-- the thing the materialisation is supposed to equal.
+SELECT eq('...all three agreeing with what the log says the company holds',
           held_for_company('t1','omega','USD'),
-          (SELECT COALESCE(SUM(held_minor),0)::bigint FROM card_hold_groups
-            WHERE tenant_id='t1' AND company_id='omega' AND currency='USD' AND held_minor > 0));
+          (SELECT COALESCE(SUM(GREATEST(g.total_minor,0)),0)::bigint
+             FROM card_hold_groups g
+            WHERE g.tenant_id='t1' AND g.company_id='omega' AND g.currency='USD'
+              AND g.expired_at IS NULL));
 
 -- A NON-CANONICAL CURRENCY ON THE READ PATH. 'usd' is refused when a group is
 -- written and was accepted here, matching no row and answering 0 -- the identical

@@ -1097,10 +1097,26 @@ $q$, 'orphan cache detected');
 -- entries, all three currencies reporting balanced = t, and every drift view at
 -- zero rows -- there was nothing left to disagree with. The comment beside the
 -- REVOKEs used to say "nothing in SQL can stop that", which was false.
-SELECT must_fail('truncating the entries', $q$ TRUNCATE ledger_entries CASCADE; $q$, 'is history');
-SELECT must_fail('truncating the transactions', $q$ TRUNCATE ledger_transactions CASCADE; $q$, 'is history');
-SELECT must_fail('truncating the event log', $q$ TRUNCATE ledger_events CASCADE; $q$, 'is history');
-SELECT must_fail('truncating the accounts', $q$ TRUNCATE ledger_accounts CASCADE; $q$, 'is history');
+SELECT must_fail('truncating the entries', $q$ TRUNCATE ledger_entries CASCADE; $q$,
+                 'cannot be truncated: ledger_entries is history');
+-- NAME THE TABLE. All four truncate triggers share refuse_truncate(), whose
+-- message interpolates TG_TABLE_NAME -- so an expectation of 'is history' is
+-- satisfied by ANY of them, and by assert_transaction_immutable's DELETE message
+-- besides. Verified: with ck_accounts__no_truncate dropped,
+-- `TRUNCATE ledger_accounts CASCADE` still says 'ledger_entries is history',
+-- because the cascade reaches the entries trigger first. Three of these four
+-- controls were passing on a fourth table's guard.
+SELECT must_fail('truncating the transactions', $q$ TRUNCATE ledger_transactions CASCADE; $q$,
+                 'cannot be truncated: ledger_transactions is history');
+SELECT must_fail('truncating the event log', $q$ TRUNCATE ledger_events CASCADE; $q$,
+                 'cannot be truncated: ledger_events is history');
+-- ...including this one. A reviewer argued ck_accounts__no_truncate was an
+-- equivalent mutant, on the grounds that CASCADE must reach ledger_entries and
+-- that trigger fires first. It does not: a BEFORE TRUNCATE trigger on the named
+-- table runs before the cascade is expanded, so ledger_accounts answers for
+-- itself, and naming the table here is what makes the difference visible.
+SELECT must_fail('truncating the accounts', $q$ TRUNCATE ledger_accounts CASCADE; $q$,
+                 'cannot be truncated: ledger_accounts is history');
 SELECT must_fail('truncating as the app role', $q$
     GRANT ALL ON ledger_entries TO openledger_app;
     SET LOCAL ROLE openledger_app;
@@ -1974,6 +1990,78 @@ BEGIN
     RAISE EXCEPTION 'rollback the cache truncation';
 EXCEPTION WHEN OTHERS THEN
     IF SQLERRM <> 'rollback the cache truncation' THEN RAISE; END IF;
+END $$;
+
+-- ============ round 7: the states the alarms were written for, and closed sets
+
+-- ledger_transaction_drift exists for the state its header names: TRUNCATE
+-- ledger_entries, which leaves transactions with ZERO entries. The suite probed
+-- n=1 -- "a one-entry transaction is flagged" -- and never n=0, so the view's
+-- LEFT JOIN could be narrowed to an INNER JOIN and the case it was written for
+-- would vanish while the case it was not would still be caught.
+DO $$
+DECLARE t uuid; v_n int;
+BEGIN
+    SET CONSTRAINTS ALL IMMEDIATE; SET CONSTRAINTS ALL DEFERRED;
+    ALTER TABLE ledger_transactions DISABLE TRIGGER ck_txn__has_entries;
+    INSERT INTO ledger_transactions (tenant_id,kind,status,effective_at)
+    VALUES ('t1','neg','posted',now()) RETURNING id INTO t;
+    SET CONSTRAINTS ALL IMMEDIATE; SET CONSTRAINTS ALL DEFERRED;
+    SELECT entries INTO v_n FROM ledger_transaction_drift WHERE id = t;
+    IF v_n IS DISTINCT FROM 0 THEN
+        RAISE EXCEPTION 'a ZERO-entry transaction is invisible to the cross-check '
+                        '(got %) -- which is the only state its header names', v_n;
+    END IF;
+    RAISE NOTICE 'ok  a ZERO-entry transaction is flagged, not only a one-entry one';
+    ALTER TABLE ledger_transactions ENABLE ALWAYS TRIGGER ck_txn__has_entries;
+END $$;
+
+-- The as-of AXIS is a CLOSED SET, not two literals. The controls named 'efective'
+-- and NULL; an allowlisted-but-unhandled third value returns assets 0, revenue 0
+-- and `balanced = t` -- the empty-report-read-as-balanced failure the empty-ledger
+-- guard exists to prevent, reachable through a parameter.
+SELECT must_fail('an axis that is neither recorded nor effective', $q$
+    DO $d$ BEGIN PERFORM * FROM accounting_equation('t1', now(), 'wire'); END $d$;
+$q$, 'expected recorded or effective');
+SELECT must_fail('an axis that differs only in case', $q$
+    DO $d$ BEGIN PERFORM * FROM accounting_equation('t1', now(), 'Recorded'); END $d$;
+$q$, 'expected recorded or effective');
+
+-- uq_accounts__owned covers every owner_type that is not 'house'. Narrowing it to
+-- `= 'company'` leaves `platform` and `bank_account` without uniqueness, and the
+-- golden trace never duplicates either.
+SELECT must_fail('two platform accounts for one owner, purpose and currency', $q$
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    VALUES ('t1','platform','plat_a','platform_rev_share_payable','liability','credit','USD'),
+           ('t1','platform','plat_a','platform_rev_share_payable','liability','credit','USD');
+$q$, 'uq_accounts__owned');
+SELECT must_fail('two bank_account accounts for one owner, purpose and currency', $q$
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    VALUES ('t1','bank_account','acct_a','operating_cash','asset','debit','USD'),
+           ('t1','bank_account','acct_a','operating_cash','asset','debit','USD');
+$q$, 'uq_accounts__owned');
+
+-- The seal and the correction-target check are both keyed on (tenant, id), and a
+-- transaction id is only unique WITHIN a tenant -- `id` carries a DEFAULT, and a
+-- column-level INSERT can choose it, which is this schema's own argument about
+-- xact_id. Drop either tenant filter and `SELECT ... INTO` picks whichever row it
+-- reaches first: non-deterministically too strict or too lax.
+DO $$
+DECLARE v_id uuid := '00000000-0000-7000-8000-00000000dead'; t2 uuid;
+BEGIN
+    SET CONSTRAINTS ALL IMMEDIATE; SET CONSTRAINTS ALL DEFERRED;
+    INSERT INTO ledger_transactions (tenant_id,id,kind,status,effective_at)
+    VALUES ('t1',v_id,'neg','posted',now());
+    PERFORM entry('t1', v_id, acct('t1','customer_receivable'), 'debit',  60);
+    PERFORM entry('t1', v_id, acct('t1','interchange_revenue'), 'credit', 60);
+    -- the SAME id, in a different tenant, is legitimate and must be accepted
+    INSERT INTO ledger_transactions (tenant_id,id,kind,status,effective_at)
+    VALUES ('t2',v_id,'neg','posted',now());
+    PERFORM entry('t2', v_id, acct('t2','customer_receivable'), 'debit',  60);
+    PERFORM entry('t2', v_id, acct('t2','customer_receivable'), 'credit', 60);
+    SET CONSTRAINTS ALL IMMEDIATE; SET CONSTRAINTS ALL DEFERRED;
+    RAISE NOTICE 'ok  one transaction id in two tenants is two transactions, and the '
+                 'seal does not confuse them';
 END $$;
 
 SELECT on_origin('the end of the file');

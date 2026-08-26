@@ -237,7 +237,7 @@ BEGIN
      WHERE tenant_id='bt' AND effective_at <= '2026-02-28'
        AND account_id=(SELECT id FROM ledger_accounts
                         WHERE tenant_id='bt' AND purpose='customer_receivable');
-    IF v_running = v_true THEN
+    IF v_running IS NOT DISTINCT FROM v_true THEN
         RAISE EXCEPTION 'the running balance agreed with the business-date truth (% = %) -- '
             'the fixture no longer separates the axes, so this file proves nothing',
             v_running, v_true;
