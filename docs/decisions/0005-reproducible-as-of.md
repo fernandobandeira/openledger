@@ -63,8 +63,8 @@ endpoints**, the selector spelled three ways, undocumented in their OpenAPI.
 | **Serialize all ledger writes** behind one commit-ordered lock | Trivially correct, and measured expensive. See below. |
 | **Push "as of entry #N" to the caller** | Honest, and fine internally — but a credit agreement says "as of June 30", not "as of entry 4,183,992". Something still has to map a date to a cursor. |
 
-**Why serializing is ruled out — measured.** [Spike
-003](../../spikes/003-throughput-ceiling/README.md) characterised exactly this shape:
+**Why serializing is ruled out — measured.**
+[Spike 003](../../spikes/003-throughput-ceiling/README.md) characterised exactly this shape:
 
 | | clearings/s |
 | --- | --- |
@@ -80,8 +80,8 @@ ledger by adding workers would make it slower, which is the least debuggable fai
 
 ## What it costs
 
-- The cursor **lags the newest writes** by the duration of the longest in-flight transaction — the
-  price of keeping write concurrency.
+- The cursor **lags the newest writes** by the longest in-flight transaction — the price of keeping
+  write concurrency.
 - **The query layer is not bitemporal yet, though storage is.** `accounting_equation` takes one
   instant and one axis, so *the effective-axis February close as known on 1 March* cannot be
   expressed; `balance_sheet`, `income_statement` and `balance_sheet_balances` have no date predicate.
@@ -90,6 +90,7 @@ ledger by adding workers would make it slower, which is the least debuggable fai
 ## Why this is still `proposed`
 
 The watermark has to be built and tested against concurrent writers. Unverified:
+
 1. That `pg_snapshot_xmin(pg_current_snapshot())` gives a usable watermark under our real write
    pattern. The risk is a **batched posting run**, not the scheduler —
    [0008](./0008-durable-timers.md)'s timers are one-shot jobs with short transactions.
