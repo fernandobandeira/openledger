@@ -212,8 +212,17 @@ BEGIN
                     ELSE split_part(x,'|',4) END::bigint AS balance_minor
         FROM unnest(p_expect) AS x
     ), got AS (
+        -- WHOLE-LEDGER, ONE NAMED EXCLUSION. The UNEXPECTED branch below is what
+        -- catches a leg posted somewhere plausible but wrong, and it only catches
+        -- it because this reads every scope rather than this file's own. The single
+        -- exclusion is tests/fixtures/recorded_axis.sql's tenant, which is committed
+        -- before any suite runs so that the recorded axis has a boundary that is not
+        -- now() -- see the fixture's own header. It is stated here rather than left
+        -- implicit, and it is asserted on its own immediately after this function,
+        -- so the exclusion cannot hide a write.
         SELECT tenant_id, purpose, currency, SUM(balance_minor)::bigint AS balance_minor
-        FROM trial_balance GROUP BY tenant_id, purpose, currency
+        FROM trial_balance WHERE tenant_id <> 'bt0'
+        GROUP BY tenant_id, purpose, currency
     )
     SELECT string_agg(line, E'\n' ORDER BY line) INTO msg FROM (
         SELECT format('  MISSING  %s/%s/%s expected %s', w.tenant_id, w.purpose,
@@ -282,6 +291,25 @@ BEGIN
     END IF;
 
     RAISE NOTICE 'ok  %', p_step;
+END $$;
+
+-- THE EXCLUSION, ASSERTED. state() skips tenant 'bt0' -- the committed fixture that
+-- gives the recorded axis a boundary other than now() -- so this file would not see
+-- a write landing there. One assertion closes that: the fixture holds exactly what
+-- it was created with, 50.00 of receivable against 50.00 of wallet, and nothing else.
+DO $$
+DECLARE v_rows int; v_recv bigint; v_wallet bigint;
+BEGIN
+    SELECT count(*) INTO v_rows FROM trial_balance WHERE tenant_id='bt0';
+    SELECT SUM(balance_minor) INTO v_recv   FROM trial_balance
+     WHERE tenant_id='bt0' AND purpose='customer_receivable';
+    SELECT SUM(balance_minor) INTO v_wallet FROM trial_balance
+     WHERE tenant_id='bt0' AND purpose='customer_wallet';
+    IF v_rows <> 2 OR v_recv IS DISTINCT FROM 5000 OR v_wallet IS DISTINCT FROM 5000 THEN
+        RAISE EXCEPTION 'the recorded-axis fixture tenant has been written to: '
+                        '% rows, receivable %, wallet %', v_rows, v_recv, v_wallet;
+    END IF;
+    RAISE NOTICE 'ok  the one scope state() excludes still holds exactly its fixture';
 END $$;
 
 -- ------------------------------------------------------------------ the trace
@@ -527,11 +555,13 @@ BEGIN
         RAISE NOTICE 'ok  balance sheet %/%: assets % = liabilities + equity %',
             r.tenant_id, r.currency, r.assets, r.liabilities_and_equity;
     END LOOP;
-    -- three now: _treasury/USD, t1/USD and t1/EUR. The count is asserted rather
-    -- than left open because it is the only thing standing between a dropped scope
-    -- and a green suite.
-    IF n <> 3 THEN
-        RAISE EXCEPTION 'expected a balance sheet for every scope, got %', n;
+    -- EVERY scope, counted from the chart rather than typed as a literal. The count
+    -- is asserted because it is the only thing standing between a dropped scope and
+    -- a green suite; it is derived because "there are three" is a fact about today's
+    -- fixtures and "one balance sheet per scope that exists" is the claim.
+    IF n <> (SELECT count(DISTINCT (tenant_id, currency)) FROM ledger_accounts) THEN
+        RAISE EXCEPTION 'expected a balance sheet for every scope, got % of %', n,
+            (SELECT count(DISTINCT (tenant_id, currency)) FROM ledger_accounts);
     END IF;
 END $$;
 
@@ -557,6 +587,12 @@ BEGIN
                            FROM balance_sheet WHERE fs_line='current_year_earnings'
                           GROUP BY tenant_id, currency) b
           ON b.tenant_id = i.tenant_id AND b.currency = i.currency
+        -- A SCOPE WITH NOTHING ON EITHER SIDE HAS NOTHING TO TIE. Both sides zero
+        -- ties trivially, so counting such a scope adds no coverage and does make
+        -- the count below depend on which scopes merely EXIST -- which is how the
+        -- committed fixture tenant (asset against liability, no P&L at all) started
+        -- appearing here.
+        WHERE COALESCE(i.profit, 0) <> 0 OR COALESCE(b.earnings, 0) <> 0
     LOOP
         n := n + 1;
         -- income_statement presents revenue and expense both positive, so profit
@@ -570,8 +606,17 @@ BEGIN
                 r.tenant_id, r.currency, r.earnings;
         END IF;
     END LOOP;
-    IF n <> 3 THEN
-        RAISE EXCEPTION 'expected an income statement per scope, got %', n;
+    -- ...and the count is derived from the JOURNAL, not typed as a literal and not
+    -- read back from the report under test: every scope that has posted a revenue or
+    -- expense entry must appear above. A literal 3 is a fact about today's fixtures;
+    -- reading income_statement itself would agree with whatever the report produced.
+    IF n <> (SELECT count(*) FROM (
+                SELECT DISTINCT en.tenant_id, en.currency
+                  FROM ledger_entries en
+                  JOIN ledger_accounts a
+                    ON a.tenant_id = en.tenant_id AND a.id = en.account_id
+                 WHERE a.category IN ('revenue','expense')) z) THEN
+        RAISE EXCEPTION 'expected an income statement per scope that has posted one, got %', n;
     END IF;
     RAISE NOTICE 'ok  income statement ties to the balance sheet in % scope(s)', n;
 END $$;
@@ -768,13 +813,32 @@ END $$;
 -- 44,000.00 of customer suspense folded into the plug, which is verbatim the
 -- defect the CHECK exists for. Tie the two together here.
 DO $$
-DECLARE v_caption text;
+DECLARE v_caption text; v_missing text;
 BEGIN
     SELECT caption INTO v_caption FROM balance_sheet
      WHERE fs_line = 'current_year_earnings' LIMIT 1;
     IF v_caption IS NULL THEN
         RAISE EXCEPTION 'the balance sheet no longer emits a current_year_earnings line';
     END IF;
+    -- ...IN EVERY SCOPE, NOT SOMEWHERE. `LIMIT 1` over all scopes was the whole of
+    -- this check, and the golden trace's tenants all have revenue, so the row was
+    -- always found. Turning the plug's `LEFT JOIN dp` into a plain `JOIN` in 0002
+    -- makes the line VANISH for any scope with no posted revenue or expense -- a
+    -- deposit-only book, a new tenant, a currency that has only seen transfers --
+    -- and the suite stayed green, because the vanished line is zero for exactly
+    -- the scopes it vanishes from, so the sheet still balances. The promise 0002
+    -- and ADR-0009 both make is that a line with no activity appears as a ZERO
+    -- rather than vanishing; presence is the property, and it is per scope.
+    SELECT string_agg(z.tenant_id || '/' || z.currency, ', ') INTO v_missing
+      FROM (SELECT DISTINCT a.tenant_id, a.currency FROM ledger_accounts a) z
+     WHERE NOT EXISTS (SELECT 1 FROM balance_sheet b
+                        WHERE b.tenant_id = z.tenant_id AND b.currency = z.currency
+                          AND b.fs_line = 'current_year_earnings');
+    IF v_missing IS NOT NULL THEN
+        RAISE EXCEPTION 'the earnings line is absent from scope(s) %  -- a line with '
+                        'no activity must report zero, not vanish', v_missing;
+    END IF;
+    RAISE NOTICE 'ok  every scope gets an earnings line, including the ones with no P&L';
     -- the CHECK must refuse exactly the string the view emits
     BEGIN
         INSERT INTO fs_lines (code,caption,statement,side,sort_order)

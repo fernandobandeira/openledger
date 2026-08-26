@@ -48,17 +48,22 @@ something that fails loudly.
 that raise 160 notices in a loop and print the completion sentinel. The build said PASS. So did
 replacing `concurrency.sh` with four lines of `echo`. Every guard was reading output the file
 printed *about itself*: the manifest checks existence, the floor counts notices, the sentinel is a
-string the file emits. The fix is to count assertion **call sites in the source** — a stub that
-prints 160 `ok`s has two — and to keep the floors exact rather than slack, because seven
-assertions of headroom turned out to be exactly enough to delete the three most recently added
-controls and walk a live mutant back in.
+string the file emits. The first fix was to count assertion **call sites in the source** — a stub that prints 160 `ok`s
+has two. **That guard has since been deleted** (`tests/run.sh`: "THE CALL-SITE FLOOR IS GONE"): it
+had thirty call sites of slack on the file it mattered most for, and `tests/canary.sh` subsumes it
+by requiring each suite to go red *with its own control's message*, which a stub cannot produce.
+What survives is keeping the output floors **exact** rather than slack, because seven assertions of
+headroom turned out to be exactly enough to delete the three most recently added controls and walk
+a live mutant back in.
 
 The general lesson, which is the reason this is in the roadmap and not only in a test comment:
 **a test suite that grades itself grades nothing.** Every check on a suite has to read something
 the suite cannot produce.
 
-Still open: putting it in CI, and the
-[ADR-0006 schema snapshot test](./decisions/0006-schema-conventions.md).
+~~Still open: putting it in CI~~ — `.github/workflows/test.yml` runs the whole suite against
+PostgreSQL 18 on every push and pull request. Still open: the
+[ADR-0006 schema snapshot test](./decisions/0006-schema-conventions.md), which needs a committed
+snapshot and a diff, not merely an invocation — see that ADR.
 
 The properties the core must hold, at any point, against any history:
 

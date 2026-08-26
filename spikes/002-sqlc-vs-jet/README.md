@@ -146,8 +146,10 @@ type ListEntriesWithAccountRow struct {
 }
 ```
 
-`omit_unused_structs: true` prunes the rest. What survives is genuine projections — `GetHeldRow`,
-`GetBalanceRow` — which are *report shapes*, not entities. go-jet gives you an ad-hoc destination
+`omit_unused_structs: true` prunes the rest. What survives is genuine projections — the `…Row`
+structs sqlc emits for multi-column queries — which are *report shapes*, not entities. (This line
+named `GetBalanceRow`; there is no such symbol in `gen/` — `GetBalance` returns a bare `int64`,
+because it selects one column.) go-jet gives you an ad-hoc destination
 struct for those too.
 
 ⚠️ **`sqlc.embed` on a LEFT JOIN generates non-nullable fields and fails at runtime** (upstream
@@ -206,7 +208,8 @@ type UpsertSpendControlsParams struct { CapMinor pgtype.Int8 }  // params: NOT o
 
 So "zero pgtype leakage" holds for entities, not for parameter structs.
 
-Other verified items: `initialisms: ["mcc"]` fixes `AllowedMcc` → `AllowedMCC` globally;
+Other verified items: `initialisms: ["id", "mcc", "api", "url"]` fixes `AllowedMcc` → `AllowedMCC`
+and `Id` → `ID` globally (this line quoted only `["mcc"]`; `sqlc.yaml` carries four);
 `emit_db_tags: true` makes models readable by `pgx.RowToStructByNameLax`, so hand-written dynamic
 queries return the *same* generated structs (flat models only — it does not recurse into
 `sqlc.embed`'s named fields); Postgres `DOMAIN` types fall through to `interface{}` and need an
@@ -219,6 +222,6 @@ explicit override.
 - The deferred balance trigger is invisible to sqlc (it fires at `COMMIT`). Posting code must handle
   a constraint violation surfacing from `tx.Commit()`, not from the `INSERT`. Worth an explicit test
   in M1.
-- **`CopyFrom` — which this spike found load-bearing — is unsupported on tables with row-level
-  security.** See [spike 004](../004-chart-of-accounts/README.md#rls); it forces a decision about
+- **`CopyFrom` — which **spike 003** found load-bearing, on its coalesced-batching path; there is
+  no `CopyFrom` anywhere in this spike — is unsupported on tables with row-level security.** See [spike 004](../004-chart-of-accounts/README.md#rls); it forces a decision about
   where RLS applies.

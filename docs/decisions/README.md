@@ -138,7 +138,9 @@ Undecided, listed plainly rather than buried:
   added to `tests/run.sh` — machinery whose own header says it "does not defend against a determined
   author" and names CI as the durable answer. Everyone agreed on the answer and wrote the ladder
   instead. **The schema snapshot test is still not wired to anything**, and that half stays open:
-  `expected_schema.sql` exists and runs; nothing invokes it. [0006](./0006-schema-conventions.md)
+  `expected_schema.sql` is twenty-one lines containing one `SELECT` that emits a string — there is no
+  committed snapshot to diff it against and no failure path, so wiring it into CI today would assert
+  nothing. The missing half is the snapshot, not the invocation. [0006](./0006-schema-conventions.md)
   calls it "the highest-leverage item here" and [0008](./0008-durable-timers.md) says it must cover
   ADR-quoted SQL — which, twice, it would have caught.
 - **Hash chaining for tamper evidence is deferred, not decided.**
@@ -202,7 +204,12 @@ These are real decisions with real reasoning; none has an ADR, which makes the h
 - **Five named correctness constraints appear in no document at all**: `uq_txn__one_resolution`,
   `uq_txn__one_reversal` (the double-reversal guard spike 001 identifies as a real Formance bug
   class), `uq_accounts__id_currency`, `uq_txn__id_effective` and `fk_entries__txn_effective`. All
-  five ship in `migrations/0001` and all five are exercised by `tests/`.
+  five ship in `migrations/0001`. **Three are exercised by `tests/`; the other two cannot be, and
+  that is stronger.** `uq_accounts__id_currency` and `uq_txn__id_effective` are the referenced-side
+  unique indexes the composite foreign keys point at — remove either and `0001` does not load
+  (`there is no unique constraint matching given keys`). A constraint whose absence makes the schema
+  unbuildable needs no test, which is the shape this log argues for elsewhere; the earlier sentence
+  claimed a test for them and no such test exists.
 - **PostgreSQL 18 is a floor, not a preference.** `uuidv7()` is the default on **six** tables and
   does not exist before 18. The roadmap targets RDS for M4/M6, which must therefore run 18.
 - **Three chart constraints have no ADR**: `uq_fs_lines__caption` (two lines sharing a caption are
@@ -241,10 +248,11 @@ Three rules follow, and they are cheap:
   written*: the invented processor survey survived in `spikes/006/holds.sql`, the one file that
   actually carries it, for a further round. `grep` the struck phrase across the whole tree, not
   just `docs/`.
-- **A spike's own verification can be dead.** `spikes/006/cases.sql` claimed eight measured cases
-  and contained six, none of which run against the schema in the same directory. Nothing in
-  `spikes/` is executed by CI, so "measured" there means "was measured once, against something".
-  The live attestation is `tests/`.
+- **A spike's own verification can be dead.** `spikes/006/cases.sql` claimed eight measured cases,
+  contained six, and none of the six ran against the schema in the same directory. It has been
+  deleted and its banner rewritten to say so. Nothing in `spikes/` is executed by CI — and nothing
+  in `spikes/` runs against the shipped schema at all — so "measured" there means "was measured
+  once, against something". The live attestation is `tests/`.
 
 ## On grading the graders
 
@@ -279,11 +287,23 @@ transcript. Two things learned the hard way:
 as equivalent and equivalent mutants as real gaps, and both cost a round. The ones now recorded as
 genuinely equivalent each have a one-line reason: `SUM(held_minor)` vs `SUM(total_minor)` under
 `held_minor > 0` (`held_minor` is `GREATEST(total_minor,0)`, so under that predicate they are the
-same number); dropping `tenant_id` from a partition key (ids are `uuidv7`, globally unique); and —
-found by us, not by a reviewer — **swapping the `assets` and `liabilities_and_equity` output
+same number); and — found by us, not by a reviewer — **swapping the `assets` and `liabilities_and_equity` output
 columns of `balance_sheet_balances`**, which a reviewer reported as a gap. On a balanced sheet
 those two numbers are equal by construction, so no assertion about a balanced book can tell them
 apart. The mutant is only distinguishable on books that are already broken.
+
+**An equivalence argument can be wrong, and one recorded here was.** This section used to list
+*"dropping `tenant_id` from a partition key (ids are `uuidv7`, globally unique)"* as genuinely
+equivalent. The reason is false and the mutant is not equivalent. `ledger_accounts.id` has a
+`DEFAULT uuidv7()` and **no assignment trigger**, and `GRANT INSERT` covers every column — so the
+app role can supply the id, and two tenants can hold the same one. ADR-0011's own thesis names
+`uuidv7()` ids among the columns that "all had defaults and nothing else, and every one of them
+turned out to be forgeable by an INSERT"; it is the one of the four that was never fixed. With two
+tenants sharing an account id, both books balanced and posted entirely as `openledger_app`, the
+shipped drift window reports 0 rows and the mutant reports a false corruption alarm on a correct
+book. `tests/negative_controls.sql` now carries that as a control. **A one-line reason is required,
+and a one-line reason can be wrong; what makes it checkable is that it names a state, so someone
+can go and build it.**
 
 **A control has to fail for its own reason.** The post-expiry drift control raised
 `authorized_minor`, which also makes the stored total disagree with the log — so it fired on the

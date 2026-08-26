@@ -8,10 +8,24 @@
 # docs/decisions/README.md listed "there is no CI" under Still open and called it
 # the highest-leverage item there.
 #
-# This file is that answer. It is the only check in the project that a branch
-# cannot edit its way past, because it runs from the default branch's definition
-# on a machine the author does not control. Everything in tests/run.sh is a second
-# choice, and this is why.
+# This file is part of that answer, and the earlier version of this comment claimed
+# more than it delivers. It said this was "the only check a branch cannot edit its
+# way past, because it runs from the default branch's definition". That is false
+# twice over. `on: pull_request` runs the workflow from the PR's own merge commit,
+# not from the default branch -- that is what `pull_request_target` is for. And even
+# a pinned workflow would still `run: ./tests/run.sh`, which is the BRANCH's copy of
+# every guard. Nothing checked into a repository is un-editable by the branch;
+# only branch protection with required status checks can do that, and this
+# repository has no such configuration in-tree.
+#
+# What CI actually buys, which is worth having and is not what was claimed:
+#   * a PINNED configuration -- Postgres 18, a fixed image, a fixed entrypoint --
+#     so "it passed on my machine" stops being assertable;
+#   * a machine the author does not control, so a green result is reproducible by
+#     someone else;
+#   * it runs on every push and every pull request without anyone remembering to.
+# The in-tree guards in tests/run.sh are not made redundant by any of that. They
+# are judged on their own in docs/decisions/README.md.
 name: tests
 
 on:

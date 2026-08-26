@@ -1009,6 +1009,16 @@ ALTER TABLE card_hold_groups ENABLE ALWAYS TRIGGER ck_hold_groups__no_truncate;
 -- the one failure that actually occurred: live membership rows pointing at a
 -- group that was never materialised. `stored IS NULL` is that case, and it is
 -- reported rather than skipped.
+-- ...AND THESE TWO TABLES MAY NOT BE INHERITED EITHER. 0001's guard read a literal
+-- list of four ledger tables; these two carry the same exposure and it did not name
+-- them. A child of card_hold_groups accepted a row, held_for_company read it through
+-- the parent -- 999900 of exposure out of nothing -- and ck_hold_groups__no_delete
+-- did not reach the child, so it could be removed again. The list is a table for
+-- exactly this reason: a migration declares its own.
+INSERT INTO ledger_uninheritable (relname, reason) VALUES
+  ('card_auth_events', 'the append-only authorization log the whole hold flow sums'),
+  ('card_hold_groups', 'held_for_company reads it, so a child fabricates credit');
+
 CREATE VIEW card_hold_drift AS
 WITH live AS (
     SELECT m.tenant_id, e.company_id, m.group_key,

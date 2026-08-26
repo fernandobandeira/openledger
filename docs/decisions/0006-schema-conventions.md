@@ -29,10 +29,17 @@ underscore survives table names that already contain underscores.
 
 **2. A schema snapshot test in CI.**
 [`expected_schema.sql`](../../spikes/002-sqlc-vs-jet/expected_schema.sql) dumps every index,
-constraint, trigger, and — separately — every `NOT VALID` constraint; CI diffs it against a
-committed snapshot. **This is the highest-leverage item here.** It turns "a migration silently
-dropped an index" from a latent performance bug into a failed build. Formance hit that exact
-failure four times from two migrations.
+constraint, trigger, and — separately — every `NOT VALID` constraint; CI would diff it against a
+committed snapshot. **This is the highest-leverage item here, and it is not built.** It would turn
+"a migration silently dropped an index" from a latent performance bug into a failed build. Formance
+hit that exact failure four times from two migrations.
+
+**What exists today is a query, not a test.** `expected_schema.sql` is twenty-one lines containing
+one `SELECT` that emits a string. There is no committed snapshot anywhere in the tree, no
+comparison and no failure path — it runs green against the shipped schema and against a mutated one
+alike. Wiring it into CI as it stands would assert nothing; the missing half is the snapshot and
+the diff. `docs/decisions/README.md` used to describe this as "exists and runs; nothing invokes it",
+which reads as though invocation were the gap.
 
 **3. Keep foreign keys.** Formance has essentially none — nullable back-pointers with no
 referential integrity — which is defensible for an engine chasing unconstrained write throughput.
@@ -41,7 +48,8 @@ cost is **observed rather than measured**, and this passage struck an earlier pa
 having "no recorded batch size, hardware or harness anywhere in the repo" -- then replaced them with
 figures that have no harness either. The correction did not meet its own stated remedy. Read as a
 direction, not a number: **foreign keys cost something real on bulk insert.** An
-independent re-run on the shipped schema (three foreign keys, same CHECKs and indexes, 50k rows,
+independent re-run on the shipped schema (`0001` alone defines seven foreign keys; an earlier
+version of this parenthetical said three, and like the timings it has no harness behind it — same CHECKs and indexes, 50k rows,
 three trials) gave 3002/3176/3672 ms with them against 1257/1067/793 ms without.
 
 Two honest notes. An earlier version of this ADR said the cost "was sought and not found" — that

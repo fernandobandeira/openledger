@@ -182,8 +182,10 @@ there is no second copy that can drift.
 
 ```sql
 -- current balance: one index lookup, no scan, no cache.
--- tenant_id is not optional -- it leads every index, and without it this
--- plans as an index scan PLUS a sort.
+-- tenant_id is not optional -- it leads every index, so without it this plans as
+-- a SEQ SCAN plus a sort (EXPLAIN, shipped schema: Limit -> Sort -> Seq Scan on
+-- ledger_entries). An earlier version of this line said "index scan plus a sort",
+-- which is what it degrades to only with enable_seqscan off.
 SELECT balance_after FROM ledger_entries
 WHERE tenant_id = :tenant AND account_id = :acct
 ORDER BY account_seq DESC LIMIT 1;
@@ -234,8 +236,10 @@ id, tenant_id,   -- tenant_id is NOT NULL and leads every key, including on
                  -- house accounts. An earlier version of this block showed it
                  -- absent from the unique indexes and blank for house rows;
                  -- the roadmap calls tenant-leading keys "the one irreversible
-                 -- decision on the list", and page 283 of this document already
-                 -- said every key here leads with it.
+                 -- decision on the list", and the "current balance" query earlier
+                 -- in this document already said every key here leads with it.
+                 -- (That sentence used to cite "page 283". This is a Markdown
+                 -- file; it has no pages, and a reader had nowhere to go.)
 owner_type, owner_id,
 purpose         -- 'customer_receivable' | 'fbo_cash' | 'interchange_revenue'.
                 --  finds the account, and groups it for reporting.

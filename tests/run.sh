@@ -40,8 +40,31 @@ ADMIN="${ADMIN_URL:-postgres://openledger:openledger@localhost:5433/postgres?ssl
 DB="ol_test_$$"
 BASE="${ADMIN%/postgres*}"
 
-cleanup() { psql "$ADMIN" -q -c "DROP DATABASE IF EXISTS $DB" >/dev/null 2>&1 || true; }
-trap cleanup EXIT
+# WITH (FORCE), because a plain DROP fails while any session is still attached and
+# the `|| true` swallowed it. `timeout --foreground` does not reap grandchildren --
+# it is documented not to -- so a suite killed on timeout leaves concurrency.sh's
+# backgrounded psql sessions alive, holding this database open, and the drop then
+# silently did nothing: one leaked database per timed-out run, accumulating.
+cleanup() { psql "$ADMIN" -q -c "DROP DATABASE IF EXISTS $DB WITH (FORCE)" >/dev/null 2>&1 || true; }
+
+# ...AND THIS SCRIPT MUST REACH ITS OWN LAST LINE. Every suite is required to emit a
+# completion sentinel; the file that requires it had none, and it needed one: under
+# `set -euo pipefail` a bare failing `x=$(...)` ended the run silently, so a red
+# concurrency suite printed a header and nothing else -- no diagnosis, no floor, no
+# sentinel, no verdict. Three separate rounds have now put a defect in these same
+# two statements. A verdict that never printed is not a pass, and this is the only
+# check that can say so about the checker.
+VERDICT_REACHED=0
+trap 'rc=$?
+      if [ "$VERDICT_REACHED" != 1 ]; then
+          echo "── tests/run.sh EXITED EARLY (rc=$rc) WITHOUT PRINTING A VERDICT."
+          echo "   Everything after the failing step was skipped, including the"
+          echo "   diagnosis. Treat this as FAIL."
+          echo "FAIL"
+      fi
+      cleanup
+      [ "$VERDICT_REACHED" = 1 ] || exit 1
+      exit $rc' EXIT
 
 psql "$ADMIN" -v ON_ERROR_STOP=1 -q -c "CREATE DATABASE $DB"
 URL="$BASE/$DB?sslmode=disable"
@@ -77,6 +100,24 @@ echo "   ok  both report functions refuse a ledger with no accounts"
 # -- PIPESTATUS is rewritten by the next command, so it always read 0, and dropping
 # pipefail made a hard-failing test file report PASS. Removed rather than left as a
 # safety net that isn't one.
+# ...AND THE COMMITTED FIXTURE, in a psql invocation of its own, which is the
+# entire reason it is a separate file: `recorded_at` is `now()`, i.e. transaction
+# START time, so nothing a suite writes can carry a recorded_at earlier than the
+# suite itself. It runs AFTER the empty-ledger pre-check above, which needs an
+# empty ledger, and BEFORE any suite.
+psql "$URL" -v ON_ERROR_STOP=1 -q -f tests/fixtures/recorded_axis.sql
+# ...and tests/fixtures/ is a CLOSED SET for the same reason tests/ is: every file
+# in it is applied with full privileges before the suites run, so an extra one
+# could CREATE OR REPLACE a broken function back to correct in the database.
+EXPECTED_FIXTURES="recorded_axis.sql"
+for f in tests/fixtures/*.sql; do
+    b=$(basename "$f")
+    case " $EXPECTED_FIXTURES " in
+        *" $b "*) ;;
+        *) echo "── UNEXPECTED FILE IN tests/fixtures/: $b"; echo "FAIL"; exit 1 ;;
+    esac
+done
+
 # A MANIFEST, not just a glob. Deleting bitemporal.sql and query_plans.sql left
 # the build printing PASS -- a dropped or renamed file is silently no coverage,
 # which is the same class of failure as a test that asserts nothing.
@@ -135,16 +176,19 @@ fi
 # did not. Same class of failure, one keystroke apart.
 #
 # THE FLOOR AND THE SENTINEL ARE BOTH FORGEABLE BY THE FILE THEY POLICE, and an
-# audit proved it: card_holds.sql -- 1,146 lines, the sole evidence for the entire
-# hold flow -- was replaced by FIVE LINES that raise 160 notices in a loop and then
-# print the sentinel, and this script said PASS. Every guard here reads output the
-# file prints about itself.
+# audit proved it twice: card_holds.sql -- the sole evidence for the entire hold
+# flow -- was replaced by FIVE LINES that raise 160 notices in a loop and then print
+# the sentinel, and this script said PASS; later the same was done to bitemporal.sql
+# in FOUR lines, and only tests/canary.sh caught it. Every guard here reads output
+# the file prints about itself. (This comment used to quote the file's line count.
+# It was stale by five hundred lines. Counts of things that grow do not belong in
+# prose beside them.)
 #
 # THE CALL-SITE FLOOR IS GONE, and this is why rather than a silent deletion.
 # It reused the OUTPUT floors as its own thresholds, and those are exact only
-# against emitted output: card_holds.sql carried 211 call sites against a floor of
-# 181 -- thirty lines of slack, four times the seven the comment below says was
-# already enough to gut a suite. Demonstrated by a reviewer: 255 lines deleted,
+# against emitted output: card_holds.sql carried thirty more call sites than its
+# floor -- four times the seven the comment below says was already enough to gut a
+# suite. Demonstrated by a reviewer: 255 lines deleted,
 # sixteen named controls with them, and this script printed PASS.
 #
 # It is not repaired, because tests/canary.sh now covers all six suites and
@@ -161,10 +205,10 @@ fi
 # them, which is the point.
 floor_for() {
     case "$1" in
-        *bitemporal.sql)        echo 23 ;;
-        *card_holds.sql)        echo 183 ;;
-        *golden_trace.sql)      echo 38 ;;
-        *negative_controls.sql) echo 173 ;;
+        *bitemporal.sql)        echo 24 ;;
+        *card_holds.sql)        echo 222 ;;
+        *golden_trace.sql)      echo 41 ;;
+        *negative_controls.sql) echo 177 ;;
         *query_plans.sql)       echo 11 ;;
         *)                      echo  1 ;;
     esac
@@ -201,17 +245,23 @@ done
 
 # The concurrency suite needs many sessions, so it cannot be a .sql file.
 echo "── tests/concurrency.sh"
-cout=$(timeout --foreground --kill-after=30 600 ./tests/concurrency.sh "$URL" 2>&1); crc=$?
-# rc captured on its OWN line. `cmd || fail=1` runs `fail=1`, and that assignment
-# rewrites PIPESTATUS -- so the `${PIPESTATUS[0]} = 124` test that used to live here
-# always read 0 and the timeout FAIL could never print. Same defect the comment at
-# the top of this file records as removed; it had survived one line below it.
+# `|| crc=$?`, NOT `; crc=$?`. Two rules collide here and the file has now been
+# wrong under both. `cmd || fail=1` runs an assignment, and that assignment rewrites
+# PIPESTATUS -- so the `${PIPESTATUS[0]} = 124` test that used to live here always
+# read 0. Moving the capture to its own line fixed that and broke something worse:
+# `set -euo pipefail` is on (line 36), and a bare failing command substitution
+# assignment ABORTS THE SCRIPT -- so on a red concurrency run nothing below ran: not
+# the timeout message, not `echo "$cout"` (the diagnosis itself), not the floor, not
+# the sentinel, not the final FAIL. `x=$(...) || rc=$?` is the one form that both
+# survives `set -e` and carries the real exit status.
+crc=0
+cout=$(timeout --foreground --kill-after=30 600 ./tests/concurrency.sh "$URL" 2>&1) || crc=$?
 [ "$crc" = 0 ] || fail=1
 if [ "$crc" = 124 ] || [ "$crc" = 137 ]; then echo "   FAIL tests/concurrency.sh timed out"; fail=1; fi
 echo "$cout"
 cn=$(echo "$cout" | grep -cE '^ +ok  ') || true
-if [ "$cn" -lt 57 ]; then
-    echo "   FAIL tests/concurrency.sh made $cn assertions, below its floor of 57"
+if [ "$cn" -lt 59 ]; then
+    echo "   FAIL tests/concurrency.sh made $cn assertions, below its floor of 59"
     fail=1
 fi
 if ! echo "$cout" | grep -q "SUITE-COMPLETE concurrency"; then
@@ -223,13 +273,16 @@ fi
 # the suite says about itself; canary.sh breaks the schema on purpose and requires
 # the suite to notice. See its header for what that is worth.
 echo "── tests/canary.sh"
-kout=$(timeout --foreground --kill-after=60 900 ./tests/canary.sh "$ADMIN" 2>&1); krc=$?
+# `|| krc=$?` for the reason spelled out above concurrency.sh: under `set -e` a bare
+# failing `x=$(...)` ends the script, taking the diagnosis and every check below it.
+krc=0
+kout=$(timeout --foreground --kill-after=60 900 ./tests/canary.sh "$ADMIN" 2>&1) || krc=$?
 [ "$krc" = 0 ] || fail=1
 if [ "$krc" = 124 ] || [ "$krc" = 137 ]; then echo "   FAIL tests/canary.sh timed out"; fail=1; fi
 echo "$kout"
 kn=$(echo "$kout" | grep -cE '^ +ok  canary ') || true
-if [ "$kn" -lt 6 ]; then
-    echo "   FAIL tests/canary.sh ran $kn canaries, below its floor of 6"
+if [ "$kn" -lt 7 ]; then
+    echo "   FAIL tests/canary.sh ran $kn canaries, below its floor of 7"
     fail=1
 fi
 if ! echo "$kout" | grep -q "SUITE-COMPLETE canary"; then
@@ -237,4 +290,5 @@ if ! echo "$kout" | grep -q "SUITE-COMPLETE canary"; then
     fail=1
 fi
 
+VERDICT_REACHED=1
 [ "$fail" -eq 0 ] && echo "PASS" || { echo "FAIL"; exit 1; }

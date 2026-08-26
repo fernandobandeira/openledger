@@ -277,7 +277,8 @@ check that no transaction's entry set spans more than one `tenant_id`, in M1.
 ### 3. Three constraints measured on our own stack
 
 **`COPY FROM` is not supported on RLS tables** — `ERROR: COPY FROM not supported with row-level
-security`, on PG 18.6. [Spike 002](../002-sqlc-vs-jet/README.md) found `CopyFrom` load-bearing, and
+security`, on PG 18.6. [Spike 003](../003-throughput-ceiling/README.md) found `CopyFrom` load-bearing on its
+coalesced-batching path (this line credited spike 002, which does not use it), and
 [spike 003](../003-throughput-ceiling/README.md) uses it for the coalesced batch worth 4.4×.
 **RLS on `ledger_entries` and bulk `COPY` batching are mutually exclusive.** Options: post as a
 `BYPASSRLS` role (RLS then guards only reads — arguably all we wanted), fall back to multi-row

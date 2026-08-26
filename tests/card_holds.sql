@@ -63,6 +63,11 @@ BEGIN
                       group_key, COALESCE(stored::text,'<no group>'), recomputed), '; ')
                       FROM card_hold_drift);
     END IF;
+    -- ...AND IT MUST PRINT. Silent on success meant not one of these calls counted
+    -- toward the file's assertion floor, so every no_drift() line in the file could
+    -- be deleted with the floor satisfied and the build green -- which is precisely
+    -- the erosion the floor exists to catch, in the helper that carries the alarm.
+    RAISE NOTICE 'ok  no drift: %', p_label;
 END $$;
 
 -- =========================================================== the reference trace
@@ -75,7 +80,10 @@ SELECT eq('auth 500.00 held', held_for_company('t1','acme','USD'), 50000);
 -- ...and it writes NO ledger entry. This is the single most counter-intuitive
 -- property of the design, so it is asserted rather than described.
 DO $$ BEGIN
-    IF EXISTS (SELECT 1 FROM ledger_entries) THEN
+    -- scoped to this suite's tenant: the claim is that THIS authorization wrote no
+    -- entry, and a committed fixture under another tenant (tests/fixtures) is not a
+    -- counter-example to it.
+    IF EXISTS (SELECT 1 FROM ledger_entries WHERE tenant_id = 't1') THEN
         RAISE EXCEPTION 'an authorization wrote a ledger entry';
     END IF;
     RAISE NOTICE 'ok  authorization wrote no ledger entry';
@@ -274,9 +282,36 @@ SELECT must_fail('deleting a materialised hold group', $q$
     DELETE FROM card_hold_groups WHERE tenant_id='t1' AND group_key='g_split';
 $q$, 'cannot be deleted');
 
+-- NAME THE TABLE. `refuse_truncate()` prints "<table> is history", and expecting
+-- the bare suffix meant CASCADE could answer for a guard that was gone: with
+-- ck_auth_events__no_truncate deleted, TRUNCATE card_auth_events CASCADE is still
+-- refused -- by card_auth_event_group's guard, naming a different table -- and the
+-- control passed. All three of 0003's truncate guards could be deleted with the
+-- build green. tests/negative_controls.sql records this exact defect and its fix
+-- for the ledger tables; the card suite carried the same control and not the fix.
 SELECT must_fail('truncating the auth event log', $q$
     TRUNCATE card_auth_events CASCADE;
-$q$, 'is history');
+$q$, 'card_auth_events is history');
+SELECT must_fail('truncating the materialised hold groups', $q$
+    TRUNCATE card_hold_groups CASCADE;
+$q$, 'card_hold_groups is history');
+-- ...and the membership table, which had no truncate control at all. It is the
+-- only record of WHICH group an event belongs to; the log cannot rebuild it.
+SELECT must_fail('truncating the membership table', $q$
+    TRUNCATE card_auth_event_group CASCADE;
+$q$, 'card_auth_event_group is history');
+
+-- ...AND THE DELETE ARM OF THE IMMUTABILITY TRIGGER, AS THE OWNER. The only DELETE
+-- control in this file runs as openledger_app and expects `permission denied` -- so
+-- it is answered by the missing GRANT, never by the trigger, and the trigger could
+-- be narrowed to BEFORE UPDATE with the whole build green. 0001 states the lesson
+-- in as many words: "REVOKE is a grant, not a constraint, and migrations run as a
+-- privileged role." An unmatched event has no membership, so the foreign key is
+-- not a second defence for it either -- and unmatched events are exactly what the
+-- review queue is made of.
+SELECT must_fail('deleting a stored auth event as the table OWNER', $q$
+    DELETE FROM card_auth_events WHERE processor_msg_id='msg_orphan';
+$q$, 'card_auth_events is an event log and is immutable: DELETE');
 
 SELECT must_fail('rewriting a stored auth event', $q$
     UPDATE card_auth_events SET amount_delta = 1 WHERE processor_msg_id='msg_orphan';
@@ -504,16 +539,45 @@ SELECT must_fail('an expiry_reversal with a negative delta', $q$
                                   amount_delta,currency,occurred_at)
     VALUES ('t1','neg_exprev','acme','card_z','expiry_reversal', -999999,'USD', now());
 $q$, 'ck_auth_events__sign');
+-- ...AND THE POSITIVE SIDE, WHICH IS THE SIDE THAT WAS THE BUG. The constraint is
+-- `amount_delta = 0`, and -999999 above violates `= 0` and `>= 0` alike -- so
+-- widening the constraint to `>= 0` left the whole suite green. The defect the
+-- constraint's own comment names is the POSITIVE one: carrying +remaining made a
+-- 100.00 authorization hold 200.00, and after the full 100.00 capture it still
+-- held 100.00, with drift silent because the log genuinely contained the +10000.
+-- Going through record_auth_event cannot test this: the function normalises an
+-- expiry_reversal's delta to 0 whatever the wire says, and the constraint exists
+-- because 0003 says the function gate is not enough -- "an operator backfill or a
+-- second adapter produced the double release". So this INSERTs directly, which is
+-- the path the constraint is for.
+SELECT must_fail('an expiry_reversal that adds the remaining hold back', $q$
+    INSERT INTO card_auth_events (tenant_id,processor_msg_id,company_id,card_id,kind,
+                                  amount_delta,currency,occurred_at)
+    VALUES ('t1','pos_exprev','acme','card_z','expiry_reversal', 10000,'USD', now());
+$q$, 'ck_auth_events__sign');
 
 -- The alarm must see a group whose events are not all in its declared currency --
 -- the state re-grouping used to be able to create. It compared total_minor and
 -- nothing else, so two currencies in one group reported no drift at all.
+--
+-- THIS CONTROL USED TO CATCH ON A DIFFERENT DISJUNCT THAN THE ONE IT NAMES. It
+-- attached an `acme` event carrying 100 to `g_oc`, which is `globex`'s group (see
+-- the ingest above) -- so the drift view's live CTE, which groups by the EVENT's
+-- company, produced a ('t1','acme','g_oc') row with no materialised group at all,
+-- and the alarm fired on stored-IS-NULL. Delete the currency disjunct and this
+-- still passed. Two changes isolate it: the event joins a group of its OWN
+-- company, and it carries delta 0 -- so the stored total, the stored authorized
+-- total and the convention flags (which filter `amount_delta <> 0`) all still
+-- agree with the log, and the currency EXISTS is the only disjunct left that can
+-- speak.
+SELECT record_auth_event('t1','cur_base','g_cur','acme','card_c',
+        'authorization', 5000,'USD',false, now());
 SELECT must_fail('a group holding two currencies', $q$
     INSERT INTO card_auth_events (tenant_id,processor_msg_id,company_id,card_id,kind,
                                   amount_delta,currency,occurred_at)
-    VALUES ('t1','sneak_eur','acme','card_6','authorization', 100,'EUR', now());
+    VALUES ('t1','sneak_eur','acme','card_c','authorization', 0,'EUR', now());
     INSERT INTO card_auth_event_group (tenant_id,event_id,group_key,method,assigned_by)
-    SELECT 't1', id, 'g_oc', 'manual', 'test'
+    SELECT 't1', id, 'g_cur', 'manual', 'test'
       FROM card_auth_events WHERE processor_msg_id='sneak_eur';
     SELECT no_drift('two currencies');
 $q$, 'disagrees with the event log');
@@ -827,6 +891,74 @@ SELECT must_fail('exposure above the total snapshot', $q$
     END $d$;
 $q$, 'post-expiry drift');
 
+-- A SECOND SWEEP MUST NOT RE-SNAPSHOT. `expire_hold_group`'s `AND expired_at IS
+-- NULL` guard protects TWO things, and the only control on it -- in
+-- tests/concurrency.sh -- checks the release TIMESTAMP. The other thing it protects
+-- is the snapshot the post-expiry alarm measures against, and a mutant that pinned
+-- expired_at while re-snapshotting on every call passed the entire build. Expiry
+-- sweeps run repeatedly by design, so this is one ordinary sweep with arguments it
+-- already has:
+--
+--   auth 100.00 + reversal 80.00 -> total 2000; expire -> expired_total 2000
+--   move the reversal OUT        -> total 10000, ABOVE the snapshot, so the
+--                                   post-expiry alarm fires: 100.00 of live
+--                                   exposure on a group reported as released
+--   sweep again                  -> shipped keeps 2000 and the alarm keeps firing;
+--                                   re-snapshotting to 10000 silences it, and the
+--                                   100.00 is then invisible to everything.
+--
+-- Inside must_fail so the deliberate drift is rolled back: no_drift() is global,
+-- and a fixture that leaves a group alarming disables every later drift check in
+-- this file.
+SELECT must_fail('a second expiry sweep re-snapshotting the group silent', $q$
+    SELECT record_auth_event('t1','sw_a','g_sweep','acme','card_sw',
+            'authorization', 10000,'USD',false, now());
+    SELECT record_auth_event('t1','sw_b','g_sweep','acme','card_sw',
+            'reversal', 8000,'USD',false, now());
+    SELECT expire_hold_group('t1','acme','g_sweep');
+    DO $d$ BEGIN
+        IF (SELECT expired_total FROM card_hold_groups
+             WHERE tenant_id='t1' AND group_key='g_sweep') <> 2000 THEN
+            RAISE EXCEPTION 'the first sweep did not snapshot the group as it stands';
+        END IF;
+    END $d$;
+    SELECT regroup_auth_event('t1',
+        (SELECT id FROM card_auth_events WHERE tenant_id='t1' AND processor_msg_id='sw_b'),
+        'g_sweep_out', 'operator:test');
+    DO $d$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM card_hold_drift WHERE group_key='g_sweep') THEN
+            RAISE EXCEPTION 'moving the reversal out did not raise the group above '
+                            'its snapshot, so this control tests nothing';
+        END IF;
+    END $d$;
+    SELECT expire_hold_group('t1','acme','g_sweep');
+    DO $d$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM card_hold_drift WHERE group_key='g_sweep') THEN
+            RAISE EXCEPTION 'A SECOND SWEEP SILENCED THE POST-EXPIRY ALARM';
+        END IF;
+        IF (SELECT expired_total FROM card_hold_groups
+             WHERE tenant_id='t1' AND group_key='g_sweep') <> 2000 THEN
+            RAISE EXCEPTION 'THE SECOND SWEEP MOVED THE SNAPSHOT';
+        END IF;
+        RAISE EXCEPTION 'SWEEP-KEPT-ITS-SNAPSHOT';
+    END $d$;
+$q$, 'sweep-kept-its-snapshot');
+
+-- WHAT THE REPAIR RETURNS, on an expired group. Round 9 changed this RETURN from
+-- `GREATEST(total_minor,0)` to `held_minor` -- and reverting that change verbatim
+-- left the whole build green, because not one of this file's recompute_hold_group
+-- calls compared the return value to anything. It is a public function returning a
+-- bigint documented as a hold; the other three return sites and held_for_company
+-- all say 0 here.
+SELECT record_auth_event('t1','rr_a','g_rrexp','omega','card_rr',
+        'authorization', 10000,'USD',false, now());
+SELECT expire_hold_group('t1','omega','g_rrexp');
+SELECT eq('the repair returns the CLAMPED hold, like the other three return sites',
+          recompute_hold_group('t1','omega','g_rrexp'), 0);
+SELECT eq('...and the group it repaired contributes nothing to the company total',
+          (SELECT COALESCE(held_minor,0) FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='omega' AND group_key='g_rrexp'), 0);
+
 -- Both snapshots must RATCHET DOWN when a recompute lowers the group. The only
 -- way to lower an expired group's subtotal is to move an event out of it, which
 -- goes through recompute_hold_group and nowhere else -- so with the ratchet
@@ -1101,6 +1233,24 @@ SELECT eq('last_event_seq advances once per applied event',
 SELECT recompute_hold_group('t1','acme','g_count');
 SELECT eq('...and open_events survives a repair',
           (SELECT open_events FROM card_hold_groups WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_count'), 3);
+-- ...AND IS RECOMPUTED, NOT MERELY PRESERVED. Both controls above are built so the
+-- ingest counter already equals the live membership count, so a repair that stops
+-- maintaining open_events passes them unchanged -- the assertion the block claims
+-- to make ("zero open_events") is not the one it makes. Move the count away from
+-- the counter first: supersede one membership directly, which is the operator
+-- workflow 0003 prescribes, and then require the repair to bring it back.
+UPDATE card_auth_event_group SET superseded_at = now()
+ WHERE tenant_id='t1' AND group_key='g_count' AND superseded_at IS NULL
+   AND event_id = (SELECT id FROM card_auth_events
+                    WHERE tenant_id='t1' AND processor_msg_id='cnt_c');
+SELECT eq('superseding a membership leaves the stale counter behind',
+          (SELECT open_events FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_count'), 3);
+SELECT recompute_hold_group('t1','acme','g_count');
+SELECT eq('...and the repair brings it back to the live membership count',
+          (SELECT open_events FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_count'), 2);
+SELECT no_drift('a repair after a membership was superseded');
 
 -- advice is increase-SIDE, and the repair must agree with ingest about that or
 -- the two disagree about authorized_minor -- the base every cumulative
@@ -1209,6 +1359,25 @@ SELECT eq('...so the processor''s own cumulative total is still accepted',
 SELECT eq('...and its incremental total after it',
           record_auth_event('t1','z_inc','g_zero','acme','card_z','incremental',
                             15000,'USD',true, now()), 15000);
+
+-- ...AND THE REPAIR PATH DERIVES THE CONVENTION TOO, from its own copy of the same
+-- filter. The drift view's copy is controlled above; recompute_hold_group's was
+-- not, so dropping `amount_delta <> 0` there passed the whole build -- and any
+-- routine repair after a $0.00 AVS authorization then locks the group to 'delta',
+-- after which every real cumulative total from that processor is refused FOREVER.
+-- Refused messages are never stored, so they never reach the review queue either.
+SELECT eq('a repair does not let a $0.00 message decide the convention',
+          recompute_hold_group('t1','acme','g_zero'), 15000);
+DO $$ BEGIN
+    IF (SELECT total_convention FROM card_hold_groups
+         WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_zero') <> 'total' THEN
+        RAISE EXCEPTION 'the repair re-derived the convention from a zero-amount message: %',
+            (SELECT total_convention FROM card_hold_groups
+              WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_zero');
+    END IF;
+    RAISE NOTICE 'ok  ...and the group is still on the convention its real messages set';
+END $$;
+SELECT no_drift('a repair on a group carrying a zero-amount message');
 
 -- ...and the mirror image: a $0.00 CUMULATIVE TOTAL must not lock a group to
 -- 'total' and refuse every real delta after it.
@@ -1323,6 +1492,18 @@ UPDATE card_auth_event_group SET superseded_at = now()
 SELECT eq('...and superseding its only membership puts it BACK in the queue',
           (SELECT count(*) FROM card_auth_unmatched
             WHERE tenant_id='t1' AND processor_msg_id='sq_a'), 1);
+-- ...AND THEN PUT THE LEDGER BACK, because no_drift() is GLOBAL. It takes a label
+-- and the label is decoration: the body is `EXISTS (SELECT 1 FROM card_hold_drift)`
+-- with no scope at all. The supersede above left g_squeue materialised at 2500
+-- with no live membership, i.e. permanent drift -- so from this line to the end of
+-- the file any no_drift() would have fired on a fixture three hundred lines away,
+-- which is why there is not one, which means the last ~60 assertions in this file
+-- ran with no drift check at all. Reconciling through the shipped repair path is
+-- both the fix and a control on that path: recompute must bring a group whose
+-- memberships were all superseded back to zero.
+SELECT eq('the repair reconciles a group whose only membership was superseded',
+          recompute_hold_group('t1','acme','g_squeue'), 0);
+SELECT no_drift('after superseding the review queue fixture''s membership');
 
 -- ix_hold_groups__held is a PARTIAL index, and the plan assertion pins its NAME.
 -- Dropping its predicate leaves the name intact and the index covering every group
@@ -1422,6 +1603,18 @@ SELECT record_auth_event('t1','d2_x','g_d2ok','omega','card_d2b','clearing',4000
 SELECT record_auth_event('t1','d2_y','g_d2ok','omega','card_d2b','authorization',9000,'USD',false,now());
 SELECT eq('an out-of-order clearing does not look like an over-reversal',
           (SELECT count(*) FROM card_hold_drift WHERE group_key='g_d2ok'), 0);
+-- ...AND THE BOUNDARY ITSELF, which neither control above touches. Both sit well
+-- away from zero, so `total_minor < 0` could be widened to `<= 0` with the suite
+-- green -- and then every fully-reversed authorization, the most ordinary shape
+-- there is, becomes a permanent alarm. Exactly zero, with a bloodless decrease
+-- present, must be silent.
+SELECT record_auth_event('t1','d2_z1','g_d2zero','omega','card_d2c','authorization',7000,'USD',false,now());
+SELECT record_auth_event('t1','d2_z2','g_d2zero','omega','card_d2c','reversal',7000,'USD',false,now());
+SELECT eq('a FULLY reversed authorization sits at exactly zero and does not alarm',
+          (SELECT count(*) FROM card_hold_drift WHERE group_key='g_d2zero'), 0);
+SELECT eq('...and it really is at zero with a bloodless decrease behind it',
+          (SELECT total_minor FROM card_hold_groups
+            WHERE tenant_id='t1' AND group_key='g_d2zero'), 0);
 
 SELECT must_fail('reversing more than was ever authorized', $q$
     SELECT record_auth_event('t1','r6_ov_c','g_overrev','omega','card_ov','reversal',10000,'USD',false,now());
@@ -1553,10 +1746,29 @@ SELECT eq('...and so does the attach path',
 -- against a hand-typed copy of its own body -- same predicate, same cast -- was a
 -- restatement, not a check. Sum the LOG instead, over live memberships, which is
 -- the thing the materialisation is supposed to equal.
+-- ...AND THE REPLACEMENT WAS THE SAME RESTATEMENT. It read `card_hold_groups`,
+-- the materialised table -- the very thing held_for_company reads -- with a
+-- hand-retyped copy of the `held_minor` expression. Tampering the materialisation
+-- to disagree with the log by 977,999 minor units left both sides reading 999999
+-- and the assertion green. `total_minor` below now comes from SUM(amount_delta)
+-- over live memberships. Currency and expiry still come from the group row
+-- because neither is in the log -- that is a real limit of this check and it is
+-- stated rather than hidden, which is the whole complaint about the two versions
+-- before it.
 SELECT eq('...all three agreeing with what the log says the company holds',
           held_for_company('t1','omega','USD'),
-          (SELECT COALESCE(SUM(GREATEST(g.total_minor,0)),0)::bigint
+          (SELECT COALESCE(SUM(GREATEST(l.recomputed,0)),0)::bigint
              FROM card_hold_groups g
+             JOIN (SELECT m.tenant_id, e.company_id, m.group_key,
+                          SUM(e.amount_delta) AS recomputed
+                     FROM card_auth_event_group m
+                     JOIN card_auth_events e
+                       ON e.tenant_id = m.tenant_id AND e.id = m.event_id
+                    WHERE m.superseded_at IS NULL
+                    GROUP BY m.tenant_id, e.company_id, m.group_key) l
+               ON l.tenant_id  = g.tenant_id
+              AND l.company_id = g.company_id
+              AND l.group_key  = g.group_key
             WHERE g.tenant_id='t1' AND g.company_id='omega' AND g.currency='USD'
               AND g.expired_at IS NULL));
 
@@ -1599,7 +1811,7 @@ RESET ROLE;
 SELECT must_fail('the app role rewriting a stored auth event', $q$
     SET LOCAL ROLE openledger_app;
     UPDATE card_auth_events SET amount_delta = 1 WHERE processor_msg_id='r7_app';
-$q$, 'is an event log and is immutable');
+$q$, 'card_auth_events is an event log and is immutable: UPDATE');
 -- ...and DELETE is not granted at all, so that one never reaches the trigger.
 -- Two independent defences, and the control says which is answering.
 SELECT must_fail('the app role deleting a stored auth event', $q$
@@ -1625,6 +1837,13 @@ SELECT must_fail('a stored convention that disagrees with the log', $q$
         END IF;
     END $d$;
 $q$, 'stored convention disagrees with the log');
+
+-- NOTHING IN THIS FILE MAY LEAVE THE LEDGER DRIFTING. no_drift() is global, so a
+-- single call here covers every fixture in the file at once -- and it is only
+-- possible because the review-queue fixture above now reconciles itself. This is
+-- the assertion whose ABSENCE meant the last stretch of the file had no drift
+-- check; it is cheap and it is the strongest thing this file can say at the end.
+SELECT no_drift('the end of the file: no fixture left a group disagreeing with its log');
 
 -- ...and again at the end, because a SET LOCAL in a DO block that SUCCEEDS
 -- persists for the rest of the transaction. MODE GUARD. `SET LOCAL session_replication_role = 'replica'` prepended to this

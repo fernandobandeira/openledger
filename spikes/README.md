@@ -22,17 +22,19 @@ Outcomes fed the decision log from [ADR-0002](../docs/decisions/0002-data-access
 ## Artifacts worth knowing about
 
 Spike 002 and 004 left behind files worth reading, because they were built against a real database
-rather than sketched. **None of them ships**: `migrations/0002` says in its own header that it
-supersedes `004/chart.sql` and `004/completeness.sql`, and running either against the shipped
-schema now fails on an object that already exists -- `account_types` for `chart.sql`,
-`fs_lines` for `completeness.sql`. Nothing in `spikes/` is executed
-by CI.
+rather than sketched. **None of them ships, and none of them runs.** Every `.sql` file in `spikes/` fails against the
+shipped schema -- on an object that already exists, a column that no longer exists, or a `NOT NULL`
+that did not exist when it was written. An earlier version of this paragraph named two files as the
+exceptions; there are no exceptions, and naming two was the same "a banner is a claim about scope"
+error [the decision log](../docs/decisions/README.md) records against itself. Nothing in `spikes/`
+is executed by CI, so "measured" in this directory means "was measured once, against something".
+**The live attestation is [`tests/`](../tests/).**
 
 | File | What it is |
 | --- | --- |
 | [`002-sqlc-vs-jet/schema.sql`](./002-sqlc-vs-jet/schema.sql) | The ledger schema. **Did not graduate.** `migrations/0001` was written by hand; this schema puts `idempotency_key` on `ledger_transactions`, where ADR-0004 moved it off. |
 | [`002-sqlc-vs-jet/invariants.sql`](./002-sqlc-vs-jet/invariants.sql) | Nine invariants: **seven** assert Postgres *refuses* an illegal write, and two are positive controls that must SUCCEED (a balanced transaction; the same idempotency key in a different tenant). The file's own header says so; this line said all nine. |
-| [`002-sqlc-vs-jet/expected_schema.sql`](./002-sqlc-vs-jet/expected_schema.sql) | The schema snapshot guard from [ADR-0006](../docs/decisions/0006-schema-conventions.md). |
+| [`002-sqlc-vs-jet/expected_schema.sql`](./002-sqlc-vs-jet/expected_schema.sql) | One `SELECT` that emits a schema summary. ADR-0006 wants a snapshot *guard* built on it -- a committed expected output plus a diff. Neither exists, so this is the query, not the guard. |
 | [`002-sqlc-vs-jet/sqlc.yaml`](./002-sqlc-vs-jet/sqlc.yaml) | The verified codegen config. |
 | [`004-chart-of-accounts/chart.sql`](./004-chart-of-accounts/chart.sql) | Account types as data, with the constraints that keep them honest. |
 | [`004-chart-of-accounts/completeness.sql`](./004-chart-of-accounts/completeness.sql) | The guard against a report silently omitting an account. |

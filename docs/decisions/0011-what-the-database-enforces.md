@@ -50,20 +50,25 @@ transaction's two legs could carry different recording times, so a recorded-axis
 perfectly balanced journal came back **unbalanced**; and, arranged more carefully, a **green report
 that was 50% wrong**.
 
-**What this does not fix**, and it matters: `now()` is transaction-*start* time, so `recorded_at`
-is still not monotonic with commit order. [0005](./0005-reproducible-as-of.md) is the outstanding
-work, and until it lands `balance_after` cannot answer a recorded-axis as-of question — the
-aggregate can — **which was wrong, and is now corrected in the migration too.** `now()` is
-transaction-*start* time, so a writer that begins before a report and commits after it inserts rows
-that claim to predate the report. Demonstrated with nothing but the app role's INSERT grants: the
+**What this does not fix**, and it matters: **neither `balance_after` nor the aggregate answers a
+recorded-axis as-of question reproducibly.** Not one of them, not the other — both.
+
+`recorded_at` is assigned as `now()`, and `now()` is transaction-*start* time, so it is not
+monotonic with commit order: a writer that begins before a report and commits after it inserts rows
+claiming to predate the report. Demonstrated with nothing but the app role's INSERT grants — the
 same query, the same as-of, the same axis, run either side of one `COMMIT`, moved revenue from
-110,000.00 to 160,000.00 — balanced both times, zero drift. Assigning `now()` shrank the window
-from "any instant the caller invents" to "the duration of the writer's transaction", which the
-writer still chooses. **A timestamp cannot order commits.** Neither `balance_after` nor the
-aggregate answers a recorded-axis as-of question reproducibly until
-[0005](./0005-reproducible-as-of.md) lands, and `xact_id` is already stored for it. Both axes are
-asserted in [`tests/bitemporal.sql`](../../tests/bitemporal.sql) — as *separation*, which holds; not
-as reproducibility under concurrent writes, which does not.
+110,000.00 to 160,000.00, balanced both times, zero drift. Assigning `now()` in the engine rather
+than accepting it from the client shrank the window from "any instant the caller invents" to "the
+duration of the writer's transaction", which the writer still chooses. **A timestamp cannot order
+commits.** `xact_id` is already stored for the fix; [0005](./0005-reproducible-as-of.md) is the
+outstanding work.
+
+Both axes are asserted in [`tests/bitemporal.sql`](../../tests/bitemporal.sql) — as *separation*,
+which holds; not as reproducibility under concurrent writes, which does not.
+
+*(An earlier version of this paragraph said the aggregate could answer the question, retracted that
+mid-sentence, and stated the same fact about `now()` twice in fourteen lines. The position above is
+the one that survived; the sequence is not worth reading.)*
 
 ### `account_seq` is assigned from the journal
 
@@ -242,9 +247,16 @@ Recorded here because the alternative is implying it can.
   Every internal trigger here is `ENABLE ALWAYS`, which covers the replica path, but nothing covers
   a superuser who drops the triggers outright. At that point the defence is backups and audit, not
   the schema.
-- **Table inheritance disarms every constraint.** A child of `ledger_entries` inherits CHECKs and
-  nothing else — no FKs, no unique indexes, no triggers — while remaining visible through the
-  parent to every view. It needs `CREATE` on the schema, so it is an operator path, not an app one.
+- ~~**Table inheritance disarms every constraint.**~~ **Closed, and this bullet was stale for
+  several rounds.** A child of `ledger_entries` would inherit CHECKs and nothing else — no FKs, no
+  unique indexes, no triggers — while remaining visible through the parent to every view.
+  `ck_no_ledger_inheritance`, an `ddl_command_end` event trigger marked `ENABLE ALWAYS`, now refuses
+  the statement; `tests/negative_controls.sql` carries nine controls for it, including an `UNLOGGED`
+  child, a `FOREIGN TABLE` child and one attempted on the replication apply path. The list of
+  protected parents is a table (`ledger_uninheritable`) rather than a literal, because it was a
+  literal naming four tables while the test census named six — and the two it missed were the card
+  tables, where a child of `card_hold_groups` took an INSERT and moved
+  `held_for_company` from 0 to 999900 through the parent.
 - **Gaplessness is enforced at issue, not verified at rest.** `assign_entry_seq` makes a gap
   unreachable through an INSERT; nothing scans the journal for one that arrived another way.
 - **The chart is not versioned.** Changing which statement line an account reports under is blocked

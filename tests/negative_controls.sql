@@ -2,8 +2,10 @@
 --
 -- A suite that only ever runs the happy path proves nothing: it can pass because
 -- everything is right, or because nothing is being checked. This file breaks the
--- ledger sixty-odd ways and requires each break to be REFUSED, with the error we
--- expect rather than merely some error.
+-- ledger a hundred and thirty-odd ways and requires each break to be REFUSED, with
+-- the error we expect rather than merely some error. ("Sixty-odd" stood in this
+-- header long after the file had doubled; the number is `grep -c 'must_fail('`
+-- minus its own definition.)
 --
 -- Case 2 is the reason this file exists. Re-routing interchange to fee_revenue --
 -- a real, plausible, wrong posting -- passed the previous suite silently, because
@@ -12,6 +14,55 @@
 \set ON_ERROR_STOP on
 \o /dev/null
 BEGIN;
+
+-- ==================================================================== ENABLE ALWAYS
+-- FIRST IN THE FILE, DELIBERATELY. This census used to sit at the end, and by then
+-- this file had itself issued `ALTER TABLE ... ENABLE ALWAYS TRIGGER` thirteen
+-- times -- restoring, as a side effect of its own controls, the exact property the
+-- census exists to measure. Measured: delete
+-- `ALTER TABLE ledger_transactions ENABLE ALWAYS TRIGGER ck_txn__xact_id` from
+-- migrations/0001 and the ENTIRE BUILD PRINTS PASS -- because line 213 below had
+-- already put it back before the census looked. The seal's whole basis, forgeable
+-- on the replication apply path, with a green suite. A census must read the schema
+-- the MIGRATIONS produced, so it runs before this file touches anything.
+-- EVERY trigger, not just the foreign keys. The census here checked
+-- `tgisinternal` only, so the ENABLE ALWAYS on four USER triggers could each be
+-- deleted with the suite green -- including ck_types__matches_fs_line, whose own
+-- comment says removing it "put 6,000 of revenue on the expense side of the
+-- income statement, with every check green", and all three recorded_at
+-- assignments, which reopen on the replication apply path every consequence 0001
+-- lists as closed. One assertion covers the whole set and cannot drift as
+-- triggers are added.
+DO $$
+DECLARE v_bad text;
+BEGIN
+    SELECT string_agg(c.relname || '.' || t.tgname, ', ') INTO v_bad
+      FROM pg_trigger t
+      JOIN pg_class c ON c.oid = t.tgrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND t.tgenabled <> 'A';
+    IF v_bad IS NOT NULL THEN
+        RAISE EXCEPTION 'trigger(s) not ENABLE ALWAYS, so the replication apply path '
+                        'skips them: %', v_bad;
+    END IF;
+    RAISE NOTICE 'ok  every trigger in the schema is ENABLE ALWAYS, user and internal';
+END $$;
+
+-- ...AND EVENT TRIGGERS, WHICH LIVE IN A DIFFERENT CATALOG. The census above reads
+-- pg_trigger and saw 67 of 67 ENABLE ALWAYS while ck_no_ledger_inheritance sat in
+-- pg_event_trigger as ENABLE ORIGIN -- so `session_replication_role='replica'`
+-- skipped it and an inheriting child went straight in.
+DO $$
+DECLARE v_bad text;
+BEGIN
+    SELECT string_agg(evtname || '=' || evtenabled::text, ', ') INTO v_bad
+      FROM pg_event_trigger WHERE evtenabled <> 'A';
+    IF v_bad IS NOT NULL THEN
+        RAISE EXCEPTION 'event trigger(s) not ENABLE ALWAYS, so the replication '
+                        'apply path skips them: %', v_bad;
+    END IF;
+    RAISE NOTICE 'ok  every EVENT trigger is ENABLE ALWAYS too';
+END $$;
 
 CREATE FUNCTION must_fail(p_label text, p_sql text, p_expect text) RETURNS void
 LANGUAGE plpgsql AS $$
@@ -213,7 +264,6 @@ SET CONSTRAINTS ALL DEFERRED;
 ALTER TABLE ledger_transactions ENABLE ALWAYS TRIGGER ck_txn__xact_id;
 
 
-
 -- 1c-quater. TRUNCATE is not covered by DELETE and fires no row trigger. After a
 --     careless GRANT ALL the shipped REVOKEs left it in place, and truncating the
 --     whole journal succeeded.
@@ -405,6 +455,14 @@ SELECT must_fail('a contra-asset that adds to assets', $q$
     DO $d$ DECLARE v bigint; BEGIN
         SELECT balance_debit_positive INTO v FROM trial_balance
          WHERE tenant_id='t1' AND purpose='allowance_for_credit_losses';
+        -- ...AND NULL IS NOT A PASS. `SELECT INTO` leaves v NULL when the row is
+        -- absent, `NULL <> -100` is NULL, the guard branch is skipped, and the
+        -- CONTRA-OK sentinel below fires -- so a trial_balance that lost the contra
+        -- account entirely read as the control succeeding. Absence is the failure
+        -- this control is most likely to meet and was the one state it could not see.
+        IF v IS NULL THEN
+            RAISE EXCEPTION 'the contra account has NO trial_balance row at all';
+        END IF;
         IF v <> -100 THEN
             RAISE EXCEPTION 'CONTRA ACCOUNT HAS THE WRONG SIGN: %', v;
         END IF;
@@ -426,13 +484,22 @@ $q$, 'does not balance');
 
 -- 10e. the balance sheet must balance, including un-closed earnings
 SELECT must_fail('balance sheet that does not balance', $q$
-    DO $d$ DECLARE r record; BEGIN
+    DO $d$ DECLARE r record; n int := 0; BEGIN
         FOR r IN SELECT * FROM balance_sheet_balances() LOOP
+            n := n + 1;
             IF NOT r.balanced THEN
                 RAISE EXCEPTION 'BALANCE SHEET IS OUT by %',
                     r.assets - r.liabilities_and_equity;
             END IF;
         END LOOP;
+        -- ...AND AN EMPTY REPORT IS NOT A BALANCED ONE. With zero rows the loop
+        -- body never runs and the BS-OK sentinel fires, so this control passed
+        -- against a report that produced nothing -- the exact "empty read as
+        -- balanced" failure this file criticises elsewhere, inside one of its own
+        -- controls.
+        IF n = 0 THEN
+            RAISE EXCEPTION 'balance_sheet_balances() returned NO rows';
+        END IF;
         RAISE EXCEPTION 'BS-OK';
     END $d$;
 $q$, 'bs-ok');
@@ -1285,11 +1352,13 @@ $q$, 'unknown tenant');
 -- Every seed-chart mutation was caught BY these triggers at migration time, so
 -- the triggers defended the chart and nothing defended the triggers. Both must
 -- fire on UPDATE as well as INSERT -- 0002 says so in as many words, and both
--- could be reduced to BEFORE INSERT with the suite green.
-SELECT must_fail('an asset type on an income-statement line', $q$
-    INSERT INTO account_types (code,category,normal_balance,description,fs_line)
-    VALUES ('probe_asset','asset','debit','x','revenue');
-$q$, 'cannot report under statement line');
+-- could be reduced to BEFORE INSERT with the suite green. The UPDATE half is
+-- below; the INSERT half was already done ~280 lines up ('an asset type on an
+-- income-statement line', same category, same normal_balance, same fs_line, same
+-- expected message) and a second copy of it was here. Proven duplicate by
+-- mutation: reduce the trigger to BEFORE UPDATE and the earlier control is the
+-- one that reports, with or without this one. Deleted; the reasoning stays,
+-- attached to the half that is not a duplicate.
 
 DO $$ BEGIN
     INSERT INTO fs_lines (code,caption,statement,side,sort_order)
@@ -1356,6 +1425,27 @@ SELECT must_fail('a non-positive account_seq', $q$
     INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
                                 currency,account_seq,balance_after,effective_at)
     SELECT 't1', txn('t1','seqzero'), acct('t1','fee_revenue'), 'credit', 5,'USD',0,-5,now();
+$q$, 'ck_entries__seq_positive');
+-- ...AND A NEGATIVE ONE, WHICH IS THE VALUE THE CONSTRAINT WAS WRITTEN FOR. Zero
+-- above violates `> 0` and `<> 0` alike, so widening the CHECK to `<> 0` left the
+-- whole suite green -- while admitting exactly the harm 0001 names beside it: "a
+-- seq of -9999 inserted later silently reordered an account's past". Same shape as
+-- the expiry_reversal sign CHECK in tests/card_holds.sql: a control that picks the
+-- one value both predicates reject tests the predicate it did not mean to.
+-- ...and BALANCED, with two legs, so `ck_entries__seq_positive` is the only guard
+-- that can answer. A one-legged transaction is refused by ck_txn__has_entries when
+-- must_fail forces the deferred triggers -- so under a mutant that admits -9999 the
+-- control still went red, but naming the wrong guard, which is the "a control has
+-- to fail for its own reason" rule one level down.
+SELECT must_fail('a NEGATIVE account_seq, which would reorder an account''s past', $q$
+    DO $d$ DECLARE t uuid := txn('t1','seqneg'); BEGIN
+        INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
+                                    currency,account_seq,balance_after,effective_at)
+        VALUES ('t1', t, acct('t1','customer_receivable'), 'debit', 5,'USD',-9999,-5,now());
+        INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
+                                    currency,account_seq,balance_after,effective_at)
+        VALUES ('t1', t, acct('t1','fee_revenue'), 'credit', 5,'USD',9000,5,now());
+    END $d$;
 $q$, 'ck_entries__seq_positive');
 SET CONSTRAINTS ALL IMMEDIATE;
 SET CONSTRAINTS ALL DEFERRED;
@@ -1951,45 +2041,6 @@ BEGIN
     RAISE NOTICE 'ok  customer funds payable keeps its own statement line';
 END $$;
 
--- EVERY trigger, not just the foreign keys. The census here checked
--- `tgisinternal` only, so the ENABLE ALWAYS on four USER triggers could each be
--- deleted with the suite green -- including ck_types__matches_fs_line, whose own
--- comment says removing it "put 6,000 of revenue on the expense side of the
--- income statement, with every check green", and all three recorded_at
--- assignments, which reopen on the replication apply path every consequence 0001
--- lists as closed. One assertion covers the whole set and cannot drift as
--- triggers are added.
-DO $$
-DECLARE v_bad text;
-BEGIN
-    SELECT string_agg(c.relname || '.' || t.tgname, ', ') INTO v_bad
-      FROM pg_trigger t
-      JOIN pg_class c ON c.oid = t.tgrelid
-      JOIN pg_namespace n ON n.oid = c.relnamespace
-     WHERE n.nspname = 'public' AND t.tgenabled <> 'A';
-    IF v_bad IS NOT NULL THEN
-        RAISE EXCEPTION 'trigger(s) not ENABLE ALWAYS, so the replication apply path '
-                        'skips them: %', v_bad;
-    END IF;
-    RAISE NOTICE 'ok  every trigger in the schema is ENABLE ALWAYS, user and internal';
-END $$;
-
--- ...AND EVENT TRIGGERS, WHICH LIVE IN A DIFFERENT CATALOG. The census above reads
--- pg_trigger and saw 67 of 67 ENABLE ALWAYS while ck_no_ledger_inheritance sat in
--- pg_event_trigger as ENABLE ORIGIN -- so `session_replication_role='replica'`
--- skipped it and an inheriting child went straight in.
-DO $$
-DECLARE v_bad text;
-BEGIN
-    SELECT string_agg(evtname || '=' || evtenabled::text, ', ') INTO v_bad
-      FROM pg_event_trigger WHERE evtenabled <> 'A';
-    IF v_bad IS NOT NULL THEN
-        RAISE EXCEPTION 'event trigger(s) not ENABLE ALWAYS, so the replication '
-                        'apply path skips them: %', v_bad;
-    END IF;
-    RAISE NOTICE 'ok  every EVENT trigger is ENABLE ALWAYS too';
-END $$;
-
 -- ...and truncating the CACHE is deliberately allowed, because it is rebuildable
 -- and the alarm is loud about it. The enumeration is four tables of five, and the
 -- fifth is the copy the hot path reads, so state the exclusion rather than leave
@@ -2113,6 +2164,71 @@ $q$, 'may not be inherited');
 SELECT must_fail('an UNLOGGED child', $q$
     CREATE UNLOGGED TABLE ledger_unlogged_child () INHERITS (ledger_entries);
 $q$, 'may not be inherited');
+-- ...AND THE TWO CARD TABLES, WHICH THE GUARD DID NOT NAME. The census below has
+-- always listed six parents; refuse_ledger_inheritance() named four, and the two it
+-- missed are the ones the hold flow reads. Measured before the fix: a child of
+-- card_hold_groups took an INSERT, held_for_company('t9','c9','USD') went from 0 to
+-- 999900 through the parent, and the DELETE guard did not reach the child. The list
+-- is a table now, so this is also the control on 0003 having declared its own.
+-- THE DRIFT WINDOW MUST BE PARTITIONED BY TENANT, and this was recorded in
+-- docs/decisions/README.md as an EQUIVALENT mutant on the reasoning that "ids are
+-- uuidv7, globally unique". They are not, in the sense that matters:
+-- ledger_accounts.id has a DEFAULT and no assignment trigger, and the app role's
+-- INSERT grant covers every column -- so the id is chosen by the caller, and two
+-- tenants can hold the same one. Drop tenant_id from the window in
+-- ledger_balance_drift and this correct, balanced pair of books raises a
+-- corruption alarm. An equivalence argument is a claim; this is the state it named.
+DO $$
+DECLARE v_shared uuid := '11111111-1111-7111-8111-111111111111';
+        t_a uuid; t_b uuid; n int;
+BEGIN
+    INSERT INTO ledger_accounts (tenant_id,id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    SELECT 'pw_a', v_shared, 'house', NULL, code, category, normal_balance, 'USD'
+      FROM account_types WHERE code='customer_receivable';
+    INSERT INTO ledger_accounts (tenant_id,id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    SELECT 'pw_b', v_shared, 'house', NULL, code, category, normal_balance, 'USD'
+      FROM account_types WHERE code='customer_receivable';
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    SELECT z.t, 'house', NULL, code, category, normal_balance, 'USD'
+      FROM account_types, (VALUES ('pw_a'),('pw_b')) z(t) WHERE code='interchange_revenue';
+
+    t_a := txn('pw_a','pw_one');
+    PERFORM entry('pw_a', t_a, v_shared, 'debit', 700);
+    PERFORM entry('pw_a', t_a, acct('pw_a','interchange_revenue'), 'credit', 700);
+    t_b := txn('pw_b','pw_two');
+    PERFORM entry('pw_b', t_b, v_shared, 'debit', 10000);
+    PERFORM entry('pw_b', t_b, acct('pw_b','interchange_revenue'), 'credit', 10000);
+    SET CONSTRAINTS ALL IMMEDIATE;
+    SET CONSTRAINTS ALL DEFERRED;
+
+    SELECT count(*) INTO n FROM ledger_balance_drift
+     WHERE tenant_id IN ('pw_a','pw_b');
+    IF n <> 0 THEN
+        RAISE EXCEPTION 'two tenants sharing one account id raised % drift row(s) on '
+                        'two correct books -- the running-balance window is not '
+                        'partitioned by tenant', n;
+    END IF;
+    RAISE NOTICE 'ok  two tenants may share an account id without a false drift alarm';
+END $$;
+
+-- ...AND A FOREIGN TABLE, which is a different DDL tag AND a different relkind, so
+-- fixing either filter alone left it open. It needs no reachable server: the event
+-- trigger fires at ddl_command_end, before anything connects.
+DO $$ BEGIN
+    CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+    CREATE SERVER inh_probe FOREIGN DATA WRAPPER postgres_fdw
+        OPTIONS (host 'localhost', port '1', dbname 'nowhere');
+END $$;
+SELECT must_fail('a FOREIGN TABLE child under the accounts table', $q$
+    CREATE FOREIGN TABLE ledger_acct_fchild () INHERITS (ledger_accounts)
+        SERVER inh_probe OPTIONS (table_name 'smuggle');
+$q$, 'may not be inherited');
+SELECT must_fail('a child under the authorization log', $q$
+    CREATE TABLE card_events_child () INHERITS (card_auth_events);
+$q$, 'may not be inherited');
+SELECT must_fail('a child under the hold groups the authorization read sums', $q$
+    CREATE TABLE card_groups_child () INHERITS (card_hold_groups);
+$q$, 'may not be inherited');
 -- ...and on the replication apply path, where the first version of this guard was
 -- skipped entirely because it was ENABLE ORIGIN
 SELECT must_fail('replica: a child under ledger_entries', $q$
@@ -2133,7 +2249,15 @@ BEGIN
      WHERE n.nspname='public'
        AND p.relname IN ('ledger_entries','ledger_transactions','ledger_events',
                          'ledger_accounts','card_auth_events','card_hold_groups')
-       AND c.relkind = 'r' AND NOT c.relispartition;
+       -- 'f' AND 'p', not just 'r'. The guard in 0001 names all three relkinds and
+       -- its comment records that the foreign-table door "reproduced the harm
+       -- verbatim" -- and this census, the thing that would notice one at rest,
+       -- filtered ordinary tables only. Measured: with the guard narrowed to 'r',
+       -- a FOREIGN TABLE child of ledger_accounts was accepted, one
+       -- `INSERT INTO smuggle SELECT * FROM ONLY ledger_accounts` doubled every
+       -- number in every report, both drift views stayed empty, and this census
+       -- printed `ok  no ledger table is inherited`.
+       AND c.relkind IN ('r','f','p') AND NOT c.relispartition;
     IF v_bad IS NOT NULL THEN
         RAISE EXCEPTION 'ledger table(s) are inherited, so their guards are '
                         'per-table and their views are per-hierarchy: %', v_bad;
@@ -2149,22 +2273,29 @@ END $$;
 -- A CAPTION IS COMPARED AS A READER SEES IT, and `btrim(x)` with one argument
 -- strips SPACES ONLY. Every one of these walked through the guard that claims to
 -- cover the class, needing no schema edit -- they are chart data.
+--
+-- The expect string is the FULL constraint name. All four are answered by
+-- ck_fs_lines__caption_clean, and `ck_fs_lines__caption` is a bare prefix of that
+-- AND of ck_fs_lines__caption_reserved -- so with _reserved and the UNIQUE index
+-- both dropped these four still printed `refused`, naming a guard that was not
+-- the one refusing. (Those two are covered by name further up this file; the
+-- defect here was the label, not the coverage.)
 SELECT must_fail('the reserved caption with a trailing TAB', $q$
     INSERT INTO fs_lines (code,caption,statement,side,sort_order)
     VALUES ('ws_tab', E'Undistributed earnings (since inception)\t','balance_sheet','liability_equity',9101);
-$q$, 'ck_fs_lines__caption');
+$q$, 'ck_fs_lines__caption_clean');
 SELECT must_fail('the reserved caption with a ZERO WIDTH SPACE', $q$
     INSERT INTO fs_lines (code,caption,statement,side,sort_order)
     VALUES ('ws_zwsp', E'Undistributed earnings (since inception)\u200b','balance_sheet','liability_equity',9102);
-$q$, 'ck_fs_lines__caption');
+$q$, 'ck_fs_lines__caption_clean');
 SELECT must_fail('a duplicate caption with a NON-BREAKING SPACE', $q$
     INSERT INTO fs_lines (code,caption,statement,side,sort_order)
     VALUES ('ws_nbsp', E'Cash and cash equivalents\u00a0','balance_sheet','asset',9103);
-$q$, 'ck_fs_lines__caption');
+$q$, 'ck_fs_lines__caption_clean');
 SELECT must_fail('a caption carrying a newline', $q$
     INSERT INTO fs_lines (code,caption,statement,side,sort_order)
     VALUES ('ws_nl', E'Borrowings\n','balance_sheet','liability_equity',9104);
-$q$, 'ck_fs_lines__caption');
+$q$, 'ck_fs_lines__caption_clean');
 
 -- owner_type is half of WHO an account belongs to, and was the one member of the
 -- identity tuple with no control behind it: ck_accounts__house_has_no_owner
