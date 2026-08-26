@@ -63,6 +63,11 @@ CREATE TABLE card_auth_events (
     clearing_deadline  timestamptz,
 
     CONSTRAINT pk_auth_events PRIMARY KEY (tenant_id, id),
+    -- ISO 4217 is uppercase. 0001 enforces this on entries and accounts and 0003
+    -- enforced it nowhere, so 'usd' created a SECOND hold group: held_for_company
+    -- for 'USD' reported 1000 while 500 more was live under 'usd'. Same failure the
+    -- 0001 comment describes, in the number the authorization decision is made on.
+    CONSTRAINT ck_auth_events__currency_iso CHECK (currency ~ '^[A-Z]{3}$'),
     -- sign is a property of the kind. 'advice' and 'expiry_reversal' are exempt:
     -- advice is bidirectional on some processors, and an expiry reversal is a
     -- positive delta on a release.
@@ -164,7 +169,7 @@ CREATE TABLE card_hold_groups (
     -- across denominations and reported 100.00 USD + 50.00 EUR as "held 15000" --
     -- the same vacuity removed from the accounting equation in 0002, but sitting
     -- in the authorization decision, where the number IS available credit.
-    currency    char(3) NOT NULL,
+    currency    char(3) NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
     total_minor bigint NOT NULL DEFAULT 0,
     -- The cumulative AUTHORIZED subtotal: the running sum of increase-side deltas
     -- only. A processor restating a cumulative total is restating THIS, not the

@@ -15,8 +15,9 @@ part of the product — something unrunnable is not adoptable, however correct i
 ## M0 · The conformance suite — **mostly done**
 
 [`tests/`](../tests/) exists and runs against a throwaway database via `make test-sql`:
-a full card lifecycle asserted state-by-state, the hold flow, query-plan assertions, a concurrency
-suite, and thirty-eight deliberate breakages that must each be refused. Writing it found four real defects, two of which under-reserved credit
+a full card lifecycle asserted state-by-state, the hold flow, both time axes, query-plan
+assertions, a concurrency suite, and every deliberate breakage we can think of — each of which must
+be refused, and refused for the stated reason. Writing it found four real defects, two of which under-reserved credit
 ([ADR-0010](./decisions/0010-authorization-holds.md)).
 
 One design note, learned the hard way: **counting errors is not a pass criterion.** An earlier
@@ -39,8 +40,11 @@ The properties the core must hold, at any point, against any history:
 Two of these are **not yet asserted**, and saying "the rest are" would be the kind of claim this
 project exists to avoid:
 
-- **Gaplessness.** `uq_entries__account_seq` gives duplicate-freedom, and `ck_entries__seq_positive`
-  now rules out the worst case, but nothing asserts there are no *holes*.
+- ~~**Gaplessness.**~~ Now both enforced and asserted: `ck_entries__seq` requires an entry's
+  sequence to be the one the balance upsert issued, and
+  [`tests/concurrency.sh`](../tests/concurrency.sh) asserts `max(seq) = count(*) = count(distinct
+  seq)` per account under concurrent load. This line previously said nothing asserted it, while the
+  same file said 120 lines later that concurrency.sh did.
 - **Idempotency replay.** There is no replay path to test: `idempotency_hash` is written and
   **never read**. The negative control proves only that a unique index fires — identically for a
   replay and for a different body, which is exactly the distinction the ADR says matters.

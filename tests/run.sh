@@ -25,6 +25,19 @@ done
 # -- PIPESTATUS is rewritten by the next command, so it always read 0, and dropping
 # pipefail made a hard-failing test file report PASS. Removed rather than left as a
 # safety net that isn't one.
+# A MANIFEST, not just a glob. Deleting bitemporal.sql and query_plans.sql left
+# the build printing PASS -- a dropped or renamed file is silently no coverage,
+# which is the same class of failure as a test that asserts nothing.
+EXPECTED_SUITES="bitemporal.sql card_holds.sql golden_trace.sql negative_controls.sql query_plans.sql"
+missing=""
+for want in $EXPECTED_SUITES; do
+    [ -f "tests/$want" ] || missing="$missing $want"
+done
+if [ -n "$missing" ]; then
+    echo "── MISSING SUITE(S):$missing"
+    echo "FAIL"; exit 1
+fi
+
 fail=0
 for f in tests/*.sql; do
     echo "── $f"

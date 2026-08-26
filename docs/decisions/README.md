@@ -99,7 +99,14 @@ Two rules follow, and they are cheap:
   softened — marked. "I could not check this" is a finding, not an embarrassment.
 - **Corrections get applied to the document that carries the claim**, not only to the ADR that
   discovered it. Three struck numbers stayed live in the migrations and spikes they came from,
-  while the ADRs said "fabricated — struck".
+  while the ADRs said "fabricated — struck". *This rule was itself violated the day it was
+  written*: the invented processor survey survived in `spikes/006/holds.sql`, the one file that
+  actually carries it, for a further round. `grep` the struck phrase across the whole tree, not
+  just `docs/`.
+- **A spike's own verification can be dead.** `spikes/006/cases.sql` claimed eight measured cases
+  and contained six, none of which run against the schema in the same directory. Nothing in
+  `spikes/` is executed by CI, so "measured" there means "was measured once, against something".
+  The live attestation is `tests/`.
 
 ## How this log works
 

@@ -1,6 +1,8 @@
 -- Spike 006 — holds as an append-only event log.
 --
--- v2, after surveying eleven issuer-processors. Four changes from v1, each forced
+-- v2. (An earlier version of this line said "after surveying eleven
+-- issuer-processors". NO SUCH SURVEY EXISTS -- it was invented, and is struck. This
+-- spike surveys three, below, and they disagree; that disagreement is the finding.) Four changes from v1, each forced
 -- by something a vendor documents in their own schema.
 
 BEGIN;
@@ -39,7 +41,7 @@ CREATE TABLE card_auth_events (
     card_id       text NOT NULL,
     kind          auth_event_kind NOT NULL,
 
-    -- (3) SIX OF ELEVEN PROCESSORS SEND AN ABSOLUTE TOTAL, NOT A DELTA.
+    -- (3) PROCESSORS DISAGREE: SOME SEND AN ABSOLUTE TOTAL, SOME A DELTA.
     -- Stripe rewrites `amount` in place; Galileo "presents the cumulative amount";
     -- Synctera sends total_amount; Unit's amountChanged carries no delta at all.
     -- Increase's card_fuel_confirmation has NO amount field -- only
