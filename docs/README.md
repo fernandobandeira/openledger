@@ -52,6 +52,20 @@ reference product. The card is not a demo — it is what forced the hard parts: 
 reserve money without moving it, clearings that move it, and processor messages that arrive out of
 order, twice, or never.
 
+## The three diagrams
+
+The board draws these inline; they are also here as standalone files, which is what makes them
+readable on GitHub and reusable in a slide. **A second copy is a copy that drifts**, and this one
+already has: `03-state-machines.svg` was updated for [0008](./decisions/0008-durable-timers.md) and
+the board's own copy was not, so on that one diagram *this* is the current drawing and the board is
+stale. On the other two the board is canonical.
+
+| | |
+| --- | --- |
+| ![Architecture](./diagrams/01-architecture.svg) | **01 — Architecture.** Same as the board's §02. |
+| ![The authorization hot path](./diagrams/02-auth-hot-path.svg) | **02 — The auth hot path.** Same as the board's §03. The ~1s deadline and the 300 ms p99 budget. |
+| ![State machines](./diagrams/03-state-machines.svg) | **03 — State machines.** **Updated for 0008; the board's copy still says Temporal.** |
+
 ## Two rules run through everything
 
 - **Correctness is not configurable.** No flag turns an invariant off. *Where* each one is enforced
