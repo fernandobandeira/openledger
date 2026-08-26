@@ -24,7 +24,7 @@ sentence below uses it:
 
 **1. Stored amounts are always deltas.** The adapter converts its processor's convention *at the
 boundary*, under the group's lock, before the row is written. The derivation is then a plain `SUM` —
-commutative, and order-tolerant by construction rather than by timestamp.
+commutative, and order-tolerant by construction rather than by timestamp — with two qualifications, both under *Known*: a convention mix, and an `expiry_reversal` racing our own sweep.
 
 **2. Group membership is a separate bitemporal table.** There is deliberately no `group_key` column on
 the event. Re-grouping is routine — a clearing arrives unmatched and is attached later, a mis-grouped
@@ -66,7 +66,7 @@ agree across messages, so grouping is an *inference*, and inferences get correct
 rely solely on network reference IDs to correlate authorization and clearing events. Network
 identifiers are not guaranteed to be consistent across the lifecycle of a transaction"* — and they ship
 an unmatched queue rather than guessing, with out-of-order clearing a routine sequence in their message
-table, not an edge case. *(Quoted in spike 008; no URL — unverified.)*
+table, not an edge case. *([spike 008](../../spikes/008-processor-hold-semantics/README.md) carries the URL; re-fetched and matched verbatim.)*
 
 **Processors disagree on delta versus cumulative total, with no norm to fall back on.** Adyen and
 Pismo send deltas; Lithic, Galileo, Column and Unit send restated totals; Treasury Prime sends
@@ -82,8 +82,9 @@ to reverse what they do not capture and many do not. Order tolerance is what let
 **Two divergences from the field, both deliberate.** About half the systems surveyed write a durable,
 balance-affecting row at authorization time, so *"an authorization writes no ledger entry" is a product
 choice, not a domain law* — the unqualified claim is that **an authorization posts nothing to a balance
-anyone is owed against.** And **every processor surveyed models expiry as an event**, where property 3
-uses a flag.
+anyone is owed against.** And **six of the thirteen model expiry as a release event** where property 3
+uses a flag — Pismo and Column document no expiry release at all, and TigerBeetle expires as an engine
+operation, so this is a minority position rather than a solitary one.
 
 ## Alternatives
 
@@ -101,10 +102,10 @@ uses a flag.
 | **Serialised per group** | Ingest, repair and re-grouping each take the group's lock — contention is per authorization, which is not a hot row. Re-grouping locks the event row first, then both groups in `group_key` order, materialising the destination at its place in that order. |
 | **A foreign key takes a lock on your behalf, in an order you did not choose** | The membership insert takes an implicit `FOR KEY SHARE` on the event through `fk_event_group__event`, so a lock-ordering argument counting only the locks written in the function is not an argument. This is the most expensive trap here. Every symptom was a deadlock, and deadlocks abort cleanly: they cost availability, not correctness. An advisory lock over the message key space is **not** the fix — it produced 6 deadlocks in 6 trials where the unmodified code produced 0, because a lock taken before the natural one adds an ordering rather than removing one. |
 | **Mixing conventions in one group is irreconcilable** | `{authorization +100.00 as a delta, incremental 120.00 as a total}` yields 120.00 in one arrival order and 220.00 in the other, because a total arriving before the delta it restates carries nothing saying it already includes it. Only refusing the mix can fix it. Within one convention, deltas commute and totals resolve to the maximum seen. An adapter should prefer an explicit total field over inferring the convention — Stripe, Increase, Galileo and Treasury Prime each send **both** in one message. |
-| **A cumulative total cannot be re-grouped** | Its stored delta is relative to the source group's base at the moment it arrived, and that base is not recoverable. |
+| **A cumulative total cannot be re-grouped *mid-group*** | Its stored delta is relative to the source group's base at the moment it arrived, and that base is not recoverable. **The blanket refusal is over-broad**: `raw_amount` and `raw_is_total` are kept verbatim on the event precisely so the wire value survives normalisation, so splitting a totals event to a *new, empty* group recovers exactly — `delta = raw_amount − 0`. The refusal should be narrowed to a destination that already has a base. See the first *Known* entry below, which the current rule makes uncorrectable. |
 | **A group row cannot be deleted** | `expired_at`, its snapshots and `low_water_minor` are not in the log, so rebuilding one invents them: an expired group came back live with its post-expiry alarm permanently disarmed. Materialisations may be rewritten; state that is not a materialisation may not be removed. |
 | **A group carries one currency, with no default** | Summing minor units across denominations reported 100.00 USD + 50.00 EUR as "held 15000" — the vacuity [0009](./0009-chart-and-completeness.md) removed from the accounting equation, sitting where the number *is* available credit. |
-| **Three things the model cannot express** | A **single-message transaction** (Lithic's `FINANCIAL_AUTHORIZATION`, Marqeta's `auth_plus_capture`; PIN-debit or ATM volume breaks the model). An **end-of-sequence indicator**, which several processors send and which ends a group without waiting for expiry. And **a hold that differs from the authorized amount** (Stripe holds $100 on a $1 fuel check), since `held_minor` is the sum of authorization deltas. Each needs a design decision. |
+| **Three things the model cannot express** | A **single-message transaction** (Lithic's `FINANCIAL_AUTHORIZATION`, Marqeta's `auth_plus_capture`; PIN-debit or ATM volume breaks the model). An **end-of-sequence indicator**, which several processors send and which ends a group without waiting for expiry. And **a hold that differs from the authorized amount** (Stripe holds $100 on a $1 fuel check): there is no independent hold field — `held_minor` is `GREATEST(total_minor, 0)`, and `total_minor` is the *net* of every delta, so it cannot be set apart from what the messages say. Each needs a design decision. |
 | **Expiry windows are policy, not protocol** | Our release timer is not the network's clearing deadline — that clock drives dispute eligibility and does not extend on an increment. Visa Core Rules (public PDF, 18 Apr 2026) §5.7.3.5 Table 5-12: card-present **5 calendar days**, card-absent 10, extended/estimated 30, from *"the date of a valid Authorization"*; rule **0031022**: *"An Incremental Authorization Request does not extend the processing timeframes in Table 5-12."* Region-variable, so it is policy input, not a constant to hard-code. |
 | **STIP and fuzzy matching are unmodelled** | Stand-in processing produces authorizations we never saw. The schema records *which* method assigned a group (`lifecycle_id`, `rrn`, `fuzzy`, `manual`) and keeps the trail, but the matcher is not built. |
 
@@ -112,6 +113,59 @@ The ledger itself takes no dependency on any of this: holds are a product-layer 
 core, and the core does not know they exist.
 
 ## Known, and not fixed
+
+**A cumulative-total group cannot be corrected once something is mis-grouped into it, and neither
+watcher can see it.** A second, genuinely different authorization fuzzy-matched into an existing
+`total_convention = 'total'` group computes its delta as `wire − authorized_minor`. For an equal
+amount that is **zero**. Reproduced against the schema:
+
+```
+ processor_msg_id |     kind      | wire  | raw_is_total | stored_delta
+ msg-1            | authorization | 10000 | t            |        10000
+ msg-2            | authorization | 10000 | t            |            0
+
+ TRUE live exposure  20000        REPORTED held_minor  10000
+ card_hold_drift: 0 rows          card_auth_unmatched: 0 rows
+```
+
+Every watcher is blind, and each for a reason worth stating. `card_hold_drift` is silent because the
+log **genuinely contains the zero** — the materialisation is perfectly faithful to a log that has
+already lost the money. The convention disjunct is silent because `any_total`/`any_delta` filter
+`amount_delta <> 0`, so a zero-delta event is excluded from the one check that inspects it. The
+review queue is silent because the event *has* a live membership. And re-grouping it out is refused
+by the rule above.
+
+The loss is not $100 — it is the destination's `authorized_minor` at match time, so it is bounded
+only by what the group had already accumulated. A *smaller* second authorization computes a negative
+delta and dies on `ck_auth_events__sign`: **the safe case errors, the dangerous case is silent.**
+
+The narrowing in *What it costs* is the start of a fix — splitting to a new empty group is exactly
+recoverable from `raw_amount`. What is still missing is anything that *notices*.
+
+**`held_minor` is order-dependent when an `expiry_reversal` races our own sweep, and the
+under-reserving order is the likely one.** An `expiry_reversal` carries a zero delta because expiry
+never subtracted anything. But the expiry flag is set by *our* sweep, on a clock the log does not
+order. Same two facts, two orders:
+
+```
+ group | live_exposure | reported_held
+ G-A   |         10000 |         10000    sweep first, then expiry_reversal
+ G-B   |         10000 |             0    expiry_reversal first, then sweep
+```
+
+An early-arriving reversal is a no-op clearing a flag that is not set, and it leaves nothing behind:
+an `expiry_reversal` is deliberately **not** increase-side, so it cannot re-open the group the way a
+zero-delta restatement can. The sweep then expires against live exposure and `held_minor` goes to 0.
+
+**Early arrival is the expected case, not an edge case** — our hold is typically 7 days where Visa's
+card-present window is 5, so processor-side expiry activity lands *inside* our window by design.
+
+This **qualifies property 1**. The `SUM` is commutative; `held_minor` is the `SUM` gated by a flag
+set out-of-band, and that gate is not ordered by the log. Property 3's "expiry is a flag" is where
+the order-dependence enters. The fix is a design decision — record that a reversal was seen in a form
+the sweep must consult, or make expiry itself an event and accept the read-modify-write — and neither
+is taken here.
+
 
 Recorded rather than closed, because each needs a design decision rather than a guard:
 
