@@ -15,8 +15,8 @@ startup and not from goose's CLI.**
   with a different command. It applies migrations and exits.
 - It runs as a **pre-deploy job** — a Kubernetes `Job`, a Helm `pre-upgrade` hook, an ECS one-off
   task — that must succeed before the new pods roll. The ledger process never migrates.
-- `schema/schema.sql` becomes `migrations/00001_baseline.sql`, **with its own `BEGIN;`/`COMMIT;`
-  removed**.
+- `schema/schema.sql` becomes `migrations/00001_baseline.sql`. It carries no `BEGIN;`/`COMMIT;` of its
+  own, deliberately.
 - Migrations are embedded with `//go:embed` and applied by
   `goose.NewProvider(dialect, db, fsys, goose.WithSessionLocker(...))`.
 - `-- +goose NO TRANSACTION` marks the migrations that must run outside a transaction.

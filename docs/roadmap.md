@@ -222,7 +222,7 @@ place is owning the *sweep* that consolidates suspense accounts, and draining ev
   constraint they actually have, which is precisely what tenant-leading keys bought. Not now
   because there is no in-place `ALTER TABLE` conversion, and it buys per-tenant `DETACH` rather
   than throughput: table size barely affects an append-only workload.
-- **Caching balances.** `posted` is read straight off the ledger, so there is no copy to drift.
+- **Caching balances.** `posted` is read straight off the ledger. `ledger_account_balances` ships as the write-side serialisation point and an O(1) read, so there *is* a second copy — it is rebuildable from the journal, and a drift view is what keeps it honest.
 - **Multi-currency FX.** The schema carries currency and balances per currency; conversion is a
   separate problem with its own ADR.
 - **A scripting language for transactions**, and configurable correctness in any form.
