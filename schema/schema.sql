@@ -103,7 +103,7 @@ CREATE TABLE fs_lines (
     -- space passed the reservation, and one-argument btrim() let a tab, a newline,
     -- an NBSP or a zero-width space through the version that replaced it -- each
     -- time putting customer suspense under a line pixel-identical to the derived
-    -- earnings plug, balanced, with both drift views empty.
+    -- earnings plug, balanced, with the drift views empty.
     --
     -- IT DOES NOT MAKE A CAPTION SAFE TO KEY ON, and the claim that it compared
     -- "as a reader sees it" was not something a CHECK can do. One codepoint
@@ -147,7 +147,7 @@ CREATE TABLE fs_lines (
     -- take that caption and be accepted. Measured -- 44,000.00 of customer
     -- suspense liability booked to such a line, and a reader grouping by caption
     -- saw 268,000.00 of current year earnings against a true 224,000.00, with
-    -- `balanced = t` and both drift views empty.
+    -- `balanced = t` and the drift views empty.
     CONSTRAINT ck_fs_lines__caption_reserved
         CHECK (lower(btrim(caption, E' \t\n\r\u00a0\u200b\u2007\u202f'))
                  <> 'undistributed earnings (since inception)'),
@@ -831,7 +831,7 @@ UNION ALL
 -- no year to be current within. Calling it "Current year earnings" made a ledger
 -- holding three years of activity present 34,000.00 under that caption against a
 -- true current year of 4,000.00: an 8.5x overstatement that grows without bound
--- with the age of the book, with `balanced = t` and both drift views empty.
+-- with the age of the book, with `balanced = t` and the drift views empty.
 -- `retained_earnings` sits in the chart at sort_order 800 and stays at zero
 -- forever, because nothing routes to it.
 --

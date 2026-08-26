@@ -32,7 +32,7 @@ reporting run overlapping a batched posting run is an ordinary Tuesday.
 
 **It has been reproduced** with nothing but the app role's ordinary INSERT grants: one recorded-axis
 report, run either side of one concurrent commit, gave revenue **110,000.00 then 160,000.00** —
-`balanced` both times, both drift views empty.
+`balanced` both times, the drift views empty.
 
 **A bare `bigserial` doesn't help.** Sequence values are handed out at *insert* time, so the same
 interleaving leaves gaps that fill in afterwards — `max(seq)` is not yet gap-free. Hence a watermark.
@@ -84,7 +84,7 @@ ledger by adding workers would make it slower, which is the least debuggable fai
   write concurrency.
 - **The query layer is not bitemporal yet, though storage is.** `accounting_equation` takes one
   instant and one axis, so *the effective-axis February close as known on 1 March* cannot be
-  expressed; `balance_sheet`, `income_statement` and `balance_sheet_balances` have no date predicate.
+  expressed; `balance_sheet`, `income_statement` and the balance-sheet roll-up have no date predicate.
 - It composes with [0004](./0004-event-log.md)'s deferred hash chain, which needs a total order.
 
 ## Why this is still `proposed`

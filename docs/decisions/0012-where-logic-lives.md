@@ -18,7 +18,7 @@ schema beside it:
 3. **what it does NOT protect against**, said out loud rather than implied.
 
 Two invariants clear that bar, as eight trigger objects over two functions: append-only and
-`TRUNCATE`-refusal on the four immutable logs. Twenty-five other triggers did not.
+`TRUNCATE`-refusal on the four immutable logs. Nineteen others did not — the table below sums 27 removed-or-kept, with 4 + 4 kept.
 
 The sharper version of the bar, adopted from Formance's own line between what they deleted and what
 they kept:
@@ -114,7 +114,7 @@ The write-path invariants hold only against writers that are the Go service:
   implemented as triggers** and are skipped there too;
 - **a second adapter** written later that talks to the tables instead of the service.
 
-The two surviving triggers are marked `ENABLE ALWAYS`, which the manual documents as firing
+The eight surviving trigger objects are marked `ENABLE ALWAYS`, which the manual documents as firing
 *"regardless of the current replication role"* — demonstrated by counterexample rather than asserted:
 with `ENABLE ALWAYS` removed, `SET session_replication_role='replica'; DELETE FROM ledger_events`
 deletes the row; with it, the same statement is refused.

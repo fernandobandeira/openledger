@@ -103,7 +103,7 @@ claim.)*
   0.00 on the golden trace with every check green, because reports join through the type while the
   guard only fired on the account.
 - **`trial_balance` still enumerates inward** and is the wrong thing to build a completeness claim
-  on. `accounting_equation` has been rebuilt to enumerate `FROM ledger_accounts` with the entry
+  on. the accounting equation was rebuilt, in the SQL implementation 0012 deleted, to enumerate `FROM ledger_accounts` with the entry
   aggregate left-joined on, like `balance_sheet`; `trial_balance` has not.
 - **A mis-typed reporting axis raises** rather than returning an empty, balanced report — which is
   the right failure, but it is a failure at read time rather than an unrepresentable state.
