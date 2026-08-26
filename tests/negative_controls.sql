@@ -808,6 +808,93 @@ BEGIN
     RAISE NOTICE 'ok  a scope with accounts and no entries reports zeros, not nothing';
 END $$;
 
+-- ---------------------------------------------------------------- ENABLE ALWAYS
+--
+-- "A subscriber must enforce the same invariant as its publisher, or replication
+-- is a laundering channel for corrupt rows." That property was attested for ONE
+-- trigger out of six: only ck_entries__balances had a replica-role control, so
+-- dropping ENABLE ALWAYS from any of the others was free.
+--
+-- session_replication_role='replica' is the logical-replication apply path and
+-- what `pg_restore --disable-triggers` sets.
+
+SELECT must_fail('replica: a transaction with too few entries', $q$
+    SET LOCAL session_replication_role = 'replica';
+    SELECT txn('t1','repl_empty');
+$q$, 'needs at least two');
+RESET ROLE;
+
+SELECT must_fail('replica: appending to a committed transaction', $q$
+    SET LOCAL session_replication_role = 'replica';
+    INSERT INTO ledger_events (tenant_id,kind,source,idempotency_key,idempotency_hash,
+                               payload,effective_at)
+    VALUES ('t1','neg','internal','repl_seal',sha256(convert_to('repl_seal','UTF8')),'{}',now());
+    INSERT INTO ledger_transactions (tenant_id,id,event_id,kind,status,effective_at,xact_id)
+    SELECT 't1','0c0c0c0c-0000-7000-8000-00000000c0de',id,'neg','posted',now(),
+           pg_current_xact_id()::text::bigint - 1
+      FROM ledger_events WHERE tenant_id='t1' AND idempotency_key='repl_seal';
+    INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
+                                currency,account_seq,balance_after,effective_at)
+    SELECT 't1','0c0c0c0c-0000-7000-8000-00000000c0de',
+           acct('t1','customer_receivable'),'debit',10,'USD',900,10,
+           (SELECT effective_at FROM ledger_transactions
+             WHERE id='0c0c0c0c-0000-7000-8000-00000000c0de');
+$q$, 'sealed');
+RESET ROLE;
+
+SELECT must_fail('replica: an account disagreeing with its type', $q$
+    SET LOCAL session_replication_role = 'replica';
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    VALUES ('t1','house',NULL,'fbo_cash','liability','credit','USD');
+$q$, 'but type');
+RESET ROLE;
+
+SELECT must_fail('replica: re-pointing an account that has entries', $q$
+    SET LOCAL session_replication_role = 'replica';
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    SELECT 't4','house',NULL,code,category,normal_balance,'USD'
+      FROM account_types WHERE code IN ('interchange_revenue','customer_receivable');
+    DO $d$ DECLARE t uuid := txn('t4','rp_repl'); BEGIN
+        PERFORM entry('t4', t, acct('t4','customer_receivable'), 'debit',  200);
+        PERFORM entry('t4', t, acct('t4','interchange_revenue'), 'credit', 200);
+    END $d$;
+    SET CONSTRAINTS ALL IMMEDIATE;
+    UPDATE ledger_accounts SET purpose='fee_revenue'
+     WHERE tenant_id='t4' AND purpose='interchange_revenue';
+$q$, 'cannot re-point');
+RESET ROLE;
+
+SELECT must_fail('replica: reclassifying a type that has accounts', $q$
+    SET LOCAL session_replication_role = 'replica';
+    UPDATE account_types SET category='expense', normal_balance='debit'
+     WHERE code='interchange_revenue';
+$q$, 'cannot reclassify');
+RESET ROLE;
+
+SELECT must_fail('replica: moving a statement line', $q$
+    SET LOCAL session_replication_role = 'replica';
+    UPDATE fs_lines SET statement='balance_sheet' WHERE code='revenue';
+$q$, 'cannot move statement line');
+RESET ROLE;
+
+SELECT must_fail('replica: a client-chosen account_seq', $q$
+    SET LOCAL session_replication_role = 'replica';
+    DO $d$ DECLARE t uuid := txn('t1','repl_seq'); BEGIN
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit', 5, 'USD', 777);
+    END $d$;
+$q$, 'was not issued by the balance upsert');
+RESET ROLE;
+
+SELECT must_fail('replica: mutating a committed transaction', $q$
+    SET LOCAL session_replication_role = 'replica';
+    DO $d$ DECLARE t uuid := txn('t1','repl_mut'); BEGIN
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  15);
+        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 15);
+        UPDATE ledger_transactions SET kind='changed' WHERE id = t;
+    END $d$;
+$q$, 'is immutable');
+RESET ROLE;
+
 DO $$ BEGIN RAISE NOTICE 'ok  every breakage above was refused, for the stated reason'; END $$;
 
 ROLLBACK;
