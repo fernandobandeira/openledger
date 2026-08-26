@@ -748,13 +748,11 @@ $q$, 'fk_txn__event');
 -- assertion read it -- so flipping the flagship contra account, the one the chart
 -- cites as proof that normal_balance is not derivable from category, was invisible
 DO $$
-DECLARE v_presented bigint; v_arith bigint;
+DECLARE v_presented bigint; v_arith bigint; t uuid;
 BEGIN
-    PERFORM entry('t1', txn('t1','contra_pair'), acct('t1','credit_loss_expense'), 'debit', 700);
-    PERFORM entry('t1', (SELECT id FROM ledger_transactions WHERE tenant_id='t1'
-                          AND event_id=(SELECT id FROM ledger_events
-                                         WHERE idempotency_key='contra_pair')),
-                  acct('t1','allowance_for_credit_losses'), 'credit', 700);
+    t := txn('t1','contra_pair');
+    PERFORM entry('t1', t, acct('t1','credit_loss_expense'),         'debit',  700);
+    PERFORM entry('t1', t, acct('t1','allowance_for_credit_losses'), 'credit', 700);
     SET CONSTRAINTS ALL IMMEDIATE;
     SELECT balance_minor, balance_debit_positive INTO v_presented, v_arith
       FROM trial_balance WHERE tenant_id='t1' AND purpose='allowance_for_credit_losses';
@@ -764,6 +762,50 @@ BEGIN
             v_presented, v_arith;
     END IF;
     RAISE NOTICE 'ok  a contra asset presents +700 and computes -700';
+END $$;
+
+-- ---------------------------------------------------------------- completeness
+--
+-- ADR-0009's headline -- "reports enumerate from the chart outward" -- was not
+-- attested at all: turning the CROSS JOIN into an INNER JOIN, and reverting the
+-- scope set from ledger_accounts back to ledger_entries, both left the suite green.
+-- Every balance-sheet assertion was a BALANCING assertion, and a report that drops
+-- a line or a whole scope still balances.
+
+-- a statement line with NO activity must appear as a zero, not vanish
+DO $$
+DECLARE n int;
+BEGIN
+    SELECT count(*) INTO n FROM balance_sheet
+     WHERE tenant_id='t1' AND currency='USD' AND fs_line='customer_funds' AND amount_minor = 0;
+    IF n <> 1 THEN
+        RAISE EXCEPTION 'a balance-sheet line with no activity did not appear as zero (got % rows)', n;
+    END IF;
+    SELECT count(*) INTO n FROM income_statement
+     WHERE tenant_id='t1' AND currency='USD' AND fs_line='interest' AND amount_minor = 0;
+    IF n <> 1 THEN
+        RAISE EXCEPTION 'an income-statement line with no activity did not appear as zero (got %)', n;
+    END IF;
+    RAISE NOTICE 'ok  statement lines with no activity report zero rather than vanishing';
+END $$;
+
+-- ...and a SCOPE that has been opened but has not posted must appear too. This is
+-- the dropped-sub-book threat ADR-0009 names as the real one.
+DO $$
+DECLARE n int;
+BEGIN
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    SELECT 'ghost','house',NULL,code,category,normal_balance,'USD'
+      FROM account_types WHERE code='operating_cash';
+    SELECT count(*) INTO n FROM balance_sheet WHERE tenant_id='ghost';
+    IF n = 0 THEN
+        RAISE EXCEPTION 'a scope with accounts but no entries vanished from the balance sheet';
+    END IF;
+    SELECT count(*) INTO n FROM accounting_equation('ghost');
+    IF n <> 1 THEN
+        RAISE EXCEPTION 'the equation returned % rows for a scope with no entries', n;
+    END IF;
+    RAISE NOTICE 'ok  a scope with accounts and no entries reports zeros, not nothing';
 END $$;
 
 DO $$ BEGIN RAISE NOTICE 'ok  every breakage above was refused, for the stated reason'; END $$;

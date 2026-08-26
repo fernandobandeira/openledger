@@ -43,11 +43,22 @@ FROM (VALUES
   ('t1',       'house',   NULL,        'due_from_treasury'),
   ('t1',       'platform','platform_a','platform_rev_share_payable'),
   ('t1',       'house',   NULL,        'platform_rev_share_expense'),
+  -- opened but never posted to by the trace, so it appears in no expectation set.
+  -- The stray-posting check at the end needs somewhere legitimate to go wrong.
+  ('t1',       'house',   NULL,        'fee_revenue'),
   ('_treasury','bank_account','bank_a','operating_cash'),
   ('_treasury','house',   NULL,        'paid_in_capital'),
   ('_treasury','house',   NULL,        'due_to_tenants')
 ) AS v(tenant,otype,oid,purpose)
 JOIN account_types t ON t.code = v.purpose;
+
+-- The same PURPOSE in a second currency. Without this the trace is 100% USD, so
+-- expect_state's per-currency logic is dead code and trial_balance can be made
+-- currency-blind undetected -- the exact vacuity 0002 exists to remove, in the
+-- assertion that checks it.
+INSERT INTO ledger_accounts (tenant_id, owner_type, owner_id, purpose, category, normal_balance, currency)
+SELECT 't1', 'house', NULL, t.code, t.category, t.normal_balance, 'EUR'
+FROM account_types t WHERE t.code IN ('interchange_revenue','customer_receivable');
 
 -- ------------------------------------------------------------------ posting
 --
@@ -88,7 +99,11 @@ BEGIN
                      p_legs[(i-1)*3+2]::ledger_direction AS dir,
                      p_legs[(i-1)*3+3]::bigint AS amt
               FROM generate_series(1, array_length(p_legs,1)/3) AS i) l
+        -- currency is part of the lookup: once the same purpose exists in two
+        -- currencies, a purpose alone no longer identifies an account, and posting
+        -- a USD leg against the EUR row is a foreign-key violation at best
         JOIN ledger_accounts a ON a.tenant_id = p_tenant AND a.purpose = l.purpose
+                              AND a.currency = 'USD'
         ORDER BY a.id
     LOOP
         INSERT INTO ledger_account_balances AS b (tenant_id, account_id, currency, input, output, last_seq)
@@ -354,6 +369,55 @@ SELECT expect_state('08 repayment complete', ARRAY[
   't1|facility_borrowings|0', 't1|interest_expense|354',
   't1|accrued_interest_payable|0', 't1|ach_pull_returnable|0']);
 
+-- A EUR clearing, so the final state carries two currencies for one purpose.
+CREATE FUNCTION post_eur(p_key text, p_legs text[]) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE v_event uuid; v_txn uuid; r record; v_seq bigint; v_bal bigint;
+BEGIN
+    INSERT INTO ledger_events (tenant_id,kind,source,idempotency_key,idempotency_hash,payload,effective_at)
+    VALUES ('t1','trace','internal',p_key,sha256(convert_to(p_key,'UTF8')),'{}',now())
+    RETURNING id INTO v_event;
+    INSERT INTO ledger_transactions (tenant_id,event_id,kind,status,effective_at)
+    VALUES ('t1',v_event,'trace','posted',now()) RETURNING id INTO v_txn;
+    FOR r IN SELECT a.id AS account_id, l.dir, l.amt
+             FROM (SELECT p_legs[(i-1)*3+1] AS purpose,
+                          p_legs[(i-1)*3+2]::ledger_direction AS dir,
+                          p_legs[(i-1)*3+3]::bigint AS amt
+                   FROM generate_series(1, array_length(p_legs,1)/3) AS i) l
+             JOIN ledger_accounts a ON a.tenant_id='t1' AND a.purpose=l.purpose
+                                   AND a.currency='EUR'
+             ORDER BY a.id
+    LOOP
+        INSERT INTO ledger_account_balances AS b (tenant_id,account_id,currency,input,output,last_seq)
+        VALUES ('t1',r.account_id,'EUR',
+                CASE WHEN r.dir='debit'  THEN r.amt ELSE 0 END,
+                CASE WHEN r.dir='credit' THEN r.amt ELSE 0 END,1)
+        ON CONFLICT (tenant_id,account_id,currency) DO UPDATE
+           SET input=b.input+EXCLUDED.input, output=b.output+EXCLUDED.output,
+               last_seq=b.last_seq+1
+        RETURNING b.last_seq, b.input-b.output INTO v_seq, v_bal;
+        INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
+                                    currency,account_seq,balance_after,effective_at)
+        VALUES ('t1',v_txn,r.account_id,r.dir,r.amt,'EUR',v_seq,v_bal,
+                (SELECT effective_at FROM ledger_transactions WHERE id=v_txn));
+    END LOOP;
+END $$;
+
+SELECT post_eur('evt_clear_eur', ARRAY['customer_receivable','debit','4000',
+                                       'interchange_revenue','credit','4000']);
+SELECT expect_state('a EUR clearing, alongside the USD books', ARRAY[
+  '_treasury|operating_cash|6876', '_treasury|paid_in_capital|6600',
+  '_treasury|due_to_tenants|276',
+  't1|customer_receivable|0', 't1|network_settlement_payable|0',
+  't1|interchange_revenue|900', 't1|platform_rev_share_expense|270',
+  't1|platform_rev_share_payable|0', 't1|due_from_treasury|276',
+  't1|facility_borrowings|0', 't1|interest_expense|354',
+  't1|accrued_interest_payable|0', 't1|ach_pull_returnable|0',
+  -- the same purposes again, in EUR. If the assertion or trial_balance summed
+  -- across currencies these would merge into the USD rows and the trace would
+  -- still pass.
+  't1|customer_receivable|EUR|4000', 't1|interchange_revenue|EUR|4000']);
+
 -- ------------------------------------------------------------------ the result
 --
 -- The program earned 9.00 of interchange and spent 2.70 of rev share and 3.54 of
@@ -365,12 +429,14 @@ DO $$
 DECLARE v_profit bigint; v_due bigint;
 BEGIN
     -- debit-positive: revenue carries a negative sign and expense a positive one,
-    -- so profit is the NEGATED sum of the two.
+    -- so profit is the NEGATED sum of the two. PER CURRENCY -- this summed across
+    -- them, which is the vacuity 0002 exists to remove, in the assertion the trace
+    -- calls its most meaningful.
     SELECT -COALESCE(SUM(balance_debit_positive)
                      FILTER (WHERE category IN ('revenue','expense')), 0)
-      INTO v_profit FROM trial_balance WHERE tenant_id='t1';
+      INTO v_profit FROM trial_balance WHERE tenant_id='t1' AND currency='USD';
     SELECT balance_debit_positive INTO v_due FROM trial_balance
-     WHERE tenant_id='t1' AND purpose='due_from_treasury';
+     WHERE tenant_id='t1' AND currency='USD' AND purpose='due_from_treasury';
     -- IS DISTINCT FROM, not <>. Pointed at an account that does not exist, v_due is
     -- NULL, `0 <> NULL` is NULL, and the assertion silently passed -- including on
     -- an empty database.
@@ -410,8 +476,11 @@ BEGIN
         RAISE NOTICE 'ok  balance sheet %/%: assets % = liabilities + equity %',
             r.tenant_id, r.currency, r.assets, r.liabilities_and_equity;
     END LOOP;
-    IF n <> 2 THEN
-        RAISE EXCEPTION 'expected a balance sheet for both scopes, got %', n;
+    -- three now: _treasury/USD, t1/USD and t1/EUR. The count is asserted rather
+    -- than left open because it is the only thing standing between a dropped scope
+    -- and a green suite.
+    IF n <> 3 THEN
+        RAISE EXCEPTION 'expected a balance sheet for every scope, got %', n;
     END IF;
 END $$;
 
@@ -450,10 +519,69 @@ BEGIN
                 r.tenant_id, r.currency, r.earnings;
         END IF;
     END LOOP;
-    IF n < 2 THEN
+    IF n <> 3 THEN
         RAISE EXCEPTION 'expected an income statement per scope, got %', n;
     END IF;
     RAISE NOTICE 'ok  income statement ties to the balance sheet in % scope(s)', n;
+END $$;
+
+
+-- The income statement must depend on the CHART, not merely be self-consistent.
+--
+-- The tie-out below compares (side='credit' ? -1 : 1) * v against
+-- SUM(side='credit' ? +amount : -amount) -- and those two `side` factors CANCEL,
+-- so both sides evaluate to -v whatever the chart says. Moving interchange to a
+-- cost-of-revenue line, or flipping the revenue line's side, tied perfectly. This
+-- asserts the caption an amount actually lands under.
+DO $$
+DECLARE v_rev bigint; v_cost bigint; v_int bigint;
+BEGIN
+    SELECT amount_minor INTO v_rev  FROM income_statement
+     WHERE tenant_id='t1' AND currency='USD' AND fs_line='revenue';
+    SELECT amount_minor INTO v_cost FROM income_statement
+     WHERE tenant_id='t1' AND currency='USD' AND fs_line='cost_of_revenue';
+    SELECT amount_minor INTO v_int  FROM income_statement
+     WHERE tenant_id='t1' AND currency='USD' AND fs_line='interest';
+    IF v_rev <> 900 THEN
+        RAISE EXCEPTION 'interchange is not reporting on the Revenue line: got %', v_rev;
+    END IF;
+    IF v_cost <> 270 THEN
+        RAISE EXCEPTION 'the rev share is not reporting on Cost of revenue: got %', v_cost;
+    END IF;
+    IF v_int <> 354 THEN
+        RAISE EXCEPTION 'interest is not reporting on Interest expense: got %', v_int;
+    END IF;
+    RAISE NOTICE 'ok  each amount reports under its own caption: rev %, cost %, interest %',
+        v_rev, v_cost, v_int;
+END $$;
+
+-- expect_state's UNEXPECTED branch -- the one its own comment calls "the mutation
+-- catch" -- was DEAD: no step in this trace ever produces an account outside the
+-- expectation set, so deleting the branch changed nothing. Here is a step that does.
+DO $$
+DECLARE v_caught text;
+BEGIN
+    PERFORM post('t1','stray_posting', ARRAY['fee_revenue','credit','50',
+                                             'customer_receivable','debit','50']);
+    BEGIN
+        PERFORM expect_state('this must not pass', ARRAY[
+          '_treasury|operating_cash|6876', '_treasury|paid_in_capital|6600',
+          '_treasury|due_to_tenants|276',
+          't1|customer_receivable|50', 't1|network_settlement_payable|0',
+          't1|interchange_revenue|900', 't1|platform_rev_share_expense|270',
+          't1|platform_rev_share_payable|0', 't1|due_from_treasury|276',
+          't1|facility_borrowings|0', 't1|interest_expense|354',
+          't1|accrued_interest_payable|0', 't1|ach_pull_returnable|0',
+          't1|customer_receivable|EUR|4000', 't1|interchange_revenue|EUR|4000']);
+        RAISE EXCEPTION 'expect_state accepted a state containing an account it was '
+            'not told about -- the UNEXPECTED branch is dead';
+    EXCEPTION WHEN OTHERS THEN
+        GET STACKED DIAGNOSTICS v_caught = MESSAGE_TEXT;
+        IF position('UNEXPECTED t1/fee_revenue' in v_caught) = 0 THEN
+            RAISE EXCEPTION 'expect_state failed, but not on the stray account: %', v_caught;
+        END IF;
+    END;
+    RAISE NOTICE 'ok  expect_state catches an account it was not told about';
 END $$;
 
 ROLLBACK;
