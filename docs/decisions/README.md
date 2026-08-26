@@ -75,7 +75,7 @@ Measured against a fresh load of [`schema/schema.sql`](../../schema/schema.sql),
 - **Append-only on the four immutable logs**, by trigger, `ENABLE ALWAYS`, so it holds on the
   replication apply path too. `TRUNCATE` refused on the same four.
 - Uniqueness — `uq_events__idempotency`, `uq_event_group__current` (one live membership per event),
-  `uq_accounts__house` (one house account per tenant), and **`uq_entries__account_seq`**, the
+  `uq_accounts__house` (one house account per tenant, purpose and currency), and **`uq_entries__account_seq`**, the
   journal's per-account sequence, which is arguably its most important key.
 - Three more single-row rules worth naming because they are easy to miss: `ck_balances__non_negative`
   on the cache, `ck_txn__no_self_reference`, and `ck_txn__not_both` (a transaction may resolve or
@@ -102,10 +102,10 @@ Undecided, listed plainly rather than buried.
 | --- | --- |
 | **Three guarantees [0012](./0012-where-logic-lives.md) removed** | All three were closed by PL/pgSQL that no longer exists, and all three are reproducible on the shipped schema. **Foreign keys are skipped on the replication apply path** — 40 internal FK triggers (ten foreign keys, four triggers each), all `ENABLE ORIGIN`; the fix is one `ALTER TABLE … ENABLE ALWAYS TRIGGER` each, and it needs a decision about whether a design-stage schema should carry it. **Table inheritance is open again** — a child of `ledger_entries` is visible through the parent to every view and carries none of its keys or triggers. **A statement line can be reclassified under posted history**, as long as the new line shares the old one's statement and side. |
 | **[0005](./0005-reproducible-as-of.md) is `proposed`** | The hole it names is live: the same recorded-axis report, re-run either side of one concurrent commit, moved revenue by 45% with every check green. `recorded_at` is transaction-*start* time, and a timestamp cannot order commits. The as-of cursor blocks **M5**, not M4 — M4 is the RDS benchmark and is unblocked. |
-| **Inter-scope obligations reconcile against nothing** | A tenant booking 100,000.00 of `due_from_treasury` against an operator booking 60,000.00 of `due_to_tenants` leaves every scope balanced, the drift views empty, and 40,000.00 of asset owed by nobody. Each sub-book is internally consistent; nothing compares the two sides. |
+| **Inter-scope obligations reconcile against nothing** | A tenant booking 100,000.00 of `due_from_treasury` against an operator booking 60,000.00 of `due_to_tenants` leaves every scope balanced, every check green, and 40,000.00 of asset owed by nobody. No view compares the two sides — the ledger-side drift views were deleted by [0012](./0012-where-logic-lives.md), and the one that remains, `card_hold_drift`, is card-specific. Each sub-book is internally consistent; nothing compares the two sides. |
 | **The balance sheet nets counterparties the chart declares un-nettable, and the schema cannot express the fix** | `balance_sheet` groups by `fs_line` and never reads `counterparty_scope`, so owing t1 425.00 while t2 owes 425.00 prints a payables line of **zero** — both sides understated, `trial_balance` holding the correct gross figures, and every check green. Sharding the account per counterparty does not fix it: the netting happens in the *report*, one level above the account, and an account's statement line is fixed by its type, so t2's opposite-sign position has no line to move to even if the column were read. IAS 32.42 / ASC 210-20-45-1 permit offset only between the same two parties. |
 | **The balance sheet has no period, and the income statement has no parameter** | With no close, the synthesised earnings plug sums revenue and expense over *all posted history* — 34,000.00 against a true current year of 4,000.00 on a three-year book, growing without bound. The caption now says "Undistributed earnings (since inception)", which is honest and is not the fix. The fix is the period close, designed and unbuilt; `retained_earnings` ships in the chart and stays at zero forever because nothing routes to it. |
-| **The balance cache includes `pending`; every report excludes it** | All three copies of every balance count pending transactions and no report does, so a customer served from the cache can be shown 500.00 while the balance sheet shows 0.00, with the drift views empty. Arguably available-versus-posted by design; nothing says so, and no view surfaces the pending population. |
+| **The balance cache includes `pending`; every report excludes it** | All three copies of every balance count pending transactions and no report does, so a customer served from the cache can be shown 500.00 while the balance sheet shows 0.00, and nothing reconciles the two. Arguably available-versus-posted by design; nothing says so, and no view surfaces the pending population. |
 | **No report accepts both time axes, and the three statements accept neither** | the accounting equation, when it is rebuilt in Go, must take one axis; `trial_balance`, `balance_sheet` and `income_statement` are parameterless. An issued statement cannot be reproduced after any backdated posting — legal, append-only, every check green. Separate from [0005](./0005-reproducible-as-of.md): a perfect commit cursor still would not reproduce an issued effective-period report through a single-axis parameter. |
 | **`counterparty_scope` and `is_perimeter` are declarative** | Both documented at length, both carrying CHECK constraints, and no view or function reads either — so the offsetting rule [0009](./0009-chart-and-completeness.md) §5 states as a mechanism is not implemented, and **a wrong value in either is undetectable by any test.** Documentation stored in a column. |
 | **Row-level security does not exist yet** | `schema/` contains no `CREATE POLICY` and no `ENABLE ROW LEVEL SECURITY`, while [0001](./0001-go-and-postgres.md) asserts "tenant isolation *is* row-level security". `tenant_id` leading every key is the prerequisite and is built; the policies are not. It also conflicts with bulk loading — Postgres refuses `COPY FROM` on a table with RLS enabled, and `COPY` is what makes batched posting fast. Likely resolution: post through a role that bypasses RLS, so RLS guards reads only. |
@@ -114,14 +114,14 @@ Undecided, listed plainly rather than buried.
 | **`event_id` is nullable** | So "every transaction references its causing event" is a convention rather than an invariant. `NOT NULL` is the fix; it is not done. |
 | **There is no idempotency replay path** | `idempotency_hash` is written and never read, so "same key + same body replays the stored result; a different body is refused" is designed and unbuilt. The unique index only makes the second attempt fail. |
 | **Striping is not built** | The stack summary above quotes striped figures. There is no stripe column in `schema/`, and `uq_accounts__house` would currently prevent one on the accounts that need it. |
-| **There is no CI** | `.github/workflows/test.yml` existed for one commit and was deleted with the suite it ran ([0012](./0012-where-logic-lives.md)). It comes back when the Go tests do, and should run `go test ./...` and load `schema/schema.sql` against a PostgreSQL 18 service. |
+| **There is no CI** | `.github/workflows/test.yml` was present in three commits' trees and was deleted with the suite it ran ([0012](./0012-where-logic-lives.md)). It comes back when the Go tests do, and should run `go test ./...` and load `schema/schema.sql` against a PostgreSQL 18 service. |
 | **Hash chaining for tamper evidence is deferred, not decided** | [0004](./0004-event-log.md) leaves it open: it needs a total order, so it is entangled with [0005](./0005-reproducible-as-of.md). The cost figures quoted there are extrapolated from spike 003's contended-row numbers, not measured. |
 | **The chart of accounts is not versioned** | Changing which statement line an account reports under would silently restate issued statements, so it is blocked outright — a stopgap, since IAS 1.41 *requires* reclassifying comparatives. See [0009](./0009-chart-and-completeness.md). |
 | **No number has been measured on RDS** | Everything so far is localhost, where a round trip is ten times cheaper. Nothing gets published until that is fixed. |
 | **Hold-flow findings recorded rather than closed** | The list lives in [0010 §Known, and not fixed](./0010-authorization-holds.md#known-and-not-fixed), and **at least four of them under-reserve credit**, the failure this project calls the cardinal sin. *There is deliberately no copy of that list here* — a count maintained in two files is a count that drifts, and this one miscounted four rounds running. |
 | **Completeness is guaranteed WITHIN a scope, not across them** | Recorded only in `schema/schema.sql`. A scope with no accounts at all is invisible to every report, and a tenant parameter on the balance-sheet report is exactly the "parameter in which to pass an incomplete list" that [0009](./0009-chart-and-completeness.md) says should not exist. `vision.md` states the completeness guarantee without that qualification. |
 | **Intercompany balances are presented GROSS** | Nothing nets `due_from_treasury` against `due_to_tenants`, so a consolidated balance sheet shows both sides at full size. The golden trace asserts they eliminate to zero; no *report* does. |
-| **`docs/design-board.html` still names Temporal** | "Temporal" in seven places — the header, the architecture diagram, two lifecycle timers, the state-machine boundary and two more, both decided against by [0008](./0008-durable-timers.md). `docs/diagrams/03-state-machines.svg` has been updated; the board has not. |
+| **`docs/design-board.html` still names Temporal** | "Temporal" in eight places — the masthead, the architecture diagram twice (its inline text and its `aria-label`, so a screen reader is told it too), the lifecycle prose, the `expires_at` comment, the state-machine boundary and twice in the §06 trace, both decided against by [0008](./0008-durable-timers.md). `docs/diagrams/03-state-machines.svg` has been updated; the board has not. |
 | **Shipped surface nothing reads** | `webhook_deliveries` exist in `schema/schema.sql`, carry rationale in comments, and is referenced by no view and no function. `hold_expires_at` and `clearing_deadline` are *exposed* by `card_auth_unmatched` (it selects `e.*`) but nothing reads them for a decision, and nothing writes them — see [0008](./0008-durable-timers.md), whose reconciliation sweep filters on one of them and therefore matches nothing. Either the next milestone's work or dead weight — and [0008](./0008-durable-timers.md)'s reconciliation sweep *reads* one of them, which is why that sweep can never fire. |
 | **Posting rules** | A deployment declares its own accounts; it must also declare how a business event becomes entries. Adyen proves those templates balance at design time. We have not designed ours. |
 
@@ -141,12 +141,15 @@ decided, on one page") an overstatement. Listed here until they get one:
 - **`uq_txn__one_per_event`** is a correctness constraint with a reproduced counterexample: without it
   "two transactions were produced from one event row", so the idempotency spine does not by itself
   prevent double-posting. It belongs in [0004](./0004-event-log.md).
-- **Five named correctness constraints appear in no document at all**: `uq_txn__one_resolution`,
-  `uq_txn__one_reversal` (the double-reversal guard spike 001 identifies as a real Formance bug class),
-  `uq_accounts__id_currency`, `uq_txn__id_effective` and `fk_entries__txn_effective`. The last two are
-  the referenced-side unique indexes the composite foreign keys point at — remove either and the schema
-  does not load (`there is no unique constraint matching given keys`). A constraint whose absence makes
-  the schema unbuildable needs no test.
+- **Four named correctness constraints are reasoned about in no document**: `uq_txn__one_resolution`,
+  `uq_accounts__id_currency`, `uq_txn__id_effective` and `fk_entries__txn_effective`. A fifth,
+  `uq_txn__one_reversal` — the double-reversal guard spike 001 identifies as a real Formance bug class
+  — appears in [0006](./0006-schema-conventions.md), but only as a naming example, which is not the
+  same as being justified anywhere. Of the four, **`uq_accounts__id_currency` and `uq_txn__id_effective`
+  are the referenced-side unique indexes the composite foreign keys point at** — drop either and the
+  schema does not load (`there is no unique constraint matching given keys`), verified. A constraint
+  whose absence makes the schema unbuildable needs no test. `fk_entries__txn_effective` is the foreign
+  key itself, not an index, and dropping it loads cleanly — it does need one.
 - **PostgreSQL 18 is a floor, not a preference.** `uuidv7()` is the default on **six** tables and does
   not exist before 18. The roadmap targets RDS for M4/M6, which must therefore run 18.
 - **Three chart constraints have no ADR**: `uq_fs_lines__caption` (two lines sharing a caption are
@@ -163,7 +166,7 @@ attributed to a named project turned out never to have existed. Three rules foll
 
 - **A third-party figure needs a fetchable source next to it, or it is marked unverified.** Not
   softened — marked. "I could not check this" is a finding, not an embarrassment. *This rule is not met
-  today:* an audit counted twelve unique external URLs in the whole tree against dozens of third-party
+  today:* an audit counted thirteen unique external URLs in the whole tree against dozens of third-party
   figures, and three attempts to cover the gap with a section banner each turned out to cover less than
   claimed. **So: treat every third-party figure in this repository as unverified unless a URL sits next
   to it.**

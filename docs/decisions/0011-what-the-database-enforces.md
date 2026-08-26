@@ -54,7 +54,7 @@ adversary's demonstration without re-running it is the sourcing failure nobody w
   is both — the grant binds the application role, the trigger binds a backfill script or a human at a
   psql prompt.
 - **Defend against every writer** — this ADR's own conclusion, and the part
-  [0012](./0012-where-logic-lives.md) supersedes. Twenty-five triggers were the measurement of how
+  [0012](./0012-where-logic-lives.md) supersedes. Twenty-seven triggers were the measurement of how
   much ledger had leaked into the schema, not of how much safety was bought.
 
 ## What it costs — what the database still cannot enforce

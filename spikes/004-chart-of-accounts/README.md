@@ -204,7 +204,7 @@ this passage is about: `spikes/004-chart-of-accounts/chart.sql` still ships it `
 `spikes/` runs, so that is a stale correction rather than a live defect, but it is the decision
 log's own rule broken in the file that carries the claim.
 
-**Summing shards is arithmetic netting, and netting has rules.** IAS 1.32 and ASC 210-20-45-1
+**Summing shards is arithmetic netting, and netting has rules.** IAS 32.42 and ASC 210-20-45-1
 permit offsetting only for amounts due to and from the **same party**. A set may be summed only if
 all members share one counterparty. If the split key *is* the counterparty — a receivable per
 customer — sign-flipped members must be presented **gross**, not netted. (Customer accounts in
