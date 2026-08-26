@@ -2,6 +2,10 @@
 /bin/
 /dist/
 openledger
+# ...including the spike binaries. spike003 was listed and spike005 was not, so a
+# 16 MB compiled ELF sat in the tree -- in a directory whose own README says the
+# code there is throwaway and is not built by CI.
+spikes/*/spike0*
 
 # Go
 *.test

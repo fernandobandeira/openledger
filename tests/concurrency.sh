@@ -608,8 +608,11 @@ chk "...and the alarm sees the running balance they did not maintain" \
 # NO FIFO HERE, deliberately. The first version drove the batch through a named
 # pipe to interleave the racer between two statements -- and when the reader died
 # of a deadlock, the writer blocked forever on a pipe nobody was reading. run.sh
-# has no timeout, so that is an infinite build rather than a red one, and it hung
-# twice before being caught. Each side is one self-contained transaction submitted
+# had no timeout then, so that was an infinite build rather than a red one, and it
+# hung twice before being caught. run.sh now bounds every suite with `timeout
+# --foreground --kill-after`, which turns that class into a red build -- the fifos
+# are still gone, because a red build is not a fixed test.
+# Each side is one self-contained transaction submitted
 # in a single psql call; they overlap because they run concurrently.
 #
 # What is asserted is the property that holds under EVERY interleaving: each

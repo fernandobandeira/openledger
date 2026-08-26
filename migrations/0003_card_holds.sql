@@ -608,15 +608,20 @@ BEGIN
                              OR (p_kind IN ('authorization','incremental','advice')
                                   AND (v_delta > 0 OR p_is_total))
                              THEN NULL ELSE expired_at END,
+           -- No ratchet on this branch, because it is provably the identity and a
+           -- reviewer proved it: expired_authorized = authorized_minor at expiry,
+           -- every kind that reaches the non-reopen branch adds 0 to
+           -- authorized_minor, and the only paths that LOWER it (regroup-out,
+           -- attach) go through recompute_hold_group, which carries its own
+           -- ratchet. Replaying 13,866 permutations against a build with the
+           -- LEAST removed gave byte-identical group rows. The sibling
+           -- expired_total ratchet is NOT dead -- a clearing ingested straight
+           -- onto an expired group lowers total_minor with no recompute -- which
+           -- is why they are no longer written as a symmetric pair.
            expired_authorized = CASE WHEN p_kind = 'expiry_reversal'
                                      OR (p_kind IN ('authorization','incremental','advice')
                                           AND (v_delta > 0 OR p_is_total))
                                      THEN NULL
-                                WHEN expired_at IS NOT NULL
-                                     THEN LEAST(expired_authorized,
-                                                authorized_minor
-                                                + CASE WHEN v_increases
-                                                       THEN GREATEST(v_delta,0) ELSE 0 END)
                                 ELSE expired_authorized END,
            -- ...and the total snapshot RATCHETS DOWN while expired. A late clearing
            -- lowered an expired group's total, and removing that clearing then
@@ -766,7 +771,15 @@ BEGIN
     -- other three were fixed to stop producing. It is a repair entry point rather
     -- than the hot path, but it is public and it returns a bigint that looks like
     -- a hold.
-    RETURN GREATEST(v_total, 0);
+    -- ...and the clamp is held_minor's, not just GREATEST. An earlier fix here
+    -- used GREATEST(v_total,0), which clamps an over-capture and NOT an expiry --
+    -- so on an expired group this returned the full total while the other three
+    -- return sites and held_for_company all returned 0. The comment above claimed
+    -- the site now returned held_minor; it returned something that agreed with
+    -- held_minor on three branches out of four. Read the column.
+    SELECT held_minor INTO v_total FROM card_hold_groups
+     WHERE tenant_id=p_tenant AND company_id=p_company AND group_key=p_group;
+    RETURN COALESCE(v_total, 0);
 END $$;
 
 -- Re-grouping: the corrective operation the spec's unmatched queue requires.

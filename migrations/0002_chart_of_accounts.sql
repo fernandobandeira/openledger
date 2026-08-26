@@ -22,21 +22,28 @@ CREATE TABLE fs_lines (
     -- passed every trigger and every test: the split was real in the chart and
     -- invisible in the report. Nothing in the suite reads a caption, so this is
     -- the constraint rather than a test.
-    -- A CAPTION IS COMPARED AS A READER SEES IT, not as a byte string. Both
-    -- guards below were defeated by ONE TRAILING SPACE: 'Current year earnings '
-    -- passed the reservation, and 'Cash and cash equivalents ' passed the UNIQUE,
-    -- putting 44,000.00 of customer suspense under a line visually identical to
-    -- the derived earnings plug -- balanced, both drift views empty, and a reader
-    -- seeing 2,680.00 of current year earnings against a true 2,240.00. These are
-    -- the schema's stated substitute for a test ("nothing in the suite reads a
-    -- caption"), so they have to hold against the whitespace a human cannot see.
-    -- `btrim(x)` with one argument strips SPACES ONLY. An earlier version of this
-    -- used it and claimed to compare "as a reader sees it"; a tab, a newline, a
-    -- non-breaking space or a zero-width space walked straight through, and
-    -- 44,000.00 of customer suspense sat on a line byte-different and
-    -- pixel-identical to the derived earnings plug -- 46,240.00 presented under one
-    -- caption against a true 2,240.00, with every report green. A guard tested
-    -- through one member of a class it claims to cover in full.
+    -- A CAPTION IS DISPLAY TEXT, NOT AN IDENTITY -- and three rounds of trying to
+    -- make it one are why that sentence is here rather than a stronger one.
+    --
+    -- The guard below normalises whitespace and case, which stops the accidents
+    -- and the earlier measured defects: 'Current year earnings ' with a trailing
+    -- space passed the reservation, and one-argument btrim() let a tab, a newline,
+    -- an NBSP or a zero-width space through the version that replaced it -- each
+    -- time putting customer suspense under a line pixel-identical to the derived
+    -- earnings plug, balanced, with both drift views empty.
+    --
+    -- IT DOES NOT MAKE A CAPTION SAFE TO KEY ON, and the claim that it compared
+    -- "as a reader sees it" was not something a CHECK can do. One codepoint
+    -- disproves it: `Undistributed earnings (ѕince inception)` with a Cyrillic
+    -- U+0455 for the Latin s passes this CHECK and the unique index, prints
+    -- identically, and showed 940.00 of undistributed earnings against a true
+    -- 500.00 with every report green. Unicode confusables are unbounded and a
+    -- blocklist of them is a losing game.
+    --
+    -- So the rule is stated rather than enforced: **consumers key on `fs_line`,
+    -- the code**, which ck_fs_lines__code_reserved does defend and which
+    -- `balance_sheet` emits for exactly this reason. What follows is defence in
+    -- depth against typos, not a guarantee about what a human eye can tell apart.
     caption    text NOT NULL CONSTRAINT ck_fs_lines__caption_clean
                    CHECK (caption = btrim(caption, E' \t\n\r\u00a0\u200b\u2007\u202f')
                           AND caption <> ''

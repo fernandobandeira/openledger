@@ -1,0 +1,55 @@
+# THE ANSWER THIS PROJECT WROTE DOWN THREE TIMES AND DID NOT WRITE.
+#
+# tests/run.sh carries nine guards, added over eight rounds of adversarial review,
+# each one closing the forgery the previous round found. Its own header states the
+# threat model those guards actually meet -- "they defend against EROSION ... and
+# they do not defend against a determined author" -- and then names the durable
+# answer: "review, and CI running a pinned configuration the branch cannot edit."
+# docs/decisions/README.md listed "there is no CI" under Still open and called it
+# the highest-leverage item there.
+#
+# This file is that answer. It is the only check in the project that a branch
+# cannot edit its way past, because it runs from the default branch's definition
+# on a machine the author does not control. Everything in tests/run.sh is a second
+# choice, and this is why.
+name: tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  sql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        # PostgreSQL 18 is a floor, not a preference: uuidv7() is the default on
+        # six tables and does not exist before 18.
+        image: postgres:18
+        env:
+          POSTGRES_USER: openledger
+          POSTGRES_PASSWORD: openledger
+          POSTGRES_DB: postgres
+        ports: [ '5433:5432' ]
+        options: >-
+          --health-cmd "pg_isready -U openledger"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply migrations and run every suite
+        run: ./tests/run.sh
+        env:
+          ADMIN_URL: postgres://openledger:openledger@localhost:5433/postgres?sslmode=disable
+
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./...
