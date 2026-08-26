@@ -198,7 +198,10 @@ account physically partitioned, with no accounting consequence.
 
 **`network_settlement_payable` is a perimeter account.** We marked it `is_perimeter = false`. It is
 the archetype — an external party (the card network) holds the authoritative balance and will
-confirm it. Fixed.
+confirm it. Fixed in `migrations/seed/card_chart.sql` (`is_perimeter = t`) — and **not** in the file
+this passage is about: `spikes/004-chart-of-accounts/chart.sql` still ships it `false`. Nothing in
+`spikes/` runs, so that is a stale correction rather than a live defect, but it is the decision
+log's own rule broken in the file that carries the claim.
 
 **Summing shards is arithmetic netting, and netting has rules.** IAS 1.32 and ASC 210-20-45-1
 permit offsetting only for amounts due to and from the **same party**. A set may be summed only if

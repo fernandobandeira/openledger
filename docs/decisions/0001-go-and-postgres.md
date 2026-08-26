@@ -65,7 +65,7 @@ are independent rows carrying a direction, so we *can* express an unbalanced tra
 therefore *must* prevent it. We do both: the write API accepts balanced pairs only (making the
 illegal state unrepresentable), and a deferred constraint trigger is the backstop. Spike 003 ran
 its entire benchmark with that trigger active and never found it to be the bottleneck. At the top
-of its ladder — 7,897 clearings/s, which is striped 64 ways *and* posting in a single call, on a
+of its ladder — 6,524 clearings/s at 64 stripes and c=32, on a
 2 GB table — the spike is explicit that the curve "plateaus **because the machine ran out of cores
 rather than because of a lock**. The ceiling moved from the design to the hardware." Striping alone
 at 64 measures 6,524–6,970. Contention binds at the bottom of that ladder, not the top; the trigger

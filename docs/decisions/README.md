@@ -83,7 +83,8 @@ Undecided, listed plainly rather than buried:
   role that bypasses RLS, so RLS guards reads only. Not yet decided.
 - **Historical balances get slower as history grows, and nothing bounds it yet.** Reading "the
   balance right now" is a single index lookup (0.018 ms). Reading "the balance as of last June"
-  has to add up entries, which is linear — ~0.10 µs each, so ~3 ms at 30k entries and a measured 105.91 ms at 1M. The fix is the accountants' one: close each period and store its closing balance, so a
+  has to add up entries, which is linear. The per-entry rate and the 105.91 ms at 1M usually quoted
+  here come from a one-off run with **no harness in the repository**; the linearity is the claim. The fix is the accountants' one: close each period and store its closing balance, so a
   query only has to add up the current period. Designed but not built —
   [0003](./0003-bitemporal-balances.md) has the numbers.
 - **`event_id` is nullable**, so "every transaction references its causing event" is a convention
@@ -91,9 +92,13 @@ Undecided, listed plainly rather than buried:
 - **There is no idempotency replay path.** `idempotency_hash` is written and never read, so
   "same key + same body replays the stored result; a different body is refused" is designed and
   unbuilt. The unique index only makes the second attempt fail.
-- **The write path requires READ COMMITTED.** Measured: REPEATABLE READ and SERIALIZABLE lose
-  most writes to serialization failures on the balance upsert, and a retry loop does not rescue
-  it. A hard deployment constraint, recorded in no ADR.
+- **The write path requires READ COMMITTED.** REPEATABLE READ and SERIALIZABLE lose most writes to
+  serialization failures on the balance upsert, and a retry loop does not rescue it. *Nothing in
+  `tests/`, `spikes/` or `migrations/` sets an isolation level*, so the figures the roadmap quotes
+  are observations from a one-off run, not measurements — the roadmap says so and this page said
+  "Measured" for three rounds. The conclusion does not depend on them: `ON CONFLICT DO UPDATE`
+  under a stricter isolation level fails with `could not serialize access`, which is a property of
+  Postgres. A hard deployment constraint, recorded in no ADR.
 - **Striping is not built.** The stack summary above quotes striped figures; there is no stripe
   column in `migrations/`, and `uq_accounts__house` would currently prevent one on the accounts
   that need it.
@@ -133,7 +138,8 @@ Undecided, listed plainly rather than buried:
     one, costs availability rather than correctness: it aborts cleanly and leaves no drift.
 - **Completeness is guaranteed WITHIN a scope, not across them**, and that limit is recorded only
   in `migrations/0002`. A scope with no accounts at all is invisible to every report, and
-  `balance_sheet`'s `p_tenant` is exactly the "parameter in which to pass an incomplete list" that
+  `balance_sheet_balances`' `p_tenant` is exactly the "parameter in which to pass an incomplete
+  list" that
   [0009](./0009-chart-and-completeness.md) says should not exist. `vision.md` states the
   completeness guarantee without that qualification.
 - **Shipped surface nothing reads.** `webhook_deliveries`, `hold_expires_at` and `clearing_deadline`
@@ -158,13 +164,21 @@ These are real decisions with real reasoning; none has an ADR, which makes the h
 - **`webhook_deliveries` is a separate table** from `ledger_events`: HTTP-layer redelivery is a
   different concern from ledger identity, and collapsing them makes a retried webhook look like a
   business event.
+- **`uq_txn__one_per_event` has no ADR**, and it is a correctness constraint with a reproduced
+  counterexample: without it "two transactions were produced from one event row", so the
+  idempotency spine does not by itself prevent double-posting. It belongs in
+  [0004](./0004-event-log.md), which owns the event log, and is in neither that nor
+  [0011](./0011-what-the-database-enforces.md).
 - **PostgreSQL 18 is a floor, not a preference.** `uuidv7()` is the default on **six** tables and
   does not exist before 18. The roadmap targets RDS for M4/M6, which must therefore run 18.
-- **Two chart constraints have no ADR**: `uq_fs_lines__caption` (two lines sharing a caption are
+- **Three chart constraints have no ADR**: `uq_fs_lines__caption` (two lines sharing a caption are
   indistinguishable on the face of the statement, which is the restricted-cash harm arrived at from
   the other side — and nothing in the suite reads a caption, so it had to be a constraint rather
-  than a test) and `ck_fs_lines__code_reserved` (a real chart line may not shadow the
-  `current_year_earnings` plug the balance sheet synthesises).
+  than a test); `ck_fs_lines__code_reserved` (a real chart line may not shadow the
+  `current_year_earnings` plug the balance sheet synthesises); and `ck_fs_lines__caption_reserved`,
+  **the half that does the harm** — `balance_sheet` emits that plug's caption as a literal, so it
+  sits outside the UNIQUE, and a line under any other code could take it. This entry said "two" and
+  omitted the one with the measured counterexample.
 
 ## On sourcing
 
@@ -184,7 +198,13 @@ Two rules follow, and they are cheap:
   ([spike 003](../../spikes/003-throughput-ceiling/README.md#external-validation--what-the-industry-does),
   [spike 004](../../spikes/004-chart-of-accounts/README.md#prior-art),
   [0008](./0008-durable-timers.md#why)). A banner is weaker than a URL next to each claim, and is
-  an interim measure, not the rule being met.
+  an interim measure, not the rule being met — **and its scope was narrower than this paragraph
+  claimed.** Three of the categories named above sit outside all three bannered sections and were
+  never marked: Monzo (in spike 003's *what dropping it would cost*), Supabase (in spike 004's RLS
+  section), and **every accounting-standard paragraph citation** — IAS 1.32, IAS 1.41,
+  ASC 210-20-45-1, ASC 606-10-55-36, IFRS 15.B34–B38, IFRS 8 / ASC 280, the IFRS Conceptual
+  Framework, and the FFIEC suspense-account guidance, which appear across the seed, spike 004,
+  ADR-0009 and this page. Treat every one of them as unverified.
 - **Corrections get applied to the document that carries the claim**, not only to the ADR that
   discovered it. Three struck numbers stayed live in the migrations and spikes they came from,
   while the ADRs said "fabricated — struck". *This rule was itself violated the day it was
@@ -198,7 +218,7 @@ Two rules follow, and they are cheap:
 
 ## On mutation testing
 
-Four rounds of adversarial review have used the same measure: change the schema so it is wrong, and
+Six rounds of adversarial review have used the same measure: change the schema so it is wrong, and
 see whether the suite notices. It is the only measure that distinguishes a test suite from a
 transcript. Two things learned the hard way:
 

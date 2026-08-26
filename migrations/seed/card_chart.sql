@@ -29,6 +29,16 @@ ON CONFLICT DO NOTHING;
 
 INSERT INTO account_types (code,category,normal_balance,description,fs_line,is_perimeter,counterparty_scope) VALUES
   ('customer_receivable','asset','debit','what a customer owes us','receivables',false,'per_shard'),
+  -- NOTE, as for counterparty_scope below: `is_perimeter` is currently
+  -- DECLARATIVE. No view, function or test reads it, so a wrong value here is
+  -- undetectable by anything -- mutation testing flips it and nothing fails. It
+  -- says "this account mirrors exactly one external balance and must reconcile
+  -- against it", and nothing reconciles.
+  -- NOTE, as for counterparty_scope below: `is_perimeter` is DECLARATIVE. No view,
+  -- function or test reads it, so a wrong value here is undetectable by anything --
+  -- mutation testing flips it and nothing fails. It asserts "this account mirrors
+  -- exactly one external balance and must reconcile against it", and nothing
+  -- reconciles. Its neighbour carries this note and it did not.
   ('operating_cash','asset','debit','our own bank balance','cash',true,'shared'),
   ('fbo_cash','asset','debit','customer funds held for benefit of','restricted_cash',true,'shared'),
   -- the case that proves normal_balance cannot be derived from category

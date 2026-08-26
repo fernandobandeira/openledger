@@ -78,7 +78,7 @@ recomputation*, which is what Modern Treasury does when a cached balance drifts.
 ## Consequences
 
 - **The effective-axis aggregate is linear and currently unbounded** — roughly 0.10 µs per entry
-  in range, and directly measured at **105.91 ms** for a 1M-entry account. An earlier draft extrapolated ~220 ms from the per-entry rate while that direct measurement already existed; prefer the measurement. We have traded Formance's
+  in range, and observed at **105.91 ms** for a 1M-entry account in a one-off run whose harness is not in this repo. An earlier draft extrapolated ~220 ms from the per-entry rate while that direct measurement already existed; prefer the measurement. We have traded Formance's
   unbounded `UPDATE` on backdating for an unbounded `SCAN` on business-date reporting. Ours is at
   least on the read path, off the latency deadline, and does not mutate history.
 - **It must be bounded, and accounting already knows how: period close.** Materialize each
@@ -88,7 +88,7 @@ recomputation*, which is what Modern Treasury does when a cached balance drifts.
   restatement, or a prior-period adjustment in the open period — which accounting practice
   already requires. **Prerequisite for M5.**
 - **The STRIPED read cost is unmeasured, and the assumption behind it is now unsafe.** The
-  unstriped read *was* measured -- 105.91 ms at 1M entries, four points, above. What has not been
+  unstriped read *was* observed -- 105.91 ms at 1M entries, four points, above, with no harness in the repo. What has not been
   measured is that same read summed across N stripes. This decision was
   originally justified by "thousands of rows, not millions". Spike 003 measured the *write* path
   only, and found that the accounts touched by every transaction are the shared ones — which are

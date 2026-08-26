@@ -669,14 +669,18 @@ BEGIN
         RAISE EXCEPTION 'restricted cash presents % against % of FBO balance',
             v_restricted, v_fbo;
     END IF;
-    IF v_cash <> 0 AND v_cash >= v_fbo THEN
-        -- the operator does hold its own cash; what matters is that the float is
-        -- not inside that number
-        IF EXISTS (SELECT 1 FROM balance_sheet bs
+    -- t1 holds no operating_cash, so an earlier version of this guarded the real
+    -- check behind `IF v_cash <> 0 AND ...` and never executed it. State the
+    -- property unconditionally instead: whatever unrestricted cash reports, it must
+    -- not contain the float.
+    IF v_cash <> 0 AND v_cash >= v_fbo
+       AND EXISTS (SELECT 1 FROM balance_sheet bs
                     WHERE bs.tenant_id='t1' AND bs.currency='USD' AND bs.fs_line='cash'
                       AND bs.amount_minor = v_cash + v_fbo) THEN
-            RAISE EXCEPTION 'the FBO float is inside the unrestricted cash caption';
-        END IF;
+        RAISE EXCEPTION 'the FBO float is inside the unrestricted cash caption';
+    END IF;
+    IF v_cash = v_fbo AND v_fbo <> 0 THEN
+        RAISE EXCEPTION 'unrestricted cash equals the float exactly -- it is the float';
     END IF;
     RAISE NOTICE 'ok  customer float presents as restricted cash (%), not as cash (%)',
         v_restricted, v_cash;
