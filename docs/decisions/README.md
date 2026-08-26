@@ -132,7 +132,12 @@ Undecided, listed plainly rather than buried:
 - **Striping is not built.** The stack summary above quotes striped figures; there is no stripe
   column in `migrations/`, and `uq_accounts__house` would currently prevent one on the accounts
   that need it.
-- **There is no CI, and the schema snapshot test is not wired to anything.**
+- ~~**There is no CI.**~~ **There is now**: `.github/workflows/test.yml` applies the migrations
+  against PostgreSQL 18 and runs `tests/run.sh` on every push and pull request. This was listed here
+  as "the highest-leverage item" for eight rounds while nine layers of anti-forgery machinery were
+  added to `tests/run.sh` — machinery whose own header says it "does not defend against a determined
+  author" and names CI as the durable answer. Everyone agreed on the answer and wrote the ladder
+  instead. **The schema snapshot test is still not wired to anything**, and that half stays open:
   `expected_schema.sql` exists and runs; nothing invokes it. [0006](./0006-schema-conventions.md)
   calls it "the highest-leverage item here" and [0008](./0008-durable-timers.md) says it must cover
   ADR-quoted SQL — which, twice, it would have caught.
@@ -148,28 +153,14 @@ Undecided, listed plainly rather than buried:
   nothing bounds how far back a backdated entry can restate a reported period.
 - **No number has been measured on RDS.** Everything so far is localhost, where a round trip is
   ten times cheaper. Nothing gets published until that is fixed.
-- **Four hold-flow findings are recorded rather than closed**, in
-  [0010](./0010-authorization-holds.md), and **one of them under-reserves credit** — the failure
-  this project calls the cardinal sin. *This entry has now been miscounted three rounds running:
-  "two", then "three", and the ADR's list has four bullets. It is copied by hand from a list in
-  another file, which is the whole reason it keeps drifting.*
-  - **A cumulative restatement that DECREASES is refused, and the refusal is sticky.**
-    `authorized_minor` only rises, so a processor restating a *lower* subtotal after a partial
-    reversal is read as out-of-order, and the group can never accept a total below its high-water
-    mark again. Measured at 60.00 held against 90.00 real, with `card_hold_drift` silent — the
-    materialised total and the log agree, on the wrong number. Representing a *decreasing*
-    authorized subtotal is the missing design piece, which is why this is recorded and not
-    guarded.
-  - **A refused convention mix leaves an order-dependent number in service** — the same two
-    messages leave 50.00 or 100.00 held depending on arrival order, because only the second is
-    refused and the first is already applied. Quarantining the *group* rather than the message is
-    the likely answer.
-  - **An emptied group pins its currency forever.** Group rows cannot be deleted, so once every
-    event has moved out of a group its currency is permanent, and a later genuine message for that
-    key in another currency is refused *and never stored* — so it never reaches the review queue
-    either.
-  - **A regroup can deadlock against an unsorted multi-group caller.** This one, and only this
-    one, costs availability rather than correctness: it aborts cleanly and leaves no drift.
+- **Hold-flow findings recorded rather than closed** — the list lives in
+  [0010 §Known, and not fixed](./0010-authorization-holds.md#known-and-not-fixed), and **one of
+  them under-reserves credit**, the failure this project calls the cardinal sin.
+
+  *There is deliberately no copy of that list here.* It was copied by hand and miscounted four
+  rounds running — "two", then "three", then "four", each time corrected and each time wrong again
+  by the next round, because the fix was always to correct the number rather than to stop
+  duplicating the list. A count maintained in two files is a count that drifts.
 - **Completeness is guaranteed WITHIN a scope, not across them**, and that limit is recorded only
   in `migrations/0002`. A scope with no accounts at all is invisible to every report, and
   `balance_sheet_balances`' `p_tenant` is exactly the "parameter in which to pass an incomplete
@@ -230,32 +221,20 @@ number attributed to a named project turned out never to have existed. Once it w
 once a reviewer commissioned to check such claims **fabricated an entire verification section** —
 URLs, quoted text, commit counts, price tables — after its own sub-agents died without reporting.
 
-Two rules follow, and they are cheap:
+Three rules follow, and they are cheap:
 
 - **A third-party figure needs a fetchable source next to it**, or it is marked unverified. Not
   softened — marked. "I could not check this" is a finding, not an embarrassment.
-  *This rule is not yet satisfied.* An audit counted **five** external URLs across the whole tree
-  against dozens of third-party figures — Uber, Modern Treasury, Fragment, Monzo, Adyen, Shopify,
-  Supabase, Blnk, the accounting-standard paragraph citations, and every processor message-shape
-  claim. The sections carrying the bulk of them now open with a banner saying so
-  ([spike 003](../../spikes/003-throughput-ceiling/README.md#external-validation--what-the-industry-does),
-  [spike 004](../../spikes/004-chart-of-accounts/README.md#prior-art),
-  [0008](./0008-durable-timers.md#why)). A banner is weaker than a URL next to each claim, and is
-  an interim measure, not the rule being met — **and its scope was narrower than this paragraph
-  claimed.** Three of the categories named above sit outside all three bannered sections and were
-  never marked: Monzo (in spike 003's *what dropping it would cost*), Supabase (in spike 004's RLS
-  section), and **every accounting-standard paragraph citation** — IAS 1.32, IAS 1.41,
+  *This rule is not met.* An audit counted **five** external URLs in the whole tree against dozens
+  of third-party figures. Three successive attempts to fix it with a *section banner* were each
+  found, in the next round, to cover less than the round before claimed: first the bannered
+  sections missed Monzo, Supabase and every accounting-standard paragraph citation (IAS 1.32/1.41,
   ASC 210-20-45-1, ASC 606-10-55-36, IFRS 15.B34–B38, IFRS 8 / ASC 280, the IFRS Conceptual
-  Framework, and the FFIEC suspense-account guidance, which appear across the seed, spike 004,
-  ADR-0009 and this page. **And that list was itself incomplete** — a later audit found three more
-  categories outside every banner: the processor message-shape quotes in
-  [spike 006](../../spikes/006-append-only-holds/README.md) (Marqeta, Adyen, Highnote, Galileo,
-  Pismo, Stripe, Lithic), whose banner marks only the *survey size* as fabricated and explicitly
-  endorses the table beneath it; **pgledger's 10,636.8 / 7,558.9 transfers/s**, quoted in spike 003
-  and ADR-0007 *above* spike 003's banner; and the Visa/Mastercard rule corpus. Treat every
-  third-party figure in this repository as unverified unless a URL sits next to it. The banner
-  approach has now been marked incomplete twice, which is the argument for the rule the log states
-  and does not yet meet: **a source next to each claim.**
+  Framework, FFIEC suspense guidance); then they missed spike 006's processor message shapes,
+  pgledger's 10,636.8 / 7,558.9 transfers/s, and the Visa/Mastercard rule corpus. A banner is a
+  claim about scope, and every version of it was wrong. **So: treat every third-party figure in
+  this repository as unverified unless a URL sits next to it.** That is the rule; the banners were
+  the substitute, and three rounds of narrowing scope is the argument against substitutes.
 - **Corrections get applied to the document that carries the claim**, not only to the ADR that
   discovered it. Three struck numbers stayed live in the migrations and spikes they came from,
   while the ADRs said "fabricated — struck". *This rule was itself violated the day it was
@@ -279,8 +258,10 @@ So the threat model is written down now rather than implied. **These guards defe
 a control quietly deleted, a helper weakened, a file truncated, a floor with slack — and they do not
 defend against a determined author.** Nothing checked into a repository can: whoever edits the tests
 can edit the thing that checks them. The durable answers are outside the file — review, and CI
-running a pinned configuration the branch cannot edit. Neither exists yet, which is why "there is no
-CI" sits in *Still open* and is the highest-leverage item there.
+running a pinned configuration the branch cannot edit. **CI now exists**
+([`.github/workflows/test.yml`](../../.github/workflows/test.yml)); it is what eight rounds of
+in-tree guards were a substitute for, and it was written only after a round asked why the substitute
+kept being rebuilt instead of the thing itself.
 
 The one guard in this tree that a test file cannot forge is not in the tests. `assert_type_matches_fs_line`
 refused two mutants at **seed time**: the wrong chart could not be loaded, so the wrong system could

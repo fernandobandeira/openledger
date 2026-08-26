@@ -130,6 +130,23 @@ executed against `migrations/0001`–`0003` before being written down, which is 
 schema snapshot test in [0006](./0006-schema-conventions.md) must cover ADR-quoted SQL, because
 review demonstrably does not.
 
+**And the third repair was dead too, in a way executing it could not reveal.** The query above
+parses and runs against 0001-0003 -- `hold_expires_at` exists on `card_auth_events`. It matches
+zero rows, on every database the shipped API can build. `record_auth_event` is the only path that
+inserts into `card_auth_events`, it names eleven columns, and `hold_expires_at` is not one of them;
+the function has no parameter for it either. So the column is permanently NULL, `e.hold_expires_at < now()` is
+NULL for every row, and the sweep is a query that runs, costs nothing, and can never fire.
+`README.md` already lists `hold_expires_at` and `clearing_deadline` under "shipped surface nothing
+reads" -- but this ADR *reads* one of them, as its safety net.
+
+Recorded, not repaired. Making it live means an ingest that sets a deadline, and the deadline a
+processor actually sends is a field this project has not modelled. Until then the sweep is inert
+and the recovery it describes does not exist -- which matters less than it sounds, for the reason
+this section already gives (an unswept hold over-reserves), and more than nothing, because "we have
+a reconciliation sweep" was load-bearing in the argument for not needing a durable scheduler.
+Executing a query is not evidence it can match. That is the third distinct way this one paragraph
+has been wrong.
+
 ## Consequences
 
 > **The sourcing banner above sits inside `## Why` and does not reach this section.** The

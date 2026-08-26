@@ -1974,6 +1974,22 @@ BEGIN
     RAISE NOTICE 'ok  every trigger in the schema is ENABLE ALWAYS, user and internal';
 END $$;
 
+-- ...AND EVENT TRIGGERS, WHICH LIVE IN A DIFFERENT CATALOG. The census above reads
+-- pg_trigger and saw 67 of 67 ENABLE ALWAYS while ck_no_ledger_inheritance sat in
+-- pg_event_trigger as ENABLE ORIGIN -- so `session_replication_role='replica'`
+-- skipped it and an inheriting child went straight in.
+DO $$
+DECLARE v_bad text;
+BEGIN
+    SELECT string_agg(evtname || '=' || evtenabled::text, ', ') INTO v_bad
+      FROM pg_event_trigger WHERE evtenabled <> 'A';
+    IF v_bad IS NOT NULL THEN
+        RAISE EXCEPTION 'event trigger(s) not ENABLE ALWAYS, so the replication '
+                        'apply path skips them: %', v_bad;
+    END IF;
+    RAISE NOTICE 'ok  every EVENT trigger is ENABLE ALWAYS too';
+END $$;
+
 -- ...and truncating the CACHE is deliberately allowed, because it is rebuildable
 -- and the alarm is loud about it. The enumeration is four tables of five, and the
 -- fifth is the copy the hot path reads, so state the exclusion rather than leave
@@ -2082,6 +2098,28 @@ $q$, 'may not be inherited');
 SELECT must_fail('a child under the transactions table', $q$
     CREATE TABLE ledger_txn_child () INHERITS (ledger_transactions);
 $q$, 'may not be inherited');
+-- ...and ledger_ACCOUNTS, the amplifier that needs no ledger write at all: every
+-- report joins accounts and reads the hierarchy, so duplicating those rows
+-- multiplies every number in every report while staying balanced -- and
+-- ledger_balance_drift reads entries and the cache, never accounts.
+SELECT must_fail('a child under the accounts table', $q$
+    CREATE TABLE ledger_acct_child () INHERITS (ledger_accounts);
+$q$, 'may not be inherited');
+SELECT must_fail('a child under the event log', $q$
+    CREATE TABLE ledger_evt_child () INHERITS (ledger_events);
+$q$, 'may not be inherited');
+-- ...an UNLOGGED child, which persists across an ordinary restart and is just as
+-- visible to every view
+SELECT must_fail('an UNLOGGED child', $q$
+    CREATE UNLOGGED TABLE ledger_unlogged_child () INHERITS (ledger_entries);
+$q$, 'may not be inherited');
+-- ...and on the replication apply path, where the first version of this guard was
+-- skipped entirely because it was ENABLE ORIGIN
+SELECT must_fail('replica: a child under ledger_entries', $q$
+    SET LOCAL session_replication_role = 'replica';
+    CREATE TABLE ledger_repl_child () INHERITS (ledger_entries);
+$q$, 'may not be inherited');
+SELECT on_origin('after the replica inheritance control');
 -- ...and the cheap half, which would have turned the mutation red on its own:
 -- nothing in the shipped schema inherits from a ledger table.
 DO $$

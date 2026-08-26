@@ -118,9 +118,19 @@ trials**, with the group pre-created and committed so it was a plain row lock an
 create anything. **`INSERT … ON CONFLICT DO NOTHING` is itself a lock acquisition** — the lesson
 this file states for `regroup_auth_event` and had not applied to ingest.
 
-The fix is the remedy this ADR already names for the sibling case: an advisory lock over the
-message key space, taken first on every path, so the message is the first lock everywhere. It is
-transaction-scoped and costs one hash. `tests/concurrency.sh` races it.
+The fix was **not** the remedy this ADR names for the sibling case. An advisory lock over the
+message key space, taken first on every path, was written, measured, and **reverted**: on a batch
+carrying an authorization and its increment it produced 6 deadlocks in 6 trials where the
+unmodified code produced 0. A lock taken before the natural one adds an ordering; it does not
+remove one. What shipped instead is narrower and free -- the attach path and `regroup_auth_event`
+lock the *event row* first, explicitly, so every path that touches both takes them event-then-group.
+`tests/concurrency.sh` races that, and the 8-session mutation review that most recently attacked
+this file recorded 61 deadlocks under an unsorted multi-group load with **not one deadlock context
+naming `card_auth_events`** -- the ordering held.
+
+The advisory lock is gone from the tree, so the 6-of-6 and 0-of-6 counts above are no longer
+reproducible from the code. They are recorded as the reason a fix this ADR twice recommended is
+not present.
 
 This paragraph used to end: *"and concurrent ingest on a single group **cannot deadlock** — it
 takes exactly one row lock."* **That was false, and it was false because of a lock nobody wrote.**
@@ -196,8 +206,23 @@ carry the cleared part would double-count it against available credit.
 
 What the report does correctly identify is the wording. *"An over-capture must contribute 0, never
 raise available credit"* is loose: `held_minor` is clamped at 0, so an over-captured group never
-*adds* credit — but the negative residue does reduce that group's future hold. Precisely: **an
-over-capture never makes `held_for_company` smaller than the un-cleared exposure of that group.**
+*adds* credit — but the negative residue does reduce that group's future hold.
+
+**An earlier version of this paragraph then made a stronger claim, and the stronger claim is
+false.** It read: *"an over-capture never makes `held_for_company` smaller than the un-cleared
+exposure of that group."* It does, and the sequence is three messages. Authorize 100.00, clear
+100.00, then a spurious reversal of 100.00: the group sits at −100.00 with `held_minor` clamped to
+0. Now a genuine 100.00 incremental arrives on the same group. It nets against the residue, the
+group returns to 0, and `held_for_company` still reports 0 — 100.00 of live un-cleared exposure,
+nothing held, nothing posted. That is under-reserving credit, which this file calls the cardinal
+sin, and the clamp is what hides it: clamping the *report* does not clamp the *state*.
+
+The system does not prevent this. It **detects** it: `card_hold_drift`'s
+`total_minor < 0 AND bloodless_decreases > 0` disjunct fires the moment the group goes under water,
+before the increase that would be swallowed — and then goes silent again, exactly as
+*"The over-reversal alarm SELF-HEALS"* below records for the no-clearing variant. Verified on a
+clean database against `0001`–`0003`: drift 1 row after the reversal, 0 rows after the incremental.
+Detection is the honest description; the sentence above claimed prevention.
 
 Where it *would* be a real defect is if the later increase belonged to a **different**
 authorization that merely shares an inferred `group_key`. That is a grouping error, and it is what
@@ -254,9 +279,11 @@ each needs a design decision rather than a guard:
   in call order, so a batch touching `ZZZ` then `AAA` takes them backwards.
   Measured at 91 deadlocks under mixed load. Opposite-direction regroups are fine —
   it is regroup versus an unsorted multi-statement caller. A single-group ingest
-  cannot sort a lock it does not know about, so the fix belongs in a batch API or
-  in an advisory lock over the same key space. Every deadlock aborted cleanly, so
-  this costs availability, not correctness.
+  cannot sort a lock it does not know about, so the fix belongs in a batch API that
+  sorts. **Not** in an advisory lock over the same key space: that was the other half of
+  this same recommendation, it was built, and it made things worse (6 deadlocks in 6
+  trials against 0, above). Every deadlock aborted cleanly, so this costs availability,
+  not correctness.
 
 ## Not decided here
 

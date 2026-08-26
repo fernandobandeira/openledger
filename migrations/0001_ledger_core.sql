@@ -773,10 +773,28 @@ GRANT SELECT, INSERT, UPDATE ON ledger_account_balances TO openledger_app;
 -- index and composite foreign key is per-table. The seal was provably still alive
 -- on the parent in the same database at the same moment.
 --
--- An event trigger closes it. `ddl_command_end` fires after the child exists, so
--- pg_inherits already shows the link and the whole statement rolls back; it
--- catches CREATE TABLE ... INHERITS and ALTER TABLE ... INHERIT alike, including
--- a child built with INCLUDING CONSTRAINTS. Ordinary DDL is unaffected.
+-- An event trigger closes it -- and the FIRST version of this one did not, which
+-- makes it the fourth false "cannot" in this file rather than the fix for the
+-- third. It missed two doors, either of which reproduced the harm above verbatim:
+--
+--   * a FOREIGN TABLE child. Missed twice over: the tag is CREATE FOREIGN TABLE,
+--     not CREATE TABLE, and a foreign table is relkind 'f', not 'r'. So fixing
+--     either filter alone would still have left it open.
+--   * `session_replication_role = 'replica'`. The trigger was ENABLE ORIGIN, and
+--     Postgres skips ORIGIN event triggers on the apply path exactly as it skips
+--     ORIGIN row triggers. This file spends twenty-five lines hardening every row
+--     trigger and every internal FK trigger for that path and left its newest
+--     guard off it. `pg_event_trigger` is a different catalog from `pg_trigger`,
+--     so the ENABLE ALWAYS census in tests/negative_controls.sql did not see it.
+--
+-- And the worst case needs no ledger write at all: a child of ledger_ACCOUNTS
+-- duplicates every join row, so one INSERT ... SELECT * FROM ONLY ledger_accounts
+-- multiplies every number in every report, stays balanced, and leaves nothing for
+-- ledger_balance_drift to notice -- that view reads entries and the cache, and
+-- never looks at accounts.
+--
+-- `ddl_command_end` fires after the child exists, so pg_inherits already shows the
+-- link and the whole statement rolls back. Ordinary DDL is unaffected.
 CREATE FUNCTION refuse_ledger_inheritance() RETURNS event_trigger
 LANGUAGE plpgsql AS $$
 DECLARE r record;
@@ -790,7 +808,11 @@ BEGIN
          WHERE n.nspname = 'public'
            AND p.relname IN ('ledger_entries','ledger_transactions',
                              'ledger_events','ledger_accounts')
-           AND c.relkind = 'r' AND NOT c.relispartition
+           -- 'f' is a foreign table and 'p' a partitioned one; 'r' alone was the
+           -- second half of the foreign-table escape. relpersistence is
+           -- deliberately not filtered: an UNLOGGED child persists across an
+           -- ordinary restart and is just as visible to every view.
+           AND c.relkind IN ('r','f','p') AND NOT c.relispartition
     LOOP
         RAISE EXCEPTION
             'the ledger tables may not be inherited: % would carry none of %''s '
@@ -801,8 +823,12 @@ BEGIN
 END $$;
 
 CREATE EVENT TRIGGER ck_no_ledger_inheritance ON ddl_command_end
-    WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE')
+    WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE',
+                 'CREATE FOREIGN TABLE', 'ALTER FOREIGN TABLE')
     EXECUTE FUNCTION refuse_ledger_inheritance();
+-- ...and ALWAYS, for the same reason every row trigger here is: the replication
+-- apply path skips ORIGIN event triggers.
+ALTER EVENT TRIGGER ck_no_ledger_inheritance ENABLE ALWAYS;
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 
 CREATE FUNCTION refuse_truncate() RETURNS trigger LANGUAGE plpgsql AS $$

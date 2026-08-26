@@ -1398,6 +1398,31 @@ $q$, 'fk_event_group__event');
 -- hid the money.
 SELECT record_auth_event('t1','r6_ov_a','g_overrev','omega','card_ov','authorization',10000,'USD',false,now());
 SELECT record_auth_event('t1','r6_ov_b','g_overrev','omega','card_ov','reversal',10000,'USD',false,now());
+-- ...IN THE REGION ONLY THE SECOND DISJUNCT COVERS. The control below is
+-- authorization + two reversals, where bloodless (20000) exceeds increases
+-- (10000) -- so BOTH disjuncts fire and either could be deleted with the suite
+-- green. The one that matters is the second: a group under water where a CLEARING
+-- accounts for part of the dip, which is the state 0003 records as
+-- "300.00 under-reserved, drift 0 rows at every step" and the reason that line
+-- was added. Here bloodless (10000) does NOT exceed increases (10000); only
+-- `total_minor < 0 AND bloodless > 0` can speak.
+SELECT record_auth_event('t1','d2_a','g_d2','omega','card_d2','authorization',10000,'USD',false,now());
+SELECT record_auth_event('t1','d2_b','g_d2','omega','card_d2','clearing',10000,'USD',false,now());
+SELECT must_fail('an over-reversal on a group that has also cleared', $q$
+    SELECT record_auth_event('t1','d2_c','g_d2','omega','card_d2','reversal',10000,'USD',false,now());
+    DO $d$ BEGIN
+        IF EXISTS (SELECT 1 FROM card_hold_drift WHERE group_key='g_d2') THEN
+            RAISE EXCEPTION 'UNDER-WATER GROUP DETECTED';
+        END IF;
+    END $d$;
+$q$, 'under-water group detected');
+-- ...and an out-of-order clearing that lands before its authorization must NOT
+-- fire it: that dip is order tolerance, not an over-reversal.
+SELECT record_auth_event('t1','d2_x','g_d2ok','omega','card_d2b','clearing',4000,'USD',false,now());
+SELECT record_auth_event('t1','d2_y','g_d2ok','omega','card_d2b','authorization',9000,'USD',false,now());
+SELECT eq('an out-of-order clearing does not look like an over-reversal',
+          (SELECT count(*) FROM card_hold_drift WHERE group_key='g_d2ok'), 0);
+
 SELECT must_fail('reversing more than was ever authorized', $q$
     SELECT record_auth_event('t1','r6_ov_c','g_overrev','omega','card_ov','reversal',10000,'USD',false,now());
     DO $d$ BEGIN

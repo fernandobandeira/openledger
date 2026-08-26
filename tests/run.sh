@@ -16,6 +16,13 @@
 # tests can edit the thing that checks the tests. The durable answers are outside
 # this file: review, and CI running a pinned configuration the branch cannot edit.
 #
+# **`.github/workflows/test.yml` now exists**, which is the durable answer named
+# above and the reason most of what follows is a second choice rather than the
+# defence. A branch cannot edit its way past a check that runs from the default
+# branch's definition on a machine the author does not control. An over-engineering
+# review put it plainly: eight rounds produced nine layers of a defence this file
+# documents as ineffective, in place of twenty lines of YAML that work.
+#
 # The one guard in this tree that a test file CANNOT forge is not in this file at
 # all. `assert_type_matches_fs_line` in migrations/0002 refused two mutants at
 # SEED time -- the wrong chart could not be loaded, so the wrong system could not
@@ -133,33 +140,19 @@ fi
 # print the sentinel, and this script said PASS. Every guard here reads output the
 # file prints about itself.
 #
-# `sites_for` is the guard that reads something the file cannot cheaply fake: how
-# many assertion CALL SITES its source actually contains. A stub that prints 160
-# `ok` lines from one loop has two. To forge this you have to write the
-# assertions, at which point you have written the test.
+# THE CALL-SITE FLOOR IS GONE, and this is why rather than a silent deletion.
+# It reused the OUTPUT floors as its own thresholds, and those are exact only
+# against emitted output: card_holds.sql carried 211 call sites against a floor of
+# 181 -- thirty lines of slack, four times the seven the comment below says was
+# already enough to gut a suite. Demonstrated by a reviewer: 255 lines deleted,
+# sixteen named controls with them, and this script printed PASS.
 #
-# COMMENTS ARE STRIPPED FIRST, because they are not call sites. Counting raw
-# grep matches meant a file of 200 lines reading `-- must_fail(  fake site` and
-# one loop raising 200 notices satisfied the manifest, both floors and the
-# sentinel: 1,756 lines of controls replaced by 204 lines of nothing, build green.
-# Comments are stripped WHEREVER THEY START, not only at the beginning of a line.
-# Stripping only leading comments left `SELECT 1 WHERE false; -- must_fail(`
-# counting as a call site, which is enough to gut a suite: 25 lines of that plus a
-# notice loop satisfied every floor.
-uncommented() {
-    case "$1" in
-        *.sh) sed 's/#.*//' "$1" ;;
-        *)    sed 's/--.*//' "$1" ;;
-    esac
-}
-sites_for() {
-    case "$1" in
-        *canary.sh) uncommented "$1" | grep -cE '^canary(_sh)? [a-z_]+ ' ;;
-        *.sh) uncommented "$1" | grep -cE 'chk "|echo "   ok' ;;
-        *)    uncommented "$1" \
-                | grep -cE "must_fail\(|SELECT eq\(|SELECT eqv\(|no_drift\(|expect_state\(|plan_uses\(|on_origin\(|RAISE NOTICE 'ok" ;;
-    esac
-}
+# It is not repaired, because tests/canary.sh now covers all six suites and
+# requires each to fail with its OWN control's message, which a truncated suite
+# cannot produce. The floor, the call-site count and the sentinel were three
+# approximations of that one check, each added when an adversary defeated the
+# previous. The output floor and the sentinel stay -- cheap, and a truncated file
+# is exactly the erosion they catch. The approximation with slack in it goes.
 # EXACT, not slack. Seven assertions of headroom on negative_controls.sql was
 # exactly enough to delete the last 88 lines -- the three most recently added
 # controls -- re-emit the sentinel, and walk a live mutant back in with the build
@@ -169,9 +162,9 @@ sites_for() {
 floor_for() {
     case "$1" in
         *bitemporal.sql)        echo 23 ;;
-        *card_holds.sql)        echo 181 ;;
+        *card_holds.sql)        echo 183 ;;
         *golden_trace.sql)      echo 38 ;;
-        *negative_controls.sql) echo 167 ;;
+        *negative_controls.sql) echo 173 ;;
         *query_plans.sql)       echo 11 ;;
         *)                      echo  1 ;;
     esac
@@ -194,12 +187,6 @@ for f in tests/*.sql; do
         echo "   FAIL $f made $n assertions, below its floor of $floor"
         fail=1
     fi
-    sites=$(sites_for "$f")
-    if [ "$sites" -lt "$floor" ]; then
-        echo "   FAIL $f contains $sites assertion call sites, below its floor of $floor"
-        echo "        -- output can be printed in a loop; call sites have to be written"
-        fail=1
-    fi
     # ...AND the file must have run to its last line. The floor counts OUTPUT, not
     # assertions: prepending a loop that raises N fake `ok` notices and then a
     # backslash-q satisfied the manifest, the floor and the build -- for all five
@@ -214,17 +201,17 @@ done
 
 # The concurrency suite needs many sessions, so it cannot be a .sql file.
 echo "── tests/concurrency.sh"
-cout=$(timeout --foreground --kill-after=30 600 ./tests/concurrency.sh "$URL" 2>&1) || fail=1
-if [ "${PIPESTATUS[0]:-0}" = "124" ]; then echo "   FAIL tests/concurrency.sh timed out"; fi
+cout=$(timeout --foreground --kill-after=30 600 ./tests/concurrency.sh "$URL" 2>&1); crc=$?
+# rc captured on its OWN line. `cmd || fail=1` runs `fail=1`, and that assignment
+# rewrites PIPESTATUS -- so the `${PIPESTATUS[0]} = 124` test that used to live here
+# always read 0 and the timeout FAIL could never print. Same defect the comment at
+# the top of this file records as removed; it had survived one line below it.
+[ "$crc" = 0 ] || fail=1
+if [ "$crc" = 124 ] || [ "$crc" = 137 ]; then echo "   FAIL tests/concurrency.sh timed out"; fail=1; fi
 echo "$cout"
 cn=$(echo "$cout" | grep -cE '^ +ok  ') || true
 if [ "$cn" -lt 57 ]; then
     echo "   FAIL tests/concurrency.sh made $cn assertions, below its floor of 57"
-    fail=1
-fi
-csites=$(sites_for tests/concurrency.sh)
-if [ "$csites" -lt 57 ]; then
-    echo "   FAIL tests/concurrency.sh contains $csites assertion call sites, below 57"
     fail=1
 fi
 if ! echo "$cout" | grep -q "SUITE-COMPLETE concurrency"; then
@@ -236,16 +223,13 @@ fi
 # the suite says about itself; canary.sh breaks the schema on purpose and requires
 # the suite to notice. See its header for what that is worth.
 echo "── tests/canary.sh"
-kout=$(timeout --foreground --kill-after=60 900 ./tests/canary.sh "$ADMIN" 2>&1) || fail=1
+kout=$(timeout --foreground --kill-after=60 900 ./tests/canary.sh "$ADMIN" 2>&1); krc=$?
+[ "$krc" = 0 ] || fail=1
+if [ "$krc" = 124 ] || [ "$krc" = 137 ]; then echo "   FAIL tests/canary.sh timed out"; fail=1; fi
 echo "$kout"
 kn=$(echo "$kout" | grep -cE '^ +ok  canary ') || true
 if [ "$kn" -lt 6 ]; then
     echo "   FAIL tests/canary.sh ran $kn canaries, below its floor of 6"
-    fail=1
-fi
-ksites=$(sites_for tests/canary.sh)
-if [ "$ksites" -lt 6 ]; then
-    echo "   FAIL tests/canary.sh contains $ksites canary call sites, below 6"
     fail=1
 fi
 if ! echo "$kout" | grep -q "SUITE-COMPLETE canary"; then
