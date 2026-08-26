@@ -733,8 +733,51 @@ GRANT SELECT, INSERT, UPDATE ON ledger_account_balances TO openledger_app;
 -- remain visible through the parent to every view. Verified: two legs appended to a
 -- long-committed transaction through such a child, with the seal, the append-only
 -- grant and the drift alarm all intact and silent. The invariants here are
--- per-table, not per-hierarchy, and SQL cannot make them otherwise; the least this
--- file can do is not hand out the privilege that reaches it.
+-- per-table, not per-hierarchy -- and an earlier version of this comment ended
+-- "and SQL cannot make them otherwise". THAT WAS FALSE, and it is the third
+-- "cannot" in this file to fall to a reviewer with eleven lines of SQL. (The
+-- first said nothing could stop TRUNCATE. The second said the aggregate could
+-- answer a recorded-axis as-of question.)
+--
+-- What the escape buys, measured as openledger_app in ONE session with no
+-- superuser, no SET and no DDL of its own -- only a child table an operator or a
+-- future migration created: 500.00 of revenue became 666,500.00, a 1,333x
+-- overstatement, with the income statement, the trial balance, the balance sheet,
+-- the accounting equation, balance_sheet_balances and BOTH drift views all
+-- agreeing, because every view reads the hierarchy while every trigger, unique
+-- index and composite foreign key is per-table. The seal was provably still alive
+-- on the parent in the same database at the same moment.
+--
+-- An event trigger closes it. `ddl_command_end` fires after the child exists, so
+-- pg_inherits already shows the link and the whole statement rolls back; it
+-- catches CREATE TABLE ... INHERITS and ALTER TABLE ... INHERIT alike, including
+-- a child built with INCLUDING CONSTRAINTS. Ordinary DDL is unaffected.
+CREATE FUNCTION refuse_ledger_inheritance() RETURNS event_trigger
+LANGUAGE plpgsql AS $$
+DECLARE r record;
+BEGIN
+    FOR r IN
+        SELECT c.oid::regclass AS child, p.oid::regclass AS parent
+          FROM pg_inherits i
+          JOIN pg_class c ON c.oid = i.inhrelid
+          JOIN pg_class p ON p.oid = i.inhparent
+          JOIN pg_namespace n ON n.oid = p.relnamespace
+         WHERE n.nspname = 'public'
+           AND p.relname IN ('ledger_entries','ledger_transactions',
+                             'ledger_events','ledger_accounts')
+           AND c.relkind = 'r' AND NOT c.relispartition
+    LOOP
+        RAISE EXCEPTION
+            'the ledger tables may not be inherited: % would carry none of %''s '
+            'triggers, unique indexes or foreign keys, while every view would '
+            'read its rows', r.child, r.parent
+            USING ERRCODE = '23514';
+    END LOOP;
+END $$;
+
+CREATE EVENT TRIGGER ck_no_ledger_inheritance ON ddl_command_end
+    WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE')
+    EXECUTE FUNCTION refuse_ledger_inheritance();
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 
 CREATE FUNCTION refuse_truncate() RETURNS trigger LANGUAGE plpgsql AS $$

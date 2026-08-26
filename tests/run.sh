@@ -122,39 +122,6 @@ if [ "$(grep -cE '^canary(_sh)?\(\) \{' tests/canary.sh)" -ne 2 ] \
     echo "   Redefining either one shadows the oracle with an echo."
     echo "FAIL"; exit 1
 fi
-# ...AND THE MANIFEST IS A CLOSED SET, not a whitelist. `tests/*.sql` is applied in
-# shell glob order, so a file sorting before the real ones -- `aaa_fixture.sql` --
-# runs first with full privileges and can `CREATE OR REPLACE` a deliberately broken
-# function back to correct IN THE DATABASE before any suite reads it. One new file
-# plus one migration edit shipped a live defect with the build green, and the
-# canary never noticed because it does not run the extra file.
-unexpected=""
-for f in tests/*.sql; do
-    b=$(basename "$f")
-    case " $EXPECTED_SUITES " in
-        *" $b "*) ;;
-        *) unexpected="$unexpected $b" ;;
-    esac
-done
-if [ -n "$unexpected" ]; then
-    echo "── UNEXPECTED FILE(S) IN tests/:$unexpected"
-    echo "   Every .sql in tests/ is applied, in glob order. A file that is not in"
-    echo "   the manifest runs anyway, before or after the suites, with the same"
-    echo "   privileges. Add it to EXPECTED_SUITES or remove it."
-    echo "FAIL"; exit 1
-fi
-# ...and canary.sh must define its driver exactly once. Redefining `canary()` as an
-# echo -- one line, appended -- reproduced its output byte for byte and satisfied
-# the call-site floor.
-if [ "$(grep -cE '^canary(_sh)?\(\) \{' tests/canary.sh)" -ne 2 ]; then
-    echo "── tests/canary.sh does not define exactly one canary() and one canary_sh()"
-    echo "FAIL"; exit 1
-fi
-if grep -qE '^[[:space:]]*canary(_sh)?[[:space:]]*\(\)' tests/canary.sh \
-   && [ "$(grep -cE '^[[:space:]]*canary(_sh)?[[:space:]]*\(\)' tests/canary.sh)" -ne 2 ]; then
-    echo "── tests/canary.sh redefines its driver"
-    echo "FAIL"; exit 1
-fi
 
 # ...and a FLOOR on how much each file asserts. The manifest checks existence, not
 # content: deleting bitemporal.sql fails the build, and truncating it to zero bytes
@@ -213,7 +180,11 @@ floor_for() {
 fail=0
 for f in tests/*.sql; do
     echo "── $f"
-    out=$(psql "$URL" -v ON_ERROR_STOP=1 -q -f "$f" 2>&1) || fail=1
+    # A TIMEOUT ON EVERY SUITE. Every other forgery mode here is guarded and a
+    # HANG was not: a workload that blocked on a named pipe whose reader had died
+    # left the build running for sixteen minutes with nothing waiting on a lock.
+    # An infinite CI job is worse than a red one -- it looks like progress.
+    out=$(timeout 300 psql "$URL" -v ON_ERROR_STOP=1 -q -f "$f" 2>&1) || fail=1
     echo "$out" | sed 's/^psql:[^ ]* //;s/^NOTICE:  //;s/^/   /'
     # psql prefixes diagnostics with "psql:<file>:<line>: " -- the same trap that
     # made concurrency.sh's error counter permanently zero.
@@ -243,7 +214,8 @@ done
 
 # The concurrency suite needs many sessions, so it cannot be a .sql file.
 echo "── tests/concurrency.sh"
-cout=$(./tests/concurrency.sh "$URL" 2>&1) || fail=1
+cout=$(timeout 600 ./tests/concurrency.sh "$URL" 2>&1) || fail=1
+if [ "${PIPESTATUS[0]:-0}" = "124" ]; then echo "   FAIL tests/concurrency.sh timed out"; fi
 echo "$cout"
 cn=$(echo "$cout" | grep -cE '^ +ok  ') || true
 if [ "$cn" -lt 55 ]; then
@@ -264,7 +236,7 @@ fi
 # the suite says about itself; canary.sh breaks the schema on purpose and requires
 # the suite to notice. See its header for what that is worth.
 echo "── tests/canary.sh"
-kout=$(./tests/canary.sh "$ADMIN" 2>&1) || fail=1
+kout=$(timeout 900 ./tests/canary.sh "$ADMIN" 2>&1) || fail=1
 echo "$kout"
 kn=$(echo "$kout" | grep -cE '^ +ok  canary ') || true
 if [ "$kn" -lt 6 ]; then

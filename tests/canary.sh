@@ -37,6 +37,15 @@ fail=0
 #   control for. If the suite still passes, either that control or the helper it
 #   reports through has stopped working.
 #
+#   THE EXPECTED TEXT MUST BE A FAILURE FORM, NOT A LABEL. `eqv` and `chk` both
+#   print their label on SUCCESS ("ok  <label> = <value>"), and `grep -qF` cannot
+#   tell that from a failure -- so two of these canaries degraded to "the suite
+#   went red for ANY reason", the coin flip this header says it avoids. A gutted
+#   bitemporal.sql whose named control was reduced to `eqv(<label>, 527, 527)`
+#   certified green while the control was a tautology. Match what the FAILURE
+#   prints: `must_fail` raises "NOT CAUGHT -- <label>", `eqv` raises
+#   "<label> -- expected", `chk` prints "FAIL <label> -- expected".
+#
 #   THE LAST ARGUMENT IS WHY THIS IS AN ORACLE AND NOT A COIN FLIP. Checking only
 #   that a suite goes RED is checkable by the suite: a gutted file that recognises
 #   the canary's schema -- the mutations are a fixed, public set -- can raise on
@@ -76,7 +85,12 @@ canary() {
         echo "        broken. Either its control for this is gone, or the helper it reports"
         echo "        through no longer raises."
         fail=1
-    elif ! printf '%s' "$out" | grep -qF "$want"; then
+    elif ! printf '%s' "$out" | grep -F "$want" | grep -qE 'ERROR|FAIL'; then
+        # THE MATCHED LINE MUST BE A FAILURE LINE. `eqv` and `chk` print their
+        # LABEL on success ("ok  <label> = <value>"), so matching a label alone
+        # degraded two of these canaries to "the suite went red for ANY reason" --
+        # the coin flip this header says it avoids. A gutted bitemporal.sql whose
+        # named control was reduced to a tautology certified green that way.
         echo "   FAIL canary '$name': $suite went red, but not for its own reason."
         echo "        wanted: $want"
         echo "        got:    $(printf '%s' "$out" | grep -iE 'ERROR|FAIL' | head -1)"
@@ -114,7 +128,7 @@ canary regroup_total card_holds.sql 0003_card_holds.sql \
 # be gutted without touching canary.sh at all.
 canary recorded_axis bitemporal.sql 0002_chart_of_accounts.sql \
     "s|en.recorded_at  <= p_as_of|en.recorded_at  < p_as_of|" \
-    "recorded axis, as of now: everything"
+    "recorded axis, as of now: everything -- expected"
 
 canary balance_index query_plans.sql 0001_ledger_core.sql \
     "s|ix_entries__balance_lookup|ix_entries__balance_lookup_renamed|g" \
@@ -145,7 +159,12 @@ canary_sh() {
     if out=$(./tests/concurrency.sh "$url" 2>&1); then
         echo "   FAIL canary '$name': concurrency.sh PASSED against a broken lock"
         fail=1
-    elif ! printf '%s' "$out" | grep -qF "$want"; then
+    elif ! printf '%s' "$out" | grep -F "$want" | grep -qE 'ERROR|FAIL'; then
+        # THE MATCHED LINE MUST BE A FAILURE LINE. `eqv` and `chk` print their
+        # LABEL on success ("ok  <label> = <value>"), so matching a label alone
+        # degraded two of these canaries to "the suite went red for ANY reason" --
+        # the coin flip this header says it avoids. A gutted bitemporal.sql whose
+        # named control was reduced to a tautology certified green that way.
         echo "   FAIL canary '$name': concurrency.sh went red, but not for its own reason."
         echo "        wanted: $want"
         echo "        got:    $(printf '%s' "$out" | grep -iE 'FAIL' | head -1)"
@@ -157,7 +176,7 @@ canary_sh() {
 
 canary_sh ingest_lock 0003_card_holds.sql \
     "s|         WHERE tenant_id=p_tenant AND company_id=p_company AND group_key=p_group FOR UPDATE;|         WHERE tenant_id=p_tenant AND company_id=p_company AND group_key=p_group;|" \
-    "concurrent identical totals converge on that total"
+    "FAIL concurrent identical totals converge on that total"
 
 echo "   ok  SUITE-COMPLETE canary"
 exit "$fail"
