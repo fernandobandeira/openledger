@@ -1,0 +1,833 @@
+-- openledger -- the schema, declaratively.
+--
+-- THIS IS A DESIGN ARTEFACT, NOT A PRODUCT. The ledger itself will be written in
+-- Go; see docs/roadmap.md. This file exists to prove one thing: that the shape the
+-- ADRs describe is expressible in PostgreSQL using nothing but tables, types,
+-- CHECK constraints, foreign keys and unique indexes.
+--
+-- NO TRIGGERS. NO PL/pgSQL. NO LOGIC IN VIEWS BEYOND REPORTING.
+--
+-- An earlier version of this schema carried 27 triggers and 26 PL/pgSQL functions,
+-- and had quietly become the ledger -- the balance invariant, sequence assignment,
+-- running balances and the entire card authorization state machine all lived in
+-- the database, while cmd/openledger was eleven lines that printed "nothing to run
+-- yet". That was the design defect. Triggers were the symptom: you only need one
+-- to police a table that arbitrary callers write to directly, and callers only
+-- write directly when there is no service in front of the database.
+--
+-- So the rules here are:
+--
+--   * Anything a single row can check is a CHECK.
+--   * Anything a key can express is a FOREIGN KEY or a UNIQUE index.
+--   * Anything that needs to read other rows -- "debits equal credits",
+--     "account_seq is the next one for this account", "this hold group's total is
+--     the sum of its live events" -- belongs in Go, in one code path, where an
+--     unbalanced transaction is UNREPRESENTABLE rather than refused.
+--   * Append-only is a GRANT, not a trigger: the application role gets no UPDATE,
+--     DELETE or TRUNCATE on the journal, so there is nothing to police.
+--
+-- Two invariants that used to be triggers are now foreign keys, which is strictly
+-- better -- they are declarative, they are visible in \d, and they cannot be
+-- forgotten by a new writer:
+--
+--   * an account's (purpose, category, normal_balance) must exist in the chart
+--   * an account type's statement line must agree with its category and normal
+--     balance -- a revenue type cannot report under an expense caption
+--
+-- PostgreSQL 18 is a floor: uuidv7() is the default on six tables.
+
+BEGIN;
+
+
+
+
+-- ----------------------------------------------------------------------
+-- types
+
+
+
+-- ----------------------------------------------------------------------
+-- types
+
+
+
+CREATE TYPE ledger_category       AS ENUM ('asset','liability','equity','revenue','expense');
+
+CREATE TYPE ledger_normal_balance AS ENUM ('debit','credit');
+
+CREATE TYPE ledger_direction      AS ENUM ('debit','credit');
+
+CREATE TYPE ledger_txn_status     AS ENUM ('pending','posted');
+
+CREATE TYPE account_owner_type    AS ENUM ('company','platform','bank_account','house');
+
+
+CREATE TYPE auth_event_kind AS ENUM (
+    'authorization','incremental','advice','reversal','clearing','expiry','expiry_reversal');
+
+
+-- ----------------------------------------------------------------------
+-- the chart of accounts -- what an account MEANS
+
+
+
+-- Every account type maps to exactly one financial-statement line. This is what
+-- makes omission structurally impossible: reports enumerate from the chart
+-- outward, so there is no parameter in which to pass an incomplete account list.
+CREATE TABLE fs_lines (
+    code       text CONSTRAINT pk_fs_lines PRIMARY KEY,
+    -- The caption is what a reader sees, so two lines carrying the SAME caption
+    -- are indistinguishable on the face of the statement -- which is exactly the
+    -- harm the restricted-cash split exists to prevent, arrived at from the other
+    -- direction. Giving `restricted_cash` the caption 'Cash and cash equivalents'
+    -- passed every trigger and every test: the split was real in the chart and
+    -- invisible in the report. Nothing in the suite reads a caption, so this is
+    -- the constraint rather than a test.
+    -- A CAPTION IS DISPLAY TEXT, NOT AN IDENTITY -- and three rounds of trying to
+    -- make it one are why that sentence is here rather than a stronger one.
+    --
+    -- The guard below normalises whitespace and case, which stops the accidents
+    -- and the earlier measured defects: 'Current year earnings ' with a trailing
+    -- space passed the reservation, and one-argument btrim() let a tab, a newline,
+    -- an NBSP or a zero-width space through the version that replaced it -- each
+    -- time putting customer suspense under a line pixel-identical to the derived
+    -- earnings plug, balanced, with both drift views empty.
+    --
+    -- IT DOES NOT MAKE A CAPTION SAFE TO KEY ON, and the claim that it compared
+    -- "as a reader sees it" was not something a CHECK can do. One codepoint
+    -- disproves it: `Undistributed earnings (ѕince inception)` with a Cyrillic
+    -- U+0455 for the Latin s passes this CHECK and the unique index, prints
+    -- identically, and showed 940.00 of undistributed earnings against a true
+    -- 500.00 with every report green. Unicode confusables are unbounded and a
+    -- blocklist of them is a losing game.
+    --
+    -- So the rule is stated rather than enforced: **consumers key on `fs_line`,
+    -- the code**, which ck_fs_lines__code_reserved does defend and which
+    -- `balance_sheet` emits for exactly this reason. What follows is defence in
+    -- depth against typos, not a guarantee about what a human eye can tell apart.
+    caption    text NOT NULL CONSTRAINT ck_fs_lines__caption_clean
+                   CHECK (caption = btrim(caption, E' \t\n\r\u00a0\u200b\u2007\u202f')
+                          AND caption <> ''
+                          AND caption !~ '[\u0000-\u001f\u00a0\u200b-\u200f\u2028\u2029\u202f\ufeff]'),
+    statement  text NOT NULL CONSTRAINT ck_fs_lines__statement
+                   CHECK (statement IN ('balance_sheet','income_statement')),
+    -- Which side of the statement this line sits on, declared rather than
+    -- inferred. balance_sheet used to derive it from whatever happened to be
+    -- posted (`bool_or(category = 'asset')`), so a line with NO activity evaluated
+    -- to NULL and landed on the liability/equity side -- inferring the chart from
+    -- the data, in the one report whose whole purpose is the opposite.
+    -- side must belong to the statement. The CHECK used to admit all four values on
+    -- either statement, and balance_sheet_balances counts only 'asset' and
+    -- 'liability_equity' -- so a balance-sheet line carrying side 'debit' was
+    -- counted on NEITHER side and vanished. Verified: 90% of a balance sheet
+    -- missing, reporting balanced = true.
+    side       text NOT NULL,
+    -- `current_year_earnings` is SYNTHESISED by the balance_sheet view for
+    -- un-closed earnings. A chart that also declares a real line by that code
+    -- produces two rows with the same caption and no way to tell them apart --
+    -- one an account subtotal, one a derived plug.
+    CONSTRAINT ck_fs_lines__code_reserved
+        CHECK (code <> 'current_year_earnings'),
+    -- ...AND THE CAPTION, which is the half that actually does the harm the
+    -- comment above describes. balance_sheet emits `'current_year_earnings',
+    -- 'Current year earnings'` as LITERALS, so the synthesised row sits outside
+    -- uq_fs_lines__caption entirely: a chart line under a different code could
+    -- take that caption and be accepted. Measured -- 44,000.00 of customer
+    -- suspense liability booked to such a line, and a reader grouping by caption
+    -- saw 268,000.00 of current year earnings against a true 224,000.00, with
+    -- `balanced = t` and both drift views empty.
+    CONSTRAINT ck_fs_lines__caption_reserved
+        CHECK (lower(btrim(caption, E' \t\n\r\u00a0\u200b\u2007\u202f'))
+                 <> 'undistributed earnings (since inception)'),
+    CONSTRAINT ck_fs_lines__side_matches_statement CHECK (
+        (statement = 'balance_sheet'    AND side IN ('asset','liability_equity')) OR
+        (statement = 'income_statement' AND side IN ('credit','debit'))),
+    sort_order int  NOT NULL DEFAULT 1000
+);
+
+
+-- ...and uniqueness on what the reader distinguishes, not on bytes.
+CREATE UNIQUE INDEX uq_fs_lines__caption
+    ON fs_lines (lower(btrim(caption, E' \t\n\r\u00a0\u200b\u2007\u202f')));
+
+
+-- ...and the key the chart's integrity FK points at. `code` is already the primary
+-- key, so this adds no new uniqueness -- it exists so that a composite foreign key
+-- can carry `statement` and `side` along with the code, which is what turns "a
+-- revenue type may not report under an expense caption" from a trigger into a key.
+ALTER TABLE fs_lines ADD CONSTRAINT uq_fs_lines__code_statement_side
+    UNIQUE (code, statement, side);
+
+CREATE TABLE account_types (
+    code           text CONSTRAINT pk_account_types PRIMARY KEY,
+    category       ledger_category       NOT NULL,
+    -- NOT derivable from category: a loss allowance is an asset with a CREDIT
+    -- normal balance. Storing both is the only correct option.
+    normal_balance ledger_normal_balance NOT NULL,
+    description    text NOT NULL,
+    fs_line        text NOT NULL,
+    -- WHICH STATEMENT AND WHICH SIDE A CATEGORY IMPLIES. Derived, never supplied,
+    -- so it cannot disagree with the category it comes from -- and then carried
+    -- into the foreign key below. This replaces assert_type_matches_fs_line, the
+    -- trigger this project called its best guard because it refused a wrong chart
+    -- at SEED time: the wrong system could not be built and no test had to notice.
+    -- A foreign key does the same and is visible in \\d.
+    fs_statement   text GENERATED ALWAYS AS (
+        CASE WHEN category IN ('revenue','expense') THEN 'income_statement'
+             ELSE 'balance_sheet' END) STORED,
+    fs_side        text GENERATED ALWAYS AS (
+        CASE WHEN category IN ('revenue','expense') THEN
+                  CASE WHEN normal_balance = 'credit' THEN 'credit' ELSE 'debit' END
+             WHEN category = 'asset'               THEN 'asset'
+             ELSE 'liability_equity' END) STORED,
+    CONSTRAINT fk_types__fs_line FOREIGN KEY (fs_line, fs_statement, fs_side)
+        REFERENCES fs_lines (code, statement, side),
+    -- ...and the key ledger_accounts points at, so an account cannot claim a
+    -- category or normal balance its type does not have. Was a trigger.
+    CONSTRAINT uq_types__identity UNIQUE (code, category, normal_balance),
+    -- mirrors exactly one external balance and must reconcile against it
+    is_perimeter   boolean NOT NULL DEFAULT false,
+    -- Can a set of these accounts be summed for reporting? Only if all members
+    -- face ONE counterparty. IAS 1.32 / ASC 210-20-45-1 permit offsetting only
+    -- for amounts due to and from the same party; where the shard key IS the
+    -- counterparty, opposite-sign members must be presented gross.
+    counterparty_scope text NOT NULL DEFAULT 'none'
+        CONSTRAINT ck_types__counterparty_scope
+        CHECK (counterparty_scope IN ('none','shared','per_shard'))
+);
+
+
+-- ----------------------------------------------------------------------
+-- the journal
+
+
+
+-- ---------------------------------------------------------------- accounts
+
+CREATE TABLE ledger_accounts (
+    tenant_id      text NOT NULL,
+    id             uuid NOT NULL DEFAULT uuidv7(),
+    owner_type     account_owner_type    NOT NULL,
+    owner_id       text,                      -- NULL only when owner_type = 'house'
+    purpose        text                  NOT NULL,
+    category       ledger_category       NOT NULL,
+    -- NOT derivable from category: allowance_for_credit_losses is an asset with a
+    -- CREDIT normal balance.
+    normal_balance ledger_normal_balance NOT NULL,
+    currency       char(3)               NOT NULL,
+    metadata       jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+
+    -- composite key: tenant leads every key in the schema (ADR-0007). Free now,
+    -- expensive later -- it is the prerequisite for both partitioning and sharding.
+    CONSTRAINT pk_accounts PRIMARY KEY (tenant_id, id),
+    CONSTRAINT ck_accounts__house_has_no_owner
+        CHECK ((owner_type = 'house') = (owner_id IS NULL)),
+    CONSTRAINT ck_accounts__currency_iso CHECK (currency ~ '^[A-Z]{3}$'),
+    -- AN ACCOUNT MAY NOT DISAGREE WITH ITS TYPE. Carrying category and
+    -- normal_balance on the account is deliberate -- a report must not have to join
+    -- the chart to know the sign of a balance -- but a copy can drift, so the copy
+    -- is a foreign key into the row it was copied from. Was a trigger.
+    CONSTRAINT fk_accounts__type FOREIGN KEY (purpose, category, normal_balance)
+        REFERENCES account_types (code, category, normal_balance)
+);
+
+
+-- Disjoint sets. A plain UNIQUE would not constrain house rows at all, since
+-- owner_id is NULL there and NULL <> NULL.
+-- Lets entries reference (account, currency) as a unit, so an entry cannot carry a
+-- currency its account does not hold. Verified: without this, USD entries sit
+-- happily in EUR accounts and the declared currency is decorative.
+CREATE UNIQUE INDEX uq_accounts__id_currency
+    ON ledger_accounts (tenant_id, id, currency);
+
+
+CREATE UNIQUE INDEX uq_accounts__owned
+    ON ledger_accounts (tenant_id, owner_type, owner_id, purpose, currency)
+    WHERE owner_type <> 'house';
+
+-- House accounts are PER TENANT, not per deployment (ADR-0007): a deployment-global
+-- house account makes every tenant contend on one row and blocks tenant-locality.
+CREATE UNIQUE INDEX uq_accounts__house
+    ON ledger_accounts (tenant_id, purpose, currency)
+    WHERE owner_type = 'house';
+
+
+-- ------------------------------------------------------------ events (ADR-0004)
+-- The idempotency spine. Most of the lifecycle writes NO ledger transaction --
+-- authorizations, declines, hold expiry, reversals, limit changes -- so idempotency
+-- cannot live on ledger_transactions.
+
+CREATE TABLE ledger_events (
+    tenant_id        text NOT NULL,
+    id               uuid NOT NULL DEFAULT uuidv7(),
+    kind             text NOT NULL,
+    source           text NOT NULL,          -- processor | treasury | customer | internal
+    idempotency_key  text NOT NULL,
+    -- sha256 of the canonical request body. Same key + same hash -> replay the
+    -- stored result. Same key + DIFFERENT hash -> reject: silently replaying the
+    -- wrong result is worse than failing.
+    idempotency_hash bytea NOT NULL,
+    payload          jsonb NOT NULL,
+    effective_at     timestamptz NOT NULL,
+    recorded_at      timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT pk_events PRIMARY KEY (tenant_id, id)
+);
+
+
+-- NULLS NOT DISTINCT is INERT here and kept only for uniformity: both columns are
+-- NOT NULL, so there are no NULLs to make distinct. It was load-bearing when
+-- house-scoped rows carried tenant_id NULL; they no longer can. Where the clause
+-- still earns its keep is uq_accounts__owned, whose owner_id IS nullable.
+-- (Found by mutation testing: removing it changed nothing.)
+CREATE UNIQUE INDEX uq_events__idempotency
+    ON ledger_events (tenant_id, idempotency_key) NULLS NOT DISTINCT;
+
+
+-- ------------------------------------------------------------ transactions
+
+CREATE TABLE ledger_transactions (
+    tenant_id       text NOT NULL,
+    id              uuid NOT NULL DEFAULT uuidv7(),
+    event_id        uuid,                    -- the event that caused this
+    kind            text NOT NULL,
+    status          ledger_txn_status NOT NULL,   -- NEVER MUTATES
+    -- from the SOURCE's clock, never now(): a clearing's is the network business
+    -- date, not our webhook's arrival.
+    effective_at    timestamptz NOT NULL,
+    recorded_at     timestamptz NOT NULL DEFAULT now(),
+    resolves_id     uuid,                    -- pending -> posted is a NEW row
+    reverses_id     uuid,
+    external_ref    jsonb NOT NULL DEFAULT '{}'::jsonb,
+    metadata        jsonb NOT NULL DEFAULT '{}'::jsonb,
+    -- The database transaction that created this row. Entries may only be added
+    -- by that same transaction (ck_entries__sealed below).
+    --
+    -- Without this, append-only protected the ENTRY and not the JOURNAL: the app
+    -- role, holding nothing but its ordinary INSERT grant, could add a balanced,
+    -- correctly-dated, correctly-sequenced pair of legs to a transaction committed
+    -- and reported months earlier. February revenue went from 500.00 to 1,166.00
+    -- with the drift view, the accounting equation and the balance sheet all
+    -- green, because every constraint in this file was satisfied.
+    -- ASSIGNED by ck_txn__xact_id, never accepted. The DEFAULT is kept so the
+    -- column is never null if the trigger is ever disabled for a bulk load, but it
+    -- is not the mechanism -- see assign_xact_id() below for what a forged value
+    -- bought before the trigger existed.
+    xact_id         bigint NOT NULL DEFAULT pg_current_xact_id()::text::bigint,
+
+    CONSTRAINT pk_txn PRIMARY KEY (tenant_id, id),
+    -- the target of fk_entries__txn_effective, below
+    CONSTRAINT uq_txn__id_effective UNIQUE (tenant_id, id, effective_at),
+    CONSTRAINT fk_txn__event    FOREIGN KEY (tenant_id, event_id)
+        REFERENCES ledger_events (tenant_id, id),
+    CONSTRAINT fk_txn__resolves FOREIGN KEY (tenant_id, resolves_id)
+        REFERENCES ledger_transactions (tenant_id, id),
+    CONSTRAINT fk_txn__reverses FOREIGN KEY (tenant_id, reverses_id)
+        REFERENCES ledger_transactions (tenant_id, id),
+    -- A transaction cannot reverse or resolve ITSELF, and cannot be both a
+    -- resolution and a reversal. All three committed before these existed.
+    -- The two IS DISTINCT FROM conjuncts are the whole rule. An earlier version
+    -- also compared against a nil-uuid sentinel, which was redundant AND rejected a
+    -- transaction whose id happened to be the nil uuid even when it referenced
+    -- nothing at all.
+    CONSTRAINT ck_txn__no_self_reference
+        CHECK (id IS DISTINCT FROM reverses_id AND id IS DISTINCT FROM resolves_id),
+    CONSTRAINT ck_txn__not_both
+        CHECK (NOT (reverses_id IS NOT NULL AND resolves_id IS NOT NULL))
+);
+
+
+-- A transaction may be reversed once, and resolved once. We refuse to mutate, so
+-- we cannot use the UPDATE ... WHERE reverted_at IS NULL guard.
+-- One event, at most one transaction. Without this the "idempotency spine" does
+-- not by itself prevent double-posting: two transactions were produced from one
+-- event row. (An event may still cause NONE -- most of the lifecycle does.)
+CREATE UNIQUE INDEX uq_txn__one_per_event
+    ON ledger_transactions (tenant_id, event_id) WHERE event_id IS NOT NULL;
+
+
+CREATE UNIQUE INDEX uq_txn__one_reversal
+    ON ledger_transactions (tenant_id, reverses_id) WHERE reverses_id IS NOT NULL;
+
+CREATE UNIQUE INDEX uq_txn__one_resolution
+    ON ledger_transactions (tenant_id, resolves_id) WHERE resolves_id IS NOT NULL;
+
+
+-- ------------------------------------------------------------ entries
+
+CREATE TABLE ledger_entries (
+    -- tenant_id is what makes "no transaction spans two tenants" EXPRESSIBLE.
+    -- Without it, M1's own acceptance criterion could not be stated.
+    tenant_id      text NOT NULL,
+    id             uuid NOT NULL DEFAULT uuidv7(),
+    transaction_id uuid NOT NULL,
+    account_id     uuid NOT NULL,
+    direction      ledger_direction NOT NULL,   -- direction carries the sign,
+    amount_minor   bigint NOT NULL,             -- never the amount
+    currency       char(3) NOT NULL,
+    account_seq    bigint NOT NULL,             -- monotonic per account
+    -- Running balance on the RECORDED axis only. It cannot answer a business-date
+    -- question once anything is backdated (ADR-0003).
+    --
+    -- SIGN CONVENTION: debit-positive. balance_after is SUM(debits) - SUM(credits)
+    -- for this account, so a credit-normal account carries a negative running
+    -- balance. This was undefined until the drift view forced the question -- the
+    -- golden trace stored it natural-positive, which disagrees. Presentation flips
+    -- the sign using the account's normal_balance; storage does not.
+    balance_after  bigint NOT NULL,
+    recorded_at    timestamptz NOT NULL DEFAULT now(),
+    -- denormalised from the transaction so the effective-axis aggregate is a
+    -- single-table index scan.
+    effective_at   timestamptz NOT NULL,
+
+    CONSTRAINT pk_entries PRIMARY KEY (tenant_id, id),
+    CONSTRAINT ck_entries__amount_positive CHECK (amount_minor > 0),
+    -- account_seq orders history: it is the key ledger_balance_drift walks and the
+    -- key every as-of reconstruction depends on. Nothing enforced even POSITIVITY
+    -- -- a seq of -9999 inserted later silently reordered an account's past.
+    -- Gaplessness itself is still only asserted by the suite, not enforced here.
+    CONSTRAINT ck_entries__seq_positive CHECK (account_seq > 0),
+    -- ISO 4217 is uppercase. Without this 'usd' and 'USD' are different
+    -- currencies: each "balances" on its own, a customer's USD balance reads
+    -- 100.00 when it is 300.00, and uq_accounts__owned is defeated because the
+    -- same owner can then hold two operating_cash accounts.
+    CONSTRAINT ck_entries__currency_iso CHECK (currency ~ '^[A-Z]{3}$'),
+    -- THE cross-tenant guard. A composite FK makes a transaction spanning two
+    -- tenants structurally impossible rather than merely discouraged.
+    CONSTRAINT fk_entries__txn FOREIGN KEY (tenant_id, transaction_id)
+        REFERENCES ledger_transactions (tenant_id, id),
+    -- currency is part of the key: an entry inherits its account's currency and
+    -- cannot contradict it.
+    CONSTRAINT fk_entries__account FOREIGN KEY (tenant_id, account_id, currency)
+        REFERENCES ledger_accounts (tenant_id, id, currency),
+    -- effective_at is denormalised from the transaction, and nothing held it
+    -- honest: a transaction dated 2026-06-15 accepted 1,000 entries dated
+    -- 1999-01-01. This column is the entire basis of ADR-0003 and every
+    -- business-date report. Same trick as the currency FK above -- make the
+    -- denormalised copy part of a composite key so it CANNOT disagree.
+    CONSTRAINT fk_entries__txn_effective FOREIGN KEY (tenant_id, transaction_id, effective_at)
+        REFERENCES ledger_transactions (tenant_id, id, effective_at),
+    CONSTRAINT uq_entries__account_seq UNIQUE (tenant_id, account_id, account_seq)
+);
+
+
+-- ------------------------------------------------------------ balances
+-- The write-side serialization point AND the O(1) current-balance read. One atomic
+-- upsert returns the new balance and the next sequence number together, so the row
+-- lock IS the serialization -- no SELECT max(), no advisory lock, no retry loop.
+--
+-- input/output kept separate rather than one signed balance: the upsert stays
+-- commutative, gross turnover is free, and no row needs to know the sign convention.
+
+CREATE TABLE ledger_account_balances (
+    tenant_id  text    NOT NULL,
+    account_id uuid    NOT NULL,
+    currency   char(3) NOT NULL,
+    input      bigint  NOT NULL DEFAULT 0,
+    output     bigint  NOT NULL DEFAULT 0,
+    last_seq   bigint  NOT NULL DEFAULT 0,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT pk_balances PRIMARY KEY (tenant_id, account_id, currency),
+    -- currency is IN the foreign key, as it is for entries. Without it the cache
+    -- -- the copy the hot path reads, and the only one the app role may write --
+    -- accepted a second row for the same account under 'usd' or 'JPY', splitting
+    -- one account's balance across two rows.
+    CONSTRAINT fk_balances__account FOREIGN KEY (tenant_id, account_id, currency)
+        REFERENCES ledger_accounts (tenant_id, id, currency),
+    CONSTRAINT ck_balances__non_negative CHECK (input >= 0 AND output >= 0),
+    CONSTRAINT ck_balances__currency_iso CHECK (currency ~ '^[A-Z]{3}$')
+);
+
+
+-- ----------------------------------------------------------------------
+-- indexes -- the hot reads named in ADR-0003 and docs/reference-product.md
+
+
+
+CREATE INDEX ix_entries__balance_lookup
+    ON ledger_entries (tenant_id, account_id, account_seq DESC) INCLUDE (balance_after);
+
+CREATE INDEX ix_entries__asof_recorded
+    ON ledger_entries (tenant_id, account_id, recorded_at DESC, account_seq DESC);
+
+CREATE INDEX ix_entries__effective
+    ON ledger_entries (tenant_id, account_id, effective_at);
+
+CREATE INDEX ix_entries__txn ON ledger_entries (tenant_id, transaction_id);
+
+
+-- ----------------------------------------------------------------------
+-- the card reference product -- authorizations, holds, clearing
+
+
+
+CREATE TABLE card_auth_events (
+    tenant_id     text NOT NULL,
+    id            uuid NOT NULL DEFAULT uuidv7(),
+
+    -- The processor's per-MESSAGE object id (Marqeta transaction token, Increase
+    -- element id, Lithic events[].token) -- NOT the webhook delivery id. Stripe
+    -- documents that one occurrence can emit two distinct evt_ ids, so keying on
+    -- delivery would admit semantic duplicates.
+    processor_msg_id text NOT NULL,
+
+    -- NOTE: there is deliberately no group_key column. Grouping is a revisable
+    -- INFERENCE, not a fact -- see card_auth_event_group below.
+
+    company_id    text NOT NULL,
+    card_id       text NOT NULL,
+    kind          auth_event_kind NOT NULL,
+
+    -- NORMALISED. Signed, always a delta, never a wire value. The adapter is
+    -- responsible for converting a cumulative total into a delta.
+    amount_delta  bigint NOT NULL,
+    -- The minor-unit exponent is currency-dependent (JPY 0, most 2, some 3), so
+    -- the code is part of the value, not metadata.
+    currency      char(3) NOT NULL,
+    -- What the processor actually sent, for audit of the conversion above.
+    raw_amount    bigint,
+    raw_is_total  boolean NOT NULL DEFAULT false,
+    raw           jsonb NOT NULL DEFAULT '{}'::jsonb,
+
+    occurred_at   timestamptz NOT NULL,   -- processor's clock; NOT a total order
+    recorded_at   timestamptz NOT NULL DEFAULT now(),
+    -- Our hold-release policy. NOT the network clearing deadline, which is a
+    -- different clock: it drives dispute eligibility, does not extend on an
+    -- increment, and is 5 days card-present on Visa where our hold is typically 7.
+    hold_expires_at    timestamptz,
+    clearing_deadline  timestamptz,
+
+    CONSTRAINT pk_auth_events PRIMARY KEY (tenant_id, id),
+    -- ISO 4217 is uppercase. 0001 enforces this on entries and accounts and 0003
+    -- enforced it nowhere, so 'usd' created a SECOND hold group: held_for_company
+    -- for 'USD' reported 1000 while 500 more was live under 'usd'. Same failure the
+    -- 0001 comment describes, in the number the authorization decision is made on.
+    CONSTRAINT ck_auth_events__currency_iso CHECK (currency ~ '^[A-Z]{3}$'),
+    -- sign is a property of the kind. 'advice' and 'expiry_reversal' are exempt:
+    -- advice is bidirectional on some processors, and an expiry reversal is a
+    -- positive delta on a release.
+    -- amount_delta = 0 is legal ONLY for a cumulative total that restates the
+    -- amount already applied. A processor re-sending the same total under a new
+    -- message id is a routine re-delivery; before this it produced a delta of 0
+    -- and died on this CHECK with an opaque constraint error.
+    -- A $0.00 authorization is a real message -- account verification / AVS /
+    -- card-on-file -- and so is a $0.00 capture. Both were refused outright, with
+    -- an opaque constraint error. An expiry_reversal is a positive delta on a
+    -- release by definition, so it is no longer exempt.
+    CONSTRAINT ck_auth_events__sign CHECK (
+        kind = 'advice' OR
+        -- expiry_reversal carries ZERO. Expiry is a flag that never subtracted
+        -- anything from total_minor, so a reversal of it must not ADD anything
+        -- back: it clears the flag. Carrying +remaining made one 100.00
+        -- authorization hold 200.00, and after the full 100.00 capture it still
+        -- held 100.00 -- with drift silent, because the log genuinely contained
+        -- the +10000 and the alarm can only compare the total to the log. The
+        -- header argues at length that an event carrying -remaining would be a
+        -- read-modify-write smuggled into an append-only log; the mirror image
+        -- shipped anyway. The wire amount is kept in raw_amount.
+        (kind = 'expiry_reversal' AND amount_delta = 0) OR
+        (kind IN ('authorization','incremental') AND amount_delta >= 0) OR
+        -- 'expiry' is absent deliberately: expiry is a FLAG. The enum value stays
+        -- (removing one is a rewrite) and no row may carry it. record_auth_event
+        -- refuses it too, but that gated only the function -- an operator backfill
+        -- or a second adapter produced the double release the header argues
+        -- against, five lines above the constraint that used to permit it.
+        (kind IN ('reversal','clearing')  AND amount_delta <= 0))
+);
+
+
+-- ------------------------------------------------------------ grouping
+-- Which authorization an event belongs to is NOT a fact we receive; it is an
+-- inference. The spec is explicit: "No clean foreign key. Network IDs (ARN, RRN)
+-- don't reliably agree across messages. Needs exact match, then fuzzy fallback on
+-- card+merchant+amount +/- tolerance+window, then an explicit unmatched queue --
+-- never a silent guess."
+--
+-- So re-grouping is a ROUTINE corrective operation: a clearing sits unmatched and
+-- is later attached; a sentinel-polluted trace merged two unrelated authorizations
+-- and must be split. Storing group_key on the event would force that operation to
+-- UPDATE a row we call immutable.
+--
+-- Membership is therefore its own bitemporal table. The event stays a genuinely
+-- immutable financial fact; the inference about it is revisable and auditable.
+CREATE TABLE card_auth_event_group (
+    tenant_id    text NOT NULL,
+    -- Identity is a uuidv7, NOT (event_id, assigned_at). now() is TRANSACTION
+    -- time, so it is constant across a transaction: an operator correcting the
+    -- same event twice in one transaction collided on the primary key. This is
+    -- the same lesson as ADR-0005 -- a timestamp is not an ordering key -- and
+    -- uuidv7 is time-ordered, so the trail still reads chronologically.
+    id           uuid NOT NULL DEFAULT uuidv7(),
+    event_id     uuid NOT NULL,
+    group_key    text NOT NULL,
+    method       text NOT NULL CONSTRAINT ck_event_group__method
+                     CHECK (method IN ('lifecycle_id','rrn','fuzzy','manual')),
+    assigned_at  timestamptz NOT NULL DEFAULT now(),
+    assigned_by  text NOT NULL,
+    -- NULL = the current assignment. Equal to assigned_at when an assignment is
+    -- superseded inside the transaction that created it: a zero-width interval,
+    -- correct because that assignment was never visible outside it.
+    superseded_at timestamptz,
+    CONSTRAINT pk_event_group PRIMARY KEY (tenant_id, id),
+    CONSTRAINT fk_event_group__event FOREIGN KEY (tenant_id, event_id)
+        REFERENCES card_auth_events (tenant_id, id)
+);
+
+
+-- Materialised per-group total. Every processor surveyed ships one; against a
+-- ~1s real-time-decisioning budget, deriving a hold by summing an unbounded event
+-- log is unbounded work. This is the design, not a contingency.
+--
+-- That is an ARGUMENT, not a measurement. An earlier version of this comment said
+-- "measured at 1131ms on two years of history against a 1500ms budget"; neither
+-- number has a source, spike 006 says the derivation "has not been benchmarked
+-- here", and every other budget figure in this repo says ~1s. Both are struck.
+CREATE TABLE card_hold_groups (
+    tenant_id   text NOT NULL,
+    company_id  text NOT NULL,
+    group_key   text NOT NULL,
+    -- A group holds ONE currency. Without this, total_minor summed minor units
+    -- across denominations and reported 100.00 USD + 50.00 EUR as "held 15000" --
+    -- the same vacuity removed from the accounting equation in 0002, but sitting
+    -- in the authorization decision, where the number IS available credit.
+    currency    char(3) NOT NULL CONSTRAINT ck_hold_groups__currency_iso
+                    CHECK (currency ~ '^[A-Z]{3}$'),
+    total_minor bigint NOT NULL DEFAULT 0,
+    -- The cumulative AUTHORIZED subtotal: the running sum of increase-side deltas
+    -- only. A processor restating a cumulative total is restating THIS, not the
+    -- net total -- the net total also has clearings and reversals in it. Deriving
+    -- the delta from the net total made the result depend on arrival order: the
+    -- same three messages produced four different holds across six orders, with no
+    -- error and no drift. That falsifies the headline claim of this whole file.
+    authorized_minor bigint NOT NULL DEFAULT 0,
+    -- Which convention this group's increase-side messages use, fixed by the first
+    -- one. NULL until then.
+    --
+    -- MIXING THEM IS IRRECONCILABLE, and this is the honest limit of the
+    -- order-tolerance claim. {authorization +100.00 as a delta, incremental 120.00
+    -- as a cumulative total} yields 120.00 in one order and 220.00 in the other,
+    -- because a total arriving BEFORE the delta it restates cannot be identified as
+    -- already inclusive of it -- there is no information in the message that says
+    -- so. No derivation can fix that; only refusing the mix can.
+    --
+    -- Within one convention order-tolerance holds: pure deltas commute, and pure
+    -- totals resolve to the maximum total seen, with anything lower refused as
+    -- out-of-order rather than guessed.
+    total_convention text CONSTRAINT ck_hold_groups__total_convention
+                          CHECK (total_convention IN ('delta','total')),
+    -- GREATEST(total,0): an over-capture ($1 fuel auth clearing at $95) must
+    -- contribute 0, never raise available credit. Increase ships the same clamp as
+    -- pending_transaction.held_amount.
+    held_minor  bigint GENERATED ALWAYS AS (
+        CASE WHEN expired_at IS NOT NULL THEN 0 ELSE GREATEST(total_minor, 0) END) STORED,
+    open_events int  NOT NULL DEFAULT 0,
+    -- Expiry is a FLAG, not an event carrying -remaining. Computing that amount
+    -- requires reading the aggregate, which is a read-modify-write smuggled into
+    -- an append-only log -- and a read does not commute. TigerBeetle models the
+    -- same thing as an interval whose expiry restores the remainder as an engine
+    -- operation, for exactly this reason.
+    expired_at  timestamptz,
+    -- authorized_minor at the moment of expiry. The alarm needs to distinguish
+    -- EXPOSURE ADDED after a release from an event merely arriving after one: a
+    -- late clearing on an expired group is entirely normal and reduces the log,
+    -- while an increase-side message is the thing that must never be swallowed by
+    -- the clamp. Keying on "any event after expiry" flagged the normal case.
+    expired_authorized bigint,
+    -- ...and total_minor at that moment. authorized_minor counts increase-side
+    -- deltas ONLY, so two ways of raising live exposure after a release moved it
+    -- not at all: an expiry_reversal (excluded from the increase list by design),
+    -- and REMOVING a decrease-side event -- splitting a mis-grouped clearing out of
+    -- an expired group took exposure from 20.00 to 100.00 with the alarm's
+    -- discriminator unchanged. Both are visible in the total.
+    expired_total bigint,
+    -- Distinguishes the three conditions the clamp otherwise maps onto one 0:
+    -- legitimate over-capture, an adapter feeding a total into a delta column, and
+    -- a mis-grouped clearing. Over-capture becomes a recorded, alarmable state
+    -- rather than a value silently swallowed at SELECT time.
+    overcaptured_at timestamptz,
+    -- Durable evidence, because overcaptured_at is deliberately non-latching and
+    -- was therefore ERASED by the next event that brought the total back up: a
+    -- 95.00 over-capture became invisible one message later. The low-water mark
+    -- cannot be erased, so "did this group ever over-capture" stays answerable.
+    low_water_minor bigint NOT NULL DEFAULT 0,
+    last_event_seq  bigint NOT NULL DEFAULT 0,
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT pk_hold_groups PRIMARY KEY (tenant_id, company_id, group_key)
+);
+
+
+-- HTTP-layer dedup. A separate concern from ledger identity, with no ledger effect.
+CREATE TABLE webhook_deliveries (
+    tenant_id   text NOT NULL,
+    delivery_id text NOT NULL,
+    received_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT pk_webhook_deliveries PRIMARY KEY (tenant_id, delivery_id)
+);
+
+
+CREATE UNIQUE INDEX uq_auth_events__msg
+    ON card_auth_events (tenant_id, processor_msg_id);
+
+
+-- exactly one live assignment per event
+CREATE UNIQUE INDEX uq_event_group__current
+    ON card_auth_event_group (tenant_id, event_id) WHERE superseded_at IS NULL;
+
+CREATE INDEX ix_event_group__group
+    ON card_auth_event_group (tenant_id, group_key) WHERE superseded_at IS NULL;
+
+-- the audit trail for one event, in assignment order
+CREATE INDEX ix_event_group__event ON card_auth_event_group (tenant_id, event_id, id);
+
+
+CREATE INDEX ix_hold_groups__held
+    ON card_hold_groups (tenant_id, company_id) WHERE held_minor > 0;
+
+
+-- ----------------------------------------------------------------------
+-- reports -- the claim Formance cannot meet without a mapping layer
+
+
+
+-- ------------------------------------------------------------ reporting
+
+CREATE VIEW trial_balance AS
+SELECT a.tenant_id, a.id AS account_id, a.owner_id, a.purpose,
+       t.category, t.normal_balance, e.currency,
+       -- COALESCE, because an account with only credits returned NULL for debits,
+       -- and `WHERE debits - credits <> 0` then DROPS the row instead of flagging
+       -- it -- the same NULL-swallowing class as the `NULL NOT IN (...)` bug.
+       COALESCE(SUM(e.amount_minor) FILTER (WHERE e.direction='debit'), 0)  AS debits,
+       COALESCE(SUM(e.amount_minor) FILTER (WHERE e.direction='credit'), 0) AS credits,
+       -- natural balance: positive means more of what this account normally holds
+       -- PRESENTATION value: positive means more of what this account normally
+       -- holds. Correct for showing ONE account; WRONG to sum across a category,
+       -- because a contra account (asset/credit) would then ADD to assets.
+       CASE WHEN t.normal_balance = 'debit'
+            THEN SUM(CASE WHEN e.direction='debit'  THEN e.amount_minor ELSE -e.amount_minor END)
+            ELSE SUM(CASE WHEN e.direction='credit' THEN e.amount_minor ELSE -e.amount_minor END)
+       END AS balance_minor,
+       -- ARITHMETIC value -- roll up with this one. normal_balance never enters it,
+       -- so a contra account carries its own sign instead of being flipped twice.
+       SUM(CASE WHEN e.direction='debit' THEN e.amount_minor ELSE -e.amount_minor END)
+           AS balance_debit_positive
+FROM ledger_entries e
+JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+                          AND x.status = 'posted'
+JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
+JOIN account_types   t ON t.code = a.purpose
+GROUP BY a.tenant_id, a.id, a.owner_id, a.purpose, t.category, t.normal_balance, e.currency;
+
+
+-- The income statement, enumerated the same way. Its absence was itself a gap:
+-- the completeness defence covered only the balance sheet, while revenue
+-- understatement -- the thing ADR-0009 is about -- had no chart-outward report.
+CREATE VIEW income_statement AS
+WITH dp AS (
+    SELECT e.tenant_id, e.currency, t.fs_line,
+           SUM(CASE WHEN e.direction='debit' THEN e.amount_minor ELSE -e.amount_minor END) AS v
+    FROM ledger_entries e
+    JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+                              AND x.status = 'posted'
+    JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
+    JOIN account_types   t ON t.code = a.purpose
+    GROUP BY e.tenant_id, e.currency, t.fs_line
+), scopes AS (SELECT DISTINCT tenant_id, currency FROM ledger_accounts)
+SELECT s.tenant_id, s.currency, f.code AS fs_line, f.caption, f.sort_order,
+       -- credit-normal lines (revenue) present positive; debit-normal (expense) too
+       (CASE WHEN f.side = 'credit' THEN -1 ELSE 1 END
+        * COALESCE(SUM(d.v), 0))::bigint AS amount_minor,
+       f.side
+FROM scopes s
+CROSS JOIN fs_lines f
+LEFT JOIN dp d ON d.tenant_id = s.tenant_id AND d.currency = s.currency AND d.fs_line = f.code
+WHERE f.statement = 'income_statement'
+GROUP BY s.tenant_id, s.currency, f.code, f.caption, f.sort_order, f.side
+-- ORDERED BY THE CHART. sort_order was written by the seed and read by
+-- nothing, so every value in it could be changed with the suite green -- and the
+-- assertion that claimed to check the order was reading PHYSICAL ROW ORDER: moving
+-- one VALUES row in the seed, changing no sort_order at all, turned it red. A
+-- statement whose lines come out in an arbitrary order is not a statement.
+ORDER BY tenant_id, currency, sort_order;
+
+
+-- ------------------------------------------------------------ the balance sheet
+--
+-- ADR-0009 claimed "reports enumerate from the chart outward, so there is no
+-- parameter in which to pass an incomplete account list." That was ASPIRATIONAL:
+-- trial_balance and accounting_equation both start FROM ledger_entries and
+-- enumerate INWARD, so an account with no entries is simply absent. This view is
+-- the claim made true -- it starts FROM fs_lines and left-joins the numbers on, so
+-- a statement line with no activity appears as a zero rather than vanishing.
+--
+-- It also carries the line the chart could not previously produce. Before this,
+-- a balance sheet built from fs_lines was out by exactly net income: there is no
+-- retained_earnings account and no close, so revenue and expense had nowhere to
+-- go. Un-closed books present that residual as CURRENT YEAR EARNINGS inside
+-- equity, which is standard interim presentation -- and it is a derived line, not
+-- an account, precisely because no closing entry has been made.
+CREATE VIEW balance_sheet AS
+WITH dp AS (
+    SELECT e.tenant_id, e.currency, t.fs_line, t.category,
+           SUM(CASE WHEN e.direction='debit' THEN e.amount_minor ELSE -e.amount_minor END) AS v
+    FROM ledger_entries e
+    JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+                              AND x.status = 'posted'
+    JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
+    JOIN account_types   t ON t.code = a.purpose
+    GROUP BY e.tenant_id, e.currency, t.fs_line, t.category
+), scopes AS (
+    -- Enumerated from the ACCOUNTS, not from the entries. A scope that has been
+    -- opened but has not yet posted anything is still a scope, and a report that
+    -- cannot name it cannot claim completeness over it.
+    --
+    -- HONEST LIMIT: this is still enumeration from data, one level further out.
+    -- There is no tenant registry and no currency registry, so a scope with no
+    -- accounts at all remains invisible, and `p_tenant` below is exactly the
+    -- "parameter in which to pass an incomplete list" that ADR-0009 says should
+    -- not exist. Completeness here is guaranteed WITHIN a scope, not across them.
+    SELECT DISTINCT tenant_id, currency FROM ledger_accounts
+), lines AS (
+    SELECT s.tenant_id, s.currency, f.code AS fs_line, f.caption, f.sort_order, f.side,
+           COALESCE(SUM(CASE WHEN d.category = 'asset' THEN d.v ELSE -d.v END), 0)::bigint
+               AS amount_minor
+    FROM scopes s
+    CROSS JOIN fs_lines f
+    LEFT JOIN dp d ON d.tenant_id = s.tenant_id AND d.currency = s.currency
+                  AND d.fs_line = f.code
+    WHERE f.statement = 'balance_sheet'
+    GROUP BY s.tenant_id, s.currency, f.code, f.caption, f.sort_order, f.side
+)
+SELECT tenant_id, currency, fs_line, caption, sort_order, amount_minor, side FROM lines
+UNION ALL
+-- "UNDISTRIBUTED", NOT "CURRENT YEAR". This plug sums revenue and expense over
+-- ALL POSTED HISTORY, with no date bound -- there is no period close, so there is
+-- no year to be current within. Calling it "Current year earnings" made a ledger
+-- holding three years of activity present 34,000.00 under that caption against a
+-- true current year of 4,000.00: an 8.5x overstatement that grows without bound
+-- with the age of the book, with `balanced = t` and both drift views empty.
+-- `retained_earnings` sits in the chart at sort_order 800 and stays at zero
+-- forever, because nothing routes to it.
+--
+-- The honest fix is a period close, which is designed and unbuilt (ADR-0009, and
+-- "Still open" in the decision log). Until then the caption says what the number
+-- is. `income_statement` has the same shape and no parameter at all: it reports
+-- every posted entry ever, so it is a since-inception statement too.
+SELECT s.tenant_id, s.currency, 'current_year_earnings',
+       'Undistributed earnings (since inception)', 9000,
+       (-COALESCE(SUM(d.v), 0))::bigint, 'liability_equity'
+FROM scopes s
+LEFT JOIN dp d ON d.tenant_id = s.tenant_id AND d.currency = s.currency
+              AND d.category IN ('revenue','expense')
+GROUP BY s.tenant_id, s.currency
+-- ORDERED BY THE CHART. sort_order was written by the seed and read by
+-- nothing, so every value in it could be changed with the suite green -- and the
+-- assertion that claimed to check the order was reading PHYSICAL ROW ORDER: moving
+-- one VALUES row in the seed, changing no sort_order at all, turned it red. A
+-- statement whose lines come out in an arbitrary order is not a statement.
+ORDER BY tenant_id, currency, sort_order;
+
+
+COMMIT;

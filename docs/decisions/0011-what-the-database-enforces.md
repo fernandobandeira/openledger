@@ -63,7 +63,7 @@ duration of the writer's transaction", which the writer still chooses. **A times
 commits.** `xact_id` is already stored for the fix; [0005](./0005-reproducible-as-of.md) is the
 outstanding work.
 
-Both axes are asserted in [`tests/bitemporal.sql`](../../tests/bitemporal.sql) — as *separation*,
+Both axes were asserted in the deleted `tests/bitemporal.sql` suite — as *separation*,
 which holds; not as reproducibility under concurrent writes, which does not.
 
 *(An earlier version of this paragraph said the aggregate could answer the question, retracted that
@@ -251,7 +251,7 @@ Recorded here because the alternative is implying it can.
   several rounds.** A child of `ledger_entries` would inherit CHECKs and nothing else — no FKs, no
   unique indexes, no triggers — while remaining visible through the parent to every view.
   `ck_no_ledger_inheritance`, an `ddl_command_end` event trigger marked `ENABLE ALWAYS`, now refuses
-  the statement; `tests/negative_controls.sql` carries nine controls for it, including an `UNLOGGED`
+  the statement; the deleted `tests/negative_controls.sql` suite carried nine controls for it, including an `UNLOGGED`
   child, a `FOREIGN TABLE` child and one attempted on the replication apply path. The list of
   protected parents is a table (`ledger_uninheritable`) rather than a literal, because it was a
   literal naming four tables while the test census named six — and the two it missed were the card

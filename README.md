@@ -20,7 +20,7 @@ Its **reference implementation** is an embedded B2B charge card funded by a cred
 product exists to prove the core carries something real without forking, and to give the core a
 demanding acceptance test. It is not the project.
 
-**Status:** pre-implementation, but the schema is real and attested. `migrations/` holds the
+**Status:** pre-implementation, but the schema is real and attested. `schema/` holds the
 ledger core, the chart of accounts, and the card hold model; `tests/` replays a full card
 lifecycle against them, asserts the plans of the queries the docs promise are O(1), and then tries
 every way we can think of to break it — each of which must be refused, and refused for the stated reason.
@@ -33,7 +33,7 @@ No Go service yet.
 | [docs/vision.md](./docs/vision.md) | What this is, what is non-negotiable, and a primer if you have never built a ledger. **Read this first.** |
 | [docs/roadmap.md](./docs/roadmap.md) | What gets built, in what order, and why that order |
 | [docs/decisions/](./docs/decisions/) | ADRs — every architectural decision and its reasoning |
-| [tests/](./tests/) | The acceptance suites — a full card lifecycle, and every way we know to break it |
+| [tests/](./schema/) | The acceptance suites — a full card lifecycle, and every way we know to break it |
 | [spikes/](./spikes/) | Timeboxed investigations — brief, findings, and code together |
 | [docs/reference-product.md](./docs/reference-product.md) | The reference card product this ledger was designed against |
 
@@ -44,25 +44,26 @@ six tables and does not exist before 18.
 
 ```sh
 make up        # start postgres on :5433
-make migrate   # apply migrations
-make test-sql  # replay the golden trace + every negative control
-make test      # the above, plus go test
+make schema    # load schema/schema.sql + the seed chart
+make test      # go test ./...
 make help      # everything else
 ```
+
+**Nothing is built yet.** This repository is at the design stage: the deliverable is
+[`docs/decisions/`](./docs/decisions/), and `schema/schema.sql` exists to show that the shape those
+decisions describe is expressible with declarative constraints alone. `go test ./...` covers
+nothing so far.
 
 ## Layout
 
 ```
-cmd/openledger/   entrypoint
-internal/ledger/  the ledger core — accounts, transactions, entries, posting
-internal/pg/      database plumbing
-migrations/       ordered .sql, applied by `make migrate`
-                  seed/ is example data — the card chart of accounts
-tests/            acceptance suites, run by `make test-sql` against a throwaway
-                  database. Mostly SQL; concurrency.sh needs many sessions
-docs/             vision, roadmap, decisions, reference product spec
+docs/             THE DELIVERABLE — vision, decisions, reference product spec
+schema/           the design schema: tables, CHECKs, foreign keys, report views.
+                  Zero triggers, zero PL/pgSQL — see decisions/0012.
+                  chart.sql seeds an example chart of accounts.
 spikes/           timeboxed investigations, one directory each.
                   Separate Go modules, not built by CI.
+cmd/openledger/   entrypoint. Prints "nothing to run yet".
 ```
 
 ## Performance

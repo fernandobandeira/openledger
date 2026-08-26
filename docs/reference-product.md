@@ -81,7 +81,7 @@ statements — runs as a durable scheduled job calling **idempotent** ledger act
 ## 03 — The auth decision
 
 > ⚠️ **This section is a specification, not a description of what exists.** `card_holds`,
-> `credit_lines`, `spend_controls` and `card_transactions` are **not** in `migrations/`. The hold
+> `credit_lines`, `spend_controls` and `card_transactions` are **not** in `schema/`. The hold
 > model shipped instead as `card_auth_events` + `card_auth_event_group` + `card_hold_groups`
 > ([ADR-0010](./decisions/0010-authorization-holds.md)); the credit-line and spend-control tables
 > are unbuilt (roadmap M7). The SQL below shows intended *shape* — none of it runs against the
@@ -197,7 +197,7 @@ WHERE tenant_id = :tenant AND account_id = :acct AND recorded_at <= :as_of
 ORDER BY recorded_at DESC, account_seq DESC LIMIT 1;
 ```
 
-**Two corrections. The shape below is asserted by `tests/query_plans.sql`; the millisecond figures
+**Two corrections. The shape below was asserted by the deleted `tests/query_plans.sql` suite; the millisecond figures
 are not** — they came from a 2M-entry account whose harness is not in the repo. The shipped plan
 test builds 200,000 rows and reports ~36,000 rows removed by filter: same shape, smaller numbers.
 
@@ -384,8 +384,8 @@ A hold is **partially consumed**, not open/closed:
 
 **Superseded.** This whole section describes a mutable `card_holds` row, which
 [ADR-0010](./decisions/0010-authorization-holds.md) replaced with an append-only event log:
-`card_auth_events` + `card_auth_event_group` + `card_hold_groups`, shipped in `migrations/0003` and
-attested by [`tests/card_holds.sql`](../tests/card_holds.sql). It is kept because the *problems* it
+`card_auth_events` + `card_auth_event_group` + `card_hold_groups`, shipped in `schema/schema.sql` and
+attested by the deleted `tests/card_holds.sql` suite. It is kept because the *problems* it
 enumerates are the real ones; the schema below is not what was built.
 `GREATEST` clamps over-capture: a $1 fuel auth clearing at $95 goes to 0, not −94.
 
@@ -393,8 +393,8 @@ enumerates are the real ones; the schema below is not what was built.
 > row, which the domain does not support. [ADR-0010](./decisions/0010-authorization-holds.md)
 > replaced it with an append-only event log: `card_auth_events` (immutable facts),
 > `card_auth_event_group` (revisable grouping, bitemporal), and `card_hold_groups` (the
-> materialised per-group total). Shipped in `migrations/0003` and attested by
-> [`tests/card_holds.sql`](../tests/card_holds.sql). The table below is kept because the problems
+> materialised per-group total). Shipped in `schema/schema.sql` and attested by
+> the deleted `tests/card_holds.sql` suite. The table below is kept because the problems
 > it lists are real; the schema is not what was built.
 
 Other rails get the same shape: `ach_transfers`, `disputes`, `statements`. The ledger is the

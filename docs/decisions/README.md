@@ -19,11 +19,18 @@ here, so the ADRs don't each stop to re-explain them.
   SQL*.
 - **Postgres for durable timers too** — an in-process job queue, no scheduler cluster to run.
 
+> **The SQL implementation and its test suites are gone.** Several entries below refer to
+> `tests/…` files, adversarial rounds and mutation runs. Those existed, they found the defects
+> recorded here, and [0012](./0012-no-triggers.md) deleted them along with the 27 triggers and 26
+> PL/pgSQL functions they were written to attest. The **findings** are the output of this project
+> and they stand; the code that produced them does not. What remains is
+> [`schema/schema.sql`](../../schema/schema.sql) — declarative only, and it loads.
+
 ## The decisions
 
 | # | We decided | Because | Status |
 | --- | --- | --- | --- |
-| [0001](./0001-go-and-postgres.md) | Go + Postgres, no ORM | The load-bearing logic is SQL, so the host language's job is narrow; Postgres has measured headroom of 17–40× what we sized for | accepted |
+| [0001](./0001-go-and-postgres.md) | Go + Postgres, no ORM | Postgres has measured headroom of 17–40× what we sized for. (This cell used to open "the load-bearing logic is SQL, so the host language's job is narrow" — [0012](./0012-no-triggers.md) reverses that: the logic goes in Go, and Postgres keeps only what is declarative.) | accepted |
 | [0002](./0002-data-access-layer.md) | Native pgx + sqlc, over go-jet | go-jet can silently scan a money column as zero with no error, and its codegen needs a live database | accepted |
 | [0003](./0003-bitemporal-balances.md) | Running balance for "now", aggregate-on-read for "as of a business date" | A backdated entry lands with a *later* sequence number, so a running balance answers business-date questions wrongly | accepted |
 | [0004](./0004-event-log.md) | Add an append-only `ledger_events` table | Most accepted operations write no ledger transaction, so idempotency can't live on the transactions table | accepted |
@@ -33,7 +40,8 @@ here, so the ADRs don't each stop to re-explain them.
 | [0008](./0008-durable-timers.md) | Durable timers in Postgres, not Temporal | The need is durable *scheduling*, not workflow orchestration — and a job row commits in the same transaction as the ledger write, which Temporal cannot do | accepted |
 | [0009](./0009-chart-and-completeness.md) | Chart of accounts as data; completeness is a separate invariant | A dropped *balanced sub-book* satisfies the accounting equation while the report is incomplete. (This cell used to say a missing account "drops out of both sides" — [0009](./0009-chart-and-completeness.md) strikes that as false: one account drops out of exactly ONE side, and the equation catches it loudly.) | accepted |
 | [0010](./0010-authorization-holds.md) | A hold is a SUM over an append-only event log, not a mutable amount | Grouping a clearing to its authorization is a revisable inference, and processors disagree on whether an increment carries a delta or a cumulative total | accepted |
-| [0011](./0011-what-the-database-enforces.md) | The dozen guards added under adversarial review, and what the database still cannot enforce | A column with a DEFAULT is not a constraint — `recorded_at`, `account_seq` and `xact_id` all had one, and each turned out forgeable by an INSERT | accepted |
+| [0011](./0011-what-the-database-enforces.md) | The dozen guards added under adversarial review, and what the database still cannot enforce | A column with a DEFAULT is not a constraint — `recorded_at`, `account_seq` and `xact_id` all had one, and each turned out forgeable by an INSERT | **enforcement half superseded by [0012](./0012-no-triggers.md)** |
+| [0012](./0012-no-triggers.md) | **Zero triggers, zero PL/pgSQL. The ledger goes in Go; Postgres keeps only what is declarative** | The schema had quietly become the ledger — 27 triggers and 26 functions against 11 lines of Go — and ten review rounds went into hardening a validation harness that had turned into an unintended product | accepted |
 
 ## Non-negotiable
 
@@ -61,7 +69,7 @@ Undecided, listed plainly rather than buried:
   moved revenue by 45% with every check green. `recorded_at` is transaction-*start* time, and a
   timestamp cannot order commits. The as-of cursor blocks
   **M5**, not M4 — M4 is the RDS benchmark and is unblocked. Both time axes are now asserted
-  ([`tests/bitemporal.sql`](../../tests/bitemporal.sql)); what 0005 still owes is *reproducibility
+  (the deleted `tests/bitemporal.sql` suite); what 0005 still owes is *reproducibility
   under concurrent writes*, which needs a commit-ordered cursor.
 - **Inter-scope obligations reconcile against nothing.** A tenant booking 100,000.00 of
   `due_from_treasury` against an operator booking 60,000.00 of `due_to_tenants` leaves every scope
@@ -103,7 +111,7 @@ Undecided, listed plainly rather than buried:
   them, **a wrong value in either is undetectable by any test** — mutation testing flips them and
   nothing fails, and no test we could write would change that without first building the mechanism.
   They are documentation stored in a column.
-- **Row-level security does not exist yet.** `migrations/` contains no `CREATE POLICY` and no
+- **Row-level security does not exist yet.** `schema/` contains no `CREATE POLICY` and no
   `ENABLE ROW LEVEL SECURITY`, while [0001](./0001-go-and-postgres.md) asserts "tenant isolation
   *is* row-level security" and spike 004 calls it a correctness constraint. `tenant_id` leading
   every key is the *prerequisite*, and it is built; the policies are not. The bullet below
@@ -124,18 +132,18 @@ Undecided, listed plainly rather than buried:
   unbuilt. The unique index only makes the second attempt fail.
 - **The write path requires READ COMMITTED.** REPEATABLE READ and SERIALIZABLE lose most writes to
   serialization failures on the balance upsert, and a retry loop does not rescue it. *Nothing in
-  `tests/`, `spikes/` or `migrations/` sets an isolation level*, so the figures the roadmap quotes
+  the deleted suites, `spikes/` or `schema/` sets an isolation level*, so the figures the roadmap quotes
   are observations from a one-off run, not measurements — the roadmap says so and this page said
   "Measured" for three rounds. The conclusion does not depend on them: `ON CONFLICT DO UPDATE`
   under a stricter isolation level fails with `could not serialize access`, which is a property of
   Postgres. A hard deployment constraint, recorded in no ADR.
 - **Striping is not built.** The stack summary above quotes striped figures; there is no stripe
-  column in `migrations/`, and `uq_accounts__house` would currently prevent one on the accounts
+  column in `schema/`, and `uq_accounts__house` would currently prevent one on the accounts
   that need it.
 - ~~**There is no CI.**~~ **There is now**: `.github/workflows/test.yml` applies the migrations
-  against PostgreSQL 18 and runs `tests/run.sh` on every push and pull request. This was listed here
+  against PostgreSQL 18 and runs the deleted test runner suite on every push and pull request. This was listed here
   as "the highest-leverage item" for eight rounds while nine layers of anti-forgery machinery were
-  added to `tests/run.sh` — machinery whose own header says it "does not defend against a determined
+  added to the deleted test runner suite — machinery whose own header says it "does not defend against a determined
   author" and names CI as the durable answer. Everyone agreed on the answer and wrote the ladder
   instead. **The schema snapshot test is still not wired to anything**, and that half stays open:
   `expected_schema.sql` is twenty-one lines containing one `SELECT` that emits a string — there is no
@@ -164,7 +172,7 @@ Undecided, listed plainly rather than buried:
   by the next round, because the fix was always to correct the number rather than to stop
   duplicating the list. A count maintained in two files is a count that drifts.
 - **Completeness is guaranteed WITHIN a scope, not across them**, and that limit is recorded only
-  in `migrations/0002`. A scope with no accounts at all is invisible to every report, and
+  in `schema/schema.sql`. A scope with no accounts at all is invisible to every report, and
   `balance_sheet_balances`' `p_tenant` is exactly the "parameter in which to pass an incomplete
   list" that
   [0009](./0009-chart-and-completeness.md) says should not exist. `vision.md` states the
@@ -175,7 +183,7 @@ Undecided, listed plainly rather than buried:
 - **The state-machine diagram still names Temporal.** `docs/diagrams/03-state-machines.svg` reads
   "This is the Temporal boundary" — [0008](./0008-durable-timers.md) decided against Temporal.
 - **Shipped surface nothing reads.** `webhook_deliveries`, `hold_expires_at` and `clearing_deadline`
-  exist in `migrations/0003`, carry rationale in comments, and are referenced by no view, no
+  exist in `schema/schema.sql`, carry rationale in comments, and are referenced by no view, no
   function and no test. They are either the next milestone's work or dead weight; recorded here
   rather than left to be discovered as "untested".
 - **Posting rules.** A deployment declares its own accounts; it must also declare how a business
@@ -189,7 +197,7 @@ These are real decisions with real reasoning; none has an ADR, which makes the h
 
 - **All four reports filter `status = 'posted'`.** Without it a pending authorization was
   recognised as revenue and its posted resolution counted it again — 500.00 of interchange twice.
-  The reasoning is in `migrations/0002`.
+  The reasoning is in `schema/schema.sql`.
 - **Balances are stored debit-positive**, and `trial_balance` splits `balance_minor`
   (presentation, normal-balance-signed) from `balance_debit_positive` (arithmetic). Every report
   does its addition in the second and its display in the first.
@@ -204,7 +212,7 @@ These are real decisions with real reasoning; none has an ADR, which makes the h
 - **Five named correctness constraints appear in no document at all**: `uq_txn__one_resolution`,
   `uq_txn__one_reversal` (the double-reversal guard spike 001 identifies as a real Formance bug
   class), `uq_accounts__id_currency`, `uq_txn__id_effective` and `fk_entries__txn_effective`. All
-  five ship in `migrations/0001`. **Three are exercised by `tests/`; the other two cannot be, and
+  five ship in `schema/schema.sql`. **Three were exercised by the deleted suites; the other two cannot be, and
   that is stronger.** `uq_accounts__id_currency` and `uq_txn__id_effective` are the referenced-side
   unique indexes the composite foreign keys point at — remove either and `0001` does not load
   (`there is no unique constraint matching given keys`). A constraint whose absence makes the schema
@@ -252,11 +260,11 @@ Three rules follow, and they are cheap:
   contained six, and none of the six ran against the schema in the same directory. It has been
   deleted and its banner rewritten to say so. Nothing in `spikes/` is executed by CI — and nothing
   in `spikes/` runs against the shipped schema at all — so "measured" there means "was measured
-  once, against something". The live attestation is `tests/`.
+  once, against something". The live attestation was the deleted suites; today it is nothing, and the findings live in these ADRs.
 
 ## On grading the graders
 
-Seven rounds have each found a way to make `tests/run.sh` print PASS over a suite that proves
+Seven rounds have each found a way to make the deleted test runner suite print PASS over a suite that proves
 nothing, and each fix added a guard that reads **something the thing it polices controls** — the
 floor reads output the file prints, the call-site count reads the file's own source, the sentinel
 reads a string the file emits, and the canary reads whether a suite that can recognise it went red.
@@ -267,14 +275,14 @@ a control quietly deleted, a helper weakened, a file truncated, a floor with sla
 defend against a determined author.** Nothing checked into a repository can: whoever edits the tests
 can edit the thing that checks them. The durable answers are outside the file — review, and CI
 running a pinned configuration the branch cannot edit. **CI now exists**
-([`.github/workflows/test.yml`](../../.github/workflows/test.yml)); it is what eight rounds of
+([`.github/workflows/test.yml`](../../schema/schema.sql)); it is what eight rounds of
 in-tree guards were a substitute for, and it was written only after a round asked why the substitute
 kept being rebuilt instead of the thing itself.
 
 **A census must read state the file it lives in has not touched.** Round 10 deleted one line from
-`migrations/0001` — the `ENABLE ALWAYS` on the transaction seal's trigger — and the whole build
+`schema/schema.sql` — the `ENABLE ALWAYS` on the transaction seal's trigger — and the whole build
 printed PASS. The catalog census that exists to catch exactly that sat at the *end* of
-`tests/negative_controls.sql`, and by then the file had issued thirteen `ALTER TABLE … ENABLE
+the deleted `tests/negative_controls.sql` suite, and by then the file had issued thirteen `ALTER TABLE … ENABLE
 ALWAYS` statements of its own as part of unrelated controls: **the suite had repaired the mutant it
 was measuring.** It runs immediately after `BEGIN;` now. The same round found the other half of the
 rule: **a census filter must be as wide as the guard it audits.** The inheritance guard names three
@@ -286,7 +294,7 @@ drift views empty.
 The one guard in this tree that a test file cannot forge is not in the tests. `assert_type_matches_fs_line`
 refused two mutants at **seed time**: the wrong chart could not be loaded, so the wrong system could
 not be built, and no test had to notice. That is the shape worth generalising — **prefer a constraint
-that makes a state unreachable to a check that looks for it afterwards.** Everything in `tests/` is a
+that makes a state unreachable to a check that looks for it afterwards.** Everything in the deleted suites was a
 second choice, and the ones worth the most are the ones that could have been constraints.
 
 ## On mutation testing
@@ -313,7 +321,7 @@ app role can supply the id, and two tenants can hold the same one. ADR-0011's ow
 turned out to be forgeable by an INSERT"; it is the one of the four that was never fixed. With two
 tenants sharing an account id, both books balanced and posted entirely as `openledger_app`, the
 shipped drift window reports 0 rows and the mutant reports a false corruption alarm on a correct
-book. `tests/negative_controls.sql` now carries that as a control. **A one-line reason is required,
+book. the deleted `tests/negative_controls.sql` suite carried that as a control before the suites were deleted. **A one-line reason is required,
 and a one-line reason can be wrong; what makes it checkable is that it names a state, so someone
 can go and build it.**
 

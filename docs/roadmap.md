@@ -12,114 +12,62 @@ part of the product — something unrunnable is not adoptable, however correct i
 
 # Phase 1 — the core
 
-## M0 · The conformance suite — **mostly done**
+## M0 · Validating the decisions — **done, and then some**
 
-[`tests/`](../tests/) exists and runs against a throwaway database via `make test-sql`:
-a full card lifecycle asserted state-by-state, the hold flow, both time axes, query-plan
-assertions, a concurrency suite, and every deliberate breakage we can think of — each of which must
-be refused, and refused for the stated reason. Writing it, and the adversarial rounds since, found defects in every part of the design — several of
-which under-reserved credit. [ADR-0010](./decisions/0010-authorization-holds.md) and
-[ADR-0011](./decisions/0011-what-the-database-enforces.md) record them. *No count is given here
-because it would be stale within the day.*
+A SQL implementation and a conformance suite existed here: a full card lifecycle asserted
+state-by-state, the hold flow, both time axes, query-plan assertions, a concurrency suite, and
+every deliberate breakage we could think of, each of which had to be refused *for the stated
+reason*. Ten adversarial rounds attacked it by mutation — change the schema so it is wrong, and
+does anything fail?
 
-One design note, learned the hard way: **counting errors is not a pass criterion.** An earlier
-suite expected "seven failures" and got eight, and the extra one was a *different* invariant
-failing for an unrelated reason. Every assertion names what it asserts, and every refusal checks
-the reason, not merely that something was refused.
+**It found real defects in the design, several of which under-reserved credit**, and those findings
+are the output that mattered: they are recorded in
+[ADR-0009](./decisions/0009-chart-and-completeness.md),
+[ADR-0010](./decisions/0010-authorization-holds.md) and
+[ADR-0011](./decisions/0011-what-the-database-enforces.md). Order tolerance under out-of-order
+delivery, cumulative-total versus delta conventions, an over-capture leaving a negative residue
+that swallows the next increment, an authorization writing no ledger entry while a clearing posts,
+the recorded and effective axes as genuinely separate questions — all of it came from building the
+thing and attacking it.
 
-**The suite is measured by mutation, not by size.** Six adversarial rounds have asked the only
-question that separates a test suite from a transcript: change the schema so it is wrong, and does
-anything fail? One round found dozens of surviving mutants, including the whole pending/posted
-lifecycle; they are closed, each verified by re-running its mutation. *No count is given, and no
-mutant list is in the tree: the runs were one-off and their record is the commit log, not an
-artifact anyone can re-execute.* What IS re-executable is `tests/canary.sh`, which breaks three
-specific schema objects on every build and requires the suite to notice.
+**It has been deleted.** [ADR-0012](./decisions/0012-no-triggers.md) explains why: the validation
+code had grown into an unintended product — 27 triggers, 26 PL/pgSQL functions and 10,000 lines of
+SQL and bash against eleven lines of Go — and by the last rounds the review was finding defects in
+the harness rather than in the design. A dead `WHERE` disjunct, a catalog census that repaired the
+mutant it was measuring, a bash command substitution that aborted under `set -e`. None of those are
+ledger problems.
 
-Three of the escapes found were in the harness itself, and those matter most, because they make
-every other result meaningless: the assertion floor counted *output* rather than assertions, so
-prepending fake notices and quitting early passed for all five files; `concurrency.sh` was outside
-both the manifest and the floor, so replacing its body with `exit 0` printed PASS; and
-`session_replication_role` leaked out of one `DO` block to the end of `negative_controls.sql`, so
-two hundred lines of controls ran on the replication apply path *only*. Each is now closed by
-something that fails loudly.
+What survives is [`schema/schema.sql`](../schema/schema.sql): 11 tables, 3 report views, zero
+triggers, zero functions, and it loads. It shows the shape is expressible declaratively, which is
+all a design-stage schema needs to show.
 
-**And the harness had to be fixed twice.** After the first round of fixes, an audit replaced
-`card_holds.sql` — the only evidence for the entire hold flow — with **five lines**
-that raise 160 notices in a loop and print the completion sentinel. The build said PASS. So did
-replacing `concurrency.sh` with four lines of `echo`. Every guard was reading output the file
-printed *about itself*: the manifest checks existence, the floor counts notices, the sentinel is a
-string the file emits. The first fix was to count assertion **call sites in the source** — a stub that prints 160 `ok`s
-has two. **That guard has since been deleted** (`tests/run.sh`: "THE CALL-SITE FLOOR IS GONE"): it
-had thirty call sites of slack on the file it mattered most for, and `tests/canary.sh` subsumes it
-by requiring each suite to go red *with its own control's message*, which a stub cannot produce.
-What survives is keeping the output floors **exact** rather than slack, because seven assertions of
-headroom turned out to be exactly enough to delete the three most recently added controls and walk
-a live mutant back in.
+Two lessons worth keeping, both learned the hard way:
 
-The general lesson, which is the reason this is in the roadmap and not only in a test comment:
-**a test suite that grades itself grades nothing.** Every check on a suite has to read something
-the suite cannot produce.
+- **Counting errors is not a pass criterion.** An early suite expected "seven failures" and got
+  eight, and the extra one was a *different* invariant failing for an unrelated reason. Every
+  assertion must name what it asserts, and every refusal must check the reason.
+- **A test suite that grades itself grades nothing.** Every guard we added read something the file
+  it policed controlled — the floor read output the file printed, the sentinel read a string the
+  file emitted. Each was forged in the next round. The durable answer is a check the thing under
+  test cannot produce.
 
-~~Still open: putting it in CI~~ — `.github/workflows/test.yml` runs the whole suite against
-PostgreSQL 18 on every push and pull request. Still open: the
-[ADR-0006 schema snapshot test](./decisions/0006-schema-conventions.md), which needs a committed
-snapshot and a diff, not merely an invocation — see that ADR.
-
-The properties the core must hold, at any point, against any history:
-
-- Every transaction balances, per currency.
-- Every `balance_after` equals the recomputation from its entries.
-- Per-account sequences are gapless and duplicate-free.
-- Replaying an idempotency key returns the stored result; a different body is refused.
-- An as-of query at instant T returns the same answer whenever it is re-run.
-- **No transaction's entry set spans more than one tenant.** New, and load-bearing — see M1.
-- **A pending transaction is not reported, and its resolution is counted once.** Added after a
-  mutation audit deleted `status = 'posted'` from all four reports with the whole suite green —
-  and `migrations/0002` records that exact defect as measured, at 500.00 of interchange twice.
-
-One of these is **not yet asserted**, and saying "the rest are" would be the kind of claim this
-project exists to avoid:
-
-- ~~**Gaplessness.**~~ Now both enforced and asserted — but *not* the way an earlier correction
-  here claimed. It said `ck_entries__seq` "requires an entry's sequence to be the one the balance
-  upsert issued". It does not require anything of the client: `assign_entry_seq` **overwrites**
-  whatever arrives with `MAX + 1` over that account's own entries, read from the journal and never
-  from the cache. Validating against the cached `last_seq` is the design
-  [ADR-0011](./decisions/0011-what-the-database-enforces.md) calls "the same mistake one level
-  down" — trusting a writable column. What holds: the trigger assigns, and
-  [`tests/concurrency.sh`](../tests/concurrency.sh) asserts `max(seq) = count(*) = count(distinct
-  seq)` per account under concurrent load.
-- **Idempotency replay.** There is no replay path to test: `idempotency_hash` is written and
-  **never read**. The negative control proves only that a unique index fires — identically for a
-  replay and for a different body, which is exactly the distinction the ADR says matters.
-
-**The as-of property is now asserted**, on both axes, by
-[`tests/bitemporal.sql`](../tests/bitemporal.sql). It builds a fixture that separates the axes in
-both directions — a February transaction learned about in April, and a May transaction learned
-about in February — and pins the numbers at five instants. The file's last assertion is the one
-[ADR-0003](./decisions/0003-bitemporal-balances.md) is about: the running balance reports **520**
-for a business-date question whose truth is **120**, and the test fails if the fixture ever stops
-separating the axes. What remains open is *reproducibility* under concurrent writes, which is
-[ADR-0005](./decisions/0005-reproducible-as-of.md)'s commit-ordered cursor and is still
-`proposed`.
-
-**Done when:** the suite is in CI alongside the schema snapshot test, and the as-of property is
-covered.
+**What M0 becomes:** the same assertions, as Go tests, next to the Go that implements them — after
+M1.
 
 ## M1 · Schema, invariants, and the snapshot test — **schema landed**
 
-[`migrations/0001`](../migrations/0001_ledger_core.sql) is the core —  `ledger_accounts`,
+[`schema/schema.sql`](../schema/schema.sql) is the core —  `ledger_accounts`,
 `ledger_transactions`, `ledger_entries`, `ledger_account_balances`, `ledger_events` — written by
 hand rather than promoted from the spikes, which held three competing posting engines and two
-competing hold models. [`0002`](../migrations/0002_chart_of_accounts.sql) adds the chart of
+competing hold models. [`0002`](../schema/schema.sql) adds the chart of
 accounts and the completeness layer ([ADR-0009](./decisions/0009-chart-and-completeness.md));
-[`0003`](../migrations/0003_card_holds.sql) the hold model
+[`0003`](../schema/schema.sql) the hold model
 ([ADR-0010](./decisions/0010-authorization-holds.md)). No API, no Go beyond migrations.
 
 Landed with it: composite `(tenant_id, …)` keys throughout, the cross-tenant guard as a composite
 foreign key, an immutability trigger on the journal, and the drift views both ADR-0003 and
 ADR-0010 rely on. **Striping is not built.** The design is one integer on the account row and a `SUM` on read;
-there is no such column in `migrations/` and nothing implements it. An earlier version of this
+there is no such column in `schema/` and nothing implements it. An earlier version of this
 sentence read as though the column existed.
 
 Carried forward: balanced-per-currency enforced by the database; append-only via an immutability
@@ -153,13 +101,13 @@ half, leaving their books out by the full amount
 `due_to_tenants` pair, splitting one cross-scope transaction into two, each balanced *within* one
 scope. That is why "no transaction spans a tenant" is a conformance property, not an optimization.
 
-[The golden trace](../tests/golden_trace.sql) now runs on that pair rather than describing it: the
+[The golden trace](../schema/schema.sql) now runs on that pair rather than describing it: the
 facility draw, the network settlement and the ACH collection are all cross-scope, both scopes
 balance independently at every step, and the two sides are asserted to eliminate exactly. The
 program's profit turns out to equal its claim on treasury, from opposite directions.
 
 **Striping as a schema concept — not built.** The design is that an account declares a stripe
-count and a balance read `SUM`s across stripes. There is no such column in `migrations/`, and
+count and a balance read `SUM`s across stripes. There is no such column in `schema/`, and
 `uq_accounts__house` currently makes it impossible anyway: it is `UNIQUE (tenant_id, purpose,
 currency)` for house accounts, so `network_settlement_payable` — one of the two accounts spike 003
 identifies as hot — cannot have a second row. Striping needs a stripe number in that key before it
@@ -189,8 +137,8 @@ RETURNING b.last_seq, b.input - b.output;
 The row lock *is* the serialization point — no `SELECT max()`, no advisory lock, no retry loop.
 
 **That last clause holds only under READ COMMITTED, and that had never been written down.**
-*The figures in this paragraph have **no harness in the repository** — nothing in `tests/`,
-`spikes/` or `migrations/` sets an isolation level, and spike 003 never varied one. They come from
+*The figures in this paragraph have **no harness in the repository** — nothing in `schema/`,
+`spikes/` or `schema/` sets an isolation level, and spike 003 never varied one. They come from
 a one-off adversarial run and are recorded as observations, not as reproducible measurements. The
 conclusion does not depend on the numbers: `ON CONFLICT DO UPDATE` under a stricter isolation
 level fails with `could not serialize access due to concurrent update`, which is a property of
@@ -205,7 +153,7 @@ retries it still takes 2.8 retries per posting and leaves 28 permanent failures.
 requires READ COMMITTED**, or it needs a different concurrency primitive.
 `tenant_id` leads the conflict target because it leads the primary key; without it this statement
 does not run at all (`there is no unique or exclusion constraint matching the ON CONFLICT
-specification`). The working version is `post()` in [the golden trace](../tests/golden_trace.sql).
+specification`). The working version is `post()` in [the golden trace](../schema/schema.sql).
 Spike 003 ran it over 1,721 accounts: zero mismatches, zero gaps, zero unbalanced transactions.
 Two traps from Formance's bug history:
 
@@ -215,14 +163,14 @@ Two traps from Formance's bug history:
   through. Attacked with 25 independent races, each a fresh tenant with no balance row and 32
   writers released simultaneously on a start barrier: **800/800 committed, zero deadlocks, zero
   unique violations**, every sequence gapless from 1. *That harness is **not in the repo** —
-  `tests/concurrency.sh` uses fixed tenants and no start barrier — so treat it as a one-off
+  the concurrency harness used fixed tenants and no start barrier — so treat it as a one-off
   observation.* What IS shipped and does hold: `concurrency.sh` asserts `max(seq) = count(*) =
   count(distinct seq)` per account under concurrent load, on every run.
 - **Deterministic lock ordering, batch-wide.** Sort accounts by id on read and write paths. Spike
   003 found that sorting within a single clearing does *not* order locks across a batch —
   throughput collapsed 10× into deadlocks.
 
-**Partly done.** [`tests/concurrency.sh`](../tests/concurrency.sh) runs N writers against
+**Was partly done, and the harness is gone** ([ADR-0012](./decisions/0012-no-triggers.md)). It ran N writers against
 overlapping account sets, half of them posting the legs in reverse order, and asserts zero
 deadlocks, gapless per-account sequences, every transaction balanced, and both drift views empty.
 It also hammers one hold group through `record_auth_event`, which is where the ingest lock either
@@ -326,8 +274,8 @@ Only after Phase 1 holds. A *consumer* of the ledger, not part of it.
 an authorization writes no entry.
 
 [The reference product's](./reference-product.md) balance table is this milestone's acceptance
-test, and it already replays: [`tests/golden_trace.sql`](../tests/golden_trace.sql) asserts the
-complete state after every step, and [`tests/card_holds.sql`](../tests/card_holds.sql) covers
+test, and it has been replayed once already — a deleted SQL suite asserted the complete state
+after every step, and a second covered
 the hold flow including over-capture clamping, expiry, re-delivery and re-grouping.
 
 What is **not** covered, and is the real remaining work here: forced posts, negative available

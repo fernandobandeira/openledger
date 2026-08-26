@@ -13,7 +13,7 @@ Almost all the load-bearing logic in a ledger lives in SQL, not in application c
 - Immutability is a trigger that refuses `UPDATE` and `DELETE` on entries for every role, backed
   by a narrow `GRANT` — not application discipline. See [0011](./0011-what-the-database-enforces.md).
 - Tenant isolation is **meant to be** row-level security. `tenant_id` leading every key is the
-  prerequisite and it is built; the policies are **not** -- `migrations/` contains no
+  prerequisite and it is built; the policies are **not** -- `schema/` contains no
   `CREATE POLICY` and no `ENABLE ROW LEVEL SECURITY`. This line read as present tense for three
   rounds while the decision log's front page recorded the gap and named this file.
 

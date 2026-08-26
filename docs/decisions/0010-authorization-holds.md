@@ -22,7 +22,7 @@ The obvious model is a mutable `holds` row with a running amount. It does not su
 - Messages arrive out of order, are re-delivered, and are sometimes never sent at all.
 
 [Spike 006](../../spikes/006-append-only-holds/README.md) has the survey.
-[`migrations/0003`](../../migrations/0003_card_holds.sql) is the implementation.
+[`schema/schema.sql`](../../schema/schema.sql) is the implementation.
 
 ## Decision
 
@@ -69,7 +69,7 @@ are struck. The materialised total stays on the reasoning above; the cost of the
 
 ## What the acceptance test found
 
-[`tests/card_holds.sql`](../../tests/card_holds.sql) attests the flow. Writing it surfaced four
+the deleted `tests/card_holds.sql` suite attested the flow. Writing it surfaced four
 defects in a design that had already been through adversarial review — which is the argument for
 executable attestation over careful reading:
 
@@ -87,7 +87,7 @@ failure available here. Neither was found by reading.
 
 Fixing the four above introduced or exposed three defects that no single-session test can reach.
 All three were reproduced with two interleaved sessions and are now covered by
-[`tests/concurrency.sh`](../../tests/concurrency.sh):
+the deleted `tests/concurrency.sh` suite:
 
 | | |
 | --- | --- |
@@ -100,7 +100,7 @@ shipped suite* — the deadlock counts in the table above (198) and under "Recor
 closed" (91); the 2.96 s block and 3,600 concurrent calls below; and, further down, "18 of 20
 trials", "seven of the eight" and "1,304 of 1,800". An earlier version of this note said "the
 paragraph below", singular, and left the last three unmarked. They all come from one-off runs, not from the shipped
-suite: `tests/concurrency.sh` defaults to 6 workers x 15 operations. They are recorded as
+suite: the deleted `tests/concurrency.sh` suite defaults to 6 workers x 15 operations. They are recorded as
 observations, not as reproducible benchmarks — the harness that produced them is not in the repo.*
 
 **What held under the same attack**, and is worth recording as attested rather than assumed:
@@ -123,7 +123,7 @@ message key space, taken first on every path, was written, measured, and **rever
 carrying an authorization and its increment it produced 6 deadlocks in 6 trials where the
 unmodified code produced 0. A lock taken before the natural one adds an ordering; it does not
 remove one. What shipped instead is narrower and free -- the attach path and `regroup_auth_event`
-lock the *event row* first, explicitly. `tests/concurrency.sh` races that, and an 8-session review
+lock the *event row* first, explicitly. the deleted `tests/concurrency.sh` suite raced that, and an 8-session review
 recorded 61 deadlocks under an unsorted multi-group load with not one deadlock context naming
 `card_auth_events`.
 
@@ -198,7 +198,7 @@ that, and `card_hold_drift` reported nothing for any of them.
 - **So is the repair, and so is a re-grouping.** `recompute_hold_group` takes the row lock itself
   rather than relying on its caller; `regroup_auth_event` locks the event, then both groups in
   `group_key` order, materialising the destination *at its place in that order*. Each of those is
-  load-bearing and each is now raced by [`tests/concurrency.sh`](../../tests/concurrency.sh) —
+  load-bearing and each was raced by the deleted `tests/concurrency.sh` suite —
   which took three attempts for the repair's lock, because the two obvious races both passed
   against code that did not have it.
 - **A group's convention is a derived fact, not a stored decision.** It is recomputed from the log
@@ -278,7 +278,7 @@ each needs a design decision rather than a guard:
   `low_water_minor` — monotone, unerasable — false-positives on the central claim
   of this design: a group whose messages arrive decrease-first dips below any
   clearing that has landed yet, which is exactly the order tolerance the whole
-  file exists to provide (`tests/card_holds.sql` permutation 4,3,2,1 catches it
+  file exists to provide (the deleted `tests/card_holds.sql` suite permutation 4,3,2,1 catches it
   immediately). **The log cannot decide the question**: a reversal that arrives
   before its authorization and a reversal that should never have been sent are the
   same three columns. Deciding needs the processor's reversal-to-authorization
@@ -286,7 +286,7 @@ each needs a design decision rather than a guard:
   called a revisable inference. `low_water_minor` keeps the durable evidence that
   the group was ever there.
 
-  *This paragraph exists because `migrations/0003` said "the ambiguity is recorded
+  *This paragraph exists because `schema/schema.sql` said "the ambiguity is recorded
   in ADR-0010" and it was not. Writing that a thing is recorded elsewhere is not
   recording it.*
 - **An emptied group pins its currency forever.** Group rows cannot be deleted (they carry

@@ -20,26 +20,21 @@ down: ## Stop local postgres
 
 .PHONY: reset
 reset: ## Drop and recreate the local database
-	docker compose down -v && $(MAKE) up && $(MAKE) migrate
+	docker compose down -v && $(MAKE) up && $(MAKE) schema
 
-.PHONY: migrate
-migrate: ## Apply migrations in order
-	@shopt -s nullglob; \
-	files=(migrations/*.sql); \
-	if [ $${#files[@]} -eq 0 ]; then echo "  no migrations yet"; exit 0; fi; \
-	for f in "$${files[@]}"; do echo "  $$f"; psql "$(DB_URL)" -v ON_ERROR_STOP=1 -q -f "$$f" || exit 1; done
+.PHONY: schema
+schema: ## Load the design schema and the seed chart
+	@psql "$(DB_URL)" -v ON_ERROR_STOP=1 -q -f schema/schema.sql
+	@psql "$(DB_URL)" -v ON_ERROR_STOP=1 -q -f schema/chart.sql
+	@echo "  loaded schema/schema.sql + schema/chart.sql"
 
 .PHONY: psql
 psql: ## Open a psql shell
 	psql "$(DB_URL)"
 
 .PHONY: test
-test: test-sql ## Run every test
+test: ## Run the Go tests
 	go test ./...
-
-.PHONY: test-sql
-test-sql: ## Run the SQL suites against a throwaway database
-	@./tests/run.sh
 
 .PHONY: build
 build: ## Build the binary
