@@ -539,6 +539,37 @@ SELECT eq('...and it leaves the unmatched queue',
           (SELECT count(*) FROM card_auth_unmatched WHERE processor_msg_id='redeliv'), 0);
 SELECT no_drift('re-delivery with better matching');
 
+-- =========================================================== the conversion base
+--
+-- THE ROOT-CAUSE BUG THIS FILE EXISTS FOR, and it had no control: deriving a
+-- cumulative total's delta from the group's NET total instead of its AUTHORIZED
+-- subtotal. Mutation testing showed both that mutation and its sibling
+-- (authorized_minor accumulating every delta rather than the increase side) passed
+-- the entire suite.
+--
+-- A group that reports totals, with a partial clearing in between:
+--   authorization total 100.00      -> authorized 10000, total 10000
+--   clearing delta       30.00      -> authorized 10000, total  7000
+--   incremental total   120.00      -> delta is 120.00 - 100.00 = 20.00
+--                                      NOT 120.00 - 70.00 = 50.00
+SELECT record_auth_event('t1','cb_auth','g_base','acme','card_b',
+        'authorization', 10000,'USD',true, now());
+SELECT record_auth_event('t1','cb_clr','g_base','acme','card_b',
+        'clearing', 3000,'USD',false, now());
+SELECT eq('after a partial clearing, the net total moves',
+          (SELECT total_minor FROM card_hold_groups WHERE group_key='g_base'), 7000);
+SELECT eq('...but the authorized subtotal does NOT',
+          (SELECT authorized_minor FROM card_hold_groups WHERE group_key='g_base'), 10000);
+SELECT record_auth_event('t1','cb_inc','g_base','acme','card_b',
+        'incremental', 12000,'USD',true, now());
+SELECT eq('a later total converts against AUTHORIZED, not the net total',
+          (SELECT amount_delta FROM card_auth_events WHERE processor_msg_id='cb_inc'), 2000);
+SELECT eq('...so the hold is 120.00 authorized less 30.00 cleared',
+          (SELECT total_minor FROM card_hold_groups WHERE group_key='g_base'), 9000);
+SELECT eq('...and the authorized subtotal tracks the restatement',
+          (SELECT authorized_minor FROM card_hold_groups WHERE group_key='g_base'), 12000);
+SELECT no_drift('the conversion base');
+
 DO $$ BEGIN RAISE NOTICE 'ok  card hold flow attested'; END $$;
 
 ROLLBACK;

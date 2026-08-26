@@ -1,0 +1,203 @@
+-- The two time axes, which the suite had never evaluated with an as-of value.
+--
+-- ADR-0003's headline claim is that a running balance answers "now" and CANNOT
+-- answer "as of a business date", because a backdated entry lands with a LATER
+-- sequence number than entries whose business date is later than its own. Every
+-- test in this repository posted with effective_at = now(), so:
+--
+--   * accounting_equation() ignoring p_as_of entirely,
+--   * its 'effective' axis reading recorded_at instead,
+--   * and it ignoring p_tenant,
+--
+-- were each individually deletable with the whole suite still green. Nothing here
+-- asserted the design's most-cited property.
+--
+-- The fixture below deliberately separates the axes: three transactions whose
+-- business dates run Jan, Feb, Mar, RECORDED in the order Jan, Mar, Feb. The
+-- February one is the backdated arrival.
+
+\set ON_ERROR_STOP on
+\o /dev/null
+BEGIN;
+
+CREATE FUNCTION eqv(p_label text, p_got bigint, p_want bigint) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF p_got IS DISTINCT FROM p_want THEN
+        RAISE EXCEPTION '% -- expected %, got %', p_label, p_want, p_got;
+    END IF;
+    RAISE NOTICE 'ok  % = %', p_label, p_got;
+END $$;
+
+INSERT INTO ledger_accounts (tenant_id, owner_type, owner_id, purpose, category, normal_balance, currency)
+SELECT 'bt','company','acme',code,category,normal_balance,'USD'
+  FROM account_types WHERE code = 'customer_receivable';
+INSERT INTO ledger_accounts (tenant_id, owner_type, owner_id, purpose, category, normal_balance, currency)
+SELECT 'bt','house',NULL,code,category,normal_balance,'USD'
+  FROM account_types WHERE code = 'interchange_revenue';
+-- a second tenant, so p_tenant is a filter that must actually filter
+INSERT INTO ledger_accounts (tenant_id, owner_type, owner_id, purpose, category, normal_balance, currency)
+SELECT 'bt2','company','beta',code,category,normal_balance,'USD'
+  FROM account_types WHERE code = 'customer_receivable';
+INSERT INTO ledger_accounts (tenant_id, owner_type, owner_id, purpose, category, normal_balance, currency)
+SELECT 'bt2','house',NULL,code,category,normal_balance,'USD'
+  FROM account_types WHERE code = 'interchange_revenue';
+
+-- post(tenant, key, effective_at, recorded_at, amount)
+CREATE FUNCTION bpost(p_tenant text, p_key text, p_eff timestamptz,
+                      p_rec timestamptz, p_amt bigint) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE v_event uuid; v_txn uuid; r record; v_seq bigint; v_bal bigint;
+BEGIN
+    INSERT INTO ledger_events (tenant_id,kind,source,idempotency_key,idempotency_hash,payload,effective_at)
+    VALUES (p_tenant,'bt','internal',p_key,sha256(convert_to(p_key,'UTF8')),'{}',p_eff)
+    RETURNING id INTO v_event;
+    INSERT INTO ledger_transactions (tenant_id,event_id,kind,status,effective_at,recorded_at)
+    VALUES (p_tenant,v_event,'bt','posted',p_eff,p_rec) RETURNING id INTO v_txn;
+
+    FOR r IN SELECT a.id AS account_id, v.d::ledger_direction AS dir
+               FROM (VALUES ('customer_receivable','debit'),('interchange_revenue','credit')) v(p,d)
+               JOIN ledger_accounts a ON a.tenant_id=p_tenant AND a.purpose=v.p
+              ORDER BY a.id
+    LOOP
+        INSERT INTO ledger_account_balances AS b (tenant_id,account_id,currency,input,output,last_seq)
+        VALUES (p_tenant,r.account_id,'USD',
+                CASE WHEN r.dir='debit'  THEN p_amt ELSE 0 END,
+                CASE WHEN r.dir='credit' THEN p_amt ELSE 0 END,1)
+        ON CONFLICT (tenant_id,account_id,currency) DO UPDATE
+           SET input=b.input+EXCLUDED.input, output=b.output+EXCLUDED.output,
+               last_seq=b.last_seq+1
+        RETURNING b.last_seq, b.input-b.output INTO v_seq, v_bal;
+
+        INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
+                                    currency,account_seq,balance_after,effective_at,recorded_at)
+        VALUES (p_tenant,v_txn,r.account_id,r.dir,p_amt,'USD',v_seq,v_bal,p_eff,p_rec);
+    END LOOP;
+END $$;
+
+-- business date Jan, recorded Jan
+SELECT bpost('bt','jan', '2026-01-15','2026-01-15', 100);
+-- business date MARCH, recorded FEBRUARY -- ahead of its own recording? no:
+-- recorded later than the January one, business date later too. The normal case.
+SELECT bpost('bt','mar', '2026-03-15','2026-03-15', 400);
+-- THE BACKDATED ARRIVAL: business date FEBRUARY, learned about in APRIL. It lands
+-- with a HIGHER account_seq than the March entry, which is the whole point.
+SELECT bpost('bt','feb', '2026-02-15','2026-04-01', 20);
+-- ...and the mirror case: a POST-dated arrival. Business date May, learned about
+-- in February. On the recorded axis it is already known on 28 Feb; on the
+-- effective axis it has not happened yet. The two axes therefore diverge in BOTH
+-- directions, which a fixture that only backdates cannot show.
+SELECT bpost('bt','may', '2026-05-15','2026-02-01', 7);
+SELECT bpost('bt2','other','2026-01-15','2026-01-15', 7777);
+
+-- the sequence really is out of business-date order
+SELECT eqv('the backdated entry has the highest account_seq',
+    (SELECT account_seq FROM ledger_entries e
+      JOIN ledger_transactions t ON t.tenant_id=e.tenant_id AND t.id=e.transaction_id
+      JOIN ledger_events v ON v.tenant_id=t.tenant_id AND v.id=t.event_id
+     WHERE e.tenant_id='bt' AND v.idempotency_key='feb' AND e.direction='debit'), 3);
+
+-- ============================================================ the effective axis
+-- What was TRUE of the business on 28 February: January + February = 120.
+SELECT eqv('effective axis, as of 28 Feb: revenue',
+    (SELECT revenue FROM accounting_equation('bt','2026-02-28','effective')), 120);
+SELECT eqv('effective axis, as of 31 Jan: revenue',
+    (SELECT revenue FROM accounting_equation('bt','2026-01-31','effective')), 100);
+SELECT eqv('effective axis, as of 31 Mar: revenue',
+    (SELECT revenue FROM accounting_equation('bt','2026-03-31','effective')), 520);
+SELECT eqv('effective axis, as of 31 May: revenue (the post-dated one lands)',
+    (SELECT revenue FROM accounting_equation('bt','2026-05-31','effective')), 527);
+
+-- ============================================================ the recorded axis
+-- What we KNEW on 28 February: January + March = 500. The February transaction had
+-- not arrived yet. This is the number a reproducible report must return forever.
+-- Jan (recorded Jan) + May (recorded Feb) = 107. March was not recorded until
+-- March, and February did not arrive until April -- neither is known yet.
+SELECT eqv('recorded axis, as of 28 Feb: revenue',
+    (SELECT revenue FROM accounting_equation('bt','2026-02-28','recorded')), 107);
+SELECT eqv('recorded axis, as of 31 Mar: revenue (March arrives)',
+    (SELECT revenue FROM accounting_equation('bt','2026-03-31','recorded')), 507);
+SELECT eqv('recorded axis, as of 30 Apr: revenue (the backdated one arrives)',
+    (SELECT revenue FROM accounting_equation('bt','2026-04-30','recorded')), 527);
+
+-- THE POINT, as an assertion: on the same instant the two axes disagree, and each
+-- holds something the other does not. Effective knows February (backdated, not yet
+-- recorded on 28 Feb); recorded knows May (post-dated, already recorded).
+SELECT eqv('effective knows the backdated February that recorded does not',
+    (SELECT revenue FROM accounting_equation('bt','2026-02-28','effective'))
+  - (SELECT revenue FROM accounting_equation('bt','2026-02-28','recorded')), 13);
+SELECT eqv('...and they converge once everything has both happened and arrived',
+    (SELECT revenue FROM accounting_equation('bt','2026-05-31','effective'))
+  - (SELECT revenue FROM accounting_equation('bt','2026-05-31','recorded')), 0);
+
+-- ...and both still balance at every instant.
+DO $$
+DECLARE r record; n int := 0;
+BEGIN
+    FOR r IN SELECT * FROM accounting_equation('bt','2026-02-28','effective')
+             UNION ALL SELECT * FROM accounting_equation('bt','2026-02-28','recorded')
+             UNION ALL SELECT * FROM accounting_equation('bt','2026-01-31','effective')
+    LOOP
+        n := n + 1;
+        IF NOT r.balanced THEN
+            RAISE EXCEPTION 'as-of report does not balance: % % lhs=% rhs=%',
+                r.tenant_id, r.currency, r.lhs, r.rhs;
+        END IF;
+    END LOOP;
+    IF n <> 3 THEN RAISE EXCEPTION 'expected 3 as-of reports, got %', n; END IF;
+    RAISE NOTICE 'ok  every as-of report balances (% checked)', n;
+END $$;
+
+-- ============================================================ p_tenant filters
+-- bt2 holds 7777 and must not appear in bt's numbers, on either axis.
+-- Explicitly: a filtered report returns ONE scope. Without this the assertions
+-- below still "pass" when p_tenant is ignored, because a scalar subquery over two
+-- rows either takes the first (which happens to be 'bt') or errors with a message
+-- that says nothing about tenancy.
+SELECT eqv('a filtered report covers exactly one scope',
+    (SELECT count(*) FROM accounting_equation('bt','2026-05-31','effective')), 1);
+SELECT eqv('...and so does the other one',
+    (SELECT count(*) FROM accounting_equation('bt2','2026-05-31','effective')), 1);
+
+SELECT eqv('p_tenant filters, effective axis',
+    (SELECT revenue FROM accounting_equation('bt','2026-05-31','effective')), 527);
+SELECT eqv('p_tenant filters, recorded axis',
+    (SELECT revenue FROM accounting_equation('bt','2026-05-31','recorded')), 527);
+SELECT eqv('...and the other tenant is genuinely there',
+    (SELECT revenue FROM accounting_equation('bt2','2026-05-31','effective')), 7777);
+SELECT eqv('unfiltered covers both scopes',
+    (SELECT count(*) FROM accounting_equation(NULL,'2026-05-31','effective')), 2);
+
+-- ============================================================ balance_after
+-- ADR-0003's actual claim: balance_after answers the RECORDED axis and is WRONG
+-- for a business-date question. Asserting it rather than describing it.
+SELECT eqv('running balance = the recorded-axis total (it is the insertion axis)',
+    (SELECT balance_after FROM ledger_entries
+      WHERE tenant_id='bt' AND account_id=(SELECT id FROM ledger_accounts
+                                            WHERE tenant_id='bt' AND purpose='customer_receivable')
+      ORDER BY account_seq DESC LIMIT 1), 527);
+
+DO $$
+DECLARE v_running bigint; v_true bigint;
+BEGIN
+    -- the last entry whose BUSINESS date is on or before 28 Feb, by sequence
+    SELECT balance_after INTO v_running FROM ledger_entries
+     WHERE tenant_id='bt' AND effective_at <= '2026-02-28'
+       AND account_id=(SELECT id FROM ledger_accounts
+                        WHERE tenant_id='bt' AND purpose='customer_receivable')
+     ORDER BY account_seq DESC LIMIT 1;
+    SELECT COALESCE(SUM(CASE WHEN direction='debit' THEN amount_minor ELSE -amount_minor END),0)
+      INTO v_true FROM ledger_entries
+     WHERE tenant_id='bt' AND effective_at <= '2026-02-28'
+       AND account_id=(SELECT id FROM ledger_accounts
+                        WHERE tenant_id='bt' AND purpose='customer_receivable');
+    IF v_running = v_true THEN
+        RAISE EXCEPTION 'the running balance agreed with the business-date truth (% = %) -- '
+            'the fixture no longer separates the axes, so this file proves nothing',
+            v_running, v_true;
+    END IF;
+    RAISE NOTICE 'ok  running balance % is WRONG for the business date; truth is % (ADR-0003)',
+        v_running, v_true;
+END $$;
+
+ROLLBACK;
