@@ -502,6 +502,13 @@ CREATE TABLE card_auth_events (
         -- or a second adapter produced the double release the header argues
         -- against, five lines above the constraint that used to permit it.
         (kind IN ('reversal','clearing')  AND amount_delta <= 0))
+        -- This is a WHITELIST over kinds, not a blacklist, and that is worth more
+        -- than it looks: a value added to auth_event_kind later matches no arm, so
+        -- it can carry NO delta at all -- positive, negative or zero. Verified in
+        -- spike 010 by adding 'financial_authorization' to the enum; the first
+        -- INSERT was refused here. The database is the only layer in the stack that
+        -- noticed. Go's generated enum is `type AuthEventKind string`, an open set
+        -- that decoded the unknown value silently with err == nil.
 );
 
 

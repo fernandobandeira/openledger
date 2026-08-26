@@ -13,6 +13,21 @@ path that writes an entry on its own.
 
 An unbalanced transaction is therefore **unconstructible**, not refused.
 
+**That claim is not free in Go, and as written it was false.** [Spike 010](../../spikes/010-go-or-rust/README.md)
+built the type with four unexported fields and one validating constructor, then fabricated it from
+another package anyway: `ledger.Posting{}` compiles, `var p ledger.Posting` compiles, and
+`make([]ledger.Posting, 2)` compiles — **an empty composite literal is legal outside the package even
+when every field is unexported**, and Go's zero value fills the rest. The fabricated postings reached
+the write path and were stopped by `ck_balances__currency_iso`, *a database CHECK* — the mechanism
+this ADR exists to say we are not relying on. Rust refuses all three at compile time (`cannot
+construct … due to private fields`; `the trait bound Posting: Default is not satisfied`), which is
+what "unconstructible" means without qualification.
+
+In Go the claim becomes true only with a **validating unwrap at the top of the writer** — every
+posting re-checked for a non-zero currency, distinct accounts and a positive amount before expansion,
+so a zero-valued struct cannot pass. That is cheap, and it is not written yet. Until it is, this ADR
+describes an intent rather than a guarantee.
+
 `ledger_entries` keeps its present shape — independent rows carrying a `direction`, with
 `account_seq` and `balance_after`. That is deliberate, and it is what Formance does too: `Posting` in
 the type, two `moves` rows in storage. The row is a leg; the *primitive you can call* is a pair.
