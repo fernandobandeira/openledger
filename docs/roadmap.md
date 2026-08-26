@@ -27,6 +27,19 @@ suite expected "seven failures" and got eight, and the extra one was a *differen
 failing for an unrelated reason. Every assertion names what it asserts, and every refusal checks
 the reason, not merely that something was refused.
 
+**The suite is measured by mutation, not by size.** Four adversarial rounds have asked the only
+question that separates a test suite from a transcript: change the schema so it is wrong, and does
+anything fail? The last round found 58 mutants that survived, including the whole pending/posted
+lifecycle. They are closed, each verified by re-running its mutation.
+
+Three of the escapes found were in the harness itself, and those matter most, because they make
+every other result meaningless: the assertion floor counted *output* rather than assertions, so
+prepending fake notices and quitting early passed for all five files; `concurrency.sh` was outside
+both the manifest and the floor, so replacing its body with `exit 0` printed PASS; and
+`session_replication_role` leaked out of one `DO` block to the end of `negative_controls.sql`, so
+two hundred lines of controls ran on the replication apply path *only*. Each is now closed by
+something that fails loudly.
+
 Still open: putting it in CI, and the
 [ADR-0006 schema snapshot test](./decisions/0006-schema-conventions.md).
 
@@ -38,6 +51,9 @@ The properties the core must hold, at any point, against any history:
 - Replaying an idempotency key returns the stored result; a different body is refused.
 - An as-of query at instant T returns the same answer whenever it is re-run.
 - **No transaction's entry set spans more than one tenant.** New, and load-bearing — see M1.
+- **A pending transaction is not reported, and its resolution is counted once.** Added after a
+  mutation audit deleted `status = 'posted'` from all four reports with the whole suite green —
+  and `migrations/0002` records that exact defect as measured, at 500.00 of interchange twice.
 
 One of these is **not yet asserted**, and saying "the rest are" would be the kind of claim this
 project exists to avoid:

@@ -108,6 +108,20 @@ concurrent calls on one group produced a materialised total exactly equal to the
 cumulative-total conversion also fails closed: 1,304 of 1,800 racing attempts were refused as
 out-of-order, and the derived total was never wrong.
 
+### And five more, all under-reserving credit, all invisible to the alarm
+
+A fourth round attacked the flow specifically for the cardinal sin: reporting **less** exposure
+than is really live, so an authorization is approved that should not be. Every one of these did
+that, and `card_hold_drift` reported nothing for any of them.
+
+| What broke | The fix |
+| --- | --- |
+| **A cumulative total could be RE-GROUPED.** Its stored `amount_delta` is a *relative* quantity — `wire_amount − authorized_minor`, computed under the **source** group's lock against the **source** group's base — so re-summing it against a different base is arithmetic on two unrelated numbers. Two authorizations of 100.00 and 250.00 in one group, then moving the second out, left the destination holding 150.00 against a true 250.00, while `card_auth_events` still recorded the wire amount as 250.00: the audit trail and the total disagreed, on the wrong number. It also poisoned the over-capture signal — the ordinary clearing that followed printed a permanent 100.00 over-capture. | Refused. Re-deriving the delta needs the destination's base *at the time the message arrived*, which is not recoverable. The convention guard compared only labels, so `total → total` passed. |
+| **`total_convention` was set in exactly one place**, the fresh-ingest `UPDATE`. The re-delivery attach, `regroup_auth_event` and `recompute_hold_group` all left it `NULL` — and the mixing guard reads `IS NOT NULL AND …`, so **any group whose first increase arrived by re-delivery had no convention and the guard never engaged.** A delta processor's genuine +120.00, normalised as a total by a second adapter, became +20.00. Reachable through the public API alone. | Derived from the log, by every path that recomputes. `card_hold_drift` compares it too — a group holding both kinds is the state this ADR calls irreconcilable, and the alarm never looked. |
+| **A re-delivery naming a *corrected* group** created a phantom group from caller parameters, returned that phantom's 0 to the adapter while 600.00 was live, and fixed a currency **permanently** from unchecked input — after which every genuine message for that key was refused forever, and refused messages are never stored, so they never reached the review queue either. | Dedup runs before any group is materialised. A re-delivery naming a different key is now refused, not swallowed: that is the processor and the operator disagreeing about where a message belongs, which is what `regroup_auth_event` exists to settle deliberately. |
+| **`regroup_auth_event` read the event's current group with no lock** and never re-read it, so a concurrent move superseded a membership in a group this call held no lock on and never recomputed. Two operators moving one event X→Y and X→Z left Y and Z each materialising the full amount. | Lock the event row first. It is the thing being moved. |
+| **A deleted group row was rebuilt WRONG rather than failing.** `expired_at`, its snapshots and `low_water_minor` are not in the log, so a repair invented them: an expired group came back **live**, its post-expiry alarm permanently disarmed. And an ordinary incremental after a delete had ingest report 70.00 against 1,070.00 of live exposure — drift fires afterwards, but the authorization decision does not wait for it. | `card_hold_groups` rows cannot be deleted. Materialisations may be rewritten; the row carrying the part of the state that is *not* a materialisation may not be removed. |
+
 ## Consequences
 
 - **The unmatched queue is a view, not a special value.** An event with no live assignment is
@@ -118,6 +132,14 @@ out-of-order, and the derived total was never wrong.
   arrive out of order dips negative in passing; a latching flag would turn every such delivery into
   a false alarm. It describes the current total, so a transient dip self-heals.
 - **Ingest is serialised per group.** Contention is per authorization, which is not a hot row.
+- **So is the repair, and so is a re-grouping.** `recompute_hold_group` takes the row lock itself
+  rather than relying on its caller; `regroup_auth_event` locks the event, then both groups in
+  `group_key` order, materialising the destination *at its place in that order*. Each of those is
+  load-bearing and each is now raced by [`tests/concurrency.sh`](../../tests/concurrency.sh) —
+  which took three attempts for the repair's lock, because the two obvious races both passed
+  against code that did not have it.
+- **A group's convention is a derived fact, not a stored decision.** It is recomputed from the log
+  wherever membership changes, so no path can leave the mixing guard disarmed.
 - The ledger takes no dependency on any of this: holds are a product-layer concern built on the
   core, and the core does not know they exist.
 
