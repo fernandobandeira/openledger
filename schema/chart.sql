@@ -35,8 +35,6 @@ INSERT INTO account_types (code,category,normal_balance,description,fs_line,is_p
   -- exactly one external balance and must reconcile against it", and nothing
   -- reconciles. There is no CHECK either, and a CHECK could not help: the column
   -- is a claim about the world, not about the row.
-  -- (This note was written twice, in successive review rounds, and sat here as two
-  -- near-identical paragraphs until the third round noticed. Deduplicated.)
   ('operating_cash','asset','debit','our own bank balance','cash',true,'shared'),
   ('fbo_cash','asset','debit','customer funds held for benefit of','restricted_cash',true,'shared'),
   -- the case that proves normal_balance cannot be derived from category

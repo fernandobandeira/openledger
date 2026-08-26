@@ -10,56 +10,6 @@
 -- CHECK, a key, a GRANT, or one code path in Go. No PL/pgSQL business logic, no
 -- orchestration, no derivation-with-backfill, and no logic in views beyond reporting.
 --
--- An earlier version of this schema carried 27 triggers and 26 PL/pgSQL functions,
--- and had quietly become the ledger -- the balance invariant, sequence assignment,
--- running balances and the entire card authorization state machine all lived in
--- the database, while cmd/openledger was eleven lines that printed "nothing to run
--- yet". That was the design defect. Triggers were the symptom: you only need one
--- to police a table that arbitrary callers write to directly, and callers only
--- write directly when there is no service in front of the database.
---
--- So the rules here are:
---
---   * Anything a single row can check is a CHECK.
---   * Anything a key can express is a FOREIGN KEY or a UNIQUE index.
---   * Anything that needs to read other rows -- "debits equal credits",
---     "account_seq is the next one for this account", "this hold group's total is
---     the sum of its live events" -- belongs in Go, in one code path, where an
---     unbalanced transaction is UNREPRESENTABLE rather than refused.
---   * Append-only is a GRANT *and* a trigger, because a grant binds the application
---     role and nothing else. Migrations, backfills and psql sessions run as the
---     OWNER, `pg_restore --disable-triggers` and the logical-replication apply path
---     set `session_replication_role = 'replica'`, and PostgreSQL's own manual says
---     that in that configuration triggers do not fire at all. See the bottom of
---     this file for what is guarded and what is honestly not.
---
--- Two invariants that used to be triggers are now foreign keys, which is strictly
--- better -- they are declarative, they are visible in \d, and they cannot be
--- forgotten by a new writer:
---
---   * an account's (purpose, category, normal_balance) must exist in the chart
---   * an account type's statement line must agree with its category and normal
---     balance -- a revenue type cannot report under an expense caption
---
--- PostgreSQL 18 is a floor: uuidv7() is the default on six tables.
---
--- HOW THIS GETS APPLIED: goose, from Go -- ADR-0014. This file becomes
--- migrations/00001_baseline.sql when the Go service exists; `make schema` runs it through psql
--- with --single-transaction, which is a development shortcut and not the deployment path.
---
--- NO `BEGIN;`/`COMMIT;` IN THIS FILE, and that is not a style choice. Spike 007
--- measured what they do to a migration runner: goose wraps each migration in its
--- own transaction, an inner `COMMIT;` ENDS IT, and everything after that line then
--- runs unprotected. Demonstrated -- a migration that failed on its last statement
--- left two tables behind AND was not recorded as applied, so the retry died on
--- `relation already exists`. The same file without the two lines rolled back
--- cleanly. `make schema` gets atomicity from `psql --single-transaction` instead,
--- which is the caller's business rather than the file's.
-
-
-
--- ----------------------------------------------------------------------
--- types
 
 
 
@@ -129,7 +79,7 @@ CREATE TABLE fs_lines (
     -- to NULL and landed on the liability/equity side -- inferring the chart from
     -- the data, in the one report whose whole purpose is the opposite.
     -- side must belong to the statement. The CHECK used to admit all four values on
-    -- either statement, and balance_sheet_balances counts only 'asset' and
+    -- either statement, and a balance-sheet roll-up counts only 'asset' and
     -- 'liability_equity' -- so a balance-sheet line carrying side 'debit' was
     -- counted on NEITHER side and vanished. Verified: 90% of a balance sheet
     -- missing, reporting balanced = true.
@@ -343,10 +293,9 @@ CREATE TABLE ledger_transactions (
         REFERENCES ledger_transactions (tenant_id, id),
     -- A transaction cannot reverse or resolve ITSELF, and cannot be both a
     -- resolution and a reversal. All three committed before these existed.
-    -- The two IS DISTINCT FROM conjuncts are the whole rule. An earlier version
-    -- also compared against a nil-uuid sentinel, which was redundant AND rejected a
-    -- transaction whose id happened to be the nil uuid even when it referenced
-    -- nothing at all.
+    -- The two IS DISTINCT FROM conjuncts are the whole rule. Do not add a nil-uuid
+    -- sentinel to them: it is redundant, and it rejects a transaction whose id
+    -- happens to be the nil uuid even when it references nothing.
     CONSTRAINT ck_txn__no_self_reference
         CHECK (id IS DISTINCT FROM reverses_id AND id IS DISTINCT FROM resolves_id),
     CONSTRAINT ck_txn__not_both
@@ -399,7 +348,7 @@ CREATE TABLE ledger_entries (
 
     CONSTRAINT pk_entries PRIMARY KEY (tenant_id, id),
     CONSTRAINT ck_entries__amount_positive CHECK (amount_minor > 0),
-    -- account_seq orders history: it is the key ledger_balance_drift walks and the
+    -- account_seq orders history: it is the key a drift check walks and the
     -- key every as-of reconstruction depends on. Nothing enforced even POSITIVITY
     -- -- a seq of -9999 inserted later silently reordered an account's past.
     -- Gaplessness itself is still only asserted by the suite, not enforced here.
@@ -523,14 +472,6 @@ CREATE TABLE card_auth_events (
     CONSTRAINT ck_auth_events__currency_iso CHECK (currency ~ '^[A-Z]{3}$'),
     -- sign is a property of the kind. 'advice' is exempt because it is bidirectional
     -- on some processors. 'expiry_reversal' is NOT exempt -- it is pinned to ZERO,
-    -- for the reason given fifteen lines down. (This header used to say an expiry
-    -- reversal "is a positive delta on a release", stating as fact the position the
-    -- constraint below exists to forbid. A reader who stopped at the header took
-    -- away the exact behaviour that made one 100.00 authorization hold 200.00.)
-    -- amount_delta = 0 is legal ONLY for a cumulative total that restates the
-    -- amount already applied. A processor re-sending the same total under a new
-    -- message id is a routine re-delivery; before this it produced a delta of 0
-    -- and died on this CHECK with an opaque constraint error.
     -- A $0.00 authorization is a real message -- account verification / AVS /
     -- card-on-file -- and so is a $0.00 capture. Both were refused outright, with
     -- an opaque constraint error.
@@ -598,10 +539,8 @@ CREATE TABLE card_auth_event_group (
 -- ~1s real-time-decisioning budget, deriving a hold by summing an unbounded event
 -- log is unbounded work. This is the design, not a contingency.
 --
--- That is an ARGUMENT, not a measurement. An earlier version of this comment said
--- "measured at 1131ms on two years of history against a 1500ms budget"; neither
--- number has a source, spike 006 says the derivation "has not been benchmarked
--- here", and every other budget figure in this repo says ~1s. Both are struck.
+-- That is an ARGUMENT, not a measurement. The cost of summing the log has not been
+-- benchmarked, and the auth budget everywhere else in this repo is ~1s.
 CREATE TABLE card_hold_groups (
     tenant_id   text NOT NULL,
     company_id  text NOT NULL,
@@ -638,12 +577,6 @@ CREATE TABLE card_hold_groups (
     -- GREATEST(total,0): an over-capture ($1 fuel auth clearing at $95) must
     -- contribute 0, never raise available credit. LITHIC ships the same clamp:
     -- "if there is an over-reversal, Lithic will cap the amounts.hold.amount to $0."
-    -- (This comment used to cite Increase's pending_transaction.held_amount. That is
-    -- a credit-DIRECTION guard -- it differs from `amount` "if the amount is
-    -- positive", so a pending refund does not raise spending power -- not an
-    -- over-capture floor. ADR-0010 recorded the correction and named a file that had
-    -- already been deleted, so the false sentence survived here. Correcting a claim
-    -- in the document that discovered it is not the same as correcting the claim.)
     held_minor  bigint GENERATED ALWAYS AS (
         CASE WHEN expired_at IS NOT NULL THEN 0 ELSE GREATEST(total_minor, 0) END) STORED,
     open_events int  NOT NULL DEFAULT 0,
@@ -781,7 +714,7 @@ ORDER BY tenant_id, currency, sort_order;
 --
 -- ADR-0009 claimed "reports enumerate from the chart outward, so there is no
 -- parameter in which to pass an incomplete account list." That was ASPIRATIONAL:
--- trial_balance and accounting_equation both start FROM ledger_entries and
+-- trial_balance starts FROM ledger_entries and
 -- enumerate INWARD, so an account with no entries is simply absent. This view is
 -- the claim made true -- it starts FROM fs_lines and left-joins the numbers on, so
 -- a statement line with no activity appears as a zero rather than vanishing.
@@ -860,8 +793,8 @@ ORDER BY tenant_id, currency, sort_order;
 --
 -- The rule: a trigger states (1) the invariant it holds, (2) why nothing
 -- declarative can hold it, and (3) what it does NOT protect against. Two clear
--- that bar. An earlier version of this schema had twenty-seven; ADR-0012 records
--- what happened to the other twenty-five.
+-- that bar, as eight trigger objects; ADR-0012 records what happened to the other
+-- nineteen.
 --
 -- The evidence for drawing the line here rather than elsewhere is spike 009.
 -- Formance -- Go, PostgreSQL, in production, the closest analogue there is -- built
@@ -1081,9 +1014,6 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
    -- invisible to held_for_company while total_minor and the log still agree --
    -- the alarm compared exactly those two and therefore reported nothing. The
    -- clamp is the thing hiding the number, so the alarm has to look past it.
-   -- (An earlier version of this comment said the branch was "keyed on the
-   -- monotonic counter, not on now()". It is keyed on the expired_* snapshots.
-   -- `last_event_seq` is read by nothing at all -- see the open list.)
    -- Exposure added to a group AFTER it was expired. held_minor is GENERATED to 0
    -- once expired_at is set, so anything attached later is invisible to
    -- held_for_company while total_minor and the log still agree -- the two columns
@@ -1110,8 +1040,8 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
    -- deleted. It is NOT unerasable: the app role holds UPDATE on this table --
    -- granted so record_auth_event can maintain it -- and one statement sets both
    -- low_water_minor and overcaptured_at back to a clean state with drift silent,
-   -- because drift reads neither column. An earlier version of this comment said
-   -- "it cannot be erased", which is true of the code and false of the table.
+   -- because drift reads neither column: it cannot be erased by the WRITER, which is
+   -- not the same as cannot be erased.
    -- It is also ORDER-DEPENDENT: across 720 permutations of one six-message set,
    -- total_minor, authorized_minor and held_minor each took ONE value and
    -- low_water_minor took TWELVE -- which is the mechanical reason the latching
@@ -1211,9 +1141,8 @@ GRANT SELECT, INSERT, UPDATE ON ledger_account_balances TO openledger_app;
 -- NOTE, AND IT IS A REAL GAP: ADR-0010's fix for the attach/regroup deadlock is
 -- "take the event row lock first, explicitly" -- and `SELECT ... FOR UPDATE` on
 -- card_auth_events requires UPDATE privilege, which this role is NOT granted and is
--- explicitly revoked below. An earlier version of this comment claimed the grant was
--- "deliberate and narrow"; it was describing a privilege that is not there. The
--- application role cannot currently execute the ADR's own remedy. Deciding between
+-- explicitly revoked below. The application role cannot currently execute the ADR's
+-- own remedy. Deciding between
 -- granting UPDATE (and leaning on the append-only trigger to keep it a lock rather
 -- than mutability) and finding a lock that does not need it is open work, recorded
 -- in the decision log rather than papered over here.
