@@ -1,8 +1,8 @@
 # Spike 007 — how do schema changes get applied?
 
-**Status:** closed → [ADR-0014](../../docs/decisions/0014-schema-migrations.md)
+**Status:** closed → [ADR-0003](../../docs/decisions/0003-migrations.md)
 
-**Question.** [ADR-0012](../../docs/decisions/0012-where-logic-lives.md) replaced an ordered
+**Question.** [ADR-0004](../../docs/decisions/0004-where-logic-lives.md) replaced an ordered
 `migrations/` directory with one flat `schema/schema.sql` and did not say what replaces the
 ordering. A ledger cannot take a schema change by hand. Which tool, and versioned or declarative?
 
@@ -84,7 +84,7 @@ instance 2: err=... (42701)
 
 The 5 s / 10 s are the try-lock poll interval. **The CLI has no lock flag at all.** And
 `goose_db_version` has **no unique index on `version_id`** — nothing but the lock prevents a double
-apply. That is why ADR-0014 says *from Go, never from the CLI*.
+apply. That is why ADR-0003 says *from Go, never from the CLI*.
 
 ---
 
@@ -105,7 +105,7 @@ window with no uniqueness on house accounts:
 
 The engine is not wrong — it cannot know that index is a correctness constraint rather than a
 performance one. We know, and a versioned migration is where you say so.
-[ADR-0006](../../docs/decisions/0006-schema-conventions.md) already made this argument for
+[ADR-0007](../../docs/decisions/0007-schema-conventions-and-chart.md) already made this argument for
 `NOT VALID`: the zero-downtime pattern *is an ordering*, and **a diff of two shapes cannot contain
 an ordering**.
 
@@ -121,14 +121,14 @@ error is the silent variant: `atlas schema inspect --format '{{ sql . }}' > insp
 259 clean-looking lines and **zero `CREATE VIEW`** in them; the "Skipping… Upgrade to Pro" notice
 only appears on a TTY. psqldef v3.11.20 **SIGSEGVs** on `trial_balance`. Adopting either means paying
 for Pro or deleting from `schema.sql` the objects it exists to prove are expressible — the same shape
-as River's periodic jobs in [ADR-0008](../../docs/decisions/0008-durable-timers.md).
+as River's periodic jobs in [ADR-0008](../../docs/decisions/0008-authorization-holds.md).
 
 **The declarative half was never about applying anything, and we keep it.** What one flat file buys
 is readability and diffability. The synthesis is **versioned application, declarative verification**:
-ordered migrations replayed with the transitions we chose, plus ADR-0006's still-unbuilt
+ordered migrations replayed with the transitions we chose, plus ADR-0007's still-unbuilt
 snapshot test — apply to an empty database, dump every index, constraint and `NOT VALID` row, diff
 against a committed snapshot. That yields "the database matches the file" with no diff engine, no dev
-database and no login, and it catches the failure ADR-0006 is actually afraid of. **Spike 007 does
+database and no login, and it catches the failure ADR-0007 is actually afraid of. **Spike 007 does
 not build it; it removes the excuse that a declarative tool would have covered it.**
 
 The honest case for declarative, on the record: after N migrations nobody can read the current shape
@@ -141,10 +141,10 @@ diff engine authority over transitions on a ledger.
 | | verdict |
 | --- | --- |
 | **goose** v3.27.3 | **Chosen.** `pg_try_advisory_lock` + poll. Library API, `embed.FS`, `-- +goose NO TRANSACTION`. MIT, 151 contributors — best bus factor here. |
-| **tern** v2.4.3 | **Runner-up, and the only native-pgx candidate** — which is what ADR-0002 asked for. Loses on the blocking-lock deadlock, and on a 452-vs-14 commit bus factor. |
+| **tern** v2.4.3 | **Runner-up, and the only native-pgx candidate** — which is what ADR-0001 asked for. Loses on the blocking-lock deadlock, and on a 452-vs-14 commit bus factor. |
 | **golang-migrate** v4.19.1 | Same deadlock. **No per-migration transaction and no way to opt out** — it sends the file as one `Exec`, so PostgreSQL's implicit transaction block rejects `CONCURRENTLY` anyway; the only fix is one statement per file. Failure sets a `dirty` flag whose documented recovery is a human running `migrate force`. |
 | **Atlas** v1.3.3 | Refuses our views and our RLS below Pro; `migrate lint` is Pro; the Go SDK is a subprocess wrapper around a **121 MB** binary; a dev database is mandatory. Does the `CONCURRENTLY` part well. |
-| **psqldef** v3.11.20 | SIGSEGV on `trial_balance`. Also: `go install` resolves to a stale `v1.0.7` that cannot parse a *named* inline primary key — which ADR-0006 mandates. |
+| **psqldef** v3.11.20 | SIGSEGV on `trial_balance`. Also: `go install` resolves to a stale `v1.0.7` that cannot parse a *named* inline primary key — which ADR-0007 mandates. |
 | **dbmate**, **sql-migrate** | **No locking at all** in the Postgres path. Rejected on source inspection, not run — said plainly rather than implied. |
 | **Skeema** | MySQL/MariaDB only. |
 | **Bytebase** | A server with a web UI, not a library. |
@@ -152,7 +152,7 @@ diff engine authority over transitions on a ledger.
 ## What it costs, named rather than smoothed over
 
 **goose's `NewProvider` requires `*sql.DB`, so migrations run over `pgx/stdlib`** — a
-`database/sql` dependency [ADR-0002](../../docs/decisions/0002-data-access-layer.md) deliberately
+`database/sql` dependency [ADR-0001](../../docs/decisions/0001-rust-and-postgres.md) deliberately
 avoided. One `sql.Open("pgx", dsn)` at startup, closed after migrating; the hot path stays on
 `pgxpool`. **tern would have avoided this entirely.**
 

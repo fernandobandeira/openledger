@@ -1,43 +1,17 @@
 # Documentation
 
-**Start with the design board: [`design-board.html`](./design-board.html).** Open it in a browser.
-It is the whole system in six sections — sizing, architecture, the auth hot path, the data model,
-state machines, and a row-by-row trace of one $500 purchase. Everything else here exists to record
-*decisions* the board assumes.
+**Read in this order:** [`glossary.md`](./glossary.md) if the vocabulary is new, then
+[`vision.md`](./vision.md) for what this is and why, then [`decisions/`](./decisions/) for how every
+piece got the shape it has. [`reference-product.md`](./reference-product.md) is the worked example
+underneath all of it — one $500 purchase, traced through every account it touches.
 
 | | |
 | --- | --- |
-| [design-board.html](./design-board.html) | **The system design.** Read this first — with the note below. |
 | [glossary.md](./glossary.md) | Every term, defined for someone who has never built a ledger. |
 | [vision.md](./vision.md) | Why this exists when Formance already does, and what it deliberately does not do. |
 | [decisions/](./decisions/) | One file per decision, with the evidence. [decisions/README](./decisions/README.md) is the index and carries what is still open. |
 | [reference-product.md](./reference-product.md) | The embedded charge card the ledger is designed against: the chart of accounts, and the lifecycle in text. |
 | [roadmap.md](./roadmap.md) | What gets built next, and why in that order. |
-
-> **Where the board and the decisions differ.** The board is the design as first drawn, and three
-> decisions have moved since. It still names **Temporal** in eight places (the masthead; the
-> architecture diagram twice, in its text and in its `aria-label`, so a screen reader is told it too;
-> the lifecycle prose; the `expires_at` comment; the state-machine boundary; and twice in the §06
-> trace), where [0008](./decisions/0008-durable-timers.md) chose River on Postgres. Its §04 models a hold as a **mutable `card_holds` row** with a running
-> `cleared_minor`, keyed on `auth_id`; [0010](./decisions/0010-authorization-holds.md) rejects that by
-> name and derives the hold as a sum over an append-only event log, because a clearing has no reliable
-> key back to its authorization. And its §04 says append-only is enforced by revoking `UPDATE` —
-> [0012](./decisions/0012-where-logic-lives.md) shows a grant binds the application role and nothing
-> else, so it is enforced by trigger.
->
-> Four smaller divergences, all in §04 and §06: the board puts `idempotency_key` on
-> `ledger_transactions`, where [0004](./decisions/0004-event-log.md) moved it to the event log and
-> the shipped table has no such column; **no key in the board carries `tenant_id`**, which
-> [the roadmap](./roadmap.md) calls the one irreversible decision on the list; the board has no
-> `account_types`/`fs_lines` layer, so `category` and `normal_balance` sit as free columns rather
-> than behind the two composite foreign keys [0009](./decisions/0009-chart-and-completeness.md)
-> put them behind; and its §03 says "no cache anywhere" while `ledger_account_balances` ships as
-> the write-side serialisation point. Three account names in the lifecycle trace are not in
-> `schema/chart.sql`: `ach_pull_unsettled` (the chart says `ach_pull_returnable`),
-> `outbound_transfer_in_transit`, and `unapplied_receipts`.
->
-> The board's **sizing, the auth-deadline budget, and the shape of the lifecycle** are unaffected
-> and remain the clearest statement of them anywhere in this repo.
 
 ## What a ledger is, in one paragraph
 
@@ -47,24 +21,25 @@ credit, and the two sides must sum to zero. The rest is consequences. Entries ar
 deleted, because a correction that edits history is indistinguishable from a lie; you post a new,
 opposite entry instead. Balances are derived from entries, never the other way round.
 
-This project is that ledger, in Go and PostgreSQL, with an **embedded B2B charge card** as the
+This project is that ledger, in Rust and PostgreSQL, with an **embedded B2B charge card** as the
 reference product. The card is not a demo — it is what forced the hard parts: authorizations that
 reserve money without moving it, clearings that move it, and processor messages that arrive out of
 order, twice, or never.
 
 ## The three diagrams
 
-The board draws these inline; they are also here as standalone files, which is what makes them
-readable on GitHub and reusable in a slide. **A second copy is a copy that drifts**, and this one
-already has: `03-state-machines.svg` was updated for [0008](./decisions/0008-durable-timers.md) and
-the board's own copy was not, so on that one diagram *this* is the current drawing and the board is
-stale. On the other two the board is canonical.
+These are the only drawings of the system, and they are canonical. They were extracted from an
+earlier HTML design board that has since been removed — it had drifted from the decisions in three
+major ways and existed mainly to be corrected. Everything it was best at now lives in prose: the
+sizing derivation in [0002](./decisions/0002-scaling.md), the authorization latency budget in
+[0008](./decisions/0008-authorization-holds.md), and the lifecycle trace in
+[reference-product.md](./reference-product.md).
 
 | | |
 | --- | --- |
-| ![Architecture](./diagrams/01-architecture.svg) | **01 — Architecture.** Same as the board's §02. |
-| ![The authorization hot path](./diagrams/02-auth-hot-path.svg) | **02 — The auth hot path.** Same as the board's §03. The ~1s deadline and the 300 ms p99 budget. |
-| ![State machines](./diagrams/03-state-machines.svg) | **03 — State machines.** **Updated for 0008; the board's copy still says Temporal.** |
+| ![Architecture](./diagrams/01-architecture.svg) | **01 — Architecture.** The authorization decision runs synchronously; the ledger write does not. |
+| ![The authorization hot path](./diagrams/02-auth-hot-path.svg) | **02 — The authorization hot path.** The ~1s network deadline and the 300 ms p99 budget — see [0008](./decisions/0008-authorization-holds.md). |
+| ![State machines](./diagrams/03-state-machines.svg) | **03 — State machines.** Hold, clearing and settlement lifecycles, as decided in [0008](./decisions/0008-authorization-holds.md). |
 
 ## Two rules run through everything
 
@@ -77,11 +52,11 @@ stale. On the other two the board is canonical.
 
 ## Status
 
-**Design stage.** The Go service is not built. `schema/schema.sql` exists to show the shape the
+**Design stage.** The service is not built. `schema/schema.sql` exists to show the shape the
 decisions describe is expressible in PostgreSQL, and it loads:
 
 ```sh
 make up       # PostgreSQL 18 in Docker
 make schema   # load schema/schema.sql + the seed chart
-make test     # go test ./...  (covers nothing yet)
+make test     # cargo test  (covers nothing yet)
 ```

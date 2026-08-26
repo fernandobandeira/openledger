@@ -1,6 +1,6 @@
 # openledger
 
-An open-source **double-entry ledger**. Postgres for storage, Go for the service.
+An open-source **double-entry ledger**. Postgres for storage, Rust for the service.
 
 **The whole project is about correctness**, not throughput: every cent accounted for, the books
 balanced at every instant, any number reproducible as of any date, and no manual fixes ever. All
@@ -42,7 +42,7 @@ unbounded `UPDATE` of every later row for that account. Their `moves` table carr
 `fillfactor = 80` (verified at their pinned commit; that this is *why* is our inference, not their
 stated reason), and **three migrations repair volume data** — 19, 20 and 28 — with two more
 replacing the aggregation functions and a sixth that is a no-op stub.
-[ADR-0003](./decisions/0003-bitemporal-balances.md) declines to build that: our running balance is
+[ADR-0006](./decisions/0006-time-and-as-of.md) declines to build that: our running balance is
 immutable and lives on the insertion axis only; business-date balances aggregate on read.
 
 **3. No pending state.** No holds, no authorizations, no status — users model a hold by moving
@@ -53,7 +53,7 @@ oversight: its primitive is a `Posting{Source, Destination, Amount, Asset}`, bal
 construction, so `Postings.Validate()` has no balance check — nothing is left to check. The cost is
 that the guarantee lives only in the write path: verified against their applied schema, a single
 unbalanced row inserted straight into `moves` commits silently.
-[0013](./decisions/0013-the-write-path.md) takes the same bet — make the illegal state
+[0005](./decisions/0005-event-log-and-write-path.md) takes the same bet — make the illegal state
 unrepresentable in the writer. **The invariant they do enforce is the interesting one:** Formance
 refuses a negative account balance by default (`ErrInsufficientFunds`, per source account per
 asset, `@world` the only hardcoded exemption), but their own docs say it checks the *final* state
@@ -81,9 +81,9 @@ Four properties. None is a setting.
 
 - **Append-only.** Triggers refuse `UPDATE`, `DELETE` and `TRUNCATE` on the journal outright, for
   *every* role including the owner. The narrow grant matters too but is not the mechanism: a
-  `REVOKE` is undone by one later `GRANT ALL` ([0011](./decisions/0011-what-the-database-enforces.md)).
+  `REVOKE` is undone by one later `GRANT ALL` ([0004](./decisions/0004-where-logic-lives.md)).
 - **Balanced per currency**, by construction in the writer rather than by the database
-  ([0013](./decisions/0013-the-write-path.md)). **The writer does not exist yet**, and entries are
+  ([0005](./decisions/0005-event-log-and-write-path.md)). **The writer does not exist yet**, and entries are
   independent rows carrying a direction — so an unbalanced transaction is expressible today and
   nothing refuses it. That is the next thing to build.
 - **Bitemporal.** Every transaction carries when it happened and when it was learned about. These
@@ -98,7 +98,7 @@ results to point-in-time queries, a wrong answer that looks like an answer. Two 
 counter-intuitive. **Balanced books do not mean correct reports:** drop a whole *balanced* slice —
 a tenant, a currency, a range of whole transactions — and the accounting equation still holds while
 revenue is understated, so the balance sheet is built by enumerating the chart of accounts, never
-by listing whatever accounts have entries ([0009](./decisions/0009-chart-and-completeness.md)). And
+by listing whatever accounts have entries ([0007](./decisions/0007-schema-conventions-and-chart.md)). And
 **each tenant's slice must balance on its own**, so no transaction may span tenants: cross-scope
 movements split into two, joined by clearing accounts. Tenant-locality is correctness, not
 optimization.
@@ -130,8 +130,8 @@ spend controls and multi-tenancy still need Postgres, which is two systems and a
 boundary between them. And **it defeats the deployment goal**: [TigerBeetle
 Cloud](https://tigerbeetle.com/cloud) is managed hosting on AWS/Azure/GCP, but there is no
 AWS-*native* service, and self-hosting wants a six-replica cluster on local NVMe operated by you.
-[ADR-0007](./decisions/0007-open-source-positioning.md) has the full comparison.
+[ADR-0002](./decisions/0002-scaling.md) has the full comparison.
 
-Next: the [design board](./design-board.html) for the system, [`decisions/`](./decisions/) for why
+Next: [`decisions/`](./decisions/) for why
 each piece is what it is, [`reference-product.md`](./reference-product.md) for the chart of
 accounts and the card lifecycle, and [`roadmap.md`](./roadmap.md) for the build order.

@@ -19,16 +19,16 @@
 > | Missing | The metadata-revision uniqueness indexes were **dropped by migration 37** with the `*_seq` columns and never recreated. Revision uniqueness now rests on an unsynchronised `max(revision)+1` inside a trigger. |
 >
 > **The three findings from that read that changed our own decisions**, recorded where they belong:
-> the **740×** backdating measurement on their effective-volume trigger → [ADR-0003](../../docs/decisions/0003-bitemporal-balances.md);
-> their rule for what earns a trigger → [ADR-0012](../../docs/decisions/0012-where-logic-lives.md);
+> the **740×** backdating measurement on their effective-volume trigger → [ADR-0006](../../docs/decisions/0006-time-and-as-of.md);
+> their rule for what earns a trigger → [ADR-0004](../../docs/decisions/0004-where-logic-lives.md);
 > and `pit` resolving to six different columns despite being a named axis →
-> [ADR-0005](../../docs/decisions/0005-reproducible-as-of.md).
+> [ADR-0006](../../docs/decisions/0006-time-and-as-of.md).
 >
 > Two more worth carrying: **migration 53** exists because `logs_blocks` had primary key
 > `(previous)` and two ledgers in one bucket both wrote block `previous = 0` — *the tenant must be in
 > every natural key*. And **migration 37 dropped four indexes and two unique constraints as a side
 > effect of dropping three columns**, two of which were never recreated — which is the strongest
-> argument anyone has made for [ADR-0006](../../docs/decisions/0006-schema-conventions.md)'s
+> argument anyone has made for [ADR-0007](../../docs/decisions/0007-schema-conventions-and-chart.md)'s
 > still-unbuilt schema snapshot test.
 
 # Spike 001 — Learn from Formance
@@ -37,10 +37,10 @@
 production, with its schema, migration history and issue tracker all public. Which of our design
 assertions does their experience confirm, and which does it contradict?
 
-**Status:** closed. Produced [ADR-0003](../../docs/decisions/0003-bitemporal-balances.md),
-[0004](../../docs/decisions/0004-event-log.md),
-[0005](../../docs/decisions/0005-reproducible-as-of.md),
-[0006](../../docs/decisions/0006-schema-conventions.md).
+**Status:** closed. Produced [ADR-0006](../../docs/decisions/0006-time-and-as-of.md),
+[0005](../../docs/decisions/0005-event-log-and-write-path.md),
+[0006](../../docs/decisions/0006-time-and-as-of.md),
+[0007](../../docs/decisions/0007-schema-conventions-and-chart.md).
 **Explicit non-goal:** adopting Formance. Prior art, not a dependency decision.
 
 ---
@@ -95,7 +95,7 @@ silently includes the Jan 30 entry, because the backdated row has a *higher* `ac
 **On the recorded axis both queries agree.** So the vision doc's as-of query is correct as
 written — the gap is that its stated *purpose* (reproducible lender reporting, "as of June 30")
 is a business-date question, and on that axis `balance_after` is unusable the moment anything is
-backdated. Resolved in [ADR-0003](../../docs/decisions/0003-bitemporal-balances.md): keep the
+backdated. Resolved in [ADR-0006](../../docs/decisions/0006-time-and-as-of.md): keep the
 running balance for the recorded axis, aggregate on read for the effective axis.
 
 ---
@@ -222,7 +222,7 @@ Three findings only the apply-and-dump method surfaces:
 The pattern behind most of their schema debt is one mechanism: **dropping a column silently drops
 its indexes and constraints, and nothing in their process caught it.** Four separate regressions
 trace to migrations 37 and 46 alone. That is what
-[ADR-0006's snapshot test](../../docs/decisions/0006-schema-conventions.md) exists to prevent.
+[ADR-0007's snapshot test](../../docs/decisions/0007-schema-conventions-and-chart.md) exists to prevent.
 
 ### Verified against our schema — and the headline didn't transfer
 
@@ -244,7 +244,7 @@ The mirror image is why their covering index on `accounts_volumes` is a mistake:
 PK's key columns on an **UPDATE-heavy** table, paying two index writes per posting to save a heap
 fetch the visibility map will mostly deny.
 
-### `logs` — the DDL behind ADR-0004
+### `logs` — the DDL behind ADR-0005
 
 ```sql
 CREATE TABLE logs (
@@ -269,7 +269,7 @@ excluding derived fields — their comment: *"We don't want those fields to be p
 they are not part of the decision-making process."* The tamper-evidence chain therefore covers
 **the decision, not the derived state**, so recomputing a balance never invalidates it. Get this
 wrong and every backfill breaks the chain. Folded into
-[ADR-0004](../../docs/decisions/0004-event-log.md).
+[ADR-0005](../../docs/decisions/0005-event-log-and-write-path.md).
 
 The hash input also pins `"id":0` and `"hash":null` so the digest is position-independent. The
 predecessor lookup rides the PK as a backward index scan and is cheap — but it must see a stable
@@ -277,7 +277,7 @@ predecessor, which is why every write takes `pg_advisory_xact_lock(ledger_id)` a
 
 ### On our open ordering question — they have no answer
 
-Directly relevant to [ADR-0005](../../docs/decisions/0005-reproducible-as-of.md): **Formance has no
+Directly relevant to [ADR-0006](../../docs/decisions/0006-time-and-as-of.md): **Formance has no
 commit-ordered total order anywhere in their schema.**
 
 - `transaction_date()` seeds from `statement_timestamp()` — *start*-ordered. It guarantees
@@ -287,7 +287,7 @@ commit-ordered total order anywhere in their schema.**
   on ids since a sql transaction can be reverted after a usage of the sequence."*
 
 So `WHERE recorded_at <= T` is not reproducible for them either, and they do nothing about it. That
-raises confidence ADR-0005 is a real problem and lowers confidence a clever solution exists — the
+raises confidence ADR-0006 is a real problem and lowers confidence a clever solution exists — the
 recommendation was our option (c): make "as of" mean "as of entry id N" and hand the lender an id,
 not a timestamp.
 
@@ -311,7 +311,7 @@ PKs, not indexes on `ledger`. `accounts_metadata_idx` is on `accounts`, not `acc
 and that name is exactly why a missing index on a hot write path went unnoticed for thirty
 migrations. Column names drift badly too: `date`, `timestamp`, `insertion_date`, `inserted_at`,
 `added_at`, `addedat`, `created_at` all appear, several meaning the same thing.
-→ [ADR-0006 §1](../../docs/decisions/0006-schema-conventions.md).
+→ [ADR-0007 §1](../../docs/decisions/0007-schema-conventions-and-chart.md).
 
 ### Their unfixed bugs, as a checklist of what to avoid
 
@@ -338,12 +338,12 @@ migrations. Column names drift badly too: `date`, `timestamp`, `insertion_date`,
   *commit* order: a transaction starting at T1 and committing at T3 writes `recorded_at=T1`, while
   one starting at T2 > T1 and committing at T2.5 writes T2. The same "as of T" report run later can
   differ. A reproducible cursor must be **commit-ordered, not a wall clock**. →
-  [ADR-0005](../../docs/decisions/0005-reproducible-as-of.md).
+  [ADR-0006](../../docs/decisions/0006-time-and-as-of.md).
 - **We have no event log, and probably need one.** Their `logs` table is the real source of truth;
   everything else is a projection. Our idempotency key lives on `ledger_transactions`, so we can only
   dedupe things that *produce* a transaction — a declined authorization, a limit change, an account
   opening have no home and cannot be made idempotent. **The one table from their schema we are
-  genuinely missing.** → [ADR-0004](../../docs/decisions/0004-event-log.md).
+  genuinely missing.** → [ADR-0005](../../docs/decisions/0005-event-log-and-write-path.md).
 - **Metadata mutability defeats reproducibility.** They maintain metadata *revision* tables
   precisely because a mutable jsonb blob cannot answer "what did we believe at time T". Ours is
   mutable with no history. If any of it feeds collateral reporting it needs history — cheapest path

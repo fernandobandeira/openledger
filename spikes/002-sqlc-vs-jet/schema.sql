@@ -4,7 +4,7 @@
 -- int[], jsonb, bigint money, partial unique indexes, and a deferred constraint
 -- trigger. If a generator handles this cleanly it handles the real thing.
 --
--- Graduates to migrations/0001 once ADR-0002 lands and M1 starts for real.
+-- Graduates to migrations/0001 once ADR-0001 lands and M1 starts for real.
 --
 -- NAMING: ix_<table>__<cols> / uq_<table>__<cols> / ck_<table>__<rule>. Mechanical
 -- and greppable, so "does this table have an index on X" is answerable without a
@@ -112,7 +112,7 @@ CREATE TABLE ledger_entries (
     amount_minor   bigint NOT NULL CHECK (amount_minor > 0),  -- never the amount
     currency       char(3) NOT NULL,
     account_seq    bigint NOT NULL,               -- monotonic per account
-    -- running balance on the RECORDED axis only. See ADR-0003: this cannot answer
+    -- running balance on the RECORDED axis only. See ADR-0006: this cannot answer
     -- an effective-date as-of query once anything is backdated.
     balance_after  bigint NOT NULL,
     recorded_at    timestamptz NOT NULL DEFAULT now(),
@@ -128,7 +128,7 @@ CREATE TABLE ledger_entries (
 -- MEASURED on 400k rows: Heap Fetches drops to 0 on settled data, at +19% index
 -- size (19MB vs 16MB). But on a FRESHLY INSERTED row -- which is exactly what the
 -- auth hot path reads -- the visibility map bit is not yet set and it is still
--- Heap Fetches: 1. So INCLUDE is justified by the REPORTING workload (ADR-0003
+-- Heap Fetches: 1. So INCLUDE is justified by the REPORTING workload (ADR-0006
 -- as-of reads over settled history), not by the hot path.
 --
 -- This works for us and would not for Formance: index-only scans need the
@@ -141,7 +141,7 @@ CREATE INDEX ix_entries__asof_recorded
     ON ledger_entries (account_id, recorded_at DESC, account_seq DESC);
 CREATE INDEX ix_entries__txn ON ledger_entries (transaction_id);
 -- the EFFECTIVE axis. balance as of a business date is an aggregate over this,
--- not a running-balance lookup. See ADR-0003.
+-- not a running-balance lookup. See ADR-0006.
 CREATE INDEX ix_entries__effective
     ON ledger_entries (account_id, effective_at);
 
@@ -194,7 +194,7 @@ CREATE TABLE spend_controls (
     cap_minor         bigint,               -- optional
     period            control_period,       -- RESETS. a credit line doesn't.
     timezone          text NOT NULL DEFAULT 'UTC',  -- the CUSTOMER's midnight
-    -- the array columns. THE crux of ADR-0002.
+    -- the array columns. THE crux of ADR-0001.
     allowed_mcc       int[],                -- NULL = no allowlist
     blocked_mcc       int[]  NOT NULL DEFAULT '{}',
     allowed_merchants text[] NOT NULL DEFAULT '{}',

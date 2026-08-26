@@ -1,49 +1,15 @@
-# Binaries
-/bin/
-/dist/
-# ...the built binary at the ROOT, and only there. Without the leading slash this
-# pattern matches at any depth, so it also ignored the directory cmd/openledger/ --
-# and `cmd/` was never committed at all. `make build` and `make test` both failed on
-# a fresh clone, and ADR-0012's central framing ("10,053 lines of SQL against eleven
-# lines of Go") rested on a file no reader could see.
+# Rust
+/target/
+**/*.rs.bk
+
+# The built binary at the ROOT, and only there. Without the leading slash this
+# pattern matches at any depth, so it would also ignore a directory of that name.
 /openledger
-# ...including the spike binaries. spike003 was listed and spike005 was not, so a
-# 16 MB compiled ELF sat in the tree -- in a directory whose own README says the
-# code there is throwaway and is not built by CI.
-spikes/*/spike0*
 
-# Go
-*.test
-*.out
-coverage.*
-vendor/
+# sqlx offline query cache is COMMITTED, not ignored -- ADR-0001 depends on it:
+# CI has no database, so `.sqlx/` is what makes the compile-time checking run
+# there. Do not add it here.
 
-# Generated data-access code. The question this NOTE used to hold open is settled:
-# ADR-0002 is accepted and spike 002 is closed, and the answer is that generated code
-# belongs IN version control, because that is what makes a review diff honest. This
-# line survives only until a generator and a `make` target for it exist — there is no
-# such target today, so do not go looking for one.
-/internal/pg/gen/
-
-# Local env / secrets
+# Local
 .env
-.env.*
-!.env.example
-
-# Editors
-.idea/
-.vscode/
-*.swp
-
-# OS
-.DS_Store
-
-# Local postgres volume
-/.pgdata/
-
-# Scratch
-/tmp/
-
-# Spike codegen output — regenerate with `sqlc generate` in the spike dir
-/spikes/*/gen/
-spike003
+*.log

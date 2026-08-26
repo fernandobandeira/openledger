@@ -1,15 +1,15 @@
 # Spike 010 — Go or Rust for the ledger service
 
-**Status:** closed. Produced [ADR-0015](../../docs/decisions/0015-go-or-rust.md), and three
+**Status:** closed. Produced [ADR-0001](../../docs/decisions/0001-rust-and-postgres.md), and three
 corrections to ADRs that were already accepted.
 
-**Question.** [0001](../../docs/decisions/0001-go-and-postgres.md) chose Go, partly on Temporal SDK
-quality — a premise [0008](../../docs/decisions/0008-durable-timers.md) removed when it chose River.
-Meanwhile [0013](../../docs/decisions/0013-the-write-path.md) moved the balance invariant *into the
+**Question.** [0001](../../docs/decisions/0001-rust-and-postgres.md) chose Go, partly on Temporal SDK
+quality — a premise [0008](../../docs/decisions/0008-authorization-holds.md) removed when it chose River.
+Meanwhile [0005](../../docs/decisions/0005-event-log-and-write-path.md) moved the balance invariant *into the
 type system*. Both changes put weight on the type system that Go was never chosen for. So: is Go
 still right?
 
-**Method.** `post_transaction`, the design board's §03 auth hot path, and the seven-variant
+**Method.** `post_transaction`, the authorization hot path, and the seven-variant
 `auth_event_kind` machine, implemented twice against the real `schema/schema.sql` + `chart.sql`.
 Then this project's own bugs written into both, on purpose, to see which compiler stops you.
 
@@ -41,7 +41,7 @@ already here, in §3 below.
 
 These are the reason this spike was worth running, and none of them is about Rust.
 
-### 1. [0002](../../docs/decisions/0002-data-access-layer.md) recommended the trap it rejected go-jet for
+### 1. [0001](../../docs/decisions/0001-rust-and-postgres.md) recommended the trap it rejected go-jet for
 
 0002 rejects go-jet because it "can silently scan a money column as zero with no error", then four
 bullets later recommends `pgx.RowToStructByNameLax` as the escalation path for dynamic queries.
@@ -61,7 +61,7 @@ B-1c Strict / posted_minor DROPPED   err=cannot find field posted_minor in retur
 `go build` exit 0, `go vet` exit 0. The sentence is struck; the strict form is what 0002 now says.
 **`Lax` is one switch that makes every money field on a struct silently zeroable.**
 
-### 2. [0013](../../docs/decisions/0013-the-write-path.md)'s headline claim was false in Go
+### 2. [0005](../../docs/decisions/0005-event-log-and-write-path.md)'s headline claim was false in Go
 
 0013: *"An unbalanced transaction is therefore **unconstructible**, not refused."* The type was built
 as 0013 describes — four unexported fields, one validating constructor. From an outside package:
@@ -190,7 +190,7 @@ port. No sqlx equivalent of `pgx.Batch` pipelining was found; **untested.**
 
 ## Q4 — migrations, where Rust loses
 
-[0014](../../docs/decisions/0014-schema-migrations.md)'s criterion, reproduced: 2,000,000 rows,
+[0003](../../docs/decisions/0003-migrations.md)'s criterion, reproduced: 2,000,000 rows,
 127 MB, one migration containing `CREATE INDEX CONCURRENTLY`, three concurrent migrators.
 
 ```
@@ -229,7 +229,7 @@ coordination at all, and it is the one that does it the wrong way.** The rest ha
 wrong. That is not "Rust's tooling is behind on one detail" — it is a different default. Go's goose
 and Atlas both poll a try-lock; the Rust ecosystem largely does not attempt the problem.
 
-**How much this should weigh is less than it first appears.** [0014](../../docs/decisions/0014-schema-migrations.md)
+**How much this should weigh is less than it first appears.** [0003](../../docs/decisions/0003-migrations.md)
 already chose to run migrations as a **dedicated pre-deploy job, not from application startup** —
 which is a single runner by construction. The three-concurrent-migrators test models the topology
 0014 rejected. The lock is a guard against a botched deploy (a retried Job overlapping a pod that
@@ -286,5 +286,5 @@ to 2026-08-26: Go 470 postings at £80k median, Rust 285 at £90k — one aggreg
 
 `bugs/A-omitted-case/` · `bugs/A2-decode/` · `bugs/B-silent-zero/` · `bugs/C-unconstructible/`,
 each with a `go/` and an `rs/` side. The two full implementations, the migration harness and the job
-harnesses were scratch and are not kept — [0012](../../docs/decisions/0012-where-logic-lives.md) is
+harnesses were scratch and are not kept — [0004](../../docs/decisions/0004-where-logic-lives.md) is
 the standing reason a spike does not graduate into the repository.

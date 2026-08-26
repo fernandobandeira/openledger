@@ -3,7 +3,7 @@
 Ordered by what unblocks what, not by size. No estimates — the risk is correctness, and correctness
 does not estimate well. **The ledger core is the product**; cards, spend controls and credit lines
 are a *reference implementation* built on it
-([ADR-0007](./decisions/0007-open-source-positioning.md)). So the core must be verifiable by
+([ADR-0002](./decisions/0002-scaling.md)). So the core must be verifiable by
 strangers before a reference product matters, and the deployment story is part of the product.
 
 ---
@@ -14,23 +14,23 @@ strangers before a reference product matters, and the deployment story is part o
 
 A SQL implementation and its conformance suite proved the design and then outgrew it. Ten
 adversarial rounds found real defects, several of which under-reserved credit; those findings are
-recorded in [ADR-0009](./decisions/0009-chart-and-completeness.md),
-[ADR-0010](./decisions/0010-authorization-holds.md) and
-[ADR-0011](./decisions/0011-what-the-database-enforces.md). It has been deleted, and
-[ADR-0012](./decisions/0012-where-logic-lives.md) is why. **The same assertions come back as Go
+recorded in [ADR-0007](./decisions/0007-schema-conventions-and-chart.md),
+[ADR-0008](./decisions/0008-authorization-holds.md) and
+[ADR-0004](./decisions/0004-where-logic-lives.md). It has been deleted, and
+[ADR-0004](./decisions/0004-where-logic-lives.md) is why. **The same assertions come back as Rust
 tests, after M1.**
 
 ## M1 · Schema, invariants, and the snapshot test — **schema landed**
 
 [`schema/schema.sql`](../schema/schema.sql) is the core — `ledger_accounts`,
 `ledger_transactions`, `ledger_entries`, `ledger_account_balances`, `ledger_events` — plus the
-chart of accounts and completeness layer ([ADR-0009](./decisions/0009-chart-and-completeness.md))
-and the hold model ([ADR-0010](./decisions/0010-authorization-holds.md)). Eleven tables, 5 report
+chart of accounts and completeness layer ([ADR-0007](./decisions/0007-schema-conventions-and-chart.md))
+and the hold model ([ADR-0008](./decisions/0008-authorization-holds.md)). Eleven tables, 5 report
 views, 8 triggers over 2 functions each justified in place per
-[ADR-0012](./decisions/0012-where-logic-lives.md). It was written by hand rather than promoted from
+[ADR-0004](./decisions/0004-where-logic-lives.md). It was written by hand rather than promoted from
 the spikes, which held three competing posting engines and two competing hold models. No API, no Go
 beyond migrations. Balanced-per-currency is deliberately *not* in there: it belongs to the writer
-([0013](./decisions/0013-the-write-path.md)).
+([0005](./decisions/0005-event-log-and-write-path.md)).
 
 **Tenant-leading keys were the one irreversible decision on the list, and they were free.** Every
 ledger table carries `tenant_id NOT NULL`, primary keys are `(tenant_id, id)`, and every index and
@@ -39,7 +39,7 @@ partitioning and ever splitting across instances, all expensive to retrofit. A w
 sharding post-mortem named exactly this omission as its regret; **which company is unverified** —
 no source for the attribution exists in this tree, and the mechanics are the load-bearing part.
 The chart's two foreign keys deliberately lack the prefix because the chart is
-deployment-global, so a tenant cannot add an account type without a migration — a real limitation, listed in ADR-0009. Tenant-locality follows
+deployment-global, so a tenant cannot add an account type without a migration — a real limitation, listed in ADR-0007. Tenant-locality follows
 from the same keys and is a conformance property: `operating_cash` mirrors one real bank account
 and cannot be per-tenant, so treasury movements split into a `due_from_treasury` /
 `due_to_tenants` pair rather than one transaction that leaves a tenant's own books short by the
@@ -113,7 +113,7 @@ constraints, not later optimizations:
 RLS on `ledger_entries` and bulk batching are mutually exclusive. Likely resolution is posting as a
 `BYPASSRLS` role so RLS guards only the read path — but it must be decided, not discovered.
 
-**Done when:** M0's conformance suite, rebuilt in Go, passes under concurrent load, with and
+**Done when:** M0's conformance suite, rebuilt in Rust, passes under concurrent load, with and
 without batching, and with striping on and off.
 
 ## M4 · The RDS benchmark
@@ -130,11 +130,11 @@ published alongside. Only then does any throughput figure go in a README.
 
 ## M5 · Bitemporal reads
 
-Two axes, two mechanisms ([ADR-0003](./decisions/0003-bitemporal-balances.md)): current and
+Two axes, two mechanisms ([ADR-0006](./decisions/0006-time-and-as-of.md)): current and
 recorded-axis balances come from `balance_after`, business-date balances aggregate over
 `effective_at`, and every reporting function names its axis explicitly.
 
-**Blocked on [ADR-0005](./decisions/0005-reproducible-as-of.md), still `proposed`.** `recorded_at`
+**Blocked on [ADR-0006](./decisions/0006-time-and-as-of.md), still `proposed`.** `recorded_at`
 defaults to transaction *start* time and is not monotonic with commit order, so the same as-of
 query can return different answers when re-run; a reproducible cursor must be commit-ordered.
 Decide that before writing code against `recorded_at <= :as_of`. The effective-axis aggregate is
@@ -164,10 +164,10 @@ Only after Phase 1 holds. A *consumer* of the ledger, not part of it.
 
 ## M7 · Cards
 
-`credit_lines`, `spend_controls` and the clearing path — the auth transaction from the [design
-board](./design-board.html) §03, against a fake processor. Read-only with respect to the ledger: an
+`credit_lines`, `spend_controls` and the clearing path — the authorization transaction described in
+[ADR-0008](./decisions/0008-authorization-holds.md), against a fake processor. Read-only with respect to the ledger: an
 authorization writes no entry. The hold model itself is already in `schema/schema.sql`
-([ADR-0010](./decisions/0010-authorization-holds.md)); `credit_lines` and `spend_controls` are not,
+([ADR-0008](./decisions/0008-authorization-holds.md)); `credit_lines` and `spend_controls` are not,
 and nothing reads a limit today.
 
 The [lifecycle trace](./reference-product.md#the-card-lifecycle) is this milestone's acceptance
@@ -182,7 +182,7 @@ re-evaluating against a limit that may have moved, and STIP.
 Hold expiry and the ACH return window are the first two things that genuinely need a timer, which
 is why timers enter here and not before. They run **in-process on Postgres**, in the same
 transaction as the ledger write, so a hold and its expiry timer commit together or not at all
-([ADR-0008](./decisions/0008-durable-timers.md)). Handlers are idempotent already, which M3 gives.
+([ADR-0008](./decisions/0008-authorization-holds.md)). Handlers are idempotent already, which M3 gives.
 Ship the reconciliation sweep alongside — groups past their deadline that are still holding, behind
 `ix_hold_groups__held`. The deadline lives on the event, so a lost job becomes recoverable rather
 than silent; ADR-0008 has the query, executed against the shipped schema.
@@ -196,7 +196,7 @@ place is owning the *sweep* that consolidates suspense accounts, and draining ev
 ## Known work, not yet scheduled
 
 - **Per-row hash chaining** for tamper evidence. Needs a total order, so decide it alongside
-  [ADR-0005](./decisions/0005-reproducible-as-of.md). Never build Formance's block-hashing layer.
+  [ADR-0006](./decisions/0006-time-and-as-of.md). Never build Formance's block-hashing layer.
 - **The suspense sweep** for affinity striping. Workflow-shaped, so it wants M8.
 - **The auth path has never been measured.** It writes no ledger entry and serializes per company,
   so it should scale far better than clearing — but it has a latency deadline rather than a
@@ -208,8 +208,8 @@ place is owning the *sweep* that consolidates suspense accounts, and draining ev
 
 ## Open questions
 
-- **Does v0.1 need an HTTP API, or is a Go library plus migrations enough to adopt?** The API is
-  the adoption surface for anyone not writing Go. Deferred, but no longer obviously so.
+- **Does v0.1 need an HTTP API, or is a Rust crate plus migrations enough to adopt?** The API is
+  the adoption surface for anyone not writing Rust. Deferred, but no longer obviously so.
 - **How much of the card product belongs in this repository?** A reference implementation argues
   for keeping it; a clean core argues for a separate module. Not urgent until M7.
 

@@ -24,12 +24,12 @@
 > entirely empty. It is not a faster ledger; it is not a ledger.
 
 
-**The question.** [ADR-0001](../../docs/decisions/0001-go-and-postgres.md) chose Postgres because
+**The question.** [ADR-0001](../../docs/decisions/0001-rust-and-postgres.md) chose Postgres because
 "throughput is not the constraint" — an argument that only works if you *know* the volume. As a
 general open-source ledger we don't. So: what is the actual ceiling, what limits it, and what
 moves it?
 
-**Status:** closed. Produced [ADR-0007](../../docs/decisions/0007-open-source-positioning.md).
+**Status:** closed. Produced [ADR-0002](../../docs/decisions/0002-scaling.md).
 
 ---
 
@@ -361,7 +361,7 @@ proven design, just not a free one.
 
 Three further losses beyond speed:
 
-1. **The self-audit.** [ADR-0003](../../docs/decisions/0003-bitemporal-balances.md) relies on the
+1. **The self-audit.** [ADR-0006](../../docs/decisions/0006-time-and-as-of.md) relies on the
    running balance and the recomputed aggregate always agreeing; divergence is a corruption alarm.
    With aggregation as the only source there is nothing left to check against.
 2. **Gaplessness.** `UNIQUE (account_id, account_seq)` proves no entry is missing. A global
@@ -503,7 +503,7 @@ Uber: *"Using multiple DynamoDB rows for a single account complicates the single
 and hot account detection."* TigerBeetle: *"a small number of hot accounts are often involved in a
 large proportion of the transactions, so the shards responsible for those accounts become
 bottlenecks."* — though that objection is against **distributed** sharding, not N rows in one
-Postgres; ADR-0007 leaned on it slightly too heavily.
+Postgres; ADR-0002 leaned on it slightly too heavily.
 
 This ranks batching **above** striping more strongly than our localhost numbers do — which is
 exactly the reordering the round-trip finding predicts for managed Postgres.
@@ -527,7 +527,7 @@ escrow degenerates to "don't take the lock at all", which is exactly lock-free a
   set spans more than one `tenant_id` is the mechanical version.
 - **Modern Treasury degrades automatically on cache drift**: they verify cached balances against
   the sum of entries and *"automatically turn off cache reads for Accounts that have drifted"* —
-  strengthening ADR-0003's self-audit from "alarm" to "alarm and fall back to truth".
+  strengthening ADR-0006's self-audit from "alarm" to "alarm and fall back to truth".
 - **A widely-cited sharding regret** is a missing customer ID on every transaction, which
   *"dramatically"* complicated later sharding — our `tenant_id NULL` problem exactly. This line
   attributed it to Nubank and `docs/roadmap.md` attributed the same lesson to Notion; neither has a

@@ -7,7 +7,7 @@
 -- T3 gets refused by account_seq instead of by the balance trigger, which would still
 -- look like a pass if you only counted errors.
 --
--- When this becomes a CI check (ADR-0006), give it its own database. Namespacing the
+-- When this becomes a CI check (ADR-0007), give it its own database. Namespacing the
 -- identifiers instead was tried and is NOT sufficient: the entries in T3/T4 target
 -- accounts by name, so renaming them changes which account_seq values collide.
 
