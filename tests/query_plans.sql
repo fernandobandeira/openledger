@@ -186,6 +186,53 @@ BEGIN
     RAISE NOTICE 'ok  every hot-path index still exists';
 END $$;
 
+-- ...AND STILL INDEXES WHAT ITS NAME SAYS. Checking `to_regclass(name) IS NOT
+-- NULL` attests a name, and a name survives the loss: re-pointing
+-- ix_entries__effective at `recorded_at`, and dropping `INCLUDE (balance_after)`
+-- from the balance lookup, both left every assertion in this file green. That is
+-- the same failure class 0006 cites -- "Formance lost a hot-path index that way
+-- for thirty migrations" -- where the object stayed and its usefulness did not.
+DO $$
+DECLARE r record; want text; got text; bad text := '';
+BEGIN
+    FOR r IN SELECT * FROM (VALUES
+        ('ix_entries__effective',       'effective_at'),
+        ('ix_entries__balance_lookup',  'INCLUDE (balance_after)'),
+        ('ix_entries__asof_recorded',   'recorded_at'),
+        ('ix_entries__txn',             'transaction_id'),
+        ('uq_entries__account_seq',     'account_seq'),
+        ('ix_hold_groups__held',        'held_minor > 0')
+    ) AS q(idx, needle)
+    LOOP
+        SELECT indexdef INTO got FROM pg_indexes
+         WHERE schemaname='public' AND indexname = r.idx;
+        IF got IS NULL OR position(r.needle in got) = 0 THEN
+            bad := bad || format('%s (wanted %L in %L) ', r.idx, r.needle, got);
+        END IF;
+    END LOOP;
+    IF bad <> '' THEN
+        RAISE EXCEPTION 'index definition(s) no longer index what the name says: %', bad;
+    END IF;
+    RAISE NOTICE 'ok  every hot-path index still indexes what its name says';
+END $$;
+
+-- ...and the hold index is PARTIAL on a strict inequality. Widening `> 0` to
+-- `>= 0` keeps the name, keeps the word `held_minor` in the predicate, and turns
+-- the ~1s authorization read from 6,667 rows into 20,000 -- a partial index
+-- become total, which is the regression held_for_company's own comment warns of.
+DO $$
+DECLARE v_pred text;
+BEGIN
+    SELECT pg_get_expr(i.indpred, i.indrelid) INTO v_pred
+      FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+     WHERE c.relname = 'ix_hold_groups__held';
+    IF v_pred IS NULL OR v_pred !~ 'held_minor > 0' THEN
+        RAISE EXCEPTION 'ix_hold_groups__held is no longer partial on held_minor > 0: %',
+            COALESCE(v_pred, '<total index>');
+    END IF;
+    RAISE NOTICE 'ok  the hold index is partial on a strict inequality (%)', v_pred;
+END $$;
+
 -- 6. held_for_company is the ~1s real-time authorization read -- the whole reason
 --    the hold total is materialised at all -- and it had no plan coverage. Only
 --    ledger_entries did.

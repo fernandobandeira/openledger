@@ -29,6 +29,19 @@ fail=0
 q() { psql "$URL" -qAt -c "$1"; }
 
 # ---------------------------------------------------------------- fixtures
+# MODE GUARD. This is the one suite that had none, and the only evidence for four
+# locks: with `session_replication_role='replica'` set on the database it ran
+# green while every .sql suite refused to start. Not reachable through run.sh
+# today, but it is the file where "every guard it exercises may be the
+# replica-path one" would go unnoticed.
+mode=$(q "select current_setting('session_replication_role')")
+if [ "$mode" != "origin" ]; then
+    echo "   FAIL this suite is running as $mode, not origin: every guard it"
+    echo "        exercises may be the replica-path one"
+    exit 1
+fi
+echo "   ok  running on the ordinary write path"
+
 psql "$URL" -q -v ON_ERROR_STOP=1 <<'SQL'
 -- SIX accounts, not two. With two, the planner drives a Nested Loop from an index
 -- scan on ledger_accounts, so post()'s legs emerge in account-id order whether or
@@ -157,6 +170,11 @@ psql "$URL" -q -v ON_ERROR_STOP=1 -c \
   "DO \$d\$ BEGIN PERFORM record_auth_event('cc','ex_a','GEX','co1','c1','authorization',2000,'USD',false,now()); END \$d\$;"
 psql "$URL" -q -c "SELECT expire_hold_group('cc','co1','GEX')" -o /dev/null
 first_exp=$(q "select expired_at from card_hold_groups where tenant_id='cc' and group_key='GEX'")
+# ...and it must actually BE expired, or this compares empty against empty and
+# passes over a group that was never created. Replayed against a nonexistent
+# group, and again with expire_hold_group replaced by a no-op, the original
+# printed `ok ... = ` with nothing on either side.
+chk "the group is expired at all" "$([ -n "$first_exp" ] && echo yes || echo no)" yes
 psql "$URL" -q -c "SELECT expire_hold_group('cc','co1','GEX')" -o /dev/null
 chk "re-expiring in a later transaction does not move the release time" \
     "$(q "select expired_at from card_hold_groups where tenant_id='cc' and group_key='GEX'")" \
