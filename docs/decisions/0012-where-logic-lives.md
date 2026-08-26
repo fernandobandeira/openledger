@@ -133,7 +133,54 @@ both live outside the database. What is here is the cheap 80%, and the cheap 80%
 
 [0011](./0011-what-the-database-enforces.md)'s *findings* stand as a catalogue of what a database
 can and cannot be made to guarantee. Its *conclusion* — defend against every writer — is superseded.
-The bet is that one service owns the writes.
+
+## "One writer" is not the argument, and saying it was is a mistake
+
+An earlier version of this section ended *"the bet is that one service owns the writes."* That was
+never decided. It fell out of removing the enforcement, and the justification was written
+afterwards — which is backwards, and the survey says so: **every system that moved the balance
+invariant into application code shipped the enforcing code path first.**
+
+Look at what Formance actually relies on. They have **zero `GRANT` and zero `REVOKE` in the entire
+repository** — they are not betting on one writer either. Their guarantee is a *type*:
+
+```go
+type Posting struct {
+	Source      string   `json:"source"`
+	Destination string   `json:"destination"`
+	Amount      *big.Int `json:"amount"`
+	Asset       string   `json:"asset"`
+}
+```
+
+A `Posting` **cannot express one leg.** `Postings.Validate()` checks the amount and the addresses
+and contains no balance check at all, because there is nothing left to check. Any Go caller, however
+many services exist, gets a balanced pair or nothing. That is a structural property, not a
+deployment assumption — and it is why the guarantee survives a second writer appearing.
+
+The flip side was measured against their applied schema: insert a single unbalanced row directly
+into `moves` and it commits silently — 500 USD leaving `world` and arriving nowhere.
+
+**So the distinction that matters is not one writer versus many. It is:**
+
+| | |
+| --- | --- |
+| *"One service owns the writes"* | a hope about deployment. Nothing enforces it, and it fails the day someone writes a second adapter or a backfill. |
+| *"The type cannot express an unbalanced transaction"* | holds for every caller in the language, forever, and needs no coordination. |
+
+We have neither yet, and that is the honest position: `ledger_entries` stores independent rows
+carrying a `direction`, so an unbalanced transaction is fully expressible, and the deferred trigger
+that used to refuse it is gone. **Until the Go write path exists, nothing enforces balance at all.**
+
+The fix is not a grant and not a trigger — it is to make the write primitive posting-shaped, so an
+unbalanced transaction is unconstructible rather than refused. That is [0013](./0013-the-write-path.md).
+
+The plain-text ledgers make the same point from the other end, and more elegantly. Beancount,
+hledger and `ledger` all let you **elide the amount on exactly one posting** and infer it from the
+requirement that the transaction balance — *"the same balance amounts that are used to check that
+the transaction balances to zero are used to fill in the missing amounts."* There, the invariant is
+not a validation bolted onto the model; it is the thing that **completes** the model. That is a
+better argument for one write path than anything about maintainability.
 
 ## What survives from the SQL
 

@@ -42,6 +42,7 @@ here, so the ADRs don't each stop to re-explain them.
 | [0010](./0010-authorization-holds.md) | A hold is a SUM over an append-only event log, not a mutable amount | Grouping a clearing to its authorization is a revisable inference, and processors disagree on whether an increment carries a delta or a cumulative total | accepted |
 | [0011](./0011-what-the-database-enforces.md) | The dozen guards added under adversarial review, and what the database still cannot enforce | A column with a DEFAULT is not a constraint — `recorded_at`, `account_seq` and `xact_id` all had one, and each turned out forgeable by an INSERT | **enforcement half superseded by [0012](./0012-where-logic-lives.md)** |
 | [0012](./0012-where-logic-lives.md) | **The ledger goes in Go. Postgres holds the shape, and a trigger needs a written justification** | The schema had quietly become the ledger — 27 triggers and 26 functions against 11 lines of Go — and ten review rounds went into hardening a validation harness that had turned into an unintended product | accepted |
+| [0013](./0013-the-write-path.md) | **The write primitive is a posting, not an entry** — source, destination, amount, so one leg is unconstructible | "One service owns the writes" is a hope about deployment; a type that cannot express an unbalanced transaction holds for every caller. No established open-source ledger enforces this in the database — Formance deleted its deferred constraint trigger in favour of a unique index | accepted |
 
 ## Non-negotiable
 
