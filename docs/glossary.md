@@ -1,7 +1,8 @@
 # Glossary
 
-Every term this project uses that you'd only know if you'd built a ledger before. Examples are
-real — they come from [the reference product spec](./reference-product.md) or from something we measured.
+Every term this project uses that you'd only know if you'd built a ledger before. Examples are real
+— they come from the [reference product](./reference-product.md), the
+[design board](./design-board.html), or something we measured.
 
 ## Accounting
 
@@ -14,7 +15,9 @@ CR network_settlement_payable 491.00  ← we owe Visa 491
 CR interchange_revenue          9.00  ← we keep 9
 ```
 
-500 out, 500 in. A transaction that doesn't balance is not supposed to be expressible — see [the decision log](./decisions/0013-the-write-path.md) for where that is enforced, and what enforces it today.
+500 out, 500 in. A transaction that doesn't balance is meant to be *unrepresentable* rather than
+rejected — the writer never builds one. That writer does not exist yet, so today nothing refuses an
+unbalanced transaction; [ADR-0013](./decisions/0013-the-write-path.md) is the plan.
 
 **Debit / credit** — the two sides. Not "money in / money out": which one *increases* an account
 depends on the account. Debits increase assets and expenses; credits increase liabilities, equity
@@ -60,10 +63,10 @@ to us because it's what bounds an otherwise unbounded scan when computing histor
 **Entry** — one line: this account, this direction, this amount. **Transaction** — a balanced set
 of entries. **Account** — the thing entries attach to.
 
-**Running balance** (`balance_after`) — each entry stores the account's balance *after* that entry.
-Makes reading the current balance one index lookup instead of summing history. The figures often
-quoted for this -- 0.018 ms against 105.91 ms at a million entries -- come from a one-off run with
-no harness in the repo; the *shape* was asserted by the deleted `tests/query_plans.sql` suite, on every build, while it existed.
+**Running balance** (`balance_after`) — each entry stores the account's balance *after* that entry,
+so reading the current balance is one index lookup instead of summing history. What summing history
+would cost at a million entries is **unmeasured** — no harness in this repository times a balance
+read.
 
 **Recorded date vs effective date** — *when we learned about it* vs *when it happened*. A card
 clearing arrives Tuesday for a purchase Visa dates to Monday. Recorded = Tuesday, effective =
@@ -85,8 +88,9 @@ account. `operating_cash` is one. The money is physically in one place, so this 
 `interchange_revenue`, `network_settlement_payable`.
 
 **Tenant-local** — a transaction whose every entry belongs to one tenant. Matters because a
-transaction spanning tenants makes each tenant's own books not balance (measured: a tenant sees
-−500.00), and blocks ever splitting tenants across databases.
+transaction spanning tenants makes each tenant's own books not balance ([measured: a tenant sees
+−500.00](../spikes/004-chart-of-accounts/README.md)), and blocks ever splitting tenants across
+databases.
 
 ## Card processing
 
@@ -111,22 +115,55 @@ pump authorization clearing at $95. **Forced post** — a clearing with no autho
 
 **MCC** — merchant category code. Used for spend controls ("no gambling").
 
+## The hold model
+
+An authorization is not one message. A purchase can produce an authorization, several increments, a
+reversal and several clearings, arriving in any order and sometimes twice. The shipped model
+([ADR-0010](./decisions/0010-authorization-holds.md)) keeps every message as an immutable row in
+`card_auth_events` and derives the hold from them.
+
+**`group_key`** — the identifier that ties those messages together as *one* authorization. It is not
+something the processor reliably tells you: network IDs (ARN, RRN) don't agree across messages, so
+grouping is an *inference* — exact match, then a fuzzy fallback, then an unmatched queue. Because an
+inference is revisable, `group_key` lives on `card_auth_event_group`, a bitemporal membership table,
+and never on the event itself. Re-grouping a mis-matched clearing is then a new membership row, not
+an `UPDATE` to a row we call immutable.
+
+**`total_minor`** — the group's running net total: increases minus clearings and reversals. It can
+go negative, and that is information, not a bug (see over-capture).
+
+**`held_minor`** — what actually reduces available credit. A generated column: zero once the group
+has expired, otherwise `GREATEST(total_minor, 0)`. The clamp is what stops a $1 fuel authorization
+clearing at $95 from *raising* the customer's credit by 94.
+
+**`authorized_minor`** — the running sum of the *increase-side* deltas only, ignoring clearings and
+reversals. A processor restating a cumulative total is restating this number, not the net total.
+Derive the delta from the net total instead and the answer depends on arrival order — the same three
+messages produce different holds in different orders, with no error raised.
+
+**`total_convention`** — whether a group's increase-side messages carry **deltas** ("add 20.00") or
+cumulative **totals** ("the authorization is now 120.00"). Fixed by the first message in the group.
+Mixing the two is irreconcilable and must be refused rather than guessed: a total arriving *before*
+the delta it restates carries no information saying it already includes it, so `{+100.00 delta,
+120.00 total}` yields 120.00 in one order and 220.00 in the other. Within one convention, order
+tolerance holds — deltas commute, and totals resolve to the highest total seen.
+
 ## Performance
 
-**Hot account** — an account touched by nearly every transaction, so every writer queues on the
-same row. `network_settlement_payable` is ours. Measured on one machine: a single shared row put the
-ceiling in the high hundreds of clearings per second — the same configuration measured 833 and then
-482 purely from machine load, and hardware was never varied, so read it as a shape and not a number.
-This is a named, forty-year-old problem — it's the branch record in the 1985 DebitCredit
-benchmark.
+**Hot account** — an account touched by nearly every transaction, so every writer queues on the same
+row. `network_settlement_payable` is ours. [Spike 003](../spikes/003-throughput-ceiling/README.md)
+put a single shared row in the high hundreds of clearings per second on one machine, where the same
+configuration re-measured at 833 and then 482 purely from machine load — a shape, not a number. This
+is a named, forty-year-old problem: it is the branch record in the 1985 DebitCredit benchmark.
 
 **Contention** — writers waiting on the same row. The ceiling above is contention, not CPU or
 disk, which is why a bigger instance doesn't help.
 
 **Striping** — storing one logical account as N physical rows so writers spread across them;
 balance = sum of the stripes. **Not built here**: there is no stripe column in `schema/`, and
-`uq_accounts__house` would currently prevent one on the accounts that need it. Measured in spike 003
-only, on the same single machine as the figure above: 872 → 6,970 clearings/s at 64 stripes.
+`uq_accounts__house` would currently prevent one on the accounts that need it. Measured in [spike
+003](../spikes/003-throughput-ceiling/README.md) only, on the same single machine as the figure
+above: 872 → 6,970 clearings/s at 64 stripes.
 
 **Skew** — how unevenly traffic is spread across customers. Uniform = everyone equal; skewed = one
 customer is most of your volume, which is what real platforms look like. It matters because giving

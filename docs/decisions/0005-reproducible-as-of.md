@@ -1,15 +1,46 @@
-# 0005 — A reproducible as-of cursor
+# 0005 — "As of" means a commit-ordered cursor, not a timestamp
 
 **Status:** proposed — blocks roadmap M5
-**Date:** 2026-08-25
 
+## The decision
 
-## The closest prior art has the same hole, and knows it
+A report resolves a business date to a **gap-free watermark over a global sequence** on
+[`ledger_events`](./0004-event-log.md) — one monotonic sequence for the whole system, assigned once
+per accepted event — stores the watermark alongside the report, and re-runs against the stored
+watermark forever after. The date picks a cursor; the cursor is what the query uses.
 
-Formance's `transaction_date()` seeds from `statement_timestamp()` into a session temp table, so
-every row in one SQL transaction shares a timestamp — intra-transaction consistency, and **nothing
-about commit order**. Their per-ledger sequence carries this comment, which appears three times in
-their tree:
+The watermark is not `max(seq)`. It is the highest **N such that every entry ≤ N has committed**,
+computable from `pg_snapshot_xmin(pg_current_snapshot())`, since every transaction below the
+snapshot's xmin has resolved. Standard CDC technique.
+
+With it, a rule: **an as-of query must name the column it filters, and a resource must have exactly
+one such column.** Naming the axis on the *parameter* is not enough.
+
+## Why
+
+**`recorded_at` is not reproducible.** It is `now()` — *transaction start* time, not commit order:
+
+| Transaction | starts | commits | writes `recorded_at` |
+| --- | --- | --- | --- |
+| A | T1 | **T3** | T1 |
+| B | T2 (> T1) | T2.5 | T2 |
+
+A report for "as of T2.6" run at T2.7 sees B but not A — A hasn't committed yet. The same report,
+same as-of value, re-run at T4, sees both. **Different answer.** No care with time zones fixes this;
+the problem is not the clock. It needs two concurrent writers and one slow transaction, and a
+reporting run overlapping a batched posting run is an ordinary Tuesday.
+
+**It has been reproduced** with nothing but the app role's ordinary INSERT grants: one recorded-axis
+report, run either side of one concurrent commit, gave revenue **110,000.00 then 160,000.00** —
+`balanced` both times, both drift views empty.
+
+**A bare `bigserial` doesn't help.** Sequence values are handed out at *insert* time, so the same
+interleaving leaves gaps that fill in afterwards — `max(seq)` is not yet gap-free. Hence a watermark.
+
+**The closest prior art has the same hole and knows it.** Formance's `transaction_date()` seeds from
+`statement_timestamp()` into a session temp table: intra-transaction consistency, nothing about
+commit order. Their per-ledger sequence carries this comment, three times over
+([spike 001](../../spikes/001-formance/README.md)):
 
 ```sql
 -- create a sequence for transactions by ledger instead of a sequence of the table as we want to
@@ -18,99 +49,22 @@ their tree:
 -- of the sequence
 ```
 
-Note the contradiction inside one comment: *"as we want to have contiguous ids"* immediately
-followed by *"we can still have holes."* They wanted a gapless total order, built a sequence for it,
-and wrote down that it does not deliver one. **They do nothing further about it** —
-`WHERE recorded_at <= T` is not reproducible for them either, and their transaction PIT filter is on
-the *business* date, so they have no "as we knew it at T" read for transactions at all.
+They wanted a gapless total order, built a sequence for it, wrote down that it does not deliver one,
+and did nothing further — while their `logs (ledger, id)` primary key *is* the cursor this ADR wants.
+The naming rule above is theirs too, learned expensively: they *do* name the axis (`pit` plus a
+`useInsertionDate` selector) and `pit` still resolves to **six different columns across seven
+endpoints**, the selector spelled three ways, undocumented in their OpenAPI.
 
-**That raises confidence that this is a real problem and lowers confidence that a clever solution
-exists.** It also points at the answer this ADR already leans toward: make "as of" mean *as of log
-id N* and hand the counterparty an id rather than a timestamp. Their `logs (ledger, id)` primary key
-is exactly that cursor. They just never use it that way.
+## Alternatives
 
-**And a stricter rule than "name the axis", which they learned the expensive way.** Formance *does*
-name it — `pit` plus a `useInsertionDate` selector — and `pit` still resolves to **six different
-columns** across seven endpoints, with the selector spelled three different ways
-(`useInsertionDate`, `insertionDate`, and hardcoded in v1). Their OpenAPI gives `pit` no description
-at all. A maintainer confirms the fix is still pending: *"This is going to be fixed in order to have
-the same behavior as /volumes endpoint."* So:
+| | Why not |
+| --- | --- |
+| **`recorded_at <= :as_of`** | Not reproducible — the table above. Do not build M5 on it; code written against it will change. |
+| **Serialize all ledger writes** behind one commit-ordered lock | Trivially correct, and measured expensive. See below. |
+| **Push "as of entry #N" to the caller** | Honest, and fine internally — but a credit agreement says "as of June 30", not "as of entry 4,183,992". Something still has to map a date to a cursor. |
 
-> Naming the axis on the *parameter* is not enough. An as-of query must name the **column** it
-> filters, and a resource must have exactly one such column.
-
-## Context
-
-**This is no longer hypothetical.** Assigning `recorded_at` from `now()` closed three of the four
-consequences it was written for; the fourth is still live and was reproduced in round 5, needing
-nothing but the app role's ordinary INSERT grants. A writer that BEGINs before a report and COMMITs
-after it inserts rows whose `recorded_at` — transaction-start time — predates the report that could
-not see them. Same query, same as-of, same axis, either side of one commit: revenue 110,000.00 then
-160,000.00, `balanced` both times, both drift views empty.
-
-`xact_id` is already on every transaction, so the cursor this ADR proposes has its input. What is
-missing is the query layer: `accounting_equation` takes one instant and one axis, so a genuinely
-bitemporal question — *the effective-axis February close as it was known on 1 March* — cannot even
-be expressed, and `balance_sheet`, `income_statement` and `balance_sheet_balances` carry no date
-predicate at all. **Storage is bitemporal; the query layer is not.**
-
-
-A report must be **reproducible**: re-running "as of June 30" next year must return the same
-number it returned last year. That is the entire point of recording two time axes
-([0003](./0003-bitemporal-balances.md)).
-
-**`recorded_at` does not provide it.** It is assigned `now()` by a trigger, and `now()` in Postgres is *transaction
-start* time — not commit order:
-
-| Transaction | starts | commits | writes `recorded_at` |
-| --- | --- | --- | --- |
-| A | T1 | **T3** | T1 |
-| B | T2 (> T1) | T2.5 | T2 |
-
-A report for "as of T2.6" run at T2.7 sees B but not A — A hasn't committed yet. The same report,
-same as-of value, re-run at T4, sees both. **Different answer.** No amount of care with time zones
-fixes this, because the problem is not the clock.
-
-It needs only two concurrent writers and one slow transaction — a reporting run overlapping a
-batched posting run is an ordinary Tuesday.
-
-A bare `bigserial` doesn't help either: sequence values are handed out at *insert* time, so the
-same interleaving leaves gaps that fill in afterwards. A reader taking `max(seq)` gets a value
-that is not yet gap-free.
-
-## The options
-
-**(a) Serialize all ledger writes.** One lock at commit hands out a strictly commit-ordered
-number. Trivially correct, and costs every concurrent write.
-
-**(b) A gap-free watermark over a global sequence.** A reader does not use `max(seq)`; it uses the
-highest **N such that every entry ≤ N has committed** — computable from
-`pg_snapshot_xmin(pg_current_snapshot())`, since every transaction below the snapshot's xmin has
-resolved. Standard CDC technique. Reports pin a watermark, not a timestamp. Preserves write
-concurrency; the cursor lags the newest writes by the duration of the longest in-flight
-transaction.
-
-**(c) Push "as of entry #N" to the caller.** Honest, and fine internally — but a credit agreement
-says "as of June 30", not "as of entry 4,183,992". Something still has to map a date to a cursor.
-
-## Proposal
-
-**(b)**, with the cursor on [`ledger_events`](./0004-event-log.md) — one monotonic sequence for
-the whole system, assigned once per accepted event, rather than a second ordering concept per
-table.
-
-Reports resolve a business date to a watermark **once**, store the watermark alongside the report,
-and re-run against the stored watermark forever after. The date picks a cursor; the cursor is what
-the query uses.
-
-This also composes with 0004's deferred hash chain, which needs a total order anyway.
-
-## Why (a) is ruled out — measured
-
-This ADR originally said "measure before choosing the clever option".
-[Spike 003](../../spikes/003-throughput-ceiling/README.md) is that measurement, and it arrived
-without being aimed at this question. Option (a) is structurally identical to the
-single-contended-row case it characterised:
+**Why serializing is ruled out — measured.** [Spike
+003](../../spikes/003-throughput-ceiling/README.md) characterised exactly this shape:
 
 | | clearings/s |
 | --- | --- |
@@ -118,27 +72,27 @@ single-contended-row case it characterised:
 | one contended row, batched (25) | 3,420 |
 | no global contention, striped + single-call | 7,897 |
 
-So (a) costs roughly 10× unbatched and 2.3× batched (7,897 against ~800, and against 3,420) — and it is worse than those numbers look,
-because the lock is **global**. Every lever [0007](./0007-open-source-positioning.md) rests on
-works by reducing contention on *account* rows; none of them touch a lock taken by every writer
-regardless of what it posts to. Adopting (a) would make 0007's throughput story inoperative.
+Roughly 10× unbatched and 2.3× batched — and worse than it looks, because the lock is **global**:
+every lever [0007](./0007-open-source-positioning.md) rests on reduces contention on *account* rows,
+and none of them touch a lock taken by every writer. **The concurrency-4 plateau is the specific
+danger** — throughput *declines* past four concurrent writers, so a deployment that answered a slow
+ledger by adding workers would make it slower, which is the least debuggable failure mode available.
 
-**The concurrency-4 plateau is the specific danger.** Throughput on a contended row *declines*
-past four concurrent writers, so a deployment that responded to a slow ledger by adding workers
-would make it slower — the least debuggable failure mode available, and one that lands on users.
+## What it costs
+
+- The cursor **lags the newest writes** by the duration of the longest in-flight transaction — the
+  price of keeping write concurrency.
+- **The query layer is not bitemporal yet, though storage is.** `accounting_equation` takes one
+  instant and one axis, so *the effective-axis February close as known on 1 March* cannot be
+  expressed; `balance_sheet`, `income_statement` and `balance_sheet_balances` have no date predicate.
+- It composes with [0004](./0004-event-log.md)'s deferred hash chain, which needs a total order.
 
 ## Why this is still `proposed`
 
 The watermark has to be built and tested against concurrent writers. Unverified:
-
 1. That `pg_snapshot_xmin(pg_current_snapshot())` gives a usable watermark under our real write
-   pattern. This originally assumed long-running workflow activities might hold transactions open;
-   [0008](./0008-durable-timers.md) settles that they do not — timers are one-shot jobs, and a job
-   handler's transaction is as short as any other write. **The risk that remains is a batched
-   posting run**, not the scheduler.
-2. The watermark's lag under a batched run — if one transaction stays open for minutes, every
-   report in that window is pinned behind it.
+   pattern. The risk is a **batched posting run**, not the scheduler —
+   [0008](./0008-durable-timers.md)'s timers are one-shot jobs with short transactions.
+2. The watermark's lag under such a run: one transaction open for minutes pins every report in that
+   window behind it.
 3. That the watermark advances past aborted transactions automatically. It should; confirm.
-
-**Do not build M5 on `recorded_at <= :as_of` meanwhile.** It is not reproducible, and code written
-against it will change.
