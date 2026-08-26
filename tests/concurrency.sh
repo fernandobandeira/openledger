@@ -474,5 +474,63 @@ chk "...and every racing attacher was told the true exposure, not a constraint e
 chk "...with nothing left in the review queue" \
     "$(q "select count(*) from card_auth_unmatched where tenant_id='rj'")" 0
 
+# ---------------------------------------------------------------- workload K
+# assign_entry_seq's OWN LOCK, actually raced. Workload A posts through
+# golden_trace.sql's post(), which upserts ledger_account_balances -- taking that
+# row's lock -- BEFORE inserting entries. So the trigger's lock is never
+# load-bearing there, and deleting it left the whole suite green.
+#
+# The trigger exists precisely for callers that do NOT pre-lock: it materialises
+# the cache row and locks it itself. Two such posters that race collide on
+# uq_entries__account_seq with a 23505 -- indistinguishable from a genuine
+# idempotency conflict, and retried by no serialization-failure loop, which is what
+# the trigger's comment says the lock is there to prevent.
+psql "$URL" -q -v ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+SELECT 'sq','house',NULL,code,category,normal_balance,'USD'
+  FROM account_types WHERE code IN ('customer_receivable','interchange_revenue');
+SQL
+seq_poster() {
+    : > "$TMP/k$1.sql"
+    for i in $(seq 1 "$PER"); do
+        cat >> "$TMP/k$1.sql" <<SQL
+BEGIN;
+DO \$d\$
+DECLARE e uuid; t uuid; a uuid; b uuid;
+BEGIN
+    SELECT id INTO a FROM ledger_accounts WHERE tenant_id='sq' AND purpose='customer_receivable';
+    SELECT id INTO b FROM ledger_accounts WHERE tenant_id='sq' AND purpose='interchange_revenue';
+    INSERT INTO ledger_events (tenant_id,kind,source,idempotency_key,idempotency_hash,payload,effective_at)
+    VALUES ('sq','k','internal','k${1}_${i}',sha256(convert_to('k${1}_${i}','UTF8')),'{}',now())
+    RETURNING id INTO e;
+    INSERT INTO ledger_transactions (tenant_id,event_id,kind,status,effective_at)
+    VALUES ('sq',e,'k','posted',now()) RETURNING id INTO t;
+    -- NO upsert on ledger_account_balances first. That is the whole point.
+    INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
+                                currency,balance_after,effective_at)
+    VALUES ('sq',t,a,'debit',10,'USD',0,now()),
+           ('sq',t,b,'credit',10,'USD',0,now());
+END \$d\$;
+COMMIT;
+SQL
+    done
+    psql "$URL" -qAt -f "$TMP/k$1.sql" >/dev/null 2>"$TMP/k$1.err"
+}
+for w in $(seq 1 "$WORKERS"); do seq_poster "$w" & done
+wait
+k_expected=$(( WORKERS * PER ))
+chk "posters that do not pre-lock the cache row: transactions committed" \
+    "$(q "select count(*) from ledger_transactions where tenant_id='sq'")" "$k_expected"
+chk "...with every account sequence gapless and unique" \
+    "$(q "select bool_and(mx=n and dc=n) from (select max(account_seq) mx, count(*) n, count(distinct account_seq) dc from ledger_entries where tenant_id='sq' group by account_id) z")" "t"
+chk "...and no duplicate-key errors" \
+    "$(cat "$TMP"/k*.err 2>/dev/null | grep -cE 'uq_entries__account_seq' || true)" 0
+# These posters deliberately write balance_after = 0 and never touch the cache --
+# they exist to race the SEQUENCE, not to keep the running balance. So the alarm
+# must SEE that, which makes this a positive control for the drift view under
+# concurrent load rather than an assertion of absence.
+chk "...and the alarm sees the running balance they did not maintain" \
+    "$(q "select count(*) from ledger_balance_drift where tenant_id='sq'")" 2
+
 echo "   ok  SUITE-COMPLETE concurrency"
 exit "$fail"
