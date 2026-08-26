@@ -14,7 +14,7 @@ CR network_settlement_payable 491.00  ← we owe Visa 491
 CR interchange_revenue          9.00  ← we keep 9
 ```
 
-500 out, 500 in. If a transaction doesn't balance, it is rejected.
+500 out, 500 in. A transaction that doesn't balance is not supposed to be expressible — see [the decision log](./decisions/0013-the-write-path.md) for where that is enforced, and what enforces it today.
 
 **Debit / credit** — the two sides. Not "money in / money out": which one *increases* an account
 depends on the account. Debits increase assets and expenses; credits increase liabilities, equity

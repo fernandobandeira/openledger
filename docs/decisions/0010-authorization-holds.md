@@ -28,7 +28,9 @@ The obvious model is a mutable `holds` row with a running amount. It does not su
 ## What the field actually does — and where this ADR was overstating
 
 [Spike 008](../../spikes/008-processor-hold-semantics/README.md) read thirteen card processors and
-ledger APIs from their own published references, 51 URLs verified. Four claims in this ADR needed
+ledger APIs from their own published references. **Fifty-one pages were read and six are cited**;
+the rest of the quotes carry no link and are unverified — see that spike's own header, which now says
+so. Four claims in this ADR needed
 narrowing, three gaps in the model came out of it, and the rest held.
 
 **1. "An authorization writes no ledger entry" is a product choice, not a domain law.** It is true

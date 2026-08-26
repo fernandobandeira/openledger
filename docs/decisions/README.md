@@ -45,6 +45,40 @@ here, so the ADRs don't each stop to re-explain them.
 | [0013](./0013-the-write-path.md) | **The write primitive is a posting, not an entry** — source, destination, amount, so one leg is unconstructible | "One service owns the writes" is a hope about deployment; a type that cannot express an unbalanced transaction holds for every caller. No established open-source ledger enforces this in the database — Formance deleted its deferred constraint trigger in favour of a unique index | accepted |
 | [0014](./0014-schema-migrations.md) | **goose, from Go, as its own `openledger migrate` command run as a pre-deploy job** — never at startup, never from goose's CLI | A *blocking* advisory lock deadlocks against `CREATE INDEX CONCURRENTLY`, which kills tern and golang-migrate; goose polls a try-lock. Atlas Community refuses our views outright | accepted |
 
+## What the schema enforces today
+
+Measured against a fresh load of [`schema/schema.sql`](../../schema/schema.sql), not asserted. This
+section exists because five documents claimed guarantees the schema stopped providing when
+[0012](./0012-where-logic-lives.md) deleted the PL/pgSQL, and nothing held the inventory in one
+place.
+
+**11 tables · 5 views · 10 foreign keys · 8 triggers over 2 functions · 0 event triggers · 0 policies**
+
+**Enforced by the database:**
+
+- Single-row `CHECK`s — `amount_minor > 0`, ISO currency, the sign rule per authorization kind,
+  house accounts having no owner, caption cleanliness, statement/side agreement.
+- **Chart integrity, by two composite foreign keys.** An account cannot claim a category or normal
+  balance its type does not have; a type cannot report under a statement line that contradicts its
+  category. A wrong chart is refused at seed time — verified, three of four mutant charts died on
+  load.
+- **Append-only on the four immutable logs**, by trigger, `ENABLE ALWAYS`, so it holds on the
+  replication apply path too. `TRUNCATE` refused on the same four.
+- Uniqueness — idempotency keys, one live membership per event, one house account per tenant.
+
+**NOT enforced by the database, deliberately or otherwise:**
+
+| | why |
+| --- | --- |
+| **Debits equal credits** | **Deliberate.** [0013](./0013-the-write-path.md) makes it unconstructible in the Go writer rather than refused in SQL — a `Posting` cannot express one leg. Until that writer exists, **nothing enforces it at all**, and 0013 says so. |
+| `recorded_at`, `xact_id`, `account_seq`, `balance_after` | **Deliberate.** Assigned by the writer, which has no parameter for them. Today they are bare `DEFAULT`s and are forgeable by an `INSERT` — verified, `recorded_at` accepted as `1999-01-01`. |
+| **Foreign keys on the replication apply path** | **Not deliberate.** All 26 internal FK triggers are `ENABLE ORIGIN`. Under `session_replication_role = 'replica'` every foreign key is skipped — verified: a two-tenant entry in a currency its account does not hold, dated 1999, committed. [0011](./0011-what-the-database-enforces.md) claims this was closed; it was closed on an implementation that no longer exists. |
+| **Table inheritance** | **Not deliberate.** The event trigger went with the PL/pgSQL. A child of `ledger_entries` plus one `INSERT … SELECT * FROM ONLY` doubles every number in every report — verified. |
+| **Reclassifying a statement line** | **Not deliberate.** `fk_types__fs_line` blocks a move that contradicts the category; it does **not** block a move to another line of the same statement and side. Verified: 440.00 of customer float moved from restricted cash to unrestricted on an already-issued balance sheet. |
+
+The last three are the honest cost of [0012](./0012-where-logic-lives.md), and they were not stated
+when it was written. They belong in *Still open*, and they are there now.
+
 ## Non-negotiable
 
 No decision may trade these away. They are what makes the numbers trustworthy:
@@ -54,7 +88,12 @@ No decision may trade these away. They are what makes the numbers trustworthy:
   point-in-time change to a privilege; one `GRANT ALL` undoes it. This line said "enforced by
   revoking the grants" while the two documents that own the claim
   ([vision](../vision.md), [0011](./0011-what-the-database-enforces.md)) both said the opposite.
-- **Balanced per currency**, enforced by the database on every transaction.
+- **Balanced per currency.** Enforced by *construction* in the Go writer — a posting names a source
+  and a destination, so one leg is unconstructible ([0013](./0013-the-write-path.md)). This line used
+  to read "enforced by the database on every transaction", which stopped being true when
+  [0012](./0012-where-logic-lives.md) removed the deferred trigger, and **is not true today because
+  the writer is not built**. It is non-negotiable as a property of the design, not as a property of
+  the current tree.
 - **Bitemporal.** Every entry records both when it happened and when we learned about it.
 - **Event-logged.** Every accepted operation is recorded, whether or not it moves money.
   *Not yet enforced:* `ledger_transactions.event_id` is nullable — see "Still open".
@@ -65,6 +104,17 @@ No decision may trade these away. They are what makes the numbers trustworthy:
 ## Still open
 
 Undecided, listed plainly rather than buried:
+
+- **Three guarantees [0012](./0012-where-logic-lives.md) removed without saying so.** All three were
+  closed by PL/pgSQL that no longer exists, all three are reproducible on the shipped schema, and all
+  three were still described as closed until an adversarial round caught them:
+  - **Foreign keys are skipped on the replication apply path.** 26 internal FK triggers, all
+    `ENABLE ORIGIN`. The fix is one `ALTER TABLE … ENABLE ALWAYS TRIGGER` per FK trigger, and it
+    needs a decision about whether a design-stage schema should carry it.
+  - **Table inheritance is open again.** A child of `ledger_entries` is visible through the parent to
+    every view and carries none of its keys or triggers. The guard was an event trigger.
+  - **A statement line can be reclassified under posted history**, as long as the new line shares the
+    old one's statement and side.
 
 - ~~**How schema changes get applied is undecided.**~~ **Closed by [0014](./0014-schema-migrations.md)** — goose, from Go. What follows is the reasoning that entry asked for, kept because the alternatives matter: `schema/schema.sql` is loaded by `make schema`
   with plain `psql`, which is fine for a design artefact and is not a migration story. A ledger
@@ -153,17 +203,11 @@ Undecided, listed plainly rather than buried:
 - **Striping is not built.** The stack summary above quotes striped figures; there is no stripe
   column in `schema/`, and `uq_accounts__house` would currently prevent one on the accounts
   that need it.
-- ~~**There is no CI.**~~ **There is now**: `.github/workflows/test.yml` applies the migrations
-  against PostgreSQL 18 and runs the deleted test runner suite on every push and pull request. This was listed here
-  as "the highest-leverage item" for eight rounds while nine layers of anti-forgery machinery were
-  added to the deleted test runner suite — machinery whose own header says it "does not defend against a determined
-  author" and names CI as the durable answer. Everyone agreed on the answer and wrote the ladder
-  instead. **The schema snapshot test is still not wired to anything**, and that half stays open:
-  `expected_schema.sql` is twenty-one lines containing one `SELECT` that emits a string — there is no
-  committed snapshot to diff it against and no failure path, so wiring it into CI today would assert
-  nothing. The missing half is the snapshot, not the invocation. [0006](./0006-schema-conventions.md)
-  calls it "the highest-leverage item here" and [0008](./0008-durable-timers.md) says it must cover
-  ADR-quoted SQL — which, twice, it would have caught.
+- **There is no CI, again.** `.github/workflows/test.yml` existed for one commit and was deleted
+  with the suite it ran ([0012](./0012-where-logic-lives.md)) — there is nothing left for it to
+  execute. It comes back when the Go tests do, and it should run `go test ./...` and load
+  `schema/schema.sql` against a PostgreSQL 18 service. **This entry was struck through as done for
+  several hours while the file did not exist.**
 - **Hash chaining for tamper evidence is deferred, not decided.**
   [0004](./0004-event-log.md) leaves it explicitly open: it needs a total order, so it is entangled
   with [0005](./0005-reproducible-as-of.md). The cost figures quoted there are extrapolated from
@@ -208,7 +252,7 @@ Undecided, listed plainly rather than buried:
 These are real decisions with real reasoning; none has an ADR, which makes the header above
 ("everything we've decided, on one page") an overstatement. Listed here until they get one:
 
-- **All four reports filter `status = 'posted'`.** Without it a pending authorization was
+- **All three reports filter `status = 'posted'`.** Without it a pending authorization was
   recognised as revenue and its posted resolution counted it again — 500.00 of interchange twice.
   The reasoning is in `schema/schema.sql`.
 - **Balances are stored debit-positive**, and `trial_balance` splits `balance_minor`
@@ -253,7 +297,7 @@ Three rules follow, and they are cheap:
 
 - **A third-party figure needs a fetchable source next to it**, or it is marked unverified. Not
   softened — marked. "I could not check this" is a finding, not an embarrassment.
-  *This rule is not met.* An audit counted **five** external URLs in the whole tree against dozens
+  *This rule is not met.* An audit counted **twelve** unique external URLs in the whole tree (five when this rule was written) against dozens
   of third-party figures. Three successive attempts to fix it with a *section banner* were each
   found, in the next round, to cover less than the round before claimed: first the bannered
   sections missed Monzo, Supabase and every accounting-standard paragraph citation (IAS 1.32/1.41,
@@ -288,7 +332,7 @@ a control quietly deleted, a helper weakened, a file truncated, a floor with sla
 defend against a determined author.** Nothing checked into a repository can: whoever edits the tests
 can edit the thing that checks them. The durable answers are outside the file — review, and CI
 running a pinned configuration the branch cannot edit. **CI now exists**
-([`.github/workflows/test.yml`](../../schema/schema.sql)); it is what eight rounds of
+(`.github/workflows/test.yml`); it is what eight rounds of
 in-tree guards were a substitute for, and it was written only after a round asked why the substitute
 kept being rebuilt instead of the thing itself.
 

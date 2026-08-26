@@ -115,7 +115,13 @@ converted into a claim.)*
 
 ## Consequences
 
-- **Reclassification is blocked while accounts exist.** Changing a type's category silently
+- **Reclassification is blocked while accounts exist — in one direction only.**
+`fk_accounts__type` refuses a change to a type's `category` or `normal_balance` while accounts
+reference it. It does **not** refuse a change of `fs_line` to another line of the same statement and
+side: verified, `fbo_cash` moved from `restricted_cash` to `cash` and 440.00 of customer float
+silently became unrestricted liquidity on an already-issued balance sheet — the exact harm
+`schema/chart.sql` cites Reg S-X 5-02.1 and ASC 230-10-45-4 for. Open, and listed as such.
+The rest of this bullet describes the direction that IS blocked: Changing a type's category silently
   rewrote the income statement — revenue 9.00 → 0.00 on the golden trace with every check green,
   because reports join through the type while the guard only fired on the account. Both directions
   are now guarded.

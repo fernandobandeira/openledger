@@ -59,9 +59,9 @@ M1.
 [`schema/schema.sql`](../schema/schema.sql) is the core —  `ledger_accounts`,
 `ledger_transactions`, `ledger_entries`, `ledger_account_balances`, `ledger_events` — written by
 hand rather than promoted from the spikes, which held three competing posting engines and two
-competing hold models. [`0002`](../schema/schema.sql) adds the chart of
+competing hold models. `schema/schema.sql` adds the chart of
 accounts and the completeness layer ([ADR-0009](./decisions/0009-chart-and-completeness.md));
-[`0003`](../schema/schema.sql) the hold model
+`schema/schema.sql` the hold model
 ([ADR-0010](./decisions/0010-authorization-holds.md)). No API, no Go beyond migrations.
 
 Landed with it: composite `(tenant_id, …)` keys throughout, the cross-tenant guard as a composite
@@ -70,7 +70,7 @@ ADR-0010 rely on. **Striping is not built.** The design is one integer on the ac
 there is no such column in `schema/` and nothing implements it. An earlier version of this
 sentence read as though the column existed.
 
-Carried forward: balanced-per-currency enforced by the database; append-only via an immutability
+Carried forward: balanced-per-currency, enforced by construction in the writer ([0013](./decisions/0013-the-write-path.md)) rather than by the database; append-only via an immutability
 trigger (the `REVOKE` narrows the blast radius; it is not the mechanism); `amount_minor bigint CHECK (> 0)` so direction carries
 the sign; idempotency keyed to the **event**, not the business object.
 
@@ -101,7 +101,7 @@ half, leaving their books out by the full amount
 `due_to_tenants` pair, splitting one cross-scope transaction into two, each balanced *within* one
 scope. That is why "no transaction spans a tenant" is a conformance property, not an optimization.
 
-[The golden trace](../schema/schema.sql) now runs on that pair rather than describing it: the
+The golden trace (deleted) now runs on that pair rather than describing it: the
 facility draw, the network settlement and the ACH collection are all cross-scope, both scopes
 balance independently at every step, and the two sides are asserted to eliminate exactly. The
 program's profit turns out to equal its claim on treasury, from opposite directions.

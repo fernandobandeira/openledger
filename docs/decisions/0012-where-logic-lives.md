@@ -59,7 +59,7 @@ The four groups, and what replaces each:
 | Group | Count | Replacement |
 | --- | --- | --- |
 | `TRUNCATE` refusal | 7 → **4 kept** | Kept, on the four immutable logs. There is no declarative alternative and no way to collapse them into one object: PostgreSQL refuses event triggers for `TRUNCATE TABLE` outright (verified: `ERROR: event triggers are not supported for TRUNCATE TABLE`), and `TRUNCATE` fires no `ON DELETE` trigger, so the guard above does not see it. |
-| Immutability (no `UPDATE`/`DELETE` on the journal) | 5 → **2 kept** | `REVOKE` **and** a trigger. The grant binds the application role; the trigger is the only thing that also binds a backfill script or a human at a psql prompt. One `refuse_mutation()` function on the four immutable logs. |
+| Immutability (no `UPDATE`/`DELETE` on the journal) | 5 → **4 kept** | `REVOKE` **and** a trigger. The grant binds the application role; the trigger is the only thing that also binds a backfill script or a human at a psql prompt. One `refuse_mutation()` function on the four immutable logs. |
 | Assignment (`recorded_at`, `xact_id`, `account_seq`, `balance_after`) | 5 | The Go writer assigns them. There is no parameter for a caller to supply, which is stronger than a `DEFAULT` — a `DEFAULT` is overridable, and that was a measured defect: a client-settable insertion axis let an already-issued report be rewritten by a transaction claiming to predate it. |
 | Cross-row validation | ~10 | Two became **foreign keys** (below). The rest — "debits equal credits", "at least two entries", correction targets — are enforced by *construction*: the Go writer builds both legs of a transaction in one code path, so an unbalanced transaction is **unrepresentable** rather than refused. |
 
@@ -106,7 +106,7 @@ is no `UPDATE`, no `DELETE`, and no way to submit half a transfer, so there is n
 to police.
 
 So the category that gets removed is **orchestration and derivation-with-backfill**, not integrity.
-That is the bar this ADR now states, and it is why two triggers survived.
+That is the bar this ADR now states, and it is why two *invariants* survived — eight trigger objects over two functions.
 
 **Formance's own line is sharper than ours, and it is worth adopting.** Reading what they dropped
 against what they kept:
@@ -205,8 +205,10 @@ better argument for one write path than anything about maintainability.
 
 ## What survives from the SQL
 
-[`schema/schema.sql`](../../schema/schema.sql) — 11 tables, 3 report views, zero triggers, zero
-functions, and it loads. It exists to prove the shape the ADRs describe is expressible
+[`schema/schema.sql`](../../schema/schema.sql) — 11 tables, 5 views, **8 triggers over 2
+functions**, and it loads. (This line said "zero triggers, zero functions" and contradicted its own
+file, which says two invariants clear the bar. It also predated restoring the two card alarm views,
+which are declarative and should never have gone.) It exists to prove the shape the ADRs describe is expressible
 declaratively, and `schema/chart.sql` seeds a chart that satisfies it.
 
 The test suites, `tests/run.sh`, `tests/canary.sh` and `tests/concurrency.sh` are deleted. They

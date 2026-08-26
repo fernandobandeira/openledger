@@ -86,7 +86,7 @@ which is the caller's business rather than the file's.
 
 | | Why not |
 | --- | --- |
-| **tern** | The strongest runner-up and the only native-pgx candidate. Blocking `pg_advisory_lock` → the deadlock above. Also a 452-vs-14 commit bus factor. **If we ever drop "instances migrate at boot" and an operator runs migrations out of band, this choice flips.** |
+| **tern** | The strongest runner-up and the only native-pgx candidate. Blocking `pg_advisory_lock` → the deadlock above. Also a 452-vs-14 commit bus factor. *Spike 007 framed this as "if an operator runs migrations out of band, the choice flips" — and the decision above IS out of band. It does not flip, for the two reasons argued in "Why a separate command"; this row is kept only to record what the flip condition was thought to be.* |
 | **golang-migrate** | Same deadlock; no per-migration transaction and no directive to opt out, so `CONCURRENTLY` fails anyway and the fix is one statement per file; a failure sets a `dirty` flag whose documented recovery is a human running `migrate force`. |
 | **Atlas** | Community **refuses this schema**: `views are available to logged-in users only`. RLS policies are gated the same way, and we already know we need them. `migrate lint` is Pro. The Go SDK shells out to a 121 MB binary. A dev database is mandatory. Same open-core shape as River's periodic jobs in [0008](./0008-durable-timers.md). |
 | **psqldef** | SIGSEGV on `trial_balance`. |

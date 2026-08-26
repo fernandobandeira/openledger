@@ -66,8 +66,9 @@ correctness.
 **Constraints matter more for us than for them.** Formance's posting primitive is a
 source/destination pair — balanced *by construction*, so no CHECK is needed anywhere. Our entries
 are independent rows carrying a direction, so we *can* express an unbalanced transaction and
-therefore *must* prevent it. We do both: the write API accepts balanced pairs only (making the
-illegal state unrepresentable). **[0012](./0012-where-logic-lives.md) removed the trigger backstop
+therefore *must* prevent it. The decision is to make the illegal state unrepresentable in the write
+API ([0013](./0013-the-write-path.md)) rather than to refuse it in SQL — and **that API is not
+built**, so today neither half is in place. **[0012](./0012-where-logic-lives.md) removed the trigger backstop
 entirely** — the write path is the only enforcement now, and the schema keeps only declarative
 constraints. Spike 003 ran its entire benchmark with the trigger active and never found it to be
 the bottleneck, which is the part of this paragraph that still matters: at the top of its ladder —

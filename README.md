@@ -20,11 +20,10 @@ Its **reference implementation** is an embedded B2B charge card funded by a cred
 product exists to prove the core carries something real without forking, and to give the core a
 demanding acceptance test. It is not the project.
 
-**Status:** pre-implementation, but the schema is real and attested. `schema/` holds the
-ledger core, the chart of accounts, and the card hold model; `tests/` replays a full card
-lifecycle against them, asserts the plans of the queries the docs promise are O(1), and then tries
-every way we can think of to break it — each of which must be refused, and refused for the stated reason.
-No Go service yet.
+**Status: design stage.** The deliverable is [`docs/decisions/`](./docs/decisions/).
+`schema/schema.sql` holds the ledger core, the chart of accounts and the card hold model — it exists
+to show that shape is expressible, and it loads. **There is no test suite and no Go service yet**: a
+SQL implementation and its harness were deleted, and why is [ADR-0012](./docs/decisions/0012-where-logic-lives.md).
 
 ## Start here
 
@@ -33,7 +32,8 @@ No Go service yet.
 | [docs/vision.md](./docs/vision.md) | What this is, what is non-negotiable, and a primer if you have never built a ledger. **Read this first.** |
 | [docs/roadmap.md](./docs/roadmap.md) | What gets built, in what order, and why that order |
 | [docs/decisions/](./docs/decisions/) | ADRs — every architectural decision and its reasoning |
-| [tests/](./schema/) | The acceptance suites — a full card lifecycle, and every way we know to break it |
+| [docs/glossary.md](./docs/glossary.md) | Every term used here, defined for someone who has never built a ledger |
+| [schema/schema.sql](./schema/schema.sql) | The design schema — tables, constraints, keys, report views, and the two triggers that earn their place |
 | [spikes/](./spikes/) | Timeboxed investigations — brief, findings, and code together |
 | [docs/reference-product.md](./docs/reference-product.md) | The reference card product this ledger was designed against |
 
@@ -58,9 +58,9 @@ nothing so far.
 
 ```
 docs/             THE DELIVERABLE — vision, decisions, reference product spec
-schema/           the design schema: tables, CHECKs, foreign keys, report views.
-                  Zero triggers, zero PL/pgSQL — see decisions/0012.
-                  chart.sql seeds an example chart of accounts.
+schema/           the design schema: tables, CHECKs, foreign keys, 5 views, and
+                  8 triggers over 2 functions -- each justified in place, per
+                  decisions/0012. chart.sql seeds an example chart of accounts.
 spikes/           timeboxed investigations, one directory each.
                   Separate Go modules, not built by CI.
 cmd/openledger/   entrypoint. Prints "nothing to run yet".
