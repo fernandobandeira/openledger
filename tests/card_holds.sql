@@ -715,14 +715,21 @@ SELECT eq('...so the opening cumulative total is still accepted',
           (SELECT held_minor FROM card_hold_groups WHERE group_key='g_adv0'), 10000);
 
 -- the re-delivery path must honour the currency and convention guards
-SELECT must_fail('re-delivery attaching a EUR event to a USD group', $q$
+-- NOTE: this one catches on the CALLER-PARAMETER currency guard, which fires
+-- first -- the stored-event guard it was once labelled for is covered by 'a stored
+-- JPY event re-delivered as USD' below, whose expected string names the stored
+-- row. Kept because refusing on either is correct; renamed so it is not read as
+-- coverage it does not provide.
+SELECT must_fail('re-delivery in a currency the group does not hold', $q$
     SELECT record_auth_event('t1','rd_eur', NULL,'acme','card_rd',
             'authorization', 5000,'EUR',false, now());
     SELECT record_auth_event('t1','rd_eur','g_late','acme','card_rd',
             'authorization', 5000,'EUR',false, now());
 $q$, 'cannot join group');
 
-SELECT must_fail('re-delivery attaching a delta to a totals group', $q$
+-- ...and likewise: this catches the FRESH-INGEST mixing guard. The stored-event
+-- convention guard is covered by 'a stored DELTA re-delivered as a total'.
+SELECT must_fail('a delta message naming a totals group', $q$
     SELECT record_auth_event('t1','rd_delta', NULL,'acme','card_rd',
             'incremental', 5000,'USD',false, now());
     SELECT record_auth_event('t1','rd_delta','g_tip','acme','card_rd',
@@ -1348,6 +1355,35 @@ BEGIN
     END IF;
     RAISE NOTICE 'ok  an amount is a DELTA unless the message says otherwise';
 END $$;
+
+-- A DECREASE-SIDE MESSAGE OF AN INCREASE-SIDE KIND MUST NOT RE-OPEN A RELEASE.
+-- Every existing un-expire control uses a positive delta or a cumulative
+-- restatement, so `AND (v_delta > 0 OR p_is_total)` could be dropped and a
+-- NEGATIVE advice would resurrect a released hold -- which also nulls
+-- expired_authorized and expired_total, permanently disarming the post-expiry
+-- drift branch for that group.
+SELECT record_auth_event('t1','r6_ue_a','g_unexp','omega','card_ue','authorization',9000,'USD',false,now());
+SELECT expire_hold_group('t1','omega','g_unexp');
+SELECT eq('released', (SELECT held_minor FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='omega' AND group_key='g_unexp'), 0);
+SELECT eq('a NEGATIVE advice does not resurrect a released hold',
+          record_auth_event('t1','r6_ue_b','g_unexp','omega','card_ue','advice',-500,'USD',false,now()), 0);
+SELECT eq('...and the group is still expired',
+          (SELECT CASE WHEN expired_at IS NULL THEN 1 ELSE 0 END FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='omega' AND group_key='g_unexp'), 0);
+SELECT eq('...so the post-expiry snapshots survive',
+          (SELECT CASE WHEN expired_authorized IS NULL THEN 1 ELSE 0 END FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='omega' AND group_key='g_unexp'), 0);
+
+-- gap: card_auth_event_group's FOREIGN KEY had a control for its `method` CHECK
+-- and none for the FK itself. Without it a membership row can name an event that
+-- does not exist; every derivation INNER JOINs events, so the orphan is invisible
+-- to card_hold_drift AND to the unmatched queue. It is also the source of the
+-- implicit FOR KEY SHARE that the attach path's lock ordering depends on.
+SELECT must_fail('a membership row naming an event that does not exist', $q$
+    INSERT INTO card_auth_event_group (tenant_id,event_id,group_key,method,assigned_by)
+    VALUES ('t1','00000000-0000-7000-8000-0000000000ee','g_orphan','manual','backfill');
+$q$, 'fk_event_group__event');
 
 -- ============ round 6: a decrease that moved no money, and a NULL that meant zero
 

@@ -10,7 +10,7 @@ most of their schema problems are not design mistakes. They are **process** mist
 would have caught:
 
 - A migration dropped a column; Postgres silently dropped the two indexes built on it. Their
-  point-in-time balance read has been a scan-and-sort ever since — unnoticed for thirty
+  point-in-time balance read has been a scan-and-sort ever since — unnoticed for sixteen
   migrations.
 - A migration named `accounts-metadata-index` creates an index on the `accounts` table, not
   `accounts_metadata`. The real gap — a sequential scan on every metadata write, forever — was
@@ -37,7 +37,10 @@ failure four times from two migrations.
 **3. Keep foreign keys.** Formance has essentially none — nullable back-pointers with no
 referential integrity — which is defensible for an engine chasing unconstrained write throughput.
 It is the wrong trade here. We keep them on the project's stated correctness priority — and the
-cost is measured rather than assumed: **foreign keys cost roughly 3x on bulk insert.** An
+cost is **observed rather than measured**, and this passage struck an earlier pair of figures for
+having "no recorded batch size, hardware or harness anywhere in the repo" -- then replaced them with
+figures that have no harness either. The correction did not meet its own stated remedy. Read as a
+direction, not a number: **foreign keys cost something real on bulk insert.** An
 independent re-run on the shipped schema (three foreign keys, same CHECKs and indexes, 50k rows,
 three trials) gave 3002/3176/3672 ms with them against 1257/1067/793 ms without.
 

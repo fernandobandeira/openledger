@@ -61,8 +61,9 @@ to us because it's what bounds an otherwise unbounded scan when computing histor
 of entries. **Account** — the thing entries attach to.
 
 **Running balance** (`balance_after`) — each entry stores the account's balance *after* that entry.
-Makes reading the current balance one index lookup (0.018 ms) instead of summing history
-(105.91 ms at a million entries).
+Makes reading the current balance one index lookup instead of summing history. The figures often
+quoted for this -- 0.018 ms against 105.91 ms at a million entries -- come from a one-off run with
+no harness in the repo; the *shape* is asserted by `tests/query_plans.sql` on every build.
 
 **Recorded date vs effective date** — *when we learned about it* vs *when it happened*. A card
 clearing arrives Tuesday for a purchase Visa dates to Monday. Recorded = Tuesday, effective =

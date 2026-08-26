@@ -451,7 +451,13 @@ SELECT s.tenant_id, s.currency, 'current_year_earnings', 'Current year earnings'
 FROM scopes s
 LEFT JOIN dp d ON d.tenant_id = s.tenant_id AND d.currency = s.currency
               AND d.category IN ('revenue','expense')
-GROUP BY s.tenant_id, s.currency;
+GROUP BY s.tenant_id, s.currency
+-- ORDERED BY THE CHART. sort_order was written by the seed and read by
+-- nothing, so every value in it could be changed with the suite green -- and the
+-- assertion that claimed to check the order was reading PHYSICAL ROW ORDER: moving
+-- one VALUES row in the seed, changing no sort_order at all, turned it red. A
+-- statement whose lines come out in an arbitrary order is not a statement.
+ORDER BY tenant_id, currency, sort_order;
 
 -- The income statement, enumerated the same way. Its absence was itself a gap:
 -- the completeness defence covered only the balance sheet, while revenue
@@ -476,7 +482,13 @@ FROM scopes s
 CROSS JOIN fs_lines f
 LEFT JOIN dp d ON d.tenant_id = s.tenant_id AND d.currency = s.currency AND d.fs_line = f.code
 WHERE f.statement = 'income_statement'
-GROUP BY s.tenant_id, s.currency, f.code, f.caption, f.sort_order, f.side;
+GROUP BY s.tenant_id, s.currency, f.code, f.caption, f.sort_order, f.side
+-- ORDERED BY THE CHART. sort_order was written by the seed and read by
+-- nothing, so every value in it could be changed with the suite green -- and the
+-- assertion that claimed to check the order was reading PHYSICAL ROW ORDER: moving
+-- one VALUES row in the seed, changing no sort_order at all, turned it red. A
+-- statement whose lines come out in an arbitrary order is not a statement.
+ORDER BY tenant_id, currency, sort_order;
 
 -- Assets must equal liabilities + equity, PER SCOPE and PER CURRENCY, with the
 -- earnings line included. Unlike the roll-up check it replaced -- which compared

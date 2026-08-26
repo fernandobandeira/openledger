@@ -230,7 +230,13 @@ answers a *recording*-axis question only — a business-date balance must aggreg
 ### `ledger_accounts`
 
 ```
-id, tenant_id, owner_type, owner_id,
+id, tenant_id,   -- tenant_id is NOT NULL and leads every key, including on
+                 -- house accounts. An earlier version of this block showed it
+                 -- absent from the unique indexes and blank for house rows;
+                 -- the roadmap calls tenant-leading keys "the one irreversible
+                 -- decision on the list", and page 283 of this document already
+                 -- said every key here leads with it.
+owner_type, owner_id,
 purpose         -- 'customer_receivable' | 'fbo_cash' | 'interchange_revenue'.
                 --  finds the account, and groups it for reporting.
 category        -- 'asset'|'liability'|'equity'|'revenue'|'expense'.
@@ -240,9 +246,9 @@ normal_balance  -- 'debit'|'credit'. NOT derivable from category.
                 --  category 'asset' with a CREDIT normal balance.
 currency, metadata
 
-UNIQUE (owner_type, owner_id, purpose, currency)
+UNIQUE (tenant_id, owner_type, owner_id, purpose, currency)
   -- covers company / platform / bank_account: owner_id is a real value.
-UNIQUE (purpose, currency) WHERE owner_type = 'house'
+UNIQUE (tenant_id, purpose, currency) WHERE owner_type = 'house'
   -- house rows have owner_id NULL, and NULL != NULL in Postgres, so the
   -- constraint above would happily allow a second interchange_revenue.
   -- the two cover disjoint sets.
@@ -253,17 +259,21 @@ siblings gets a real owner — which is why **cash is owned by its bank account*
 sponsor bank or a EUR FBO is a matter of time. That makes the reconciliation target
 structural: every perimeter account has exactly one external balance that must agree with it.
 
-`tenant_id` is the RLS scope. `owner_*` is the economic owner. They coincide sometimes.
+`tenant_id` is the RLS scope. `owner_*` is the economic owner. They coincide sometimes — but
+`tenant_id` is **never absent**. An earlier version of this table left it blank for the shared
+accounts, which contradicted the shipped `NOT NULL` and the tenant-leading keys the roadmap calls
+irreversible. Shared accounts belong to an operator scope (`_treasury` in the golden trace); that is
+what makes a treasury movement an intercompany pair rather than a cross-tenant transaction.
 
 | purpose | tenant_id | owner_type | owner_id |
 | --- | --- | --- | --- |
 | customer_receivable | platform_a | company | acme_property_mgmt |
 | customer_wallet | platform_a | company | acme_property_mgmt |
 | platform_rev_share_payable | platform_a | platform | platform_a |
-| fbo_cash | — | bank_account | bank_acct_a |
-| operating_cash | — | bank_account | bank_acct_b |
-| network_settlement_payable | — | house | — |
-| facility_borrowings | — | house | — |
+| fbo_cash | _treasury | bank_account | bank_acct_a |
+| operating_cash | _treasury | bank_account | bank_acct_b |
+| network_settlement_payable | _treasury | house | — |
+| facility_borrowings | _treasury | house | — |
 | interchange_revenue | — | house | — |
 
 ### `ledger_transactions` — the unit of atomicity. **Status never mutates.**
@@ -307,7 +317,7 @@ amount_minor bigint CHECK (> 0),
 currency,
 account_seq  bigint  -- monotonic per account
 balance_after bigint -- running balance, O(1) reads + as-of queries
-UNIQUE (account_id, account_seq)
+UNIQUE (tenant_id, account_id, account_seq)
 ```
 
 The idempotency key is scoped to the **event**, not the purchase. So pending → posted is a

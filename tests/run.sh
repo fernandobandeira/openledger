@@ -100,9 +100,9 @@ sites_for() {
 floor_for() {
     case "$1" in
         *bitemporal.sql)        echo 23 ;;
-        *card_holds.sql)        echo 164 ;;
+        *card_holds.sql)        echo 169 ;;
         *golden_trace.sql)      echo 35 ;;
-        *negative_controls.sql) echo 139 ;;
+        *negative_controls.sql) echo 142 ;;
         *query_plans.sql)       echo  9 ;;
         *)                      echo  1 ;;
     esac

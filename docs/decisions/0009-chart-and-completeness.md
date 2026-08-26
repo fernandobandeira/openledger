@@ -63,8 +63,11 @@ outward** — `FROM fs_lines`, left-joining the numbers on, so a line with no ac
 zero instead of vanishing.
 
 That last part was also aspirational until recently: `trial_balance` and `accounting_equation` both
-start `FROM ledger_entries` and enumerate *inward*, so an account with no entries is simply absent
-from them. The chart-outward report now exists; those two still enumerate inward and are the wrong
+started `FROM ledger_entries` and enumerated *inward*, so an account with no entries was simply
+absent from them. **`accounting_equation` has since been rebuilt** and now enumerates its scopes
+`FROM ledger_accounts` with the entry aggregate LEFT JOINed on, exactly like `balance_sheet` -- a
+scope with no activity reports zeros rather than vanishing. `trial_balance` still enumerates inward
+and is the wrong
 thing to build a completeness claim on.
 
 ### 4. The equation is evaluated per currency

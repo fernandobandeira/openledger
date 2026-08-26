@@ -1792,6 +1792,13 @@ END $$;
 -- written by the seed and was read by nothing, so every value in it could be
 -- changed with the suite green -- a statement whose lines come out in an
 -- arbitrary order is not a statement.
+-- ...and this assertion had to be rewritten before it meant anything. It read
+-- PHYSICAL ROW ORDER: the view had no ORDER BY, the loop had none either, and it
+-- passed only because the seed's INSERT order happened to match sort_order. Moving
+-- one VALUES row in the seed -- changing no sort_order value at all, leaving the
+-- fs_lines set byte-identical -- turned the build red. It fired on something no
+-- consumer of the view could observe. The view is ordered now, and this reads the
+-- order the view actually returns.
 DO $$
 DECLARE v_prev int := -1; r record;
 BEGIN
@@ -1805,6 +1812,83 @@ BEGIN
         v_prev := r.sort_order;
     END LOOP;
     RAISE NOTICE 'ok  the balance sheet comes out in the chart''s declared order';
+END $$;
+
+-- ================= round 6: the DELETE half, and a report gone currency-blind
+
+-- assert_transaction_immutable has TWO branches and only the UPDATE one was
+-- reached. 0001 says the DELETE branch closed a MEASURED hole: "deleting the legs
+-- AND the transaction row in one statement erased 50,000 of revenue with every
+-- check green." Reachable under exactly the premise this file's own 1c-alt and
+-- 1c-bis controls adopt -- corruption arriving with ck_entries__immutable lifted --
+-- and `SET CONSTRAINTS ALL DEFERRED` defeats the backstop, because by commit time
+-- the parent row is gone and assert_transaction_balances' EXISTS gate is false.
+SELECT must_fail('deleting the legs AND the transaction row together', $q$
+    DO $d$ DECLARE t uuid; BEGIN
+        t := txn('t1','del_both');
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  700);
+        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 700);
+        SET CONSTRAINTS ALL IMMEDIATE;
+        SET CONSTRAINTS ALL DEFERRED;
+        ALTER TABLE ledger_entries DISABLE TRIGGER ck_entries__immutable;
+        DELETE FROM ledger_entries WHERE transaction_id = t;
+        DELETE FROM ledger_transactions WHERE id = t;
+    END $d$;
+$q$, 'is history and cannot be deleted');
+SET CONSTRAINTS ALL IMMEDIATE;
+SET CONSTRAINTS ALL DEFERRED;
+ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ck_entries__immutable;
+
+-- accounting_equation can be made CURRENCY-BLIND again. 0002's header calls that
+-- vacuity measured: "100.00 USD + 100.00 EUR reported 'assets 200.00, balanced'".
+-- It survived because nothing read an ABSOLUTE per-currency figure out of the
+-- function -- expect_state reads `balanced` and a scope count, and the lifecycle
+-- test only ever compares revenue against its own earlier value, so a constant
+-- cross-currency offset cancels.
+DO $$
+DECLARE v_usd bigint; v_eur bigint; v_n int;
+BEGIN
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    SELECT 't6','house',NULL,code,category,normal_balance,c
+      FROM account_types, unnest(ARRAY['USD','EUR']::char(3)[]) c
+     WHERE code IN ('fbo_cash','interchange_revenue');
+    DECLARE t uuid; BEGIN
+        t := txn('t6','ccy_usd');
+        PERFORM entry('t6', t, acct('t6','fbo_cash','USD'),            'debit',  10000,'USD');
+        PERFORM entry('t6', t, acct('t6','interchange_revenue','USD'), 'credit', 10000,'USD');
+        t := txn('t6','ccy_eur');
+        PERFORM entry('t6', t, acct('t6','fbo_cash','EUR'),            'debit',  10000,'EUR');
+        PERFORM entry('t6', t, acct('t6','interchange_revenue','EUR'), 'credit', 10000,'EUR');
+    END;
+    SET CONSTRAINTS ALL IMMEDIATE; SET CONSTRAINTS ALL DEFERRED;
+
+    SELECT count(*) INTO v_n FROM accounting_equation('t6');
+    SELECT revenue INTO v_usd FROM accounting_equation('t6') WHERE currency='USD';
+    SELECT revenue INTO v_eur FROM accounting_equation('t6') WHERE currency='EUR';
+    IF v_n <> 2 THEN
+        RAISE EXCEPTION 'a two-currency tenant reported % scopes, not 2', v_n;
+    END IF;
+    IF v_usd <> 10000 OR v_eur <> 10000 THEN
+        RAISE EXCEPTION 'the equation is summing across currencies: USD %, EUR % '
+                        '(each holds exactly 10000)', v_usd, v_eur;
+    END IF;
+    RAISE NOTICE 'ok  the equation reports each currency on its own (USD %, EUR %)', v_usd, v_eur;
+END $$;
+
+-- The LIABILITY half of the restricted-cash disclosure. The asset side is
+-- controlled (fbo_cash must present as restricted cash, not cash); its mirror was
+-- not, so customer funds payable could be re-pointed to ordinary accruals --
+-- liability to liability, every chart trigger satisfied, every drift view empty.
+-- Reg S-X separate disclosure applies to the payable line too.
+DO $$
+DECLARE v_line text;
+BEGIN
+    SELECT fs_line INTO v_line FROM account_types WHERE code='customer_wallet';
+    IF v_line <> 'customer_funds' THEN
+        RAISE EXCEPTION 'customer funds payable reports under %, not its own caption '
+                        '-- the float is presented as ordinary accruals', v_line;
+    END IF;
+    RAISE NOTICE 'ok  customer funds payable keeps its own statement line';
 END $$;
 
 SELECT on_origin('the end of the file');

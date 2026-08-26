@@ -182,7 +182,7 @@ prerequisite for correct per-tenant row-level security.
 `operating_cash` mirrors *one* real bank account, and the facility is one line from one lender.
 Neither can be split per tenant. **7 of the reference trace's transactions touch `operating_cash`** — 24
 transactions in the shipped trace; the spike this came from had 13, and only the 7 survived the
-move. The four *clearing* transactions do not — so the honest claim is **clearings
+move. The *clearing* transactions do not (four in the spike's trace, five in the shipped one) — so the honest claim is **clearings
 are tenant-local; treasury is not.** Clearings are the volume and treasury is a daily batch, so
 that may be an acceptable trade, but it has to be stated rather than claimed away. Splitting a
 cross-scope transaction into two, joined by intercompany due-from/due-to accounts, restores

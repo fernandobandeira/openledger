@@ -27,7 +27,7 @@ suite expected "seven failures" and got eight, and the extra one was a *differen
 failing for an unrelated reason. Every assertion names what it asserts, and every refusal checks
 the reason, not merely that something was refused.
 
-**The suite is measured by mutation, not by size.** Four adversarial rounds have asked the only
+**The suite is measured by mutation, not by size.** Six adversarial rounds have asked the only
 question that separates a test suite from a transcript: change the schema so it is wrong, and does
 anything fail? The last round found 58 mutants that survived, including the whole pending/posted
 lifecycle. They are closed, each verified by re-running its mutation.
@@ -41,7 +41,7 @@ two hundred lines of controls ran on the replication apply path *only*. Each is 
 something that fails loudly.
 
 **And the harness had to be fixed twice.** After the first round of fixes, an audit replaced
-`card_holds.sql` — 1,146 lines, the only evidence for the entire hold flow — with **five lines**
+`card_holds.sql` — the only evidence for the entire hold flow — with **five lines**
 that raise 160 notices in a loop and print the completion sentinel. The build said PASS. So did
 replacing `concurrency.sh` with four lines of `echo`. Every guard was reading output the file
 printed *about itself*: the manifest checks existence, the floor counts notices, the sentinel is a
@@ -283,7 +283,7 @@ defaults to transaction *start* time and is not monotonic with commit order, so 
 query can return different answers when re-run. A reproducible cursor must be commit-ordered.
 Decide it before writing code against `recorded_at <= :as_of`.
 
-Also unbounded: the effective-axis aggregate grows linearly with history — measured 105.91 ms at
+Also unbounded: the effective-axis aggregate grows linearly with history — observed (one-off, no harness in repo) at 105.91 ms at
 1M entries in range. Period-close checkpoints are the bound — materialize each account's closing balance per
 period so a business-date query reads "prior close + entries since."
 

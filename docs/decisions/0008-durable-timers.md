@@ -33,12 +33,13 @@ dependency at all.
 
 ## Why
 
-> **Sourcing note.** The Temporal, Rails/Solid Queue and pricing claims below have
-> no fetchable source recorded next to them, so by this log's own rule they are
-> **unverified** — except the four that were checked against primary sources and
-> are marked inline. One of them was found overstated in a later round ("ships no
-> RBAC" — it ships RBAC *off by default*), which is what an unsourced claim looks
-> like when it fails.
+> **Sourcing note.** Every Temporal, Rails/Solid Queue and pricing claim below has
+> no fetchable source recorded next to it, so by this log's own rule they are
+> **unverified**. An earlier version of this banner exempted "the four that were
+> checked against primary sources and are marked inline" — there are no such
+> markings, and a reader was told four claims were sourced with no way to find
+> which. One claim here was later found overstated ("ships no RBAC" — it ships RBAC
+> *off by default*), which is what an unsourced claim looks like when it fails.
 
 
 **The requirement is durable *scheduling*, not workflow *orchestration*.** The longest chain in
@@ -105,7 +106,10 @@ WHERE g.expired_at IS NULL AND g.held_minor > 0
         AND e.hold_expires_at < now());
 ```
 
-`ix_hold_groups__held` already covers the outer predicate. It costs almost nothing and makes a lost
+`ix_hold_groups__held` covers the `held_minor > 0` half of the outer predicate -- it is
+`(tenant_id, company_id) WHERE held_minor > 0`, and the sweep filters on `expired_at IS NULL AND
+held_minor > 0` with no tenant or company equality, so the partial predicate is what earns it here,
+not the key columns. It costs almost nothing and makes a lost
 job recoverable rather than silent.
 
 ## Amendment — the schema moved, twice
@@ -142,7 +146,11 @@ review demonstrably does not.
   ever becomes unacceptable, `gue` (MIT) is the fallback — delayed jobs, `SKIP LOCKED`, backoff,
   transactional enqueue; uniqueness would be hand-rolled on the event log's idempotency keys, which
   exist anyway.
-- Documentation and the architecture diagram still say "Postgres · Temporal" and need updating.
+- The architecture diagram was updated and this item was not: `01-architecture.svg` reads
+  "durable jobs (Postgres)", and the string "Postgres · Temporal" appears nowhere in the tree. The
+  one surviving Temporal reference is in a file this line never named --
+  `docs/diagrams/03-state-machines.svg`, "This is the Temporal boundary" -- and that is what needs
+  updating.
 
 ## The bet, named
 

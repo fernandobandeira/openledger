@@ -71,7 +71,7 @@ better for reconciliation).
   schema change — but it *cancels out* with random striping. Pick one, or use affinity striping
   where each writer owns a stripe, which makes them compose (4,790/s).
 - **Dropping the running balance** buys only 22% over contention-free locking and costs the O(1)
-  balance read (0.018 ms → 105.91 ms at a million entries), the corruption cross-check, and the
+  balance read (0.018 ms → 105.91 ms at a million entries -- unmeasured here, see below), the corruption cross-check, and the
   gaplessness proof. **Recommendation: don't.**
 
 ## What this does NOT measure
@@ -339,6 +339,17 @@ choice was never "keep the running balance at 800/s or drop it for 13k". It is:
 | 10,000 | 0.017 ms | 0.97 ms |
 | 100,000 | 0.015 ms | 8.96 ms |
 | 1,000,000 | **0.018 ms** | **105.91 ms** |
+
+> **NO HARNESS IN THIS REPOSITORY PRODUCES THIS TABLE.** `main.go` here measures the
+> WRITE path only; nothing in `tests/`, `spikes/` or `migrations/` builds a
+> 1M-entry account or times a balance read, and `tests/query_plans.sql` asserts
+> plan SHAPE at 200,000 rows without timing anything. These four points are the
+> most-quoted figures in the repository and the basis for "O(1) reads" everywhere
+> it appears — and by this project's own rule they are **observations from a
+> one-off run, not reproducible measurements**. What IS attested, on every run, is
+> the shape: `tests/query_plans.sql` proves the current-balance read uses
+> `uq_entries__account_seq` with no sort, and that the business-date aggregate is a
+> scan. The ratio is the claim; the milliseconds are not.
 
 The running balance is genuinely **O(1)** — flat across four orders of magnitude. The aggregate is
 exactly linear and at a million entries is **~6,000× slower**, growing forever. Not survivable on

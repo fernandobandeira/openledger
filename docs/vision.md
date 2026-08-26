@@ -151,7 +151,9 @@ The design is measured rather than assumed — see
 
 Reading a balance is a **lookup, not a recomputation**: every entry carries its account's running
 balance at that moment, so the current balance is one index hit rather than a scan over history.
-On an account with a million entries that is the difference between 0.018 ms and 105.91 ms.
+On an account with a million entries that is the difference between one index lookup and a scan of
+the whole history. (The 0.018 ms / 105.91 ms pair usually quoted for it has no harness in this
+repo -- the shape is asserted every build, the milliseconds are not.)
 
 The ceiling is set by **contention, not hardware**. A *hot account* is one nearly every transaction
 touches — `network_settlement_payable` above is hot, because every clearing in the system writes
