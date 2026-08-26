@@ -124,7 +124,7 @@ Undecided, listed plainly rather than buried.
 | **Striping is not built** | The stack summary above quotes striped figures. There is no stripe column in `schema/`, and `uq_accounts__house` would currently prevent one on the accounts that need it. |
 | **There is no CI** | `.github/workflows/test.yml` was present in three commits' trees and was deleted with the suite it ran ([0004](./0004-where-logic-lives.md)). It comes back when the Rust tests do, and should run `cargo test` and load `schema/schema.sql` against a PostgreSQL 18 service. |
 | **Hash chaining for tamper evidence is deferred, not decided** | [0005](./0005-event-log-and-write-path.md) leaves it open: it needs a total order, so it is entangled with [0006](./0006-time-and-as-of.md). The cost figures quoted there are extrapolated from spike 003's contended-row numbers, not measured. |
-| **The chart of accounts is not versioned** | Changing which statement line an account reports under would silently restate issued statements, so it is blocked outright — a stopgap, since IAS 1.41 *requires* reclassifying comparatives. See [0007](./0007-schema-conventions-and-chart.md). |
+| **The chart of accounts is not versioned** | Changing which statement line an account reports under silently restates issued statements, and `fk_types__fs_line` blocks that **only across a statement or a side** — a move to another line of the *same* statement and side is accepted, which is the reclassification hole three rows above. An earlier version of this row said it was "blocked outright"; it is not. A stopgap either way, since IAS 1.41 *requires* reclassifying comparatives. See [0007](./0007-schema-conventions-and-chart.md). |
 | **No number has been measured on RDS** | Everything so far is localhost, where a round trip is ten times cheaper. Nothing gets published until that is fixed. |
 | **Hold-flow findings recorded rather than closed** | The list lives in [0008 §Known, and not fixed](./0008-authorization-holds.md#known-and-not-fixed), and **at least four of them under-reserve credit**, the failure this project calls the cardinal sin. *There is deliberately no copy of that list here* — a count maintained in two files is a count that drifts, and this one miscounted four rounds running. |
 | **Completeness is guaranteed WITHIN a scope, not across them** | Recorded only in `schema/schema.sql`. A scope with no accounts at all is invisible to every report, and a tenant parameter on the balance-sheet report is exactly the "parameter in which to pass an incomplete list" that [0007](./0007-schema-conventions-and-chart.md) says should not exist. `vision.md` states the completeness guarantee without that qualification. |
@@ -173,6 +173,12 @@ decided, on one page") an overstatement. Listed here until they get one:
 
 Claims about third-party systems are the weakest evidence in this repository, and twice a number
 attributed to a named project turned out never to have existed. Three rules follow, and they are cheap:
+
+> **Every accounting-standard citation in this tree is unverified, everywhere it appears.** IAS 32.42,
+> IAS 1.41, ASC 210-20-45-1, Reg S-X 5-02.1 and ASC 230-10-45-4 are behind paywalls, so no URL can sit
+> next to them. Stated once here rather than marked at each of the eight sites, because a marker
+> maintained in eight places is a marker that drifts — which is the failure this section exists to
+> stop. **Treat every one of them as a paraphrase from memory until an accountant confirms it.**
 
 - **A third-party figure needs a fetchable source next to it, or it is marked unverified.** Not
   softened — marked. "I could not check this" is a finding, not an embarrassment. *This rule is not met

@@ -33,8 +33,12 @@ equation; a balance is `input - output`, so a liability reads negative. It does 
 since v2.3 a versioned `schemas(chart jsonb)` table, v3 typed account patterns — but that chart is
 an address *naming grammar*, and the rules type is literally `struct{}`. **You cannot get a trial
 balance or a balance sheet out of Formance without a mapping layer beside it.** Here accounts carry
-category *and* normal balance, and `A = L + E + (R − X)` is [proven at every
-step](../spikes/004-chart-of-accounts/README.md) of a card lifecycle.
+category *and* normal balance, and `A = L + E + (R − X)` held at every step of a card lifecycle when
+[spike 004](../spikes/004-chart-of-accounts/README.md) measured it. **Read that as "was measured
+once, against something else":** the spike defines its own `account_types`, has no `fs_lines` layer
+at all, and names three accounts differently from the shipped chart. **No object in `schema/` computes
+the equation today** — that view went with [ADR-0004](./decisions/0004-where-logic-lives.md), and
+rebuilding it in the writer is on the roadmap.
 
 **2. Its effective-date balance is mutable, and that cost it.** Formance keeps running balances on
 both time axes, and the effective-axis one is not immutable: a backdated transaction triggers an

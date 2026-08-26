@@ -1,13 +1,13 @@
 -- openledger -- the schema, declaratively.
 --
 -- THIS IS A DESIGN ARTEFACT, NOT A PRODUCT. The ledger itself will be written in
--- Go; see docs/roadmap.md. This file exists to prove one thing: that the shape the
+-- Rust (ADR-0001); see docs/roadmap.md. This file exists to prove one thing: that the shape the
 -- ADRs describe is expressible in PostgreSQL using nothing but tables, types,
 -- CHECK constraints, foreign keys and unique indexes.
 --
 -- A TRIGGER NEEDS A WRITTEN JUSTIFICATION. The default is none. Two invariants clear
 -- that bar and are implemented at the bottom of this file; everything else is a
--- CHECK, a key, a GRANT, or one code path in Go. No PL/pgSQL business logic, no
+-- CHECK, a key, a GRANT, or one code path in the writer. No PL/pgSQL business logic, no
 -- orchestration, no derivation-with-backfill, and no logic in views beyond reporting.
 --
 
@@ -946,7 +946,7 @@ ALTER TABLE card_auth_events ENABLE ALWAYS TRIGGER ck_auth_events__no_truncate;
 --   * card_auth_event_group -- a membership is SUPERSEDED, not deleted, which is an
 --     UPDATE by design.
 --   * "debits equal credits", "a transaction has at least two entries" -- enforced
---     by CONSTRUCTION. The Go writer builds both legs in one code path, so an
+--     by CONSTRUCTION. The Rust writer builds both legs in one code path, so an
 --     unbalanced transaction is unrepresentable rather than refused. This is what
 --     TigerBeetle gets from a single Transfer row carrying both account ids, and
 --     what Formance gets from Posting{Source,Destination} -- their Validate() has
@@ -1116,8 +1116,12 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
    -- the dip against what clearings could explain. That FALSE-POSITIVES on the
    -- central claim of this whole design: a group whose messages arrive
    -- decrease-first dips below any clearing that has landed yet, which is exactly
-   -- the order tolerance the file exists to provide. `tests/card_holds.sql`
-   -- permutation 4,3,2,1 catches it immediately.
+   -- the order tolerance the file exists to provide. The counter-example was a
+   -- permutation test, 4,3,2,1, in a `tests/` directory ADR-0004 deleted along with
+   -- the PL/pgSQL -- SO IT CANNOT BE RE-RUN, and by this file's own rule that makes
+   -- it an argument rather than evidence. The reasoning stands on its own: a
+   -- decrease-first group legitimately dips below its own clearings, so a latch on
+   -- the low-water mark fires on correct behaviour.
    --
    -- The reason no predicate works is that THE LOG CANNOT DECIDE THE QUESTION. A
    -- reversal that arrives before its authorization and a reversal that should

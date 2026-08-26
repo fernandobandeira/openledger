@@ -28,7 +28,7 @@ chart of accounts and completeness layer ([ADR-0007](./decisions/0007-schema-con
 and the hold model ([ADR-0008](./decisions/0008-authorization-holds.md)). Eleven tables, 5 report
 views, 8 triggers over 2 functions each justified in place per
 [ADR-0004](./decisions/0004-where-logic-lives.md). It was written by hand rather than promoted from
-the spikes, which held three competing posting engines and two competing hold models. No API, no Go
+the spikes, which held three competing posting engines and two competing hold models. No API, no service code
 beyond migrations. Balanced-per-currency is deliberately *not* in there: it belongs to the writer
 ([0005](./decisions/0005-event-log-and-write-path.md)).
 
@@ -184,7 +184,9 @@ is why timers enter here and not before. They run **in-process on Postgres**, in
 transaction as the ledger write, so a hold and its expiry timer commit together or not at all
 ([ADR-0008](./decisions/0008-authorization-holds.md)). Handlers are idempotent already, which M3 gives.
 Ship the reconciliation sweep alongside — groups past their deadline that are still holding, behind
-`ix_hold_groups__held`. The deadline lives on the event, so a lost job becomes recoverable rather
+`ix_auth_events__hold_expiry` — the deadline is the selective column, not the held amount, and
+`ix_hold_groups__held` serves the authorization read instead. The deadline lives on the event, so a
+lost job becomes recoverable rather
 than silent; ADR-0008 has the query, executed against the shipped schema.
 
 **A scheduler is not a throughput mechanism.** A contended row lock is held for the duration of a

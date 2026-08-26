@@ -116,7 +116,7 @@ over each record. Both published answers live outside the database; this is the 
 | **`GRANT ALL` re-grants everything** | And a superuser can set `session_replication_role` or drop the triggers. There the defence is backups and audit, not the schema. |
 | **Table inheritance disarms every constraint — open** | `CHECK`s are inherited; foreign keys, unique indexes and triggers are not. A child of `ledger_entries` plus one `INSERT … SELECT * FROM ONLY` took an income statement from 900 to 1,800, and the child stays visible through the parent to every view. `pg_event_trigger` is empty. |
 | **Gaplessness is enforced at issue, not verified at rest** | Nothing scans the journal for a gap that arrived some other way. |
-| **The chart is not versioned** | Changing a statement line is blocked while accounts exist, in one direction only ([0007](./0007-schema-conventions-and-chart.md)) — a stopgap, since IAS 1.41 *requires* reclassifying comparatives. |
+| **The chart is not versioned** | `fk_types__fs_line` blocks a statement-line change only across a statement or a side; **within one statement and side it is accepted, under posted history** ([0007](./0007-schema-conventions-and-chart.md)). Reclassifying `fbo_cash` from `restricted_cash` to `cash` moved 440.00 of customer float into unrestricted liquidity, one statement, no error. A stopgap, since IAS 1.41 *requires* reclassifying comparatives. |
 
 **Until the write path exists, nothing enforces balance at all.** `ledger_entries` stores independent
 rows carrying a `direction`, so an unbalanced transaction is expressible and the deferred trigger that
