@@ -274,7 +274,7 @@ what makes a treasury movement an intercompany pair rather than a cross-tenant t
 | operating_cash | _treasury | bank_account | bank_acct_b |
 | network_settlement_payable | _treasury | house | — |
 | facility_borrowings | _treasury | house | — |
-| interchange_revenue | — | house | — |
+| interchange_revenue | _treasury | house | — |
 
 ### `ledger_transactions` — the unit of atomicity. **Status never mutates.**
 

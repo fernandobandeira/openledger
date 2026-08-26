@@ -29,8 +29,11 @@ the reason, not merely that something was refused.
 
 **The suite is measured by mutation, not by size.** Six adversarial rounds have asked the only
 question that separates a test suite from a transcript: change the schema so it is wrong, and does
-anything fail? The last round found 58 mutants that survived, including the whole pending/posted
-lifecycle. They are closed, each verified by re-running its mutation.
+anything fail? One round found dozens of surviving mutants, including the whole pending/posted
+lifecycle; they are closed, each verified by re-running its mutation. *No count is given, and no
+mutant list is in the tree: the runs were one-off and their record is the commit log, not an
+artifact anyone can re-execute.* What IS re-executable is `tests/canary.sh`, which breaks three
+specific schema objects on every build and requires the suite to notice.
 
 Three of the escapes found were in the harness itself, and those matter most, because they make
 every other result meaningless: the assertion floor counted *output* rather than assertions, so

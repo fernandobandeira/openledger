@@ -11,7 +11,8 @@ here, so the ADRs don't each stop to re-explain them.
 - **Go** — because the interesting logic is SQL, and Go stays out of the way.
 - **Postgres**, one instance — measured at ~800 **clearings**/s untuned (a clearing is one card
   transaction = 3 ledger entries), rising to ~6,970/s with the hot account striped 64 ways and
-  7,897/s striping *and* posting in a single call. Spike 003's own banner applies: re-auditing the
+  7,897/s striping *and* posting in a single call — on a 2 GB table; the comparable
+  43 MB figure is 7,816, and quoting only the higher one was cherry-picking. Spike 003's own banner applies: re-auditing the
   same configurations moved the baseline from 833 to 482, so **treat these as shape, not as a
   benchmark**. Nothing has been measured over a network.
 - **sqlc**, no ORM — we write the SQL; it generates typed Go. The hot queries stay reviewable *as
@@ -30,7 +31,7 @@ here, so the ADRs don't each stop to re-explain them.
 | [0006](./0006-schema-conventions.md) | Naming rules, a CI schema-snapshot test, keep FKs and enums | Dropping a column silently drops its indexes — Formance lost two that way, unnoticed for sixteen migrations | accepted |
 | [0007](./0007-open-source-positioning.md) | Reframe as a general open-source ledger; keep Postgres | The bottleneck is one contended row, not the hardware — and striping fixes it | accepted |
 | [0008](./0008-durable-timers.md) | Durable timers in Postgres, not Temporal | The need is durable *scheduling*, not workflow orchestration — and a job row commits in the same transaction as the ledger write, which Temporal cannot do | accepted |
-| [0009](./0009-chart-and-completeness.md) | Chart of accounts as data; completeness is a separate invariant | A report missing one account still satisfies the accounting equation — the missing account drops out of both sides | accepted |
+| [0009](./0009-chart-and-completeness.md) | Chart of accounts as data; completeness is a separate invariant | A dropped *balanced sub-book* satisfies the accounting equation while the report is incomplete. (This cell used to say a missing account "drops out of both sides" — [0009](./0009-chart-and-completeness.md) strikes that as false: one account drops out of exactly ONE side, and the equation catches it loudly.) | accepted |
 | [0010](./0010-authorization-holds.md) | A hold is a SUM over an append-only event log, not a mutable amount | Grouping a clearing to its authorization is a revisable inference, and processors disagree on whether an increment carries a delta or a cumulative total | accepted |
 | [0011](./0011-what-the-database-enforces.md) | The dozen guards added under adversarial review, and what the database still cannot enforce | A column with a DEFAULT is not a constraint — `recorded_at`, `account_seq` and `xact_id` all had one, and each turned out forgeable by an INSERT | accepted |
 
@@ -118,11 +119,11 @@ Undecided, listed plainly rather than buried:
   nothing bounds how far back a backdated entry can restate a reported period.
 - **No number has been measured on RDS.** Everything so far is localhost, where a round trip is
   ten times cheaper. Nothing gets published until that is fixed.
-- **Three hold-flow findings are recorded rather than closed**, in
+- **Four hold-flow findings are recorded rather than closed**, in
   [0010](./0010-authorization-holds.md), and **one of them under-reserves credit** — the failure
-  this project calls the cardinal sin. This entry previously said "two", and said both "fail
-  closed — availability, not correctness". Both halves were wrong, and the omitted one was the
-  serious one:
+  this project calls the cardinal sin. *This entry has now been miscounted three rounds running:
+  "two", then "three", and the ADR's list has four bullets. It is copied by hand from a list in
+  another file, which is the whole reason it keeps drifting.*
   - **A cumulative restatement that DECREASES is refused, and the refusal is sticky.**
     `authorized_minor` only rises, so a processor restating a *lower* subtotal after a partial
     reversal is read as out-of-order, and the group can never accept a total below its high-water
@@ -134,6 +135,10 @@ Undecided, listed plainly rather than buried:
     messages leave 50.00 or 100.00 held depending on arrival order, because only the second is
     refused and the first is already applied. Quarantining the *group* rather than the message is
     the likely answer.
+  - **An emptied group pins its currency forever.** Group rows cannot be deleted, so once every
+    event has moved out of a group its currency is permanent, and a later genuine message for that
+    key in another currency is refused *and never stored* — so it never reaches the review queue
+    either.
   - **A regroup can deadlock against an unsorted multi-group caller.** This one, and only this
     one, costs availability rather than correctness: it aborts cleanly and leaves no drift.
 - **Completeness is guaranteed WITHIN a scope, not across them**, and that limit is recorded only
@@ -142,6 +147,11 @@ Undecided, listed plainly rather than buried:
   list" that
   [0009](./0009-chart-and-completeness.md) says should not exist. `vision.md` states the
   completeness guarantee without that qualification.
+- **Intercompany balances are presented GROSS.** [0009](./0009-chart-and-completeness.md) says it:
+  nothing nets `due_from_treasury` against `due_to_tenants`, so a consolidated balance sheet shows
+  both sides at full size. The golden trace asserts they eliminate to zero; no *report* does.
+- **The state-machine diagram still names Temporal.** `docs/diagrams/03-state-machines.svg` reads
+  "This is the Temporal boundary" — [0008](./0008-durable-timers.md) decided against Temporal.
 - **Shipped surface nothing reads.** `webhook_deliveries`, `hold_expires_at` and `clearing_deadline`
   exist in `migrations/0003`, carry rationale in comments, and are referenced by no view, no
   function and no test. They are either the next milestone's work or dead weight; recorded here
@@ -169,12 +179,16 @@ These are real decisions with real reasoning; none has an ADR, which makes the h
   idempotency spine does not by itself prevent double-posting. It belongs in
   [0004](./0004-event-log.md), which owns the event log, and is in neither that nor
   [0011](./0011-what-the-database-enforces.md).
+- **Five named correctness constraints appear in no document at all**: `uq_txn__one_resolution`,
+  `uq_txn__one_reversal` (the double-reversal guard spike 001 identifies as a real Formance bug
+  class), `uq_accounts__id_currency`, `uq_txn__id_effective` and `fk_entries__txn_effective`. All
+  five ship in `migrations/0001` and all five are exercised by `tests/`.
 - **PostgreSQL 18 is a floor, not a preference.** `uuidv7()` is the default on **six** tables and
   does not exist before 18. The roadmap targets RDS for M4/M6, which must therefore run 18.
 - **Three chart constraints have no ADR**: `uq_fs_lines__caption` (two lines sharing a caption are
   indistinguishable on the face of the statement, which is the restricted-cash harm arrived at from
-  the other side — and nothing in the suite reads a caption, so it had to be a constraint rather
-  than a test); `ck_fs_lines__code_reserved` (a real chart line may not shadow the
+  the other side; it was introduced because nothing in the suite read a caption, and it now has two
+  controls of its own); `ck_fs_lines__code_reserved` (a real chart line may not shadow the
   `current_year_earnings` plug the balance sheet synthesises); and `ck_fs_lines__caption_reserved`,
   **the half that does the harm** — `balance_sheet` emits that plug's caption as a literal, so it
   sits outside the UNIQUE, and a line under any other code could take it. This entry said "two" and
@@ -204,7 +218,15 @@ Two rules follow, and they are cheap:
   section), and **every accounting-standard paragraph citation** — IAS 1.32, IAS 1.41,
   ASC 210-20-45-1, ASC 606-10-55-36, IFRS 15.B34–B38, IFRS 8 / ASC 280, the IFRS Conceptual
   Framework, and the FFIEC suspense-account guidance, which appear across the seed, spike 004,
-  ADR-0009 and this page. Treat every one of them as unverified.
+  ADR-0009 and this page. **And that list was itself incomplete** — a later audit found three more
+  categories outside every banner: the processor message-shape quotes in
+  [spike 006](../../spikes/006-append-only-holds/README.md) (Marqeta, Adyen, Highnote, Galileo,
+  Pismo, Stripe, Lithic), whose banner marks only the *survey size* as fabricated and explicitly
+  endorses the table beneath it; **pgledger's 10,636.8 / 7,558.9 transfers/s**, quoted in spike 003
+  and ADR-0007 *above* spike 003's banner; and the Visa/Mastercard rule corpus. Treat every
+  third-party figure in this repository as unverified unless a URL sits next to it. The banner
+  approach has now been marked incomplete twice, which is the argument for the rule the log states
+  and does not yet meet: **a source next to each claim.**
 - **Corrections get applied to the document that carries the claim**, not only to the ADR that
   discovered it. Three struck numbers stayed live in the migrations and spikes they came from,
   while the ADRs said "fabricated — struck". *This rule was itself violated the day it was

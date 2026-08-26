@@ -50,7 +50,9 @@ open-source project than stack weight did for a small team.
 **The sizing argument is superseded.** This ADR originally justified Postgres by *knowing* the
 workload (under 1 TPS). [0007](./0007-open-source-positioning.md) removes that knowledge.
 The conclusion holds on better grounds: [spike 003](../../spikes/003-throughput-ceiling/README.md)
-measured **~800 clearings/s unsharded, ~7,900 striped**, with durability on. Postgres is now
+measured **~800 clearings/s unsharded, and 6,524-6,970 striped**, with durability on. (The ~7,900
+figure quoted elsewhere is striping *plus* single-call posting, which this file states correctly
+further down and stated loosely here.) Postgres is now
 chosen on measured headroom and a known bottleneck, not on an assumption.
 
 **Formance reached the same "no procedural logic in the database" position, expensively.** Their
