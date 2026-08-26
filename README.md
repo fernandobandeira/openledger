@@ -23,7 +23,7 @@ demanding acceptance test. It is not the project.
 **Status:** pre-implementation, but the schema is real and attested. `migrations/` holds the
 ledger core, the chart of accounts, and the card hold model; `tests/` replays a full card
 lifecycle against them, asserts the plans of the queries the docs promise are O(1), and then tries
-thirty-eight ways to break it — each of which must be refused, and refused for the stated reason.
+every way we can think of to break it — each of which must be refused, and refused for the stated reason.
 No Go service yet.
 
 ## Start here

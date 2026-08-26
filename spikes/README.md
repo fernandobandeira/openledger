@@ -16,8 +16,8 @@ code is its own Go module so its dependencies never leak into the root `go.mod`.
 | [005](./005-durable-timers/) | Can Postgres replace Temporal for durable timers? | Yes — verified with River; the need is durable *scheduling*, not workflow orchestration, and idempotency already comes from the event log. | **closed** |
 | [004](./004-chart-of-accounts/) | What does a general ledger ship when the chart of accounts is business-specific? | Ship the chart as **data** plus constraints that make the accounting identity a theorem. But the identity does **not** prove completeness — that needs its own guard. | **closed** |
 
-Outcomes fed [ADR-0002](../docs/decisions/0002-data-access-layer.md) through
-[ADR-0007](../docs/decisions/0007-open-source-positioning.md).
+Outcomes fed the decision log from [ADR-0002](../docs/decisions/0002-data-access-layer.md) through
+[ADR-0011](../docs/decisions/0011-what-the-database-enforces.md) — spike 004 fed 0009, spike 005 fed 0008, and spike 006 fed 0010.
 
 ## Artifacts worth knowing about
 
@@ -26,10 +26,10 @@ a real database rather than sketched:
 
 | File | What it is |
 | --- | --- |
-| [`002-sqlc-vs-jet/schema.sql`](./002-sqlc-vs-jet/schema.sql) | The ledger schema. Graduates to `migrations/0001` at M1. |
+| [`002-sqlc-vs-jet/schema.sql`](./002-sqlc-vs-jet/schema.sql) | The ledger schema. **Did not graduate.** `migrations/0001` was written by hand; this schema puts `idempotency_key` on `ledger_transactions`, where ADR-0004 moved it off. |
 | [`002-sqlc-vs-jet/invariants.sql`](./002-sqlc-vs-jet/invariants.sql) | Nine invariants, each asserting Postgres *refuses* an illegal write. |
 | [`002-sqlc-vs-jet/expected_schema.sql`](./002-sqlc-vs-jet/expected_schema.sql) | The schema snapshot guard from [ADR-0006](../docs/decisions/0006-schema-conventions.md). |
 | [`002-sqlc-vs-jet/sqlc.yaml`](./002-sqlc-vs-jet/sqlc.yaml) | The verified codegen config. |
 | [`004-chart-of-accounts/chart.sql`](./004-chart-of-accounts/chart.sql) | Account types as data, with the constraints that keep them honest. |
 | [`004-chart-of-accounts/completeness.sql`](./004-chart-of-accounts/completeness.sql) | The guard against a report silently omitting an account. |
-| [`004-chart-of-accounts/golden_trace.sql`](./004-chart-of-accounts/golden_trace.sql) | M0's acceptance test — the the reference product spec lifecycle, reproduced to the cent. |
+| [`004-chart-of-accounts/golden_trace.sql`](./004-chart-of-accounts/golden_trace.sql) | **Superseded** by [`tests/golden_trace.sql`](../tests/golden_trace.sql). Still runs against spike 002's schema; against the shipped one it fails on `uq_accounts__owned`, and it writes `idempotency_key` to a table that no longer has it. |

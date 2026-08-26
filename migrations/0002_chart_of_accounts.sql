@@ -164,12 +164,16 @@ DECLARE n bigint;
 BEGIN
     IF NEW.statement IS DISTINCT FROM OLD.statement
        OR NEW.side IS DISTINCT FROM OLD.side THEN
-        SELECT count(*) INTO n FROM ledger_accounts a
-          JOIN account_types t ON t.code = a.purpose
-         WHERE t.fs_line = OLD.code;
+        -- account_TYPES, not accounts. The pairing this guards is
+        -- (account_types.category <-> fs_lines.statement/side); counting accounts
+        -- let a line with types pointing at it but no accounts YET move freely,
+        -- straight into a state its sibling guard refuses to create. A facility
+        -- draw then presented as revenue, and the equation reported balanced while
+        -- the balance sheet reported broken -- two integrity checks disagreeing.
+        SELECT count(*) INTO n FROM account_types t WHERE t.fs_line = OLD.code;
         IF n > 0 THEN
             RAISE EXCEPTION
-              'cannot move statement line % (% / %) to (% / %): % account(s) report under it',
+              'cannot move statement line % (% / %) to (% / %): % account type(s) report under it',
               OLD.code, OLD.statement, OLD.side, NEW.statement, NEW.side, n
               USING ERRCODE = '23514';
         END IF;
@@ -234,6 +238,8 @@ SELECT a.tenant_id, a.id AS account_id, a.owner_id, a.purpose,
        SUM(CASE WHEN e.direction='debit' THEN e.amount_minor ELSE -e.amount_minor END)
            AS balance_debit_positive
 FROM ledger_entries e
+JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+                          AND x.status = 'posted'
 JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
 JOIN account_types   t ON t.code = a.purpose
 GROUP BY a.tenant_id, a.id, a.owner_id, a.purpose, t.category, t.normal_balance, e.currency;
@@ -311,6 +317,13 @@ BEGIN
                SUM(CASE WHEN en.direction = 'debit' THEN en.amount_minor
                         ELSE -en.amount_minor END) AS dp
         FROM ledger_entries en
+        -- POSTED only. `status` was read by nothing: a pending authorization was
+        -- recognised as revenue, and its posted resolution then counted it AGAIN --
+        -- 500.00 of interchange twice, every check green. `ck_txn__not_both` also
+        -- forbids the resolving transaction from being the reversal of the pending
+        -- one, so the schema made the single-transaction correction illegal.
+        JOIN ledger_transactions x ON x.tenant_id = en.tenant_id
+                                  AND x.id = en.transaction_id AND x.status = 'posted'
         JOIN ledger_accounts a ON a.tenant_id = en.tenant_id AND a.id = en.account_id
         JOIN account_types   t ON t.code = a.purpose
         WHERE (p_tenant IS NULL OR en.tenant_id = p_tenant)
@@ -358,6 +371,8 @@ WITH dp AS (
     SELECT e.tenant_id, e.currency, t.fs_line, t.category,
            SUM(CASE WHEN e.direction='debit' THEN e.amount_minor ELSE -e.amount_minor END) AS v
     FROM ledger_entries e
+    JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+                              AND x.status = 'posted'
     JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
     JOIN account_types   t ON t.code = a.purpose
     GROUP BY e.tenant_id, e.currency, t.fs_line, t.category
@@ -400,6 +415,8 @@ WITH dp AS (
     SELECT e.tenant_id, e.currency, t.fs_line,
            SUM(CASE WHEN e.direction='debit' THEN e.amount_minor ELSE -e.amount_minor END) AS v
     FROM ledger_entries e
+    JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+                              AND x.status = 'posted'
     JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
     JOIN account_types   t ON t.code = a.purpose
     GROUP BY e.tenant_id, e.currency, t.fs_line
@@ -440,5 +457,17 @@ BEGIN
     GROUP BY b.tenant_id, b.currency
     ORDER BY b.tenant_id, b.currency;
 END $fn$;
+
+-- The app role could not open an account: assert_account_matches_type() is
+-- SECURITY INVOKER and reads account_types, on which 0002 granted nothing -- so
+-- 0001's GRANT INSERT ON ledger_accounts was dead (`permission denied for table
+-- account_types`). It also could not read any report, including its own alarm.
+GRANT SELECT ON account_types, fs_lines TO openledger_app;
+GRANT SELECT ON trial_balance, balance_sheet, income_statement,
+                ledger_balance_drift TO openledger_app;
+
+-- ...and re-run the replica hardening, because THESE foreign keys did not exist
+-- when 0001 ran it.
+CALL enforce_triggers_on_replicas();
 
 COMMIT;

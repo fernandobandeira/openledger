@@ -17,8 +17,10 @@ part of the product — something unrunnable is not adoptable, however correct i
 [`tests/`](../tests/) exists and runs against a throwaway database via `make test-sql`:
 a full card lifecycle asserted state-by-state, the hold flow, both time axes, query-plan
 assertions, a concurrency suite, and every deliberate breakage we can think of — each of which must
-be refused, and refused for the stated reason. Writing it found four real defects, two of which under-reserved credit
-([ADR-0010](./decisions/0010-authorization-holds.md)).
+be refused, and refused for the stated reason. Writing it, and the adversarial rounds since, found defects in every part of the design — several of
+which under-reserved credit. [ADR-0010](./decisions/0010-authorization-holds.md) and
+[ADR-0011](./decisions/0011-what-the-database-enforces.md) record them. *No count is given here
+because it would be stale within the day.*
 
 One design note, learned the hard way: **counting errors is not a pass criterion.** An earlier
 suite expected "seven failures" and got eight, and the extra one was a *different* invariant

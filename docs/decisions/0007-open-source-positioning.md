@@ -25,7 +25,7 @@ can be answered with numbers. Durable settings throughout, stock Postgres, one 1
 | --- | --- |
 | baseline (one shared account row, no batching) | ~800 |
 | + coalesced batching | 3,420 |
-| + **striping** the hot account | **7,897** |
+| + **striping** 64 ways **and** single-call posting, *instead of* batching | **7,897** |
 
 Three findings shape the decision:
 
@@ -63,7 +63,7 @@ single thing that limits it, and here is the lever.*
 
 **1. Hot-account striping becomes a first-class feature.** **Striping** means storing one logical
 account as N physical balance rows and summing them to read the balance — so N writers take N
-different row locks instead of queueing on one. It is the difference between 800/s and 7,897/s and
+different row locks instead of queueing on one. It is the difference between ~800/s and ~7,000/s striped (7,897 with single-call posting on top) and
 currently exists only as folklore. Design it in: an account declares a stripe count, writes pick a
 stripe, balance reads `SUM`.
 

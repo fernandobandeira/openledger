@@ -326,34 +326,53 @@ BEGIN
     RETURN NEW;
 END $$;
 
--- account_seq must be the sequence number the balance upsert just issued. It was
--- client-supplied with only positivity and uniqueness enforced, so an app-role
--- INSERT could leave a 48-wide gap and later FILL it with a backdated, balanced,
--- same-account round trip -- taking gross turnover from 100 to 100,000,000 with
--- the journal and the cache written together, so all three copies agreed and the
--- drift view stayed silent. The alarm detects DISAGREEMENT; it cannot detect
--- FABRICATION. Sequencing has to be enforced where it is issued.
-CREATE FUNCTION assert_entry_seq() RETURNS trigger
+-- account_seq is ASSIGNED from the journal, never accepted and never validated
+-- against the cache.
+--
+-- The previous version compared the incoming sequence against
+-- ledger_account_balances.last_seq -- a column the app role is granted UPDATE on.
+-- So the counter was not issued, it was ASKED: rewind last_seq into a reserved
+-- gap in one transaction, back-fill the gap in another, put the counter back, and
+-- gross turnover on a closed period went from 1,400.00 to 1,551,400.00 with every
+-- running balance correct, the cache in perfect agreement, and zero drift rows.
+-- The alarm detects disagreement, never fabrication, so it could not see it.
+--
+-- Deriving it from the journal under the row lock the balance upsert already holds
+-- closes the gap-creation, the gap-filling and the brand-new-account case at once
+-- (the old trigger was a no-op when no cache row existed yet, so ANY sequence was
+-- accepted, including bigint max, which permanently bricked the account).
+CREATE FUNCTION assign_entry_seq() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE v_last bigint;
 BEGIN
-    SELECT last_seq INTO v_last FROM ledger_account_balances
+    SELECT COALESCE(MAX(account_seq), 0) + 1 INTO NEW.account_seq
+      FROM ledger_entries
      WHERE tenant_id = NEW.tenant_id AND account_id = NEW.account_id
        AND currency = NEW.currency;
-    -- No cache row means no sequence has been issued for this account yet; the
-    -- posting path always creates it in the same statement that returns the seq.
-    IF v_last IS NOT NULL AND NEW.account_seq <> v_last THEN
-        RAISE EXCEPTION
-            'account_seq % was not issued by the balance upsert (which is at %); '
-            'post through the upsert rather than choosing a sequence',
-            NEW.account_seq, v_last USING ERRCODE = '23514';
-    END IF;
     RETURN NEW;
 END $$;
 
 CREATE TRIGGER ck_entries__seq BEFORE INSERT ON ledger_entries
-    FOR EACH ROW EXECUTE FUNCTION assert_entry_seq();
+    FOR EACH ROW EXECUTE FUNCTION assign_entry_seq();
 ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ck_entries__seq;
+
+-- Entries are immutable. ck_txn__immutable protects the transaction row; the table
+-- with the STRONGER stated guarantee had only a REVOKE, and this file says in
+-- terms that "REVOKE is a grant, not a constraint, and migrations run as a
+-- privileged role". As the owner, one UPDATE rewrote recorded_at across ten
+-- entries and moved an already-issued as-of report; one more made a balanced
+-- journal report UNBALANCED by moving only the credit legs.
+CREATE FUNCTION assert_entry_immutable() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION
+        'ledger entries are immutable: % on entry % refused. Correct the books with '
+        'a reversing transaction', TG_OP, OLD.id
+        USING ERRCODE = '23514';
+END $$;
+
+CREATE TRIGGER ck_entries__immutable BEFORE UPDATE OR DELETE ON ledger_entries
+    FOR EACH ROW EXECUTE FUNCTION assert_entry_immutable();
+ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ck_entries__immutable;
 
 CREATE TRIGGER ck_entries__sealed
     BEFORE INSERT ON ledger_entries
@@ -431,17 +450,32 @@ ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ck_entries__balances;
 -- every guard the composite keys exist to provide, on the replication apply path.
 -- Referential integrity is implemented as system triggers, so it takes the same
 -- treatment.
-DO $$
+-- EVERY table that participates in a foreign key, not a hand-written list.
+--
+-- The list version covered ledger_entries, ledger_transactions and
+-- ledger_account_balances -- and missed the REFERENCED side, which lives on
+-- ledger_accounts and ledger_events. Under replica, deleting two rows from
+-- ledger_accounts removed a whole balanced sub-book: every report INNER JOINs
+-- ledger_accounts, so revenue went to zero, the equation and the balance sheet
+-- both stayed BALANCED, and eight orphaned entries worth 310,280,000 minor units
+-- stayed in the journal with the drift view silent.
+--
+-- 0002 re-runs this same block, because its foreign keys do not exist yet here.
+CREATE PROCEDURE enforce_triggers_on_replicas() LANGUAGE plpgsql AS $$
 DECLARE t record;
 BEGIN
-    FOR t IN SELECT tgname, tgrelid::regclass AS tbl FROM pg_trigger
-              WHERE tgisinternal AND tgrelid IN ('ledger_entries'::regclass,
-                                                 'ledger_transactions'::regclass,
-                                                 'ledger_account_balances'::regclass)
+    FOR t IN
+        SELECT c.relname AS tbl, tg.tgname
+          FROM pg_trigger tg
+          JOIN pg_class c ON c.oid = tg.tgrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'public' AND tg.tgisinternal AND tg.tgenabled = 'O'
     LOOP
-        EXECUTE format('ALTER TABLE %s ENABLE ALWAYS TRIGGER %I', t.tbl, t.tgname);
+        EXECUTE format('ALTER TABLE public.%I ENABLE ALWAYS TRIGGER %I', t.tbl, t.tgname);
     END LOOP;
 END $$;
+
+CALL enforce_triggers_on_replicas();
 
 -- A transaction with NO entries is vacuously balanced, so the row trigger above
 -- never fires for it. Verified: a `posted` clearing with zero entries committed,
@@ -500,6 +534,15 @@ GRANT SELECT, INSERT, UPDATE ON ledger_account_balances TO openledger_app;
 -- REVOKEs left TRUNCATE in place and `SET ROLE openledger_app; TRUNCATE
 -- ledger_entries;` succeeded. That is the whole journal, silently, past every
 -- constraint in this file.
+-- A child table under INHERITS (ledger_entries) inherits the CHECK constraints and
+-- NOTHING else -- no triggers, no foreign keys, no unique indexes -- while its rows
+-- remain visible through the parent to every view. Verified: two legs appended to a
+-- long-committed transaction through such a child, with the seal, the append-only
+-- grant and the drift alarm all intact and silent. The invariants here are
+-- per-table, not per-hierarchy, and SQL cannot make them otherwise; the least this
+-- file can do is not hand out the privilege that reaches it.
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+
 REVOKE UPDATE, DELETE, TRUNCATE ON ledger_entries      FROM openledger_app;
 REVOKE UPDATE, DELETE, TRUNCATE ON ledger_transactions FROM openledger_app;
 REVOKE        DELETE, TRUNCATE ON ledger_events        FROM openledger_app;
