@@ -170,8 +170,8 @@ floor_for() {
     case "$1" in
         *bitemporal.sql)        echo 23 ;;
         *card_holds.sql)        echo 181 ;;
-        *golden_trace.sql)      echo 36 ;;
-        *negative_controls.sql) echo 155 ;;
+        *golden_trace.sql)      echo 38 ;;
+        *negative_controls.sql) echo 167 ;;
         *query_plans.sql)       echo 11 ;;
         *)                      echo  1 ;;
     esac
@@ -180,11 +180,11 @@ floor_for() {
 fail=0
 for f in tests/*.sql; do
     echo "── $f"
-    # A TIMEOUT ON EVERY SUITE. Every other forgery mode here is guarded and a
+    # A TIMEOUT ON EVERY SUITE, WITH --kill-after AND --foreground. Every other forgery mode here is guarded and a
     # HANG was not: a workload that blocked on a named pipe whose reader had died
     # left the build running for sixteen minutes with nothing waiting on a lock.
     # An infinite CI job is worse than a red one -- it looks like progress.
-    out=$(timeout 300 psql "$URL" -v ON_ERROR_STOP=1 -q -f "$f" 2>&1) || fail=1
+    out=$(timeout --foreground --kill-after=30 300 psql "$URL" -v ON_ERROR_STOP=1 -q -f "$f" 2>&1) || fail=1
     echo "$out" | sed 's/^psql:[^ ]* //;s/^NOTICE:  //;s/^/   /'
     # psql prefixes diagnostics with "psql:<file>:<line>: " -- the same trap that
     # made concurrency.sh's error counter permanently zero.
@@ -214,17 +214,17 @@ done
 
 # The concurrency suite needs many sessions, so it cannot be a .sql file.
 echo "── tests/concurrency.sh"
-cout=$(timeout 600 ./tests/concurrency.sh "$URL" 2>&1) || fail=1
+cout=$(timeout --foreground --kill-after=30 600 ./tests/concurrency.sh "$URL" 2>&1) || fail=1
 if [ "${PIPESTATUS[0]:-0}" = "124" ]; then echo "   FAIL tests/concurrency.sh timed out"; fi
 echo "$cout"
 cn=$(echo "$cout" | grep -cE '^ +ok  ') || true
-if [ "$cn" -lt 55 ]; then
-    echo "   FAIL tests/concurrency.sh made $cn assertions, below its floor of 55"
+if [ "$cn" -lt 57 ]; then
+    echo "   FAIL tests/concurrency.sh made $cn assertions, below its floor of 57"
     fail=1
 fi
 csites=$(sites_for tests/concurrency.sh)
-if [ "$csites" -lt 55 ]; then
-    echo "   FAIL tests/concurrency.sh contains $csites assertion call sites, below 55"
+if [ "$csites" -lt 57 ]; then
+    echo "   FAIL tests/concurrency.sh contains $csites assertion call sites, below 57"
     fail=1
 fi
 if ! echo "$cout" | grep -q "SUITE-COMPLETE concurrency"; then
@@ -236,7 +236,7 @@ fi
 # the suite says about itself; canary.sh breaks the schema on purpose and requires
 # the suite to notice. See its header for what that is worth.
 echo "── tests/canary.sh"
-kout=$(timeout 900 ./tests/canary.sh "$ADMIN" 2>&1) || fail=1
+kout=$(timeout --foreground --kill-after=60 900 ./tests/canary.sh "$ADMIN" 2>&1) || fail=1
 echo "$kout"
 kn=$(echo "$kout" | grep -cE '^ +ok  canary ') || true
 if [ "$kn" -lt 6 ]; then

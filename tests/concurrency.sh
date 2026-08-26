@@ -101,7 +101,13 @@ after_dl=$(q "select deadlocks from pg_stat_database where datname=current_datab
 # "psql:<file>:<line>: ". Injecting SELECT 1/0 into every worker left this printing
 # "failed statements = 0" and the suite printing PASS. Counted after ALL workloads,
 # too -- it used to be computed before D and C wrote their .err files at all.
-count_errs() { cat "$TMP"/*.err 2>/dev/null | grep -cE '(^|: )ERROR:' || true; }
+# psql prints connection and startup failures as lowercase `psql: error:` with
+# FATAL:, never ERROR: -- so a worker that never connected counted as zero errors
+# and read as a passing race. This counter's comment already records the
+# psql:<file>:<line> half of that class being fixed once; the lowercase half was
+# still open. Found the hard way by a reviewer whose uppercase database name got
+# folded by Postgres: every workload ran against nothing.
+count_errs() { cat "$TMP"/*.err 2>/dev/null | grep -cE '(^|: )ERROR:|^psql: error:|FATAL:' || true; }
 expected=$(( WORKERS * PER ))
 
 chk() {  # label, actual, expected
@@ -150,7 +156,33 @@ same_total() {
     psql "$URL" -qAt -f "$TMP/d$1.sql" >/dev/null 2>"$TMP/d$1.err"
 }
 for w in $(seq 1 "$WORKERS"); do same_total "$w" & done
+# PROVE THE RACE HAPPENED, the way race_guard does. Asserting outcomes alone made
+# "the lock serialised it" and "nobody raced" the same result: with the senders
+# serialised and FOR UPDATE deleted, every outcome assertion here still passed.
+# That is also the mechanism behind a ~9% flake in the ingest_lock canary under
+# parallel load -- a property of the control, not of the lock. A converging total
+# proves nothing unless somebody had to wait for it.
+d_blocked=0
+for _ in $(seq 1 40); do
+    n=$(q "select count(*) from pg_stat_activity
+            where datname = current_database() and wait_event_type = 'Lock'
+              and query like '%record_auth_event%'")
+    if [ "${n:-0}" -ge 1 ]; then d_blocked=1; break; fi
+    sleep 0.05
+done
 wait
+chk "the identical-totals workload actually raced (a sender was seen blocked)" "$d_blocked" 1
+# LIVENESS FIRST. This workload is the ONLY evidence for the ingest lock, and it
+# asserted outcomes only -- so it passed whenever the senders happened not to
+# overlap, which makes "the lock serialised it" and "nobody raced" the same
+# result. Measured against a schema with FOR UPDATE deleted but the sends
+# serialised: all four assertions passed. That is also the mechanism behind a ~9%
+# flake in the ingest_lock canary under parallel load -- a property of the control,
+# not of the lock. Assert that every message actually landed, as workloads A and B
+# already do.
+chk "every racing total actually landed" \
+    "$(q "select count(*) from card_auth_events where tenant_id='cc' and processor_msg_id ~ '^t[0-9]+_[0-9]+$'")" \
+    "$(( WORKERS * PER ))"
 chk "concurrent identical totals converge on that total" \
     "$(q "select total_minor from card_hold_groups where tenant_id='cc' and group_key='GT'")" 5000
 chk "...and the authorized subtotal matches" \
@@ -227,10 +259,17 @@ chk "regroup leaves no drift"     "$(q "select count(*) from card_hold_drift whe
 # held_minor while the alarm compares total_minor).
 race_guard() {  # tenant, setup-sql-in-open-txn, event-msg, dest, expect-substring, label
     local t="$1" setup="$2" msg="$3" dest="$4" expect="$5" label="$6"
-    local fifo="$TMPD/f_$t"; rm -f "$fifo"; mkfifo "$fifo"
-    ( psql "$URL" -qAt -f "$fifo" >/dev/null 2>&1 ) &
-    exec 9>"$fifo"
-    echo "BEGIN;" >&9; echo "$setup" >&9
+    # NO FIFO. This used to hold the transaction open by writing statements into a
+    # named pipe -- and when the reader died, the writer blocked forever on a pipe
+    # nobody was reading. Workload L was rewritten for that reason and these two
+    # sites were left; an orphaned concurrency.sh was later found parked in
+    # `wait_for_partner` for 84 minutes, against a database its own canary had
+    # already dropped, outliving the `timeout` that bounded its parent.
+    #
+    # `pg_sleep` inside the transaction holds it open for a bounded time and cannot
+    # outlive the connection. Same race, no pipe, and it ends whatever happens.
+    ( psql "$URL" -qAt -c "BEGIN; $setup SELECT pg_sleep(2.0); COMMIT;" >/dev/null 2>&1 ) &
+    local holder=$!
     sleep 1
     # BACKGROUND, deliberately: the racing regroup blocks on the row lock the open
     # transaction holds, so running it synchronously would wait for a COMMIT that
@@ -254,8 +293,7 @@ race_guard() {  # tenant, setup-sql-in-open-txn, event-msg, dest, expect-substri
     blocked=$(psql "$URL" -qAt -c "select count(*) from pg_stat_activity
         where datname = current_database() and wait_event_type = 'Lock'
           and query like '%regroup_auth_event%'")
-    sleep 0.5
-    echo "COMMIT;" >&9; exec 9>&-
+    wait "$holder" 2>/dev/null
     wait "$racer" 2>/dev/null
     if ! grep -qi "$expect" "$TMPD/g_$t.out"; then
         echo "   FAIL $label was ALLOWED under the race: $(head -1 "$TMPD/g_$t.out")"; fail=1
@@ -350,22 +388,22 @@ chk "failed statements (all workloads)" "$(count_errs)" 0
 psql "$URL" -q -v ON_ERROR_STOP=1 -c \
   "DO \$d\$ BEGIN PERFORM record_auth_event('fx','f_seed','gFa','co1','c1','authorization',1000,'USD',false,now()); END \$d\$;"
 f_dl_before=$(q "select deadlocks from pg_stat_database where datname=current_database()")
-ffifo="$TMPD/f_fx"; rm -f "$ffifo"; mkfifo "$ffifo"
-( psql "$URL" -qAt -f "$ffifo" >"$TMPD/fx_adapter.out" 2>&1 ) &
-exec 8>"$ffifo"
-echo "BEGIN;" >&8
-# the adapter takes gFa first...
-echo "SELECT record_auth_event('fx','f_a2','gFa','co1','c1','incremental',10,'USD',false,now());" >&8
+# ...and no fifo here either, for the reason race_guard above gives. The adapter's
+# whole batch is one psql call whose middle is a bounded pg_sleep, so the operator
+# starts inside it.
+( psql "$URL" -qAt -c "BEGIN;
+    SELECT record_auth_event('fx','f_a2','gFa','co1','c1','incremental',10,'USD',false,now());
+    SELECT pg_sleep(1.4);
+    SELECT record_auth_event('fx','f_b1','gFb','co1','c1','authorization',20,'USD',false,now());
+    COMMIT;" >"$TMPD/fx_adapter.out" 2>&1 ) &
+fx_adapter=$!
 sleep 0.7
 # ...the operator starts moving the seeded event gFa -> gFb, which does not exist
 ( psql "$URL" -qAt -c "SELECT regroup_auth_event('fx',(SELECT id FROM card_auth_events WHERE tenant_id='fx' AND processor_msg_id='f_seed'),'gFb','operator')" \
     >"$TMPD/fx_op.out" 2>&1 ) &
 fx_op=$!
 sleep 0.7
-# ...and only then does the adapter reach gFb, closing the cycle if the operator
-# grabbed it out of order
-echo "SELECT record_auth_event('fx','f_b1','gFb','co1','c1','authorization',20,'USD',false,now());" >&8
-echo "COMMIT;" >&8; exec 8>&-
+wait "$fx_adapter" 2>/dev/null
 wait "$fx_op" 2>/dev/null
 sleep 0.3
 f_dl_after=$(q "select deadlocks from pg_stat_database where datname=current_database()")
