@@ -16,6 +16,20 @@
 \o /dev/null
 BEGIN;
 
+-- MODE GUARD. `SET LOCAL session_replication_role = 'replica'` prepended to this
+-- file's BEGIN made the whole suite run on the replication apply path, where a
+-- guard marked ENABLE REPLICA fires and the ordinary write path is untested. That
+-- is how an earlier leak went unnoticed for two hundred lines of negative
+-- controls. One line per suite, at both ends.
+DO $$ BEGIN
+    IF current_setting('session_replication_role') <> 'origin' THEN
+        RAISE EXCEPTION
+            'this suite is running as %, not origin: every guard it exercises may be '
+            'the replica-path one', current_setting('session_replication_role');
+    END IF;
+    RAISE NOTICE 'ok  running on the ordinary write path';
+END $$;
+
 CREATE FUNCTION plan_uses(p_label text, p_sql text, p_index text) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE v_plan text;
@@ -191,16 +205,35 @@ ANALYZE card_hold_groups;
 DO $$
 DECLARE v_src text; v_sql text;
 BEGIN
-    SELECT prosrc INTO v_src FROM pg_proc WHERE proname = 'held_for_company';
+    SELECT substring(prosrc from 'PLAN-QUERY-BEGIN(.*)-- PLAN-QUERY-END')
+      INTO v_src FROM pg_proc WHERE proname = 'held_for_company';
     IF v_src IS NULL THEN
-        RAISE EXCEPTION 'held_for_company does not exist';
+        RAISE EXCEPTION 'held_for_company has no PLAN-QUERY marked region -- either '
+                        'the function is gone or its body was rewritten without the '
+                        'markers, and this guard is reading nothing';
     END IF;
+    v_src := replace(v_src, 'INTO v', '');
     v_sql := replace(replace(replace(v_src,
                  'p_tenant',   quote_literal('p1')),
                  'p_company',  quote_literal('co1')),
                  'p_currency', quote_literal('USD'));
     PERFORM plan_uses('held_for_company (its own shipped body)', v_sql,
                       'ix_hold_groups__held');
+END $$;
+
+-- ...and again at the end, because a SET LOCAL in a DO block that SUCCEEDS
+-- persists for the rest of the transaction. MODE GUARD. `SET LOCAL session_replication_role = 'replica'` prepended to this
+-- file's BEGIN made the whole suite run on the replication apply path, where a
+-- guard marked ENABLE REPLICA fires and the ordinary write path is untested. That
+-- is how an earlier leak went unnoticed for two hundred lines of negative
+-- controls. One line per suite, at both ends.
+DO $$ BEGIN
+    IF current_setting('session_replication_role') <> 'origin' THEN
+        RAISE EXCEPTION
+            'this suite is running as %, not origin: every guard it exercises may be '
+            'the replica-path one', current_setting('session_replication_role');
+    END IF;
+    RAISE NOTICE 'ok  running on the ordinary write path';
 END $$;
 
 ROLLBACK;

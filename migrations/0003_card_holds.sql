@@ -81,7 +81,16 @@ CREATE TABLE card_auth_events (
     -- release by definition, so it is no longer exempt.
     CONSTRAINT ck_auth_events__sign CHECK (
         kind = 'advice' OR
-        (kind = 'expiry_reversal' AND amount_delta > 0) OR
+        -- expiry_reversal carries ZERO. Expiry is a flag that never subtracted
+        -- anything from total_minor, so a reversal of it must not ADD anything
+        -- back: it clears the flag. Carrying +remaining made one 100.00
+        -- authorization hold 200.00, and after the full 100.00 capture it still
+        -- held 100.00 -- with drift silent, because the log genuinely contained
+        -- the +10000 and the alarm can only compare the total to the log. The
+        -- header argues at length that an event carrying -remaining would be a
+        -- read-modify-write smuggled into an append-only log; the mirror image
+        -- shipped anyway. The wire amount is kept in raw_amount.
+        (kind = 'expiry_reversal' AND amount_delta = 0) OR
         (kind IN ('authorization','incremental') AND amount_delta >= 0) OR
         -- 'expiry' is absent deliberately: expiry is a FLAG. The enum value stays
         -- (removing one is a rewrite) and no row may carry it. record_auth_event
@@ -466,8 +475,9 @@ BEGIN
             -- and can never reach this path. Carrying the disjunct anyway left an
             -- unreachable branch that mutation testing cannot distinguish from a
             -- tested one.
-            IF v_evt_kind IN ('authorization','incremental','advice','expiry_reversal')
-               AND v_evt_delta > 0 THEN
+            IF v_evt_kind = 'expiry_reversal'
+               OR (v_evt_kind IN ('authorization','incremental','advice')
+                   AND v_evt_delta > 0) THEN
                 UPDATE card_hold_groups
                    SET expired_at = NULL, expired_authorized = NULL, expired_total = NULL
                  WHERE tenant_id=p_tenant AND company_id=p_company AND group_key=p_group;
@@ -511,7 +521,11 @@ BEGIN
     v_delta := CASE
         WHEN p_is_total AND p_group IS NOT NULL THEN p_amount - v_authorized
         WHEN p_kind IN ('authorization','incremental')  THEN abs(p_amount)
-        WHEN p_kind IN ('advice','expiry_reversal')     THEN p_amount
+        -- ...and so the conversion gives it zero. Same shape as a cumulative
+        -- restatement whose delta is zero: the message is the liveness signal,
+        -- not an amount.
+        WHEN p_kind = 'expiry_reversal'                 THEN 0
+        WHEN p_kind = 'advice'                          THEN p_amount
         ELSE -abs(p_amount) END;
 
     INSERT INTO card_auth_events (tenant_id,processor_msg_id,company_id,card_id,kind,
@@ -548,13 +562,13 @@ BEGIN
            -- again. A late CLEARING must NOT resurrect it, so only the increase
            -- side un-expires. A cumulative RESTATEMENT counts even though its delta
            -- is zero: the restatement itself is the liveness signal.
-           expired_at = CASE WHEN p_kind IN ('authorization','incremental','advice',
-                                             'expiry_reversal')
-                                  AND (v_delta > 0 OR p_is_total)
+           expired_at = CASE WHEN p_kind = 'expiry_reversal'
+                             OR (p_kind IN ('authorization','incremental','advice')
+                                  AND (v_delta > 0 OR p_is_total))
                              THEN NULL ELSE expired_at END,
-           expired_authorized = CASE WHEN p_kind IN ('authorization','incremental','advice',
-                                                     'expiry_reversal')
-                                          AND (v_delta > 0 OR p_is_total)
+           expired_authorized = CASE WHEN p_kind = 'expiry_reversal'
+                                     OR (p_kind IN ('authorization','incremental','advice')
+                                          AND (v_delta > 0 OR p_is_total))
                                      THEN NULL
                                 WHEN expired_at IS NOT NULL
                                      THEN LEAST(expired_authorized,
@@ -566,9 +580,9 @@ BEGIN
            -- lowered an expired group's total, and removing that clearing then
            -- restored the exposure without ever exceeding the snapshot taken at
            -- expiry: 0 to 100000 on a released hold, held_minor 0, no alarm.
-           expired_total = CASE WHEN p_kind IN ('authorization','incremental','advice',
-                                                'expiry_reversal')
-                                     AND (v_delta > 0 OR p_is_total)
+           expired_total = CASE WHEN p_kind = 'expiry_reversal'
+                                OR (p_kind IN ('authorization','incremental','advice')
+                                     AND (v_delta > 0 OR p_is_total))
                                 THEN NULL
                            WHEN expired_at IS NOT NULL
                                 THEN LEAST(expired_total, total_minor + v_delta)
@@ -590,8 +604,19 @@ BEGIN
                                   THEN COALESCE(overcaptured_at, now()) END,
            updated_at   = now()
      WHERE tenant_id=p_tenant AND company_id=p_company AND group_key=p_group
-    RETURNING total_minor INTO v_current;
-    RETURN v_current;
+    RETURNING held_minor INTO v_current;
+    -- held_minor, NOT total_minor. This is the number an adapter computes
+    -- `available = limit - returned` from, and the raw total goes NEGATIVE on an
+    -- over-capture: a $1 authorization clearing at $95 returned -9400 while
+    -- held_for_company reported 0, which is 94.00 of phantom credit for anyone who
+    -- believed the return value. `tests/card_holds.sql` calls "what ingest RETURNS
+    -- must equal what held_for_company reports" its strongest single assertion and
+    -- was only exercising it on one branch.
+    --
+    -- Still per-GROUP, which the caller has to know: a company with two open groups
+    -- gets this group's number back, not its total exposure. held_for_company is
+    -- the company-wide question.
+    RETURN COALESCE(v_current, 0);
 END $$;
 
 -- Expiry is a flag, never a computed delta (see card_hold_groups.expired_at).
@@ -830,11 +855,34 @@ END $$;
 -- number the authorization decision is made on; a defaulted currency here is
 -- precisely how a cross-currency total would go unnoticed again.
 CREATE FUNCTION held_for_company(p_tenant text, p_company text, p_currency char(3))
-RETURNS bigint LANGUAGE sql STABLE AS $$
-    SELECT COALESCE(SUM(held_minor),0)::bigint FROM card_hold_groups
+RETURNS bigint LANGUAGE plpgsql STABLE AS $$
+DECLARE v bigint;
+BEGIN
+    -- A NULL argument IS the defaulted currency this function refuses to have, and
+    -- it returned the most dangerous possible answer: `currency = NULL` matches no
+    -- row, so 500.00 of live exposure came back as 0. Refusing costs nothing; the
+    -- silent zero is what an authorization gets approved against.
+    IF p_tenant IS NULL OR p_company IS NULL OR p_currency IS NULL THEN
+        RAISE EXCEPTION
+            'held_for_company requires tenant, company and currency; got (%, %, %). '
+            'A missing currency is how a cross-currency total goes unnoticed',
+            p_tenant, p_company, p_currency
+            USING ERRCODE = 'data_exception';
+    END IF;
+    -- The markers are load-bearing: tests/query_plans.sql extracts exactly this
+    -- region out of pg_proc and EXPLAINs it, so the plan guard reads the shipped
+    -- query rather than a hand-retyped copy of it. A retyped copy could not see
+    -- `AND held_minor > 0` being dropped, which is value-equivalent and
+    -- plan-critical -- it moves the read off the partial index onto the primary
+    -- key, scanning every group the company has ever had.
+    -- PLAN-QUERY-BEGIN
+    SELECT COALESCE(SUM(held_minor),0)::bigint INTO v FROM card_hold_groups
      WHERE tenant_id = p_tenant AND company_id = p_company
-       AND currency = p_currency AND held_minor > 0;
-$$;
+       AND currency = p_currency AND held_minor > 0
+    -- PLAN-QUERY-END
+    ;
+    RETURN v;
+END $$;
 
 -- The hold log is history, and card_hold_groups carries state that is NOT in the
 -- log: expired_at, its expired_* snapshots, and low_water_minor. Deleting a group
@@ -902,7 +950,22 @@ WITH live AS (
            bool_or(NOT e.raw_is_total) FILTER (
                WHERE e.amount_delta <> 0
                  AND (e.kind IN ('authorization','incremental')
-                  OR (e.kind = 'advice' AND e.amount_delta > 0))) AS any_delta
+                  OR (e.kind = 'advice' AND e.amount_delta > 0))) AS any_delta,
+           -- Decreases that moved NO MONEY. A clearing posts to the ledger, so a
+           -- group whose total went negative from clearings is not under-reserving
+           -- -- the cleared amount is a receivable in the journal, and exposure is
+           -- posted + held. ADR-0010 declines the over-capture report on exactly
+           -- that argument, and the argument covers `clearing` AND NOTHING ELSE.
+           -- `reversal` and negative `advice` post nothing. Two reversals against
+           -- one authorization left total_minor at -10000 with zero clearings in
+           -- the log, and the next genuine incremental was absorbed by the
+           -- residue: 100.00 live, 0.00 held, 0.00 posted, drift silent. The
+           -- non-latching overcaptured_at was erased by the very message that hid
+           -- the money.
+           COALESCE(-SUM(e.amount_delta) FILTER (
+               WHERE e.amount_delta < 0 AND e.kind <> 'clearing'), 0) AS bloodless_decreases,
+           COALESCE(SUM(GREATEST(e.amount_delta,0)) FILTER (
+               WHERE e.kind IN ('authorization','incremental','advice')), 0) AS increases
       FROM card_auth_event_group m
       JOIN card_auth_events e ON e.tenant_id = m.tenant_id AND e.id = m.event_id
      WHERE m.superseded_at IS NULL
@@ -948,6 +1011,9 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
    -- compared totals and currency and never this, so a group holding one
    -- raw_is_total=false event and one raw_is_total=true event -- the state the
    -- header calls IRRECONCILABLE -- reported nothing at all.
+   -- ...or the group has been reversed for more than was ever authorized, which
+   -- no arrival order can explain and no clearing accounts for.
+   OR l.bloodless_decreases > l.increases
    OR (l.any_total AND l.any_delta)
    OR g.total_convention IS DISTINCT FROM
         (CASE WHEN l.any_total AND l.any_delta THEN g.total_convention

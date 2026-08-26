@@ -23,6 +23,20 @@
 \o /dev/null
 BEGIN;
 
+-- MODE GUARD. `SET LOCAL session_replication_role = 'replica'` prepended to this
+-- file's BEGIN made the whole suite run on the replication apply path, where a
+-- guard marked ENABLE REPLICA fires and the ordinary write path is untested. That
+-- is how an earlier leak went unnoticed for two hundred lines of negative
+-- controls. One line per suite, at both ends.
+DO $$ BEGIN
+    IF current_setting('session_replication_role') <> 'origin' THEN
+        RAISE EXCEPTION
+            'this suite is running as %, not origin: every guard it exercises may be '
+            'the replica-path one', current_setting('session_replication_role');
+    END IF;
+    RAISE NOTICE 'ok  running on the ordinary write path';
+END $$;
+
 CREATE FUNCTION eqv(p_label text, p_got bigint, p_want bigint) RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -230,6 +244,21 @@ BEGIN
     END IF;
     RAISE NOTICE 'ok  running balance % is WRONG for the business date; truth is % (ADR-0003)',
         v_running, v_true;
+END $$;
+
+-- ...and again at the end, because a SET LOCAL in a DO block that SUCCEEDS
+-- persists for the rest of the transaction. MODE GUARD. `SET LOCAL session_replication_role = 'replica'` prepended to this
+-- file's BEGIN made the whole suite run on the replication apply path, where a
+-- guard marked ENABLE REPLICA fires and the ordinary write path is untested. That
+-- is how an earlier leak went unnoticed for two hundred lines of negative
+-- controls. One line per suite, at both ends.
+DO $$ BEGIN
+    IF current_setting('session_replication_role') <> 'origin' THEN
+        RAISE EXCEPTION
+            'this suite is running as %, not origin: every guard it exercises may be '
+            'the replica-path one', current_setting('session_replication_role');
+    END IF;
+    RAISE NOTICE 'ok  running on the ordinary write path';
 END $$;
 
 ROLLBACK;
