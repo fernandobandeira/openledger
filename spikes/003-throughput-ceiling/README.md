@@ -463,6 +463,16 @@ costs ~0.5 ms and reorders the levers. Treat the *ranking* as hardware-specific 
 
 ## External validation — what the industry does
 
+> **SOURCING: every third-party figure and quotation below is UNVERIFIED.** None
+> carries a fetchable URL, and the rule at
+> [`docs/decisions/README.md`](../../docs/decisions/README.md#on-sourcing) says
+> that makes it unverified, not merely unsourced. They are recorded because the
+> *shapes* they describe shaped our design, and marking them is cheaper than
+> pretending. Do not quote any number here as evidence without finding the source
+> first. Twice already, a figure attributed to a named project turned out never to
+> have existed.
+
+
 **We rediscovered a benchmark from 1985.** Jim Gray et al., *"A Measure of Transaction Processing
 Power"* (Datamation, 1985) — the **DebitCredit** benchmark, later TPC-A/TPC-B — models 10
 branches, 100 tellers, 10,000 accounts, so ~10 branch rows absorb every write. The

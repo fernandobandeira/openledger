@@ -308,6 +308,16 @@ against `DatabaseConnectionsCurrentlySessionPinned`.
 
 ## Prior art
 
+> **SOURCING: every third-party figure and quotation below is UNVERIFIED.** None
+> carries a fetchable URL, and the rule at
+> [`docs/decisions/README.md`](../../docs/decisions/README.md#on-sourcing) says
+> that makes it unverified, not merely unsourced. They are recorded because the
+> *shapes* they describe shaped our design, and marking them is cheaper than
+> pretending. Do not quote any number here as evidence without finding the source
+> first. Twice already, a figure attributed to a named project turned out never to
+> have existed.
+
+
 Splitting one logical account into N physical rows is **standard practice**, attested under six
 names:
 
