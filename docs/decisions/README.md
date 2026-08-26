@@ -74,7 +74,12 @@ Measured against a fresh load of [`schema/schema.sql`](../../schema/schema.sql),
   load.
 - **Append-only on the four immutable logs**, by trigger, `ENABLE ALWAYS`, so it holds on the
   replication apply path too. `TRUNCATE` refused on the same four.
-- Uniqueness — idempotency keys, one live membership per event, one house account per tenant.
+- Uniqueness — `uq_events__idempotency`, `uq_event_group__current` (one live membership per event),
+  `uq_accounts__house` (one house account per tenant), and **`uq_entries__account_seq`**, the
+  journal's per-account sequence, which is arguably its most important key.
+- Three more single-row rules worth naming because they are easy to miss: `ck_balances__non_negative`
+  on the cache, `ck_txn__no_self_reference`, and `ck_txn__not_both` (a transaction may resolve or
+  reverse, not both).
 
 **NOT enforced by the database, deliberately or otherwise:**
 

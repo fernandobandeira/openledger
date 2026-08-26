@@ -75,7 +75,7 @@ contention on *account* rows and do nothing about a lock every writer takes. The
 survives is **batching**, because the chain lock is taken once per transaction rather than once per
 event.
 
-> **Synchronous hash chaining costs roughly 2× throughput when batched, and roughly 8× when not.**
+> **Synchronous hash chaining costs roughly 2× throughput when batched, and roughly 8× when not — *extrapolated from spike 003's contended-row numbers, not measured*.**
 
 Affordable for a lender-facing deployment; unaffordable as a default. So it is **opt-in per
 deployment** — a durability/audit setting, not a correctness setting, which keeps it clear of

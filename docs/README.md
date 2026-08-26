@@ -21,8 +21,21 @@ state machines, and a row-by-row trace of one $500 purchase. Everything else her
 > name and derives the hold as a sum over an append-only event log, because a clearing has no reliable
 > key back to its authorization. And its §04 says append-only is enforced by revoking `UPDATE` —
 > [0012](./decisions/0012-where-logic-lives.md) shows a grant binds the application role and nothing
-> else, so it is enforced by trigger. The board's sizing, architecture, auth-deadline budget and
-> lifecycle trace are unaffected and remain the clearest statement of them.
+> else, so it is enforced by trigger.
+>
+> Four smaller divergences, all in §04 and §06: the board puts `idempotency_key` on
+> `ledger_transactions`, where [0004](./decisions/0004-event-log.md) moved it to the event log and
+> the shipped table has no such column; **no key in the board carries `tenant_id`**, which
+> [the roadmap](./roadmap.md) calls the one irreversible decision on the list; the board has no
+> `account_types`/`fs_lines` layer, so `category` and `normal_balance` sit as free columns rather
+> than behind the two composite foreign keys [0009](./decisions/0009-chart-and-completeness.md)
+> put them behind; and its §03 says "no cache anywhere" while `ledger_account_balances` ships as
+> the write-side serialisation point. Three account names in the lifecycle trace are not in
+> `schema/chart.sql`: `ach_pull_unsettled` (the chart says `ach_pull_returnable`),
+> `outbound_transfer_in_transit`, and `unapplied_receipts`.
+>
+> The board's **sizing, the auth-deadline budget, and the shape of the lifecycle** are unaffected
+> and remain the clearest statement of them anywhere in this repo.
 
 ## What a ledger is, in one paragraph
 

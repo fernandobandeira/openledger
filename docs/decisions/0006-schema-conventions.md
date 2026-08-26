@@ -63,8 +63,7 @@ would have caught:
   `accounts_metadata`. The real gap — a sequential scan on every metadata write, forever — was
   hidden by the name.
 - Two composite primary keys are named in a way that reads like single-column indexes.
-- **Five** of their nine `CHECK` constraints are `NOT VALID` and were never validated, so they
-  constrain new rows only, which is not what a reader would assume.
+- At the commit [spike 009](../../spikes/009-how-other-ledgers-enforce/README.md) read, Formance's census is **four `CHECK` constraints, all four unvalidated, and zero foreign keys** — an earlier read of five-of-nine was true at a different commit.
 - Their canonical record of money movement is a `varchar` holding pretty-printed JSON. It cannot be
   queried, indexed or validated, so four additional jsonb columns and three GIN indexes exist
   solely to make it queryable. They made the same mistake twice.

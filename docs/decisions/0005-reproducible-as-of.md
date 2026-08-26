@@ -82,7 +82,7 @@ ledger by adding workers would make it slower, which is the least debuggable fai
 
 - The cursor **lags the newest writes** by the longest in-flight transaction — the price of keeping
   write concurrency.
-- **The query layer is not bitemporal yet, though storage is.** `accounting_equation` takes one
+- **The query layer is not bitemporal yet, though storage is.** the accounting equation, when Go rebuilds it, must take one
   instant and one axis, so *the effective-axis February close as known on 1 March* cannot be
   expressed; `balance_sheet`, `income_statement` and the balance-sheet roll-up have no date predicate.
 - It composes with [0004](./0004-event-log.md)'s deferred hash chain, which needs a total order.
