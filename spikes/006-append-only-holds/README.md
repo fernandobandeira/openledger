@@ -1,5 +1,30 @@
 # Spike 006 — Holds as an append-only event log
 
+
+> ⚠️ **The verification in this spike does not run, and its headline survey was
+> invented.** Both are recorded here rather than quietly repaired, because this
+> spike is the evidence base for [ADR-0010](../../docs/decisions/0010-authorization-holds.md).
+>
+> * **`cases.sql` is dead against `holds.sql`.** It writes `event_id`, `group_key`
+>   and `expires_at`; the schema in `holds.sql` has `processor_msg_id`, no
+>   `group_key` column at all (grouping moved to its own table), and no
+>   `expires_at`. Every INSERT fails with `column "event_id" ... does not exist`,
+>   the results view prints `(0 rows)`, and `held_for_company` prints 0.00. The
+>   README's "**Measured**" table and its "**all eight cases**, plus idempotency and
+>   sign guards" were never executed against this schema. `cases.sql` is v1;
+>   `holds.sql` is v2.
+> * **It contains six cases, not eight.** G ("clearing arrives before the auth")
+>   and H ("forced post") — the two this README flags as most interesting — are not
+>   in the file.
+> * **"Surveying eleven issuer-processors" was fabricated**, and "six of eleven"
+>   with it. Three processors are surveyed below. They disagree, which is the real
+>   finding and the reason the design exists; the sample size was invented.
+>
+> The live attestation of this design is
+> [`tests/card_holds.sql`](../../tests/card_holds.sql), which runs on every
+> `make test-sql` against `migrations/0003`. Nothing in this directory is executed
+> by CI, and it is kept as a record of how the design was reached.
+
 ## The question
 
 A *hold* is the amount an authorization reserves against a card's credit limit. Today it is one

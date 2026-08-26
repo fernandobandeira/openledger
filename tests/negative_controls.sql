@@ -637,6 +637,135 @@ SELECT must_fail('a balance sheet that does not balance', $q$
     END $d$;
 $q$, 'balance sheet is out');
 
+-- ---------------------------------------------------------------- untested tier
+--
+-- Mutation testing found a whole tier of constraints that could be deleted with
+-- the suite green, plus two properties reachable only through a column no
+-- assertion read. Each of these now makes its constraint the reason a test fails.
+
+-- direction carries the sign, so a NEGATIVE amount is a silent sign inversion that
+-- still "balances" and that every downstream check tolerates
+SELECT must_fail('a negative amount_minor', $q$
+    INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
+                                currency,account_seq,balance_after,effective_at)
+    SELECT 't1', txn('t1','neg_amt'), acct('t1','customer_receivable'), 'debit', -500,'USD',
+           1, -500, now();
+$q$, 'ck_entries__amount_positive');
+
+SELECT must_fail('a zero amount_minor', $q$
+    INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
+                                currency,account_seq,balance_after,effective_at)
+    SELECT 't1', txn('t1','zero_amt'), acct('t1','customer_receivable'), 'debit', 0,'USD',
+           1, 0, now();
+$q$, 'ck_entries__amount_positive');
+
+-- the ENTRY-level currency check, distinct from the account-level one: it is what
+-- stops 'usd' entries splitting an account's per-currency balance
+SELECT must_fail('a lowercase currency on an entry', $q$
+    INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
+                                currency,account_seq,balance_after,effective_at)
+    SELECT 't1', txn('t1','lc_entry'), acct('t1','customer_receivable'), 'debit', 5,'usd',
+           1, 5, now();
+$q$, 'ck_entries__currency_iso');
+
+-- account_seq uniqueness: nothing ever ATTEMPTED a duplicate, so the unique index
+-- could be demoted to a plain one
+-- account_seq uniqueness: nothing ever ATTEMPTED a duplicate, so the unique index
+-- could be demoted to a plain one with the suite green. The duplicate goes into
+-- the SAME transaction, so ck_txn__has_entries cannot fire first.
+SELECT must_fail('a duplicate account_seq', $q$
+    DO $d$ DECLARE t uuid := txn('t1','dup_seq'); BEGIN
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  10);
+        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 10);
+        INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,
+                                    amount_minor,currency,account_seq,balance_after,effective_at)
+        VALUES ('t1', t, acct('t1','customer_receivable'), 'debit', 10,'USD', 1, 20,
+                (SELECT effective_at FROM ledger_transactions WHERE id = t));
+    END $d$;
+$q$, 'uq_entries__account_seq');
+
+-- the cache is the only table the app role may UPDATE; both its guards were dead
+SELECT must_fail('a cached balance for an account that does not exist', $q$
+    INSERT INTO ledger_account_balances (tenant_id,account_id,currency,input,output,last_seq)
+    VALUES ('t1','00000000-0000-7000-8000-0000000000ff','USD',0,0,0);
+$q$, 'fk_balances__account');
+
+SELECT must_fail('a negative cached input', $q$
+    -- its own data: must_fail rolls each control back, so without this the UPDATE
+    -- matches no rows and the control asserts nothing
+    DO $d$ DECLARE t uuid := txn('t1','neg_cache'); BEGIN
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  30);
+        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 30);
+    END $d$;
+    SET CONSTRAINTS ALL IMMEDIATE;
+    UPDATE ledger_account_balances SET input = -1
+     WHERE tenant_id='t1' AND account_id = acct('t1','customer_receivable');
+$q$, 'ck_balances__non_negative');
+
+-- the reversal / resolution model: shipped, and until now entirely unexercised
+SELECT must_fail('a transaction that both resolves and reverses', $q$
+    INSERT INTO ledger_events (tenant_id,kind,source,idempotency_key,idempotency_hash,
+                               payload,effective_at)
+    VALUES ('t1','neg','internal','both',sha256('both'),'{}',now());
+    INSERT INTO ledger_transactions (tenant_id,id,event_id,kind,status,effective_at,
+                                     resolves_id,reverses_id)
+    SELECT 't1','0b0b0b0b-0000-7000-8000-00000000000b',id,'neg','posted',now(),
+           '0b0b0b0b-0000-7000-8000-00000000000c','0b0b0b0b-0000-7000-8000-00000000000d'
+      FROM ledger_events WHERE tenant_id='t1' AND idempotency_key='both';
+$q$, 'ck_txn__not_both');
+
+-- ...and a transaction may be reversed only once. The reversals are given a fixed
+-- target id so the control cannot silently degrade to reverses_id IS NULL, where
+-- the partial index does not apply and nothing is tested.
+SELECT must_fail('reversing the same transaction twice', $q$
+    DO $d$
+    DECLARE tgt uuid := '0a0a0a0a-0000-7000-8000-00000000000a'; i int;
+    BEGIN
+        INSERT INTO ledger_events (tenant_id,kind,source,idempotency_key,idempotency_hash,
+                                   payload,effective_at)
+        VALUES ('t1','neg','internal','rev_tgt',sha256(convert_to('rev_tgt','UTF8')),'{}',now());
+        INSERT INTO ledger_transactions (tenant_id,id,event_id,kind,status,effective_at)
+        SELECT 't1',tgt,id,'neg','posted',now() FROM ledger_events
+         WHERE tenant_id='t1' AND idempotency_key='rev_tgt';
+        FOR i IN 1..2 LOOP
+            INSERT INTO ledger_events (tenant_id,kind,source,idempotency_key,idempotency_hash,
+                                       payload,effective_at)
+            VALUES ('t1','neg','internal','rev'||i,sha256(convert_to('rev'||i,'UTF8')),'{}',now());
+            INSERT INTO ledger_transactions (tenant_id,event_id,kind,status,effective_at,reverses_id)
+            SELECT 't1',id,'neg','posted',now(),tgt FROM ledger_events
+             WHERE tenant_id='t1' AND idempotency_key='rev'||i;
+        END LOOP;
+    END $d$;
+$q$, 'uq_txn__one_reversal');
+
+-- a transaction may not cite an event that does not exist
+SELECT must_fail('a transaction citing a nonexistent event', $q$
+    INSERT INTO ledger_transactions (tenant_id,event_id,kind,status,effective_at)
+    VALUES ('t1','00000000-0000-7000-8000-0000000000ee','neg','posted',now());
+$q$, 'fk_txn__event');
+
+-- normal_balance was reachable ONLY through trial_balance.balance_minor, and no
+-- assertion read it -- so flipping the flagship contra account, the one the chart
+-- cites as proof that normal_balance is not derivable from category, was invisible
+DO $$
+DECLARE v_presented bigint; v_arith bigint;
+BEGIN
+    PERFORM entry('t1', txn('t1','contra_pair'), acct('t1','credit_loss_expense'), 'debit', 700);
+    PERFORM entry('t1', (SELECT id FROM ledger_transactions WHERE tenant_id='t1'
+                          AND event_id=(SELECT id FROM ledger_events
+                                         WHERE idempotency_key='contra_pair')),
+                  acct('t1','allowance_for_credit_losses'), 'credit', 700);
+    SET CONSTRAINTS ALL IMMEDIATE;
+    SELECT balance_minor, balance_debit_positive INTO v_presented, v_arith
+      FROM trial_balance WHERE tenant_id='t1' AND purpose='allowance_for_credit_losses';
+    -- asset with a CREDIT normal balance: presented POSITIVE, arithmetic NEGATIVE
+    IF v_presented <> 700 OR v_arith <> -700 THEN
+        RAISE EXCEPTION 'contra account presented %/arithmetic % (expected 700/-700)',
+            v_presented, v_arith;
+    END IF;
+    RAISE NOTICE 'ok  a contra asset presents +700 and computes -700';
+END $$;
+
 DO $$ BEGIN RAISE NOTICE 'ok  every breakage above was refused, for the stated reason'; END $$;
 
 ROLLBACK;
