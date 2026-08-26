@@ -55,8 +55,10 @@ those commands between deploys makes replay non-deterministic. Every deploy duri
 window becomes a versioning exercise. A job row is inert JSON handed to whatever code is current.
 
 **The footprint is disproportionate.** Temporal Server is four services (frontend, history, matching, worker); it needs its own
-persistence database with its own migrations, plus a separate visibility store that its docs
-*recommend* for production rather than require; `numHistoryShards`
+persistence database with its own migrations, plus a separate visibility store (**contested:** one
+reviewer reported Temporal's docs call this recommended-for-production, another reported it
+required — and the second later retracted its external verification as fabricated, so neither
+reading is confirmed here. Treat as unverified); `numHistoryShards`
 is fixed at deploy time and changing it requires a cluster rebuild; minor versions must be upgraded
 sequentially with a schema migration each; and self-hosted Temporal ships no RBAC or audit logging
 — notable for the component driving money-movement timers. Its tested Postgres matrix also stops at

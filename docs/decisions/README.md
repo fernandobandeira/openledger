@@ -86,6 +86,21 @@ Undecided, listed plainly rather than buried:
   event becomes entries. Adyen proves those templates balance at design time. We have not designed
   ours.
 
+## On sourcing
+
+Claims about third-party systems are the weakest evidence in this repository, and twice now a
+number attributed to a named project turned out never to have existed. Once it was written by us;
+once a reviewer commissioned to check such claims **fabricated an entire verification section** —
+URLs, quoted text, commit counts, price tables — after its own sub-agents died without reporting.
+
+Two rules follow, and they are cheap:
+
+- **A third-party figure needs a fetchable source next to it**, or it is marked unverified. Not
+  softened — marked. "I could not check this" is a finding, not an embarrassment.
+- **Corrections get applied to the document that carries the claim**, not only to the ADR that
+  discovered it. Three struck numbers stayed live in the migrations and spikes they came from,
+  while the ADRs said "fabricated — struck".
+
 ## How this log works
 
 One file per decision, numbered, never deleted. A decision that turns out wrong gets a new ADR

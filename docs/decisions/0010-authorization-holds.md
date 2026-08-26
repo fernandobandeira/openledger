@@ -123,10 +123,15 @@ out-of-order, and the derived total was never wrong.
   stored; neither is derived from the other.
 
   **Correction to a correction.** An earlier version of this bullet retracted the day counts as
-  unverifiable. That retraction was wrong: Visa Core Rules (18 Apr 2026) **§5.7.3.5, Table 5-12**
-  does specify **5 calendar days** for "All other Transactions in a Card-Present Environment",
-  with the clock starting on the date of a valid authorization. Spike 006's citation is sound and
-  is reinstated. Two real refinements: Visa treats authorization validity and the clearing deadline
+  unverifiable. **That retraction was wrong, and the original research was right.** The public
+  Visa Core Rules PDF (18 Apr 2026) extracts cleanly and §**5.7.3.5 "Transaction and Processing
+  Timeframes"** reads *"An Acquirer must process a completed Transaction as specified in Table
+  5-12."* Table 5-12: card-present **5 calendar days**, card-absent 10, extended/Estimated
+  (cruise, lodging, vehicle rental) 30, with footnote 1 — *"Timeframe starts on the date of a valid
+  Authorization."* That is auth-to-clearing, not response time. Rule **0031022** is verbatim *"An
+  Incremental Authorization Request does not extend the processing timeframes in Table 5-12"*,
+  which is the source of the "does not extend on an increment" claim above. Spike 006's citation is
+  sound in every particular and is reinstated. Two real refinements: Visa treats authorization validity and the clearing deadline
   as *one* rule rather than two, and the figure is region-variable — so it is policy input, not a
   constant to hard-code.
 - **STIP** — stand-in processing, where the network approves on our behalf while we are down —
