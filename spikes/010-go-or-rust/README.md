@@ -21,11 +21,16 @@ sqlx 0.9.0 · goose v3.27.3 · river v0.45.0 · graphile_worker 0.13.5 · refine
 
 ## The answer
 
-**Stay on Go — but Go lost the type-system comparison, repeatedly, on this project's own bugs.** It
-survives because its failures land in *our* code, where a linter and a banned function reach them,
-while Rust's one hard failure lands in someone else's release cadence. Rust caught **5 of 5**
-seeded bugs with no tooling at all. Go's compiler and `go vet` caught **0 of 5**; the `exhaustive`
-linter caught 2 of 5.
+**Rust.** It won the type-system crux **5 of 5** with no tooling at all, where Go's compiler and
+`go vet` caught **0 of 5** and the `exhaustive` linter caught 2 — and two of those five were
+guarantees ADRs 0002 and 0013 had already claimed in writing and did not have.
+
+The spike's own first recommendation was *stay on Go*, on the strength of Q4. That recommendation
+did not survive checking Q4 properly: the finding is not "Rust lacks a try-lock migrator", it is
+that **only one Rust migrator locks at all**, and the deployment model 0014 already chose — a
+single-runner pre-deploy job — is the one where that matters least. Fifteen verified lines close it.
+The record of the Go case is kept below in full, because the reasons it nearly won are the things
+Rust now has to be watched for.
 
 **The condition that flips it:** a second silent-money defect reaching a balance. The first one is
 already here, in §3 below.
@@ -204,9 +209,36 @@ DETAIL:  Process 831046 waits for ExclusiveLock on advisory lock […]; blocked 
 | **sqlx 0.9.0** + `set_locking(false)` + hand-rolled `pg_try_advisory_lock` poll | **0 of 3, every trial** |
 | **refinery 0.9.2** | `CREATE INDEX CONCURRENTLY cannot run inside a transaction block` — cannot run it at all |
 
-**No Rust migrator polls a try-lock.** The repair is fifteen lines and it works, but it is us
-maintaining goose's algorithm. This is the strongest single argument in the spike, and it is the one
-that decided it.
+**No Rust migrator polls a try-lock** — but that framing understates it and points at the wrong
+thing. Read against the published sources of every Rust migrator on crates.io:
+
+| crate | version | cross-process lock | can it run `CREATE INDEX CONCURRENTLY`? |
+| --- | --- | --- | --- |
+| `sqlx` | 0.9.0 | **blocking `pg_advisory_lock`** | yes, `-- no-transaction` |
+| `diesel_migrations` | 2.3.2 | **none** | yes, `run_in_transaction = false` |
+| `sea-orm-migration` | 2.0.2 | **none** | yes, `use_transaction() -> Option<bool>` |
+| `geni` | 1.3.3 | **none** | yes, `transaction: no` in line 1 |
+| `movine` | 0.11.4 | **none** | no — `batch_execute` inside a transaction |
+| `migrant` | 0.14.0 | **none** | — |
+| `schemamama` | 0.3.0 | **none** | — |
+| `refinery` | 0.9.2 | **none** | **no** — `cannot run inside a transaction block` |
+
+`grep -rn "pg_advisory\|advisory" --include=*.rs` over the whole Diesel git repository returns
+**nothing**. So the accurate finding is: **exactly one Rust migrator attempts cross-process
+coordination at all, and it is the one that does it the wrong way.** The rest have no lock to be
+wrong. That is not "Rust's tooling is behind on one detail" — it is a different default. Go's goose
+and Atlas both poll a try-lock; the Rust ecosystem largely does not attempt the problem.
+
+**How much this should weigh is less than it first appears.** [0014](../../docs/decisions/0014-schema-migrations.md)
+already chose to run migrations as a **dedicated pre-deploy job, not from application startup** —
+which is a single runner by construction. The three-concurrent-migrators test models the topology
+0014 rejected. The lock is a guard against a botched deploy (a retried Job overlapping a pod that
+lost its lease, a node failure mid-run), not a load-bearing mechanism in the chosen design. It is
+still wanted, which is why goose has one.
+
+`sqlx` with `set_locking(false)` and a hand-rolled `pg_try_advisory_lock` poll was **verified
+0-of-3 failures across every trial** — fifteen lines, and it is the only Rust configuration that
+coordinates correctly. We maintain goose's algorithm; we do not reimplement goose.
 
 ## Q5 — the cost of Rust
 
