@@ -66,7 +66,7 @@ single-contended-row case it characterised:
 | --- | --- |
 | one contended row, unbatched | ~800, plateauing at concurrency 4 then **declining** |
 | one contended row, batched (25) | 3,420 |
-| no global contention, striped | 7,897 |
+| no global contention, striped + single-call | 7,897 |
 
 So (a) costs roughly 8× unbatched and 2× batched — and it is worse than those numbers look,
 because the lock is **global**. Every lever [0007](./0007-open-source-positioning.md) rests on

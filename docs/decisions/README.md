@@ -32,6 +32,7 @@ here, so the ADRs don't each stop to re-explain them.
 | [0008](./0008-durable-timers.md) | Durable timers in Postgres, not Temporal | The need is durable *scheduling*, not workflow orchestration — and a job row commits in the same transaction as the ledger write, which Temporal cannot do | accepted |
 | [0009](./0009-chart-and-completeness.md) | Chart of accounts as data; completeness is a separate invariant | A report missing one account still satisfies the accounting equation — the missing account drops out of both sides | accepted |
 | [0010](./0010-authorization-holds.md) | A hold is a SUM over an append-only event log, not a mutable amount | Grouping a clearing to its authorization is a revisable inference, and processors disagree on whether an increment carries a delta or a cumulative total | accepted |
+| [0011](./0011-what-the-database-enforces.md) | The dozen guards added under adversarial review, and what the database still cannot enforce | A column with a DEFAULT is not a constraint — `recorded_at`, `account_seq` and `xact_id` all had one, and each turned out forgeable by an INSERT | accepted |
 
 ## Non-negotiable
 
@@ -74,6 +75,13 @@ Undecided, listed plainly rather than buried:
 - **The write path requires READ COMMITTED.** Measured: REPEATABLE READ and SERIALIZABLE lose
   most writes to serialization failures on the balance upsert, and a retry loop does not rescue
   it. A hard deployment constraint, recorded in no ADR.
+- **Striping is not built.** The stack summary above quotes striped figures; there is no stripe
+  column in `migrations/`, and `uq_accounts__house` would currently prevent one on the accounts
+  that need it.
+- **There is no CI, and the schema snapshot test is not wired to anything.**
+  `expected_schema.sql` exists and runs; nothing invokes it. [0006](./0006-schema-conventions.md)
+  calls it "the highest-leverage item here" and [0008](./0008-durable-timers.md) says it must cover
+  ADR-quoted SQL — which, twice, it would have caught.
 - **Hash chaining for tamper evidence is deferred, not decided.**
   [0004](./0004-event-log.md) leaves it explicitly open: it needs a total order, so it is entangled
   with [0005](./0005-reproducible-as-of.md). The cost figures quoted there are extrapolated from

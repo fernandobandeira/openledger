@@ -60,8 +60,12 @@ source/destination pair — balanced *by construction*, so no CHECK is needed an
 are independent rows carrying a direction, so we *can* express an unbalanced transaction and
 therefore *must* prevent it. We do both: the write API accepts balanced pairs only (making the
 illegal state unrepresentable), and a deferred constraint trigger is the backstop. Spike 003 ran
-its entire benchmark with that trigger active and never found it to be the bottleneck — up to
-7,897 clearings/s the limit was row-lock contention.
+its entire benchmark with that trigger active and never found it to be the bottleneck. At the top
+of its ladder — 7,897 clearings/s, which is striped 64 ways *and* posting in a single call, on a
+2 GB table — the spike is explicit that the curve "plateaus **because the machine ran out of cores
+rather than because of a lock**. The ceiling moved from the design to the hardware." Striping alone
+at 64 measures 6,524–6,970. Contention binds at the bottom of that ladder, not the top; the trigger
+was never the constraint anywhere on it.
 
 ## Resolved — Temporal is gone
 

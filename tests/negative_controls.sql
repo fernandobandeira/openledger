@@ -74,42 +74,39 @@ CREATE FUNCTION entry(p_tenant text, p_txn uuid, p_acct uuid, p_dir text,
                       p_amt bigint, p_ccy char(3) DEFAULT 'USD', p_seq bigint DEFAULT NULL,
                       p_bal bigint DEFAULT NULL) RETURNS void
 LANGUAGE plpgsql AS $$
-DECLARE v_seq bigint;
+DECLARE v_seq bigint; v_bal bigint;
 BEGIN
-    -- The sequence must come FROM the balance upsert, not from MAX()+1 -- the
-    -- schema now enforces that, because a client-chosen seq was how a gap got
-    -- created and later filled with fabricated turnover. p_seq is still honoured
-    -- so the negative controls can supply a deliberately bad one.
+    -- The running balance must ACCUMULATE. It used to be written as a bare
+    -- +/-amount, which is correct for an account's first entry and wrong for every
+    -- one after -- so any account with two entries genuinely diverged, and the
+    -- drift controls below then fired on the running-balance branch instead of the
+    -- one they name.
+    SELECT COALESCE(input - output, 0) INTO v_bal FROM ledger_account_balances
+     WHERE tenant_id=p_tenant AND account_id=p_acct AND currency=p_ccy;
+    v_bal := COALESCE(v_bal, 0) + CASE WHEN p_dir='debit' THEN p_amt ELSE -p_amt END;
+
+    -- The ENTRY first, then the cache. account_seq is assigned by the engine from
+    -- the journal now, so a helper that picks a sequence from the cache and then
+    -- writes the entry can diverge from it -- which shows up as last_seq drift and
+    -- makes every later drift control assert the wrong branch. Derive the cache
+    -- from what the journal actually recorded. p_seq is still accepted so a control
+    -- can supply a deliberately bad one and watch it be discarded.
+    INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
+                                currency,account_seq,balance_after,effective_at)
+    VALUES (p_tenant,p_txn,p_acct,p_dir::ledger_direction,p_amt,p_ccy,
+            COALESCE(p_seq, 1),
+            COALESCE(p_bal, v_bal),
+            COALESCE((SELECT effective_at FROM ledger_transactions
+                       WHERE tenant_id=p_tenant AND id=p_txn), now()))
+    RETURNING account_seq INTO v_seq;
+
     INSERT INTO ledger_account_balances AS b (tenant_id,account_id,currency,input,output,last_seq)
     VALUES (p_tenant,p_acct,p_ccy,
             CASE WHEN p_dir='debit'  THEN p_amt ELSE 0 END,
-            CASE WHEN p_dir='credit' THEN p_amt ELSE 0 END, 1)
+            CASE WHEN p_dir='credit' THEN p_amt ELSE 0 END, v_seq)
     ON CONFLICT (tenant_id,account_id,currency) DO UPDATE
        SET input=b.input+EXCLUDED.input, output=b.output+EXCLUDED.output,
-           last_seq=b.last_seq+1
-    RETURNING b.last_seq INTO v_seq;
-    v_seq := COALESCE(p_seq, v_seq);
-
-    INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
-                                currency,account_seq,balance_after,effective_at)
-    VALUES (p_tenant,p_txn,p_acct,p_dir::ledger_direction,p_amt,p_ccy,v_seq,
-            COALESCE(p_bal, CASE WHEN p_dir='debit' THEN p_amt ELSE -p_amt END),
-            -- COALESCE: the cross-tenant control deliberately references a
-            -- transaction that does not exist in this tenant, and the FK is what
-            -- should reject it -- not a NOT NULL violation on the way there.
-            COALESCE((SELECT effective_at FROM ledger_transactions
-                       WHERE tenant_id=p_tenant AND id=p_txn), now()));
-
-END $$;
-
--- The baseline must be CLEAN before any drift control runs, or those controls
--- assert nothing. This is the guard that keeps them honest.
-DO $$ BEGIN
-    IF EXISTS (SELECT 1 FROM ledger_balance_drift) THEN
-        RAISE EXCEPTION 'drift baseline is not clean: %',
-            (SELECT string_agg(problem, '; ') FROM ledger_balance_drift);
-    END IF;
-    RAISE NOTICE 'ok  drift baseline is clean';
+           last_seq=EXCLUDED.last_seq;
 END $$;
 
 -- ---------------------------------------------------------------- the controls
@@ -146,6 +143,23 @@ SELECT must_fail('deleting one leg of a balanced transaction', $q$
         (SELECT id FROM ledger_transactions WHERE tenant_id='t1'
           AND event_id=(SELECT id FROM ledger_events WHERE idempotency_key='n1c'))
       AND direction='credit' AND amount_minor=100;
+$q$, 'ledger entries are immutable');
+
+-- 1c-alt. ...and with that guard explicitly lifted -- simulating corruption that
+--     reached the table another way -- the balance trigger is still the backstop.
+SELECT must_fail('deleting one leg, with immutability lifted', $q$
+    DO $d$ DECLARE t uuid := txn('t1','n1calt'); BEGIN
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  900);
+        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 900);
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  100);
+        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 100);
+    END $d$;
+    SET CONSTRAINTS ALL IMMEDIATE;
+    ALTER TABLE ledger_entries DISABLE TRIGGER ck_entries__immutable;
+    DELETE FROM ledger_entries WHERE tenant_id='t1' AND transaction_id IN
+        (SELECT id FROM ledger_transactions WHERE tenant_id='t1'
+          AND event_id=(SELECT id FROM ledger_events WHERE idempotency_key='n1calt'))
+      AND direction='credit' AND amount_minor=100;
 $q$, 'does not balance');
 
 -- 1c-bis. Deleting EVERY leg is "vacuously balanced" -- a zero-row GROUP BY finds
@@ -153,7 +167,8 @@ $q$, 'does not balance');
 --     2-leg transaction was reduced to zero entries, the posted row survived, and
 --     with its cached balances also removed the drift view returned nothing, the
 --     balance sheet balanced, and the equation returned no rows at all.
-SELECT must_fail('deleting EVERY leg of a committed transaction', $q$
+SELECT must_fail('deleting EVERY leg, with immutability lifted', $q$
+    ALTER TABLE ledger_entries DISABLE TRIGGER ck_entries__immutable;
     DO $d$ DECLARE t uuid := txn('t1','n1cb'); BEGIN
         PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  700);
         PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 700);
@@ -253,8 +268,11 @@ $q$, 'fk_entries__txn"');   -- trailing quote: fk_entries__txn is a PREFIX of
 -- 4. an entry carrying a currency its account does not hold. TWO constraints now
 --    enforce this -- the cache's FK carries currency as well -- so it is asserted
 --    on both paths rather than whichever happens to fire first.
+-- the cache's own FK carries currency too, so it is asserted directly rather than
+-- through a path where the entries FK now fires first
 SELECT must_fail('a cached balance in a currency its account does not hold', $q$
-    SELECT entry('t1', txn('t1','n4'), acct('t1','customer_receivable'), 'debit', 500, 'EUR');
+    INSERT INTO ledger_account_balances (tenant_id,account_id,currency,input,output,last_seq)
+    VALUES ('t1', acct('t1','customer_receivable'), 'EUR', 500, 0, 1);
 $q$, 'fk_balances__account');
 
 SELECT must_fail('entry currency <> account currency', $q$
@@ -419,25 +437,34 @@ $q$, 'currency_iso');
 --      it must be the number the balance upsert issued -- which subsumes the
 --      positivity CHECK on the posting path. Both are asserted: the trigger on the
 --      path callers use, and the CHECK on a direct write that skips it.
-SELECT must_fail('an account_seq the balance upsert did not issue', $q$
-    DO $d$ DECLARE t uuid := txn('t1','n10i'); BEGIN
-        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  5, 'USD', 4242);
-    END $d$;
-$q$, 'was not issued by the balance upsert');
-
-SELECT must_fail('a negative account_seq', $q$
-    INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
-                                currency,account_seq,balance_after,effective_at)
-    SELECT 't1', txn('t1','n10i2'), acct('t1','fee_revenue'), 'credit', 5,'USD', -9999, -5, now();
-$q$, 'seq_positive');
+-- account_seq is ASSIGNED from the journal now, so a client-chosen one is not
+-- refused -- it is DISCARDED, which is stronger. Asserted rather than described.
+DO $$
+DECLARE t uuid; v_seq bigint;
+BEGIN
+    t := txn('t1','n10i');
+    PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  5, 'USD', 4242);
+    PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 5, 'USD', 9999);
+    SET CONSTRAINTS ALL IMMEDIATE;
+    SET CONSTRAINTS ALL DEFERRED;
+    SELECT max(account_seq) INTO v_seq FROM ledger_entries
+     WHERE tenant_id='t1' AND account_id = acct('t1','customer_receivable');
+    IF v_seq > 100 THEN
+        RAISE EXCEPTION 'a client-supplied account_seq survived: %', v_seq;
+    END IF;
+    RAISE NOTICE 'ok  a client-supplied account_seq is discarded, not honoured (got %)', v_seq;
+END $$;
 
 -- 10j. an entry may not disagree with its transaction about when it happened
 SELECT must_fail('entry effective_at disagreeing with its transaction', $q$
-    DO $d$ DECLARE t uuid := txn('t1','n10j'); BEGIN
+    DO $d$
+    DECLARE t uuid := txn('t1','n10j');
+    BEGIN
         INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,
                                     amount_minor,currency,account_seq,balance_after,effective_at)
         VALUES ('t1', t, acct('t1','customer_receivable'), 'debit', 5,'USD',900,5,
-                '1999-01-01'::timestamptz);
+                (SELECT effective_at - interval '27 years' FROM ledger_transactions
+                  WHERE tenant_id='t1' AND id = t));
     END $d$;
 $q$, 'fk_entries__txn_effective');
 
@@ -476,6 +503,7 @@ SELECT must_fail('balance_after tampered with', $q$
     -- the FIRST entry, not the last. The alarm compared only last_value() against
     -- a full-partition sum, so corrupting any intermediate running balance was
     -- invisible -- and those are exactly the rows an as-of read returns.
+    ALTER TABLE ledger_entries DISABLE TRIGGER ck_entries__immutable;
     UPDATE ledger_entries SET balance_after = balance_after + 1
      WHERE account_id = acct('t1','customer_receivable') AND account_seq = 1;
     DO $d$ BEGIN
@@ -522,6 +550,10 @@ SELECT must_fail('an intermediate balance_after', $q$
         PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  400);
     END $d$;
     SET CONSTRAINTS ALL IMMEDIATE;
+    -- entries are immutable, so this corruption is only reachable with the guard
+    -- lifted -- which is the point: the alarm exists for damage that got in some
+    -- other way (a restore, a replication bug, a direct write)
+    ALTER TABLE ledger_entries DISABLE TRIGGER ck_entries__immutable;
     UPDATE ledger_entries SET balance_after = balance_after + 5
      WHERE tenant_id='t1' AND account_id = acct('t1','fee_revenue') AND account_seq = 1;
     DO $d$ BEGIN
@@ -535,15 +567,19 @@ $q$, 'drift: running balance diverges');
 -- GROSS TURNOVER. input and output are stored separately precisely so gross
 -- turnover is free -- and it was the one thing nothing validated: adding the same
 -- amount to both left the difference intact and the alarm silent.
+-- Seeded at top level, not inside must_fail: each control is rolled back, so a
+-- seed inside one leaves nothing for its own tamper to act on.
+DO $$ DECLARE t uuid := txn('t1','gross_seed'); BEGIN
+    PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  600);
+    PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 600);
+END $$;
+SET CONSTRAINTS ALL IMMEDIATE;
+SET CONSTRAINTS ALL DEFERRED;
+
+-- GROSS TURNOVER. input and output are stored separately precisely so gross
+-- turnover is free -- and it was the one thing nothing validated: adding the same
+-- amount to both left the difference intact and the alarm silent.
 SELECT must_fail('fabricated gross turnover', $q$
-    -- must_fail rolls back each control, so this one posts its own data rather
-    -- than relying on a predecessor's -- otherwise the account has no entries, the
-    -- UPDATE below matches nothing, and the control asserts nothing.
-    DO $d$ DECLARE t uuid := txn('t1','gt1'); BEGIN
-        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  600);
-        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 600);
-    END $d$;
-    SET CONSTRAINTS ALL IMMEDIATE;
     UPDATE ledger_account_balances SET input = input + 999999, output = output + 999999
      WHERE tenant_id='t1' AND account_id = acct('t1','customer_receivable');
     DO $d$ BEGIN
@@ -554,17 +590,9 @@ SELECT must_fail('fabricated gross turnover', $q$
     END $d$;
 $q$, 'drift: gross turnover');
 
--- last_seq drives the next account_seq. Poisoned downward it is a permanent
--- per-account denial of service; upward it silently corrupts balance_after.
+-- last_seq drives the next account_seq; poisoned, it is a per-account denial of
+-- service upward and silent corruption downward.
 SELECT must_fail('a poisoned last_seq', $q$
-    -- must_fail rolls back each control, so this one posts its own data rather
-    -- than relying on a predecessor's -- otherwise the account has no entries, the
-    -- UPDATE below matches nothing, and the control asserts nothing.
-    DO $d$ DECLARE t uuid := txn('t1','ls1'); BEGIN
-        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  600);
-        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 600);
-    END $d$;
-    SET CONSTRAINTS ALL IMMEDIATE;
     UPDATE ledger_account_balances SET last_seq = last_seq + 40
      WHERE tenant_id='t1' AND account_id = acct('t1','customer_receivable');
     DO $d$ BEGIN
@@ -668,19 +696,17 @@ SELECT must_fail('a lowercase currency on an entry', $q$
            1, 5, now();
 $q$, 'ck_entries__currency_iso');
 
--- account_seq uniqueness: nothing ever ATTEMPTED a duplicate, so the unique index
--- could be demoted to a plain one
--- account_seq uniqueness: nothing ever ATTEMPTED a duplicate, so the unique index
--- could be demoted to a plain one with the suite green. The duplicate goes into
--- the SAME transaction, so ck_txn__has_entries cannot fire first.
-SELECT must_fail('a duplicate account_seq', $q$
+-- account_seq uniqueness. A duplicate is no longer expressible through an INSERT
+-- at all -- the engine assigns the sequence, so a client-supplied one is discarded
+-- and the index has become a backstop rather than the guard. It is tested as a
+-- backstop: with the assignment lifted, the index must still refuse.
+SELECT must_fail('a duplicate account_seq, with assignment lifted', $q$
+    ALTER TABLE ledger_entries DISABLE TRIGGER ck_entries__seq;
     DO $d$ DECLARE t uuid := txn('t1','dup_seq'); BEGIN
-        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  10);
-        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 10);
-        INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,
-                                    amount_minor,currency,account_seq,balance_after,effective_at)
-        VALUES ('t1', t, acct('t1','customer_receivable'), 'debit', 10,'USD', 1, 20,
-                (SELECT effective_at FROM ledger_transactions WHERE id = t));
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  10, 'USD', 1);
+        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 10, 'USD', 1);
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  10, 'USD', 1);
+        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 10, 'USD', 1);
     END $d$;
 $q$, 'uq_entries__account_seq');
 
@@ -754,6 +780,7 @@ BEGIN
     PERFORM entry('t1', t, acct('t1','credit_loss_expense'),         'debit',  700);
     PERFORM entry('t1', t, acct('t1','allowance_for_credit_losses'), 'credit', 700);
     SET CONSTRAINTS ALL IMMEDIATE;
+    SET CONSTRAINTS ALL DEFERRED;   -- restore, or every later txn() fires at INSERT
     SELECT balance_minor, balance_debit_positive INTO v_presented, v_arith
       FROM trial_balance WHERE tenant_id='t1' AND purpose='allowance_for_credit_losses';
     -- asset with a CREDIT normal balance: presented POSITIVE, arithmetic NEGATIVE
@@ -877,13 +904,25 @@ SELECT must_fail('replica: moving a statement line', $q$
 $q$, 'cannot move statement line');
 RESET ROLE;
 
-SELECT must_fail('replica: a client-chosen account_seq', $q$
+-- account_seq is ASSIGNED, so under replica the property to check is that the
+-- assignment still happens -- a client-chosen sequence must be discarded there too,
+-- which is what ENABLE ALWAYS on ck_entries__seq buys.
+DO $$
+DECLARE t uuid; v_seq bigint;
+BEGIN
     SET LOCAL session_replication_role = 'replica';
-    DO $d$ DECLARE t uuid := txn('t1','repl_seq'); BEGIN
-        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit', 5, 'USD', 777);
-    END $d$;
-$q$, 'was not issued by the balance upsert');
-RESET ROLE;
+    t := txn('t1','repl_seq');
+    PERFORM entry('t1', t, acct('t1','fee_revenue'),         'credit', 5, 'USD', 777);
+    PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  5, 'USD', 888);
+    SET CONSTRAINTS ALL IMMEDIATE;
+    SET CONSTRAINTS ALL DEFERRED;
+    SELECT max(account_seq) INTO v_seq FROM ledger_entries
+     WHERE tenant_id='t1' AND account_id = acct('t1','fee_revenue');
+    IF v_seq > 100 THEN
+        RAISE EXCEPTION 'under replica, a client-supplied account_seq survived: %', v_seq;
+    END IF;
+    RAISE NOTICE 'ok  replica: a client-supplied account_seq is still discarded (got %)', v_seq;
+END $$;
 
 SELECT must_fail('replica: mutating a committed transaction', $q$
     SET LOCAL session_replication_role = 'replica';

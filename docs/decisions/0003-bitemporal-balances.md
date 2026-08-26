@@ -85,7 +85,9 @@ recomputation*, which is what Modern Treasury does when a cached balance drifts.
   `balance_after`. A backdated entry landing in a closed period needs explicit handling —
   restatement, or a prior-period adjustment in the open period — which accounting practice
   already requires. **Prerequisite for M5.**
-- **The read cost is unmeasured, and the assumption behind it is now unsafe.** This decision was
+- **The STRIPED read cost is unmeasured, and the assumption behind it is now unsafe.** The
+  unstriped read *was* measured -- 105.91 ms at 1M entries, four points, above. What has not been
+  measured is that same read summed across N stripes. This decision was
   originally justified by "thousands of rows, not millions". Spike 003 measured the *write* path
   only, and found that the accounts touched by every transaction are the shared ones — which are
   therefore also the accounts accumulating the most entries. The account most likely to be queried

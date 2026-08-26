@@ -684,4 +684,10 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
        AND (g.authorized_minor > COALESCE(g.expired_authorized, g.authorized_minor)
          OR g.total_minor      > COALESCE(g.expired_total,      g.total_minor)));
 
+-- ...and once more, for the foreign keys this migration created. Every migration
+-- that adds an FK must repeat this, or that FK is skipped on the replication apply
+-- path -- which is how a whole balanced sub-book was deleted with every report
+-- still green (ADR-0011).
+CALL enforce_triggers_on_replicas();
+
 COMMIT;
