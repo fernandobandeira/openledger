@@ -63,7 +63,7 @@ of entries. **Account** — the thing entries attach to.
 **Running balance** (`balance_after`) — each entry stores the account's balance *after* that entry.
 Makes reading the current balance one index lookup instead of summing history. The figures often
 quoted for this -- 0.018 ms against 105.91 ms at a million entries -- come from a one-off run with
-no harness in the repo; the *shape* is asserted by `tests/query_plans.sql` on every build.
+no harness in the repo; the *shape* was asserted by the deleted `tests/query_plans.sql` suite, on every build, while it existed.
 
 **Recorded date vs effective date** — *when we learned about it* vs *when it happened*. A card
 clearing arrives Tuesday for a purchase Visa dates to Monday. Recorded = Tuesday, effective =
@@ -124,7 +124,7 @@ benchmark.
 disk, which is why a bigger instance doesn't help.
 
 **Striping** — storing one logical account as N physical rows so writers spread across them;
-balance = sum of the stripes. **Not built here**: there is no stripe column in `migrations/`, and
+balance = sum of the stripes. **Not built here**: there is no stripe column in `schema/`, and
 `uq_accounts__house` would currently prevent one on the accounts that need it. Measured in spike 003
 only, on the same single machine as the figure above: 872 → 6,970 clearings/s at 64 stripes.
 

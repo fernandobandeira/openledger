@@ -132,7 +132,7 @@ The *conclusion* survives, and for the same reason: an unswept expired hold stil
 `held_minor` until the flag is set, so a lost timer job leaves the ledger temporarily
 **pessimistic**, never wrong. But the reframe rested on a specific predicate, and that predicate was
 dead — twice, and the second time in the very amendment that fixed the first. The query above was
-executed against `migrations/0001`–`0003` before being written down, which is now the standard: the
+executed against `schema/schema.sql`–`0003` before being written down, which is now the standard: the
 schema snapshot test in [0006](./0006-schema-conventions.md) must cover ADR-quoted SQL, because
 review demonstrably does not.
 

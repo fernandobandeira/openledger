@@ -64,4 +64,4 @@ Everything else was close to a wash — go-jet handled every hard query we have.
   `pgx.RowToStructByNameLax` into the same generated structs.
 
 **Not blocked by this:** M1 is schema and migrations — pure SQL. The spike schema applies cleanly
-with its invariants enforced by Postgres and graduates to `migrations/0001`.
+with its invariants enforced by Postgres and graduates to `schema/schema.sql`.

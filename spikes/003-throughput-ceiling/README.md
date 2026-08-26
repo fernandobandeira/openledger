@@ -341,7 +341,7 @@ choice was never "keep the running balance at 800/s or drop it for 13k". It is:
 | 1,000,000 | **0.018 ms** | **105.91 ms** |
 
 > **NO HARNESS IN THIS REPOSITORY PRODUCES THIS TABLE.** `main.go` here measures the
-> WRITE path only; nothing in `tests/`, `spikes/` or `migrations/` builds a
+> WRITE path only; nothing in `tests/`, `spikes/` or `schema/` builds a
 > 1M-entry account or times a balance read, and `tests/query_plans.sql` asserts
 > plan SHAPE at 200,000 rows without timing anything. These four points are the
 > most-quoted figures in the repository and the basis for "O(1) reads" everywhere

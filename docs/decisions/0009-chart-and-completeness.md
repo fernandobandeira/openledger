@@ -11,7 +11,7 @@ to know what *kind* of account each account is, and a guarantee that a report ha
 left one out.
 
 Both were designed and demonstrated in [spike 004](../../spikes/004-chart-of-accounts/README.md)
-and shipped in [`migrations/0002`](../../migrations/0002_chart_of_accounts.sql). Neither was
+and shipped in [`schema/schema.sql`](../../schema/schema.sql). Neither was
 recorded as a decision — an omission found by adversarial review of this log, which claims on its
 front page to hold *"everything we've decided."*
 
@@ -58,7 +58,7 @@ reference product says it already: *"the bug is never in storage, it's at every 
 an instant into a bucket."*
 
 So completeness is a **separate invariant**. Every account type has a `NOT NULL` financial-statement
-line, and [`balance_sheet`](../../migrations/0002_chart_of_accounts.sql) enumerates **from the chart
+line, and [`balance_sheet`](../../schema/schema.sql) enumerates **from the chart
 outward** — `FROM fs_lines`, left-joining the numbers on, so a line with no activity appears as a
 zero instead of vanishing.
 
@@ -135,7 +135,7 @@ converted into a claim.)*
 - **A hierarchical reporting axis.** `fs_line` is flat; nested subtotals need a tree.
 - **Multi-entity.** The theorem gives a balanced *consolidated* set, not a balanced *per-entity*
   one. Intercompany due-from/due-to accounts are the primitive, and [the golden
-  trace](../../tests/golden_trace.sql) now runs on them: the facility draw, the network settlement
+  trace](../../schema/schema.sql) now runs on them: the facility draw, the network settlement
   and the ACH collection are all cross-scope, and the two sides are asserted to eliminate exactly at
   every step. What is still missing is **elimination in a report** — nothing nets them, so a
   consolidated balance sheet presents intercompany balances gross.

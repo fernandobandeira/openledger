@@ -199,7 +199,7 @@ account physically partitioned, with no accounting consequence.
 
 **`network_settlement_payable` is a perimeter account.** We marked it `is_perimeter = false`. It is
 the archetype — an external party (the card network) holds the authoritative balance and will
-confirm it. Fixed in `migrations/seed/card_chart.sql` (`is_perimeter = t`) — and **not** in the file
+confirm it. Fixed in `schema/chart.sql` (`is_perimeter = t`) — and **not** in the file
 this passage is about: `spikes/004-chart-of-accounts/chart.sql` still ships it `false`. Nothing in
 `spikes/` runs, so that is a stale correction rather than a live defect, but it is the decision
 log's own rule broken in the file that carries the claim.
@@ -228,7 +228,7 @@ invisible to everyone. But three things follow.
 
 ### 1. `ledger_entries` needs a denormalized `tenant_id` — **and now has one**
 
-*Written when it had none.* `migrations/0001` gives `ledger_entries.tenant_id text NOT NULL` and it
+*Written when it had none.* `schema/schema.sql` gives `ledger_entries.tenant_id text NOT NULL` and it
 leads every key; house accounts carry a real tenant too. The reasoning below is why, and it stands:
 tenant would otherwise be reachable only by joining `ledger_accounts`, and an RLS policy containing
 a subquery runs **per row** — a well-known planner trap. Denormalize it, as

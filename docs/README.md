@@ -36,8 +36,13 @@ Two rules run through everything here:
 ```
 make up        # PostgreSQL 18 in Docker
 make migrate   # apply migrations/ and the seed chart
-make test-sql  # the whole suite: tests/run.sh
+make schema    # load schema/schema.sql and the seed chart
+make test      # go test ./...
 ```
 
-`tests/run.sh` prints one line per assertion and `PASS` or `FAIL` on the last line. There is no
-partial credit — a suite that does not run to its own last line is a failure.
+`schema/schema.sql` is a **design artefact, not a product**: it exists to show that the shape these
+documents describe is expressible in PostgreSQL with nothing but tables, `CHECK`s, foreign keys and
+unique indexes — no triggers and no PL/pgSQL. See
+[decisions/0012](./decisions/0012-no-triggers.md) for why that matters, and what it replaced.
+
+The ledger itself is not built yet. `go test ./...` currently covers nothing.

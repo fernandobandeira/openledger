@@ -5,7 +5,7 @@
 *Was `proposed` long after it stopped being open.* Every consequence it lists has shipped — the
 README leads with the ledger, `reference-product.md` is labelled a product spec, house accounts are
 per tenant (`uq_accounts__house`), and the tenant-leading composite keys cite this ADR by name in
-`migrations/0001`. Four other documents treat it as settled authority. What remains open is
+`schema/schema.sql`. Four other documents treat it as settled authority. What remains open is
 **measurement** (nothing on RDS, striping unbuilt), not a question of direction — and open
 measurements belong in "Still open", not in a status field.
 **Date:** 2026-08-25

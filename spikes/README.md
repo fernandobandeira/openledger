@@ -12,7 +12,7 @@ code is its own Go module so its dependencies never leak into the root `go.mod`.
 | [001](./001-formance/) | What can we take from Formance's production ledger? | Their running-balance problem was the **mutable business-date** one, not running balances in general. Ours is the immutable kind, so it stands. | **closed** |
 | [002](./002-sqlc-vs-jet/) | sqlc or go-jet? | **sqlc**, reversing the ADR's own proposal. Arrays were fine under both, so the pre-registered rule never fired; go-jet's silent-zero scan trap decided it. | **closed** |
 | [003](./003-throughput-ceiling/) | Where does the Postgres design top out, and what moves it? | **~800/s → 8,200/s** by removing contention on one shared row. Striping is the mechanism; dropping the running balance is not worth it. | **closed** |
-| [006](./006-append-only-holds/) | Should holds be a mutable row or an append-only event log? | Append-only, and `SUM` being commutative makes it order-tolerant for free. The spike's "one formula covers every edge case" did **not** survive contact: the shipped design in `migrations/0003` has no `group_key` column on the event at all (grouping is its own bitemporal table) and needs a materialised total, a delta/total convention, and expiry snapshots besides. | **closed** — superseded by [ADR-0010](../docs/decisions/0010-authorization-holds.md) |
+| [006](./006-append-only-holds/) | Should holds be a mutable row or an append-only event log? | Append-only, and `SUM` being commutative makes it order-tolerant for free. The spike's "one formula covers every edge case" did **not** survive contact: the shipped design in `schema/schema.sql` has no `group_key` column on the event at all (grouping is its own bitemporal table) and needs a materialised total, a delta/total convention, and expiry snapshots besides. | **closed** — superseded by [ADR-0010](../docs/decisions/0010-authorization-holds.md) |
 | [005](./005-durable-timers/) | Can Postgres replace Temporal for durable timers? | Yes — verified with River; the need is durable *scheduling*, not workflow orchestration, and idempotency already comes from the event log. | **closed** |
 | [004](./004-chart-of-accounts/) | What does a general ledger ship when the chart of accounts is business-specific? | Ship the chart as **data** plus constraints that make the accounting identity a theorem. But the identity does **not** prove completeness — that needs its own guard. | **closed** |
 
@@ -28,14 +28,14 @@ that did not exist when it was written. An earlier version of this paragraph nam
 exceptions; there are no exceptions, and naming two was the same "a banner is a claim about scope"
 error [the decision log](../docs/decisions/README.md) records against itself. Nothing in `spikes/`
 is executed by CI, so "measured" in this directory means "was measured once, against something".
-**The live attestation is [`tests/`](../tests/).**
+**The live attestation is [`tests/`](../schema/).**
 
 | File | What it is |
 | --- | --- |
-| [`002-sqlc-vs-jet/schema.sql`](./002-sqlc-vs-jet/schema.sql) | The ledger schema. **Did not graduate.** `migrations/0001` was written by hand; this schema puts `idempotency_key` on `ledger_transactions`, where ADR-0004 moved it off. |
+| [`002-sqlc-vs-jet/schema.sql`](./002-sqlc-vs-jet/schema.sql) | The ledger schema. **Did not graduate.** `schema/schema.sql` was written by hand; this schema puts `idempotency_key` on `ledger_transactions`, where ADR-0004 moved it off. |
 | [`002-sqlc-vs-jet/invariants.sql`](./002-sqlc-vs-jet/invariants.sql) | Nine invariants: **seven** assert Postgres *refuses* an illegal write, and two are positive controls that must SUCCEED (a balanced transaction; the same idempotency key in a different tenant). The file's own header says so; this line said all nine. |
 | [`002-sqlc-vs-jet/expected_schema.sql`](./002-sqlc-vs-jet/expected_schema.sql) | One `SELECT` that emits a schema summary. ADR-0006 wants a snapshot *guard* built on it -- a committed expected output plus a diff. Neither exists, so this is the query, not the guard. |
 | [`002-sqlc-vs-jet/sqlc.yaml`](./002-sqlc-vs-jet/sqlc.yaml) | The verified codegen config. |
 | [`004-chart-of-accounts/chart.sql`](./004-chart-of-accounts/chart.sql) | Account types as data, with the constraints that keep them honest. |
 | [`004-chart-of-accounts/completeness.sql`](./004-chart-of-accounts/completeness.sql) | The guard against a report silently omitting an account. |
-| [`004-chart-of-accounts/golden_trace.sql`](./004-chart-of-accounts/golden_trace.sql) | **Superseded** by [`tests/golden_trace.sql`](../tests/golden_trace.sql). Still runs against spike 002's schema; against the shipped one it fails on the very first statement, with `null value in column "tenant_id" of relation "ledger_accounts"` — it never reaches a unique index. It also writes `idempotency_key` to a table that no longer has it. |
+| [`004-chart-of-accounts/golden_trace.sql`](./004-chart-of-accounts/golden_trace.sql) | **Superseded** by [`tests/golden_trace.sql`](../schema/schema.sql). Still runs against spike 002's schema; against the shipped one it fails on the very first statement, with `null value in column "tenant_id" of relation "ledger_accounts"` — it never reaches a unique index. It also writes `idempotency_key` to a table that no longer has it. |

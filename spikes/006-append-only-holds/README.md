@@ -6,7 +6,7 @@
 > spike is the evidence base for [ADR-0010](../../docs/decisions/0010-authorization-holds.md).
 >
 >   *(This bullet has itself been corrected. It previously listed three schema
->   mismatches, two of which describe `migrations/0003` and not the file in this
+>   mismatches, two of which describe `schema/schema.sql` and not the file in this
 >   directory: `holds.sql` does have `group_key` and does have `expires_at`. The
 >   conclusion was right; two of its three reasons were not.)*
 > * **`cases.sql` was dead against `holds.sql`, and has been deleted.** It wrote
@@ -20,14 +20,14 @@
 >   executed against anything. A file whose only property is "this does not run"
 >   costs a reader a visit and teaches nothing the sentence above does not; the
 >   live attestation of every one of these cases is
->   [`tests/card_holds.sql`](../../tests/card_holds.sql).
+>   [`tests/card_holds.sql`](../../schema/schema.sql).
 > * **"Surveying eleven issuer-processors" was fabricated**, and "six of eleven"
 >   with it. Three processors are surveyed below. They disagree, which is the real
 >   finding and the reason the design exists; the sample size was invented.
 >
 > The live attestation of this design is
-> [`tests/card_holds.sql`](../../tests/card_holds.sql), which runs on every
-> `make test-sql` against `migrations/0003`. Nothing in this directory is executed
+> [`tests/card_holds.sql`](../../schema/schema.sql), which runs on every
+> `make test-sql` against `schema/schema.sql`. Nothing in this directory is executed
 > by CI, and it is kept as a record of how the design was reached.
 
 ## The question
