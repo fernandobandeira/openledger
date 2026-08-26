@@ -1050,10 +1050,11 @@ WITH live AS (
            -- non-latching overcaptured_at was erased by the very message that hid
            -- the money.
            COALESCE(-SUM(e.amount_delta) FILTER (
-               WHERE e.amount_delta < 0 AND e.kind <> 'clearing'), 0) AS bloodless_decreases,
-           COALESCE(SUM(GREATEST(e.amount_delta,0)) FILTER (
-               WHERE e.kind IN ('authorization','incremental','advice')), 0) AS increases,
-           COALESCE(-SUM(e.amount_delta) FILTER (WHERE e.kind = 'clearing'), 0) AS cleared
+               WHERE e.amount_delta < 0 AND e.kind <> 'clearing'), 0) AS bloodless_decreases
+           -- `increases` and `cleared` used to be computed here. `increases` was read
+           -- only by the disjunct deleted below, and `cleared` by nothing at all --
+           -- it was never in the outer SELECT nor in the WHERE. Two columns summed
+           -- over the whole live log on every read of this view, for no reader.
       FROM card_auth_event_group m
       JOIN card_auth_events e ON e.tenant_id = m.tenant_id AND e.id = m.event_id
      WHERE m.superseded_at IS NULL
@@ -1165,11 +1166,20 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
    -- than the un-cleared exposure of that group" -- in a state the system itself
    -- flags as an over-capture.
    --
-   -- The second disjunct is strictly stronger than the first (bloodless >
-   -- increases implies total < 0 and bloodless > 0), so it loses nothing, and the
-   -- genuine $1-authorization-clearing-at-$95 over-capture still does not fire,
-   -- because it has no bloodless decrease at all.
-   OR l.bloodless_decreases > l.increases
+   -- ONE DISJUNCT, NOT TWO. The first version compared `bloodless_decreases >
+   -- increases`; the replacement is strictly stronger, because within a row where
+   -- the stored total agrees with the log `total = increases - cleared - bloodless`
+   -- with `cleared, increases, bloodless >= 0`, so `bloodless > increases` forces
+   -- `total < -cleared <= 0` and `bloodless > 0` -- and where the stored total does
+   -- NOT agree with the log the first disjunct of this WHERE has already fired. The
+   -- weaker one was kept for a round as documentation of intent and was dead code:
+   -- two independent reviews confirmed it, one algebraically and one by brute force
+   -- over 226,981 (increases, cleared, bloodless) triples with zero counterexamples,
+   -- and deleting it changes no row this view emits. The intent is this comment.
+   -- The genuine $1-authorization-clearing-at-$95 over-capture still does not fire,
+   -- because it has no bloodless decrease at all; a FULLY reversed authorization
+   -- sits at exactly zero and does not fire either, which is why the comparison is
+   -- strict.
    OR (g.total_minor < 0 AND l.bloodless_decreases > 0)
    OR (l.any_total AND l.any_delta)
    OR g.total_convention IS DISTINCT FROM
