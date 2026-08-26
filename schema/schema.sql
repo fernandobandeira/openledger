@@ -137,10 +137,29 @@ CREATE TABLE account_types (
     fs_statement   text GENERATED ALWAYS AS (
         CASE WHEN category IN ('revenue','expense') THEN 'income_statement'
              ELSE 'balance_sheet' END) STORED,
+    -- DERIVED FROM CATEGORY ONLY, on both statements. `side` on fs_lines is the
+    -- LINE's presentation sign, not the account's lean, and conflating the two made
+    -- CONTRA-REVENUE UNBUILDABLE. Refunds and chargebacks are revenue category with
+    -- a DEBIT normal balance; while this consulted normal_balance they derived
+    -- side='debit', `revenue` is the only credit-side income line in the chart, and
+    -- so the foreign key below admitted exactly one home for them -- a COST line.
+    -- Measured: 80.00 of refunds against 250.00 gross printed Revenue 250.00
+    -- against a true net 170.00, a 47% overstatement, with cost of revenue equally
+    -- wrong and NET INCOME CORRECT, so every aggregate stayed green. The chart
+    -- author could not avoid it; the key refused the right answer.
+    --
+    -- The balance-sheet half was already category-only, which is exactly why a
+    -- contra-ASSET works: allowance_for_credit_losses is asset/credit and reports
+    -- under Accounts receivable. This is the same rule, applied to both halves.
+    -- income_statement already nets a debit into a credit line correctly
+    -- (`CASE WHEN f.side='credit' THEN -1 ELSE 1 END`), so nothing downstream
+    -- changes. The guard still bites in the direction it was built for: an expense
+    -- type still cannot report under Revenue, and a revenue type still cannot
+    -- report under a cost line.
     fs_side        text GENERATED ALWAYS AS (
-        CASE WHEN category IN ('revenue','expense') THEN
-                  CASE WHEN normal_balance = 'credit' THEN 'credit' ELSE 'debit' END
-             WHEN category = 'asset'               THEN 'asset'
+        CASE WHEN category = 'revenue' THEN 'credit'
+             WHEN category = 'expense' THEN 'debit'
+             WHEN category = 'asset'   THEN 'asset'
              ELSE 'liability_equity' END) STORED,
     CONSTRAINT fk_types__fs_line FOREIGN KEY (fs_line, fs_statement, fs_side)
         REFERENCES fs_lines (code, statement, side),
@@ -229,6 +248,13 @@ CREATE TABLE ledger_events (
     -- sha256 of the canonical request body. Same key + same hash -> replay the
     -- stored result. Same key + DIFFERENT hash -> reject: silently replaying the
     -- wrong result is worse than failing.
+    --
+    -- BUT THAT IS A RULE FOR THE WRITER, NOT A GUARANTEE OF THIS TABLE, and this
+    -- comment used to read as if it were one. uq_events__idempotency rejects the
+    -- second insert only if the caller lets it: `INSERT ... ON CONFLICT DO NOTHING`
+    -- swallows a same-key/different-hash replay in silence, which is exactly the
+    -- shape a retry loop reaches for. The unique index cannot tell a deliberate
+    -- DO NOTHING from a bug. Verified: accepted, no error, no row, no rejection.
     idempotency_hash bytea NOT NULL,
     payload          jsonb NOT NULL,
     effective_at     timestamptz NOT NULL,
@@ -719,6 +745,7 @@ FROM ledger_entries e
 JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
                           AND x.status = 'posted'
 JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
+                      AND a.currency  = e.currency
 JOIN account_types   t ON t.code = a.purpose
 GROUP BY a.tenant_id, a.id, a.owner_id, a.purpose, t.category, t.normal_balance, e.currency;
 
@@ -734,6 +761,7 @@ WITH dp AS (
     JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
                               AND x.status = 'posted'
     JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
+                      AND a.currency  = e.currency
     JOIN account_types   t ON t.code = a.purpose
     GROUP BY e.tenant_id, e.currency, t.fs_line
 ), scopes AS (SELECT DISTINCT tenant_id, currency FROM ledger_accounts)
@@ -759,6 +787,16 @@ ORDER BY tenant_id, currency, sort_order;
 --
 -- ADR-0007 claimed "reports enumerate from the chart outward, so there is no
 -- parameter in which to pass an incomplete account list." That was ASPIRATIONAL:
+-- CURRENCY IS PART OF THE ACCOUNT IDENTITY, so every join above re-asserts it.
+-- fk_entries__account is (tenant_id, account_id, currency); on the replication
+-- apply path that key is skipped, and an entry then existed in a currency its
+-- account does not hold. trial_balance joined on (tenant_id, id) alone and
+-- reported it; balance_sheet and income_statement derive their scopes FROM
+-- ledger_accounts, so they could not see it at all. 50,000.00 EUR of balanced,
+-- permanently unremovable entries appeared in one report and neither statement.
+-- Joining on the currency too makes the three agree: the orphan is now absent
+-- from all of them, which is a visible zero rather than a divergence.
+--
 -- trial_balance starts FROM ledger_entries and
 -- enumerate INWARD, so an account with no entries is simply absent. This view is
 -- the claim made true -- it starts FROM fs_lines and left-joins the numbers on, so
@@ -778,6 +816,7 @@ WITH dp AS (
     JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
                               AND x.status = 'posted'
     JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
+                      AND a.currency  = e.currency
     JOIN account_types   t ON t.code = a.purpose
     GROUP BY e.tenant_id, e.currency, t.fs_line, t.category
 ), scopes AS (
