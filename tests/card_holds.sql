@@ -333,11 +333,22 @@ DO $$
 DECLARE v_fn bigint; v_raw bigint;
 BEGIN
     v_fn := held_for_company('t1','acme','USD');
-    SELECT COALESCE(SUM(total_minor),0) INTO v_raw FROM card_hold_groups
+    -- Sum of held_minor over ALL groups, including those the function's
+    -- `held_minor > 0` predicate skips. Comparing against SUM(total_minor) did not
+    -- kill the mutation it names -- swapping held_minor for total_minor leaves that
+    -- predicate in place, which already excludes the over-captured group, so both
+    -- sums came out identical. This comparison has no such escape.
+    SELECT COALESCE(SUM(held_minor),0) INTO v_raw FROM card_hold_groups
      WHERE tenant_id='t1' AND company_id='acme' AND currency='USD';
-    IF v_fn <= v_raw THEN
-        RAISE EXCEPTION 'held_for_company (%) did not clamp: raw total sum is %',
+    IF v_fn IS DISTINCT FROM v_raw THEN
+        RAISE EXCEPTION 'held_for_company (%) disagrees with the sum of held_minor (%)',
             v_fn, v_raw;
+    END IF;
+    IF (SELECT COALESCE(SUM(total_minor),0) FROM card_hold_groups
+         WHERE tenant_id='t1' AND company_id='acme' AND currency='USD') >= v_fn THEN
+        RAISE EXCEPTION 'the clamp is not reducing anything: held % vs raw totals %',
+            v_fn, (SELECT SUM(total_minor) FROM card_hold_groups
+                    WHERE tenant_id='t1' AND company_id='acme' AND currency='USD');
     END IF;
     RAISE NOTICE 'ok  held_for_company clamps and honours expiry: % vs raw %', v_fn, v_raw;
 END $$;
@@ -414,8 +425,8 @@ SELECT record_auth_event('t1','v0','g_verify','acme','card_v',
         'authorization', 0,'USD',false, now());
 SELECT eq('a $0.00 verification authorization is accepted',
           (SELECT count(*) FROM card_auth_events WHERE processor_msg_id='v0'), 1);
-SELECT eq('...and holds nothing', held_for_company('t1','acme','USD')
-          - held_for_company('t1','acme','USD'), 0);
+SELECT eq('...and its group holds nothing',
+          (SELECT held_minor FROM card_hold_groups WHERE group_key='g_verify'), 0);
 
 -- =========================================================== more refusals
 
@@ -738,6 +749,22 @@ $q$, 'post-expiry drift');
 
 SELECT record_auth_event('t1','ex1','g_ex1','acme','card_e1',
         'authorization', 9000,'USD',false, now());
+-- ...and the COMPANY filter, which the tenant test cannot reach: two companies in
+-- ONE tenant sharing an inferred group key, which is a real state because group_key
+-- comes from network values that are not per-company. Expiring one must not release
+-- the other.
+SELECT record_auth_event('t1','exc_a','g_share_exp','acme','card_x1',
+        'authorization', 4400,'USD',false, now());
+SELECT record_auth_event('t1','exc_b','g_share_exp','globex','card_x2',
+        'authorization', 5500,'USD',false, now());
+SELECT expire_hold_group('t1','acme','g_share_exp');
+SELECT eq('expiring one company''s group leaves the other company''s alone',
+          (SELECT held_minor FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='globex' AND group_key='g_share_exp'), 5500);
+SELECT eq('...and the expired one is released',
+          (SELECT held_minor FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_share_exp'), 0);
+
 -- a tenant of its own: t2 already carries a hold from the multiplicities block
 SELECT record_auth_event('t3','ex2','g_ex1','acme','card_e2',
         'authorization', 3000,'USD',false, now());
