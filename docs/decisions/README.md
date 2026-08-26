@@ -169,6 +169,14 @@ Two rules follow, and they are cheap:
 
 - **A third-party figure needs a fetchable source next to it**, or it is marked unverified. Not
   softened — marked. "I could not check this" is a finding, not an embarrassment.
+  *This rule is not yet satisfied.* An audit counted **five** external URLs across the whole tree
+  against dozens of third-party figures — Uber, Modern Treasury, Fragment, Monzo, Adyen, Shopify,
+  Supabase, Blnk, the accounting-standard paragraph citations, and every processor message-shape
+  claim. The sections carrying the bulk of them now open with a banner saying so
+  ([spike 003](../../spikes/003-throughput-ceiling/README.md#external-validation--what-the-industry-does),
+  [spike 004](../../spikes/004-chart-of-accounts/README.md#prior-art),
+  [0008](./0008-durable-timers.md#why)). A banner is weaker than a URL next to each claim, and is
+  an interim measure, not the rule being met.
 - **Corrections get applied to the document that carries the claim**, not only to the ADR that
   discovered it. Three struck numbers stayed live in the migrations and spikes they came from,
   while the ADRs said "fabricated — struck". *This rule was itself violated the day it was

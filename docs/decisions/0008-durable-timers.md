@@ -33,6 +33,14 @@ dependency at all.
 
 ## Why
 
+> **Sourcing note.** The Temporal, Rails/Solid Queue and pricing claims below have
+> no fetchable source recorded next to them, so by this log's own rule they are
+> **unverified** — except the four that were checked against primary sources and
+> are marked inline. One of them was found overstated in a later round ("ships no
+> RBAC" — it ships RBAC *off by default*), which is what an unsourced claim looks
+> like when it fails.
+
+
 **The requirement is durable *scheduling*, not workflow *orchestration*.** The longest chain in
 the design is two steps (ACH settles → wait → post). Nothing uses Temporal's distinguishing
 features: workflow-as-code with replay, signals into running workflows, child workflows, or
