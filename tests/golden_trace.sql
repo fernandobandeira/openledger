@@ -615,3 +615,5 @@ BEGIN
 END $$;
 
 ROLLBACK;
+
+DO $$ BEGIN RAISE NOTICE 'ok  SUITE-COMPLETE golden_trace'; END $$;

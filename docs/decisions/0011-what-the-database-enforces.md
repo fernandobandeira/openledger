@@ -89,6 +89,59 @@ The alarm's scope also grew, for the same reason — it now compares per-row run
 just the last one), the cached net balance, `input` and `output` *individually*, and `last_seq`.
 Each of those was a state that had been reachable while the view stayed empty.
 
+### The journal cannot be emptied
+
+`TRUNCATE ledger_entries, ledger_account_balances` left eleven transactions standing with zero
+entries, all three currencies reporting `balanced = t`, drift at zero rows, and the accounting
+equation satisfied. Nothing was wrong with any report; there was simply nothing left to disagree
+with. **Silence read as assent** — the same shape as an empty report that "found no problems".
+
+`ck_txn__has_entries` could not speak, and this is worth being precise about, because it looks
+like the guard that should have: it is a DEFERRED constraint trigger, so it fires at the commit of
+a statement that *touched* a transaction. `TRUNCATE` is not such a statement. The transactions were
+never touched; their entries just stopped existing.
+
+Two things changed. `BEFORE TRUNCATE ... FOR EACH STATEMENT` triggers, `ENABLE ALWAYS`, on
+`ledger_entries`, `ledger_transactions`, `ledger_events` and `ledger_accounts` — verified to hold
+against `GRANT ALL`, `SET ROLE openledger_app`, `CASCADE`, and `session_replication_role =
+'replica'`. And `ledger_transaction_drift`, a standing cross-check of the two journal tables
+against each other, because the two of them agreeing with a *third* thing is not the same as
+agreeing with each other.
+
+The comment beside the `REVOKE`s said, in as many words, *"Nothing in SQL can stop that."* A
+reviewer disproved it in four lines. **A "cannot" in this repository is a claim like any other**,
+and this one had been sitting there being believed.
+
+### An event log with no immutability guard
+
+`ledger_events` was the one table with an assign-on-insert trigger and nothing to stop an UPDATE
+afterwards, so `recorded_at` was assigned and then rewritable — and so was `idempotency_hash`, the
+column whose entire job is *same key, different body, refuse*. Rewrite the hash and the next replay
+of that key returns the wrong stored result. The same guard now covers `card_auth_events`.
+
+### An account's owner is part of what its history means
+
+`purpose`, `currency` and `tenant_id` were frozen — by the unique indexes and the composite foreign
+keys entries carry. **Who the account belongs to was not.** One UPDATE moved 110,000 of receivable
+from a named company to `owner_id NULL`: every balance identical, the trial balance still balanced,
+`ledger_balance_drift` silent. None of them read the owner. A receivable owed by nobody is not a
+receivable, and there is no journal entry to reverse, because nothing was posted.
+
+`metadata` stays mutable: it is annotation. `purpose` deliberately stays with 0002's entry-aware
+guard rather than being frozen here too — duplicating it would shadow the better message and leave
+the richer guard permanently unreachable.
+
+### A correction must point at something it can correct
+
+`resolves_id` and `reverses_id` each had a foreign key, so the target had to **exist**. Nothing
+required it to be in a state the correction means anything against. A posted transaction
+"resolved" by another posted one, and a pending one "reversed", took revenue to **−49,223** with
+drift at 0 and the equation balanced — because both halves were internally consistent journal
+entries. The referential integrity was real; the semantic linkage was assumed.
+
+This is decidable at INSERT because a transaction's status can never change: `ck_txn__immutable`
+refuses every UPDATE, and pending → posted is a *new row* pointing back through `resolves_id`.
+
 ### `ENABLE ALWAYS` on every trigger, and on the foreign keys
 
 `session_replication_role = 'replica'` is the logical-replication apply path and what
@@ -138,9 +191,14 @@ a sheet missing, reporting balanced.
 
 Recorded here because the alternative is implying it can.
 
-- **`GRANT ALL` re-grants everything, including `TRUNCATE`.** A `REVOKE` is a point-in-time change
-  to a privilege, not a standing prohibition. Append-only comes from the narrow `GRANT` and from
-  never widening it; the `REVOKE` lines make the intent legible in review and nothing more.
+- **`GRANT ALL` re-grants everything.** A `REVOKE` is a point-in-time change to a privilege, not a
+  standing prohibition, so the narrow `GRANT` is a matter of discipline. This entry used to end
+  "including `TRUNCATE`", and to say that nothing in SQL could stop that — see the new section
+  above, which is what happens when a reviewer takes a "cannot" literally.
+- **`session_replication_role` can still be set by a superuser to something no trigger sees.**
+  Every internal trigger here is `ENABLE ALWAYS`, which covers the replica path, but nothing covers
+  a superuser who drops the triggers outright. At that point the defence is backups and audit, not
+  the schema.
 - **Table inheritance disarms every constraint.** A child of `ledger_entries` inherits CHECKs and
   nothing else — no FKs, no unique indexes, no triggers — while remaining visible through the
   parent to every view. It needs `CREATE` on the schema, so it is an operator path, not an app one.
