@@ -61,7 +61,10 @@ Undecided, listed plainly rather than buried:
   under concurrent writes*, which needs a commit-ordered cursor.
 - **`counterparty_scope` and `is_perimeter` are declarative.** Both are documented at length, both
   carry CHECK constraints, and no view or function reads either. The offsetting rule ADR-0009 §5
-  states as a mechanism is not implemented.
+  states as a mechanism is not implemented. A consequence worth stating: because nothing reads
+  them, **a wrong value in either is undetectable by any test** — mutation testing flips them and
+  nothing fails, and no test we could write would change that without first building the mechanism.
+  They are documentation stored in a column.
 - **Row-level security does not exist yet.** `migrations/` contains no `CREATE POLICY` and no
   `ENABLE ROW LEVEL SECURITY`, while [0001](./0001-go-and-postgres.md) asserts "tenant isolation
   *is* row-level security" and spike 004 calls it a correctness constraint. `tenant_id` leading
@@ -106,6 +109,10 @@ Undecided, listed plainly rather than buried:
   [0010](./0010-authorization-holds.md): a same-total race whose outcome depends on arrival order
   (50.00 or 100.00 held), and a regroup that can deadlock against an unsorted multi-group caller.
   Both fail closed — availability, not correctness — and neither has a fix in the schema.
+- **Shipped surface nothing reads.** `webhook_deliveries`, `hold_expires_at` and `clearing_deadline`
+  exist in `migrations/0003`, carry rationale in comments, and are referenced by no view, no
+  function and no test. They are either the next milestone's work or dead weight; recorded here
+  rather than left to be discovered as "untested".
 - **Posting rules.** A deployment declares its own accounts; it must also declare how a business
   event becomes entries. Adyen proves those templates balance at design time. We have not designed
   ours.
@@ -148,6 +155,27 @@ Two rules follow, and they are cheap:
   and contained six, none of which run against the schema in the same directory. Nothing in
   `spikes/` is executed by CI, so "measured" there means "was measured once, against something".
   The live attestation is `tests/`.
+
+## On mutation testing
+
+Four rounds of adversarial review have used the same measure: change the schema so it is wrong, and
+see whether the suite notices. It is the only measure that distinguishes a test suite from a
+transcript. Two things learned the hard way:
+
+**An "equivalent mutant" is a claim, and it needs an argument.** Reviewers have reported real gaps
+as equivalent and equivalent mutants as real gaps, and both cost a round. The ones now recorded as
+genuinely equivalent each have a one-line reason: `SUM(held_minor)` vs `SUM(total_minor)` under
+`held_minor > 0` (`held_minor` is `GREATEST(total_minor,0)`, so under that predicate they are the
+same number); dropping `tenant_id` from a partition key (ids are `uuidv7`, globally unique); and —
+found by us, not by a reviewer — **swapping the `assets` and `liabilities_and_equity` output
+columns of `balance_sheet_balances`**, which a reviewer reported as a gap. On a balanced sheet
+those two numbers are equal by construction, so no assertion about a balanced book can tell them
+apart. The mutant is only distinguishable on books that are already broken.
+
+**A control has to fail for its own reason.** The post-expiry drift control raised
+`authorized_minor`, which also makes the stored total disagree with the log — so it fired on the
+stored-vs-log branch and the branch it named could be deleted with the test still green. Lowering
+the *snapshot* instead isolates it. The same lesson as the `must_fail` reason strings, one level up.
 
 ## How this log works
 

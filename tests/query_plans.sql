@@ -137,13 +137,53 @@ BEGIN
          WHERE tenant_id = 'p1'
            AND account_id = (SELECT id FROM ledger_accounts WHERE tenant_id='p1')
            AND effective_at <= now()$q$ INTO v_plan;
+    -- BOTH BRANCHES USED TO EMIT A NOTICE, so this assertion could not fail --
+    -- it was pinned only by coincidence, because the file emitted exactly as many
+    -- `ok` lines as its floor and the note branch would have tripped it. Adding
+    -- one more assertion anywhere in this file re-vacated it. The claim is
+    -- ADR-0003's, and it is falsifiable: state it as one.
     IF v_plan !~ 'Seq Scan' THEN
-        RAISE NOTICE 'note: the business-date aggregate now uses an index -- if '
-            'period checkpoints landed, this file should assert their plan instead';
-    ELSE
-        RAISE NOTICE 'ok  business-date aggregate is a scan, as ADR-0003 says (unbounded, M5)';
+        RAISE EXCEPTION E'the business-date aggregate no longer scans. That is not '
+            'a failure -- it means period checkpoints or a new index landed, and '
+            'ADR-0003''s "linear in history, nothing bounds it" is now wrong. '
+            'Update the ADR and assert the new plan here:\n%', v_plan;
     END IF;
+    RAISE NOTICE 'ok  business-date aggregate is a scan, as ADR-0003 says (unbounded, M5)';
 END $$;
+
+-- 5. The indexes the ledger's hot reads depend on must EXIST. Dropping
+--    ix_entries__balance_lookup, ix_entries__effective or ix_entries__txn changed
+--    no plan this file asserts and no answer any other file checks -- a silently
+--    slower ledger, which is the failure mode 0006 is written about ("dropping a
+--    column silently drops its indexes -- Formance lost a hot-path index that way
+--    for thirty migrations").
+DO $$
+DECLARE want text; missing text := '';
+BEGIN
+    FOREACH want IN ARRAY ARRAY['ix_entries__balance_lookup','ix_entries__effective',
+                                'ix_entries__txn','ix_entries__asof_recorded',
+                                'uq_entries__account_seq','ix_hold_groups__held']
+    LOOP
+        IF to_regclass(want) IS NULL THEN missing := missing || want || ' '; END IF;
+    END LOOP;
+    IF missing <> '' THEN
+        RAISE EXCEPTION 'index(es) gone: %', missing;
+    END IF;
+    RAISE NOTICE 'ok  every hot-path index still exists';
+END $$;
+
+-- 6. held_for_company is the ~1s real-time authorization read -- the whole reason
+--    the hold total is materialised at all -- and it had no plan coverage. Only
+--    ledger_entries did.
+INSERT INTO card_hold_groups (tenant_id, company_id, group_key, currency, total_minor)
+SELECT 'p1', 'co'||(g % 200), 'k'||g, 'USD', 100 FROM generate_series(1,20000) g;
+UPDATE card_hold_groups SET expired_at = now()
+ WHERE tenant_id='p1' AND group_key <> 'k1' AND (substring(group_key from 2))::int % 3 <> 0;
+ANALYZE card_hold_groups;
+SELECT plan_uses('held_for_company', $q$
+    SELECT SUM(held_minor) FROM card_hold_groups
+     WHERE tenant_id='p1' AND company_id='co1' AND currency='USD' AND held_minor > 0
+$q$, 'ix_hold_groups__held');
 
 ROLLBACK;
 

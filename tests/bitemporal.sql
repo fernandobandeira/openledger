@@ -123,6 +123,35 @@ SELECT eqv('recorded axis, as of 31 Mar: still nothing',
 SELECT eqv('recorded axis, as of now: everything',
     (SELECT revenue FROM accounting_equation('bt', now(), 'recorded')), 527);
 
+-- ...and the predicate must READ THE ROW. The three assertions above are all
+-- BOUNDARY tests -- 0, 0, everything -- because every fixture row was recorded in
+-- this one session, so the recorded axis has no intermediate value to check
+-- against. Replacing `en.recorded_at <= p_as_of` with a comparison between two
+-- constants therefore satisfied all three, and the recorded axis was attested by
+-- nothing at all.
+--
+-- The fix is to aim at the boundary itself, from both sides, using the value the
+-- ENGINE assigned rather than a date this file chose. No constant predicate can
+-- be true at `recorded_at` and false one microsecond earlier.
+DO $$
+DECLARE v_rec timestamptz; v_at bigint; v_before bigint;
+BEGIN
+    SELECT max(en.recorded_at) INTO v_rec FROM ledger_entries en WHERE en.tenant_id='bt';
+    SELECT revenue INTO v_at     FROM accounting_equation('bt', v_rec, 'recorded');
+    SELECT revenue INTO v_before FROM accounting_equation('bt',
+        v_rec - interval '1 microsecond', 'recorded');
+    IF v_at <> 527 THEN
+        RAISE EXCEPTION 'as of the recording instant itself the ledger reports %, not 527 '
+                        '-- the axis is exclusive where it should be inclusive', v_at;
+    END IF;
+    IF v_before >= 527 THEN
+        RAISE EXCEPTION 'one microsecond BEFORE the last recording the ledger already '
+                        'reports % -- the predicate is not reading recorded_at at all', v_before;
+    END IF;
+    RAISE NOTICE 'ok  the recorded axis turns over AT the recording instant (% -> %)',
+        v_before, v_at;
+END $$;
+
 -- THE POINT, as an assertion: on the same instant the two axes disagree, and each
 -- holds something the other does not. Effective knows February (backdated, not yet
 -- recorded on 28 Feb); recorded knows May (post-dated, already recorded).

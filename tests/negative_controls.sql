@@ -211,7 +211,7 @@ $q$, 'sealed');
 SELECT must_fail('TRUNCATE as the app role', $q$
     SET LOCAL ROLE openledger_app;
     TRUNCATE ledger_entries;
-$q$, 'permission denied');
+$q$, 'permission denied for table ledger_entries');
 RESET ROLE;
 
 -- 1d. session_replication_role='replica' is the logical-replication apply path and
@@ -315,14 +315,14 @@ SELECT must_fail('UPDATE on ledger_entries as the app role', $q$
     SET CONSTRAINTS ALL IMMEDIATE;
     SET LOCAL ROLE openledger_app;
     UPDATE ledger_entries SET amount_minor = 1 WHERE tenant_id='t1';
-$q$, 'permission denied');
+$q$, 'permission denied for table ledger_entries');
 RESET ROLE;
 
 -- 7. DELETE likewise
 SELECT must_fail('DELETE on ledger_entries as the app role', $q$
     SET LOCAL ROLE openledger_app;
     DELETE FROM ledger_entries WHERE tenant_id='t1';
-$q$, 'permission denied');
+$q$, 'permission denied for table ledger_entries');
 RESET ROLE;
 
 -- 8. an account may not disagree with its own type
@@ -439,13 +439,13 @@ $q$, 'but type');
 -- 10g. the statement line an account reports under may not be silently rewritten
 SELECT must_fail('moving a type to a different statement line', $q$
     UPDATE account_types SET fs_line='other_assets' WHERE code='interchange_revenue';
-$q$, 'cannot move');
+$q$, 'from statement line revenue to other_assets');
 
 -- 10h. a lowercase currency code splits "per currency" on spelling
 SELECT must_fail('lowercase currency code', $q$
     INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
     VALUES ('t1','house',NULL,'fbo_cash','asset','debit','usd');
-$q$, 'currency_iso');
+$q$, 'ck_accounts__currency_iso');
 
 -- 10i. account_seq orders history. A client-chosen one is refused outright now --
 --      it must be the number the balance upsert issued -- which subsumes the
@@ -1193,7 +1193,7 @@ $q$, 'cannot reverse');
 RESET ROLE;
 
 -- ...and the legitimate shapes still work, or the guard above is just a wall
-DO $$ DECLARE a uuid; b uuid; BEGIN
+DO $$ DECLARE a uuid; b uuid; c uuid; BEGIN
     INSERT INTO ledger_transactions (tenant_id,kind,status,effective_at)
     VALUES ('t1','neg','pending',now()) RETURNING id INTO a;
     PERFORM entry('t1', a, acct('t1','customer_receivable'), 'debit',  100);
@@ -1203,7 +1203,12 @@ DO $$ DECLARE a uuid; b uuid; BEGIN
     PERFORM entry('t1', b, acct('t1','customer_receivable'), 'debit',  100);
     PERFORM entry('t1', b, acct('t1','interchange_revenue'), 'credit', 100);
     INSERT INTO ledger_transactions (tenant_id,kind,status,effective_at,reverses_id)
-    VALUES ('t1','neg','posted',now(),b);
+    VALUES ('t1','neg','posted',now(),b) RETURNING id INTO c;
+    -- ...with its legs. Left entry-less this transaction sat as a PENDING deferred
+    -- violation for the rest of the file, and the next control that forced
+    -- constraints immediate died on it instead of on its own subject.
+    PERFORM entry('t1', c, acct('t1','customer_receivable'), 'credit', 100);
+    PERFORM entry('t1', c, acct('t1','interchange_revenue'), 'debit',  100);
     RAISE NOTICE 'ok  pending->resolved and posted->reversed are both still legal';
 END $$;
 
@@ -1231,6 +1236,228 @@ SELECT must_fail('asking an empty ledger whether it balances', $q$
         CREATE TEMP TABLE _probe AS SELECT * FROM accounting_equation('nobody');
     END $d$;
 $q$, 'unknown tenant');
+
+-- ============================ round 4: guards nothing was defending
+--
+-- A mutation audit ran 271 mutants against the schema. These are the ones that
+-- survived: each is a constraint or a filter that could be deleted, or quietly
+-- narrowed, with the whole suite still green. Grouped by what the deletion buys
+-- an attacker, because that is what decides which ones mattered.
+
+-- ---------------------------------------------------------- the chart's guards
+-- Every seed-chart mutation was caught BY these triggers at migration time, so
+-- the triggers defended the chart and nothing defended the triggers. Both must
+-- fire on UPDATE as well as INSERT -- 0002 says so in as many words, and both
+-- could be reduced to BEFORE INSERT with the suite green.
+SELECT must_fail('an asset type on an income-statement line', $q$
+    INSERT INTO account_types (code,category,normal_balance,description,fs_line)
+    VALUES ('probe_asset','asset','debit','x','revenue');
+$q$, 'cannot report under statement line');
+
+DO $$ BEGIN
+    INSERT INTO fs_lines (code,caption,statement,side,sort_order)
+    VALUES ('probe_line','Probe line','balance_sheet','asset',9001);
+    INSERT INTO account_types (code,category,normal_balance,description,fs_line)
+    VALUES ('probe_typed','asset','debit','a type with no accounts yet','probe_line');
+END $$;
+-- ...on a type with NO accounts, so the chart-versioning guard (which fires
+-- first, and says something else) does not shadow the one under test.
+SELECT must_fail('UPDATE: moving a type onto a contradicting line', $q$
+    UPDATE account_types SET fs_line='revenue' WHERE code='probe_typed';
+$q$, 'cannot report under statement line');
+
+SELECT must_fail('UPDATE: an account contradicting its type', $q$
+    UPDATE ledger_accounts SET category='liability', normal_balance='credit'
+     WHERE tenant_id='t1' AND purpose='customer_receivable';
+$q$, 'but type');
+
+-- fk_accounts__type: without it an account with an unknown purpose is silently
+-- DROPPED FROM EVERY REPORT -- every one of them INNER JOINs account_types. That
+-- is the vanished-sub-book shape ADR-0011 is about, arrived at by a third route.
+SELECT must_fail('an account whose purpose is in no chart', $q$
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    VALUES ('t1','house',NULL,'not_in_any_chart','asset','debit','USD');
+$q$, 'fk_accounts__type');
+
+-- assert_fs_line_stable counts ACCOUNT_TYPES, not accounts. 0002 records why:
+-- "counting accounts let a line with types pointing at it but no accounts YET move
+-- freely" -- and both live controls happen to have accounts, so the fix was
+-- untested and the count could be moved back.
+SELECT must_fail('moving a line that has types but no accounts yet', $q$
+    UPDATE fs_lines SET statement='income_statement', side='debit' WHERE code='probe_line';
+$q$, 'cannot move statement line');
+
+-- ---------------------------------------------------- accounts, uniquely
+SELECT must_fail('a house account with an owner', $q$
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    VALUES ('t1','house','somebody','fee_revenue','revenue','credit','USD');
+$q$, 'ck_accounts__house_has_no_owner');
+
+SELECT must_fail('two house accounts for one purpose and currency', $q$
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    VALUES ('t1','house',NULL,'fee_revenue','revenue','credit','USD');
+$q$, 'uq_accounts__house');
+
+SELECT must_fail('two owned accounts for one owner, purpose and currency', $q$
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    VALUES ('t1','company','acme','customer_receivable','asset','debit','USD');
+$q$, 'uq_accounts__owned');
+
+-- ...and CURRENCY is part of that key, so the same owner may hold the same
+-- purpose in two denominations. Dropping currency from the index makes this legal
+-- state illegal, which no control noticed.
+DO $$ BEGIN
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    VALUES ('t1','company','acme','customer_receivable','asset','debit','JPY');
+    RAISE NOTICE 'ok  one owner may hold one purpose in two currencies';
+END $$;
+
+SET CONSTRAINTS ALL IMMEDIATE;
+SET CONSTRAINTS ALL DEFERRED;
+ALTER TABLE ledger_entries DISABLE TRIGGER ck_entries__seq;
+SELECT must_fail('a non-positive account_seq', $q$
+    INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
+                                currency,account_seq,balance_after,effective_at)
+    SELECT 't1', txn('t1','seqzero'), acct('t1','fee_revenue'), 'credit', 5,'USD',0,-5,now();
+$q$, 'ck_entries__seq_positive');
+SET CONSTRAINTS ALL IMMEDIATE;
+SET CONSTRAINTS ALL DEFERRED;
+ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ck_entries__seq;
+
+-- ------------------------------------------------ privileges, actually asserted
+-- `GRANT ALL` on the four journal tables passed the whole suite. The shipped
+-- REVOKEs left UPDATE on ledger_events and ledger_accounts and TRUNCATE on
+-- ledger_accounts ungranted only by omission -- nothing asserted any of it, so a
+-- widening was invisible. The triggers are the real defence; this asserts the
+-- grant model has not quietly been opened up underneath them.
+DO $$
+DECLARE r record; bad text := '';
+BEGIN
+    FOR r IN SELECT t.tbl, p.priv FROM
+        unnest(ARRAY['ledger_entries','ledger_transactions','ledger_events','ledger_accounts']) t(tbl),
+        unnest(ARRAY['UPDATE','DELETE','TRUNCATE']) p(priv)
+    LOOP
+        IF has_table_privilege('openledger_app', r.tbl, r.priv) THEN
+            bad := bad || format('%s:%s ', r.tbl, r.priv);
+        END IF;
+    END LOOP;
+    IF bad <> '' THEN
+        RAISE EXCEPTION 'the app role holds privileges it must not: %', bad;
+    END IF;
+    RAISE NOTICE 'ok  the app role can neither update, delete nor truncate the journal';
+END $$;
+
+DO $$
+DECLARE r record; bad text := '';
+BEGIN
+    FOR r IN SELECT v FROM unnest(ARRAY['trial_balance','balance_sheet',
+                                        'income_statement','ledger_balance_drift']) v
+    LOOP
+        IF NOT has_table_privilege('openledger_app', r.v, 'SELECT') THEN
+            bad := bad || r.v || ' ';
+        END IF;
+    END LOOP;
+    IF bad <> '' THEN
+        RAISE EXCEPTION 'the app role cannot read the reports it exists to serve: %', bad;
+    END IF;
+    RAISE NOTICE 'ok  the app role can read every report view';
+END $$;
+
+-- ----------------------------------------------- the replication apply path
+-- ck_entries__immutable could lose ENABLE ALWAYS: no replica-mode control ever
+-- attempted UPDATE or DELETE on an entry.
+SELECT must_fail('replica: rewriting an entry', $q$
+    SET LOCAL session_replication_role = 'replica';
+    UPDATE ledger_entries SET amount_minor = amount_minor + 1;
+$q$, 'entries are immutable');
+SELECT must_fail('replica: deleting an entry', $q$
+    SET LOCAL session_replication_role = 'replica';
+    DELETE FROM ledger_entries;
+$q$, 'entries are immutable');
+SELECT on_origin('after the entry-immutability replica controls');
+
+-- assign_recorded_at could be no-opped for ENTRIES and TRANSACTIONS while still
+-- assigning for events, because `entry()` never supplied one -- so the assertion
+-- that "a supplied recorded_at is overwritten" could not fire for two of the three
+-- tables it names. Supply one on every table, explicitly.
+DO $$
+DECLARE t uuid; v_bad int;
+BEGIN
+    INSERT INTO ledger_transactions (tenant_id,event_id,kind,status,effective_at,recorded_at)
+    VALUES ('t1',NULL,'neg','posted',now(),'1999-01-01') RETURNING id INTO t;
+    INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
+                                currency,balance_after,effective_at,recorded_at)
+    VALUES ('t1',t,acct('t1','customer_receivable'),'debit',7,'USD',0,now(),'1999-01-01'),
+           ('t1',t,acct('t1','interchange_revenue'),'credit',7,'USD',0,now(),'1999-01-01');
+    SET CONSTRAINTS ALL IMMEDIATE; SET CONSTRAINTS ALL DEFERRED;
+    SELECT count(*) INTO v_bad FROM (
+        SELECT recorded_at FROM ledger_transactions WHERE id=t
+        UNION ALL SELECT recorded_at FROM ledger_entries WHERE transaction_id=t
+        UNION ALL SELECT recorded_at FROM ledger_events WHERE tenant_id='t1'
+    ) q WHERE recorded_at < now() - interval '1 day';
+    IF v_bad > 0 THEN
+        RAISE EXCEPTION 'a supplied recorded_at survived on % row(s)', v_bad;
+    END IF;
+    RAISE NOTICE 'ok  a supplied recorded_at is overwritten on all three tables';
+END $$;
+
+-- ------------------------------------------------------- the drift alarm itself
+-- `first_bad_seq` is meant to name the FIRST divergent sequence -- the point where
+-- the running balance stopped being trustworthy. Reporting the LAST one instead
+-- passed the suite: nothing ever read the value.
+--
+-- The inserts, the ALTER and the assertion are three SEPARATE top-level
+-- statements on purpose. AFTER-trigger events raised inside a DO block cannot be
+-- fired until that block's statement finishes, so `SET CONSTRAINTS ALL IMMEDIATE`
+-- within it does not drain the queue -- and `ALTER TABLE` then refuses with an
+-- error that names neither the trigger nor the test.
+DO $$
+DECLARE t uuid; a uuid := acct('t1','fbo_cash');
+BEGIN
+    FOR i IN 1..3 LOOP
+        t := txn('t1','fb'||i);
+        PERFORM entry('t1', t, a, 'debit', 10);
+        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 10);
+    END LOOP;
+END $$;
+SET CONSTRAINTS ALL IMMEDIATE;
+SET CONSTRAINTS ALL DEFERRED;
+ALTER TABLE ledger_entries DISABLE TRIGGER ck_entries__immutable;
+UPDATE ledger_entries SET balance_after = balance_after + 1
+ WHERE tenant_id='t1' AND account_id = acct('t1','fbo_cash') AND account_seq >= 2;
+SET CONSTRAINTS ALL IMMEDIATE;
+SET CONSTRAINTS ALL DEFERRED;
+ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ck_entries__immutable;
+DO $$
+DECLARE v_first bigint;
+BEGIN
+    SELECT first_bad_seq INTO v_first FROM ledger_balance_drift
+     WHERE account_id = acct('t1','fbo_cash') AND first_bad_seq IS NOT NULL;
+    IF v_first IS DISTINCT FROM 2 THEN
+        RAISE EXCEPTION 'the alarm names sequence % as the first divergence, not 2 '
+                        '-- it is reporting the LAST one, so it points at the wrong '
+                        'entry to start reading from', v_first;
+    END IF;
+    RAISE NOTICE 'ok  the alarm names the FIRST divergent sequence = %', v_first;
+END $$;
+-- put it back, so the controls after this one are not reading a corrupt account
+SET CONSTRAINTS ALL IMMEDIATE;
+SET CONSTRAINTS ALL DEFERRED;
+ALTER TABLE ledger_entries DISABLE TRIGGER ck_entries__immutable;
+UPDATE ledger_entries SET balance_after = balance_after - 1
+ WHERE tenant_id='t1' AND account_id = acct('t1','fbo_cash') AND account_seq >= 2;
+SET CONSTRAINTS ALL IMMEDIATE;
+SET CONSTRAINTS ALL DEFERRED;
+ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ck_entries__immutable;
+DO $$ BEGIN
+    -- scoped to this account: other controls in this file write entries without
+    -- touching the cache, deliberately, and that drift is their subject
+    IF EXISTS (SELECT 1 FROM ledger_balance_drift
+                WHERE account_id = acct('t1','fbo_cash')) THEN
+        RAISE EXCEPTION 'the fixture was not restored -- drift remains on fbo_cash';
+    END IF;
+    RAISE NOTICE 'ok  ...and the books are whole again once it is put back';
+END $$;
 
 SELECT on_origin('the end of the file');
 
