@@ -56,7 +56,7 @@ INSERT INTO account_types (code,category,normal_balance,description,fs_line,is_p
   -- with an enforceable right of setoff; t1 and t2 are not the same party.
   -- NOTE: this field is currently declarative -- no view or function reads it, and
   -- uq_accounts__house (tenant_id, purpose, currency) makes a per-counterparty
-  -- split impossible. Recorded as open in ADR-0009.
+  -- split impossible. Recorded as open in ADR-0007.
   ('due_to_tenants','liability','credit','operator-side obligation to tenant scopes','payables',false,'per_shard'),
   ('paid_in_capital','equity','credit','equity funding','equity',false,'none'),
   -- prior periods' accumulated earnings. Unused until a close exists.

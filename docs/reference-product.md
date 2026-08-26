@@ -2,21 +2,20 @@
 
 **This is the product openledger's reference implementation targets, not the project's
 requirements.** openledger is a general double-entry ledger; see [`vision.md`](./vision.md) for why,
-and [ADR-0007](./decisions/0007-open-source-positioning.md) for the decision that made this document
+and [ADR-0002](./decisions/0002-scaling.md) for the decision that made this document
 a product spec rather than a system spec.
 
-**The system design lives in [`design-board.html`](./design-board.html)** — sizing, architecture,
-the authorization hot path, the data model, state machines, and the lifecycle trace, in six
-sections. Read that first. This document carries the two things the board cannot: **the chart of
-accounts in detail**, and **the card lifecycle in text**, where each step can be diffed, grepped and
-argued with.
+**The reasoning behind the system lives in [`decisions/`](./decisions/)** — the stack, the scaling
+model, the write path, the two time axes, and the hold model, one file each. This document carries
+the two things an ADR cannot: **the chart of accounts in detail**, and **the card lifecycle in
+text**, where each step can be diffed, grepped and argued with.
 
 Two things to hold while reading. Durable timers run **in-process on Postgres**
-([ADR-0008](./decisions/0008-durable-timers.md)), not on an external workflow engine. And the hold
+([ADR-0008](./decisions/0008-authorization-holds.md)), not on an external workflow engine. And the hold
 tables named in the trace below are the *shape* of the design, not what shipped: `card_holds`,
 `credit_lines`, `spend_controls` and `card_transactions` do not exist. The hold model shipped as an
 append-only trio — `card_auth_events`, `card_auth_event_group`, `card_hold_groups`
-([ADR-0010](./decisions/0010-authorization-holds.md)) — and the credit-line and spend-control tables
+([ADR-0008](./decisions/0008-authorization-holds.md)) — and the credit-line and spend-control tables
 are unbuilt (roadmap M7).
 
 ## The thesis
@@ -34,7 +33,7 @@ interchange is recognized. That is **our choice, not the field's** — about hal
 write a durable, balance-affecting row at authorization time and about half keep it outside the
 ledger as we do. [Spike 008](../spikes/008-processor-hold-semantics/README.md) has the split per
 vendor; it is not repeated here, because a list in two places drifts out of step with itself.
-See also [ADR-0010](./decisions/0010-authorization-holds.md).
+See also [ADR-0008](./decisions/0008-authorization-holds.md).
 
 ## The chart of accounts
 
@@ -43,7 +42,7 @@ engine**: a marketplace or wallet deployment ships a different chart against the
 type declares its `category` (which rolls up the financial statements), its `normal_balance` (which
 side it sits on), and the `fs_line` it maps to (the caption it appears under). Completeness comes
 from enumerating this table rather than from listing whatever accounts have entries — see
-[ADR-0009](./decisions/0009-chart-and-completeness.md).
+[ADR-0007](./decisions/0007-schema-conventions-and-chart.md).
 
 | type | category | normal | fs_line | perimeter | counterparty |
 | --- | --- | --- | --- | --- | --- |
@@ -88,7 +87,7 @@ Six things in that table are not obvious, and each of them is a way to get the b
   either, so a wrong value is undetectable — mutation testing flips it and nothing fails.
   `is_perimeter` asserts "this account mirrors exactly one external balance and must reconcile
   against it", and nothing reconciles yet. A `CHECK` could not help: the column is a claim about the
-  world, not about the row. Recorded as open in ADR-0009.
+  world, not about the row. Recorded as open in ADR-0007.
 
 `retained_earnings` has nothing written to it — there is no closing process yet, so un-closed
 earnings appear as the derived `current_year_earnings` line in the `balance_sheet` view.
@@ -120,9 +119,9 @@ ordering above is what reaches it.
 
 Two limits on what that second query answers. It is a *recording*-axis question only: a business-date
 balance must aggregate over `effective_at`, because a backdated entry lands with a later sequence
-number ([ADR-0003](./decisions/0003-bitemporal-balances.md)). And it is **not yet reproducible** —
+number ([ADR-0006](./decisions/0006-time-and-as-of.md)). And it is **not yet reproducible** —
 `recorded_at` defaults to transaction *start* time and is not monotonic with commit order, so the
-same as-of query can re-run to a different answer ([ADR-0005](./decisions/0005-reproducible-as-of.md)).
+same as-of query can re-run to a different answer ([ADR-0006](./decisions/0006-time-and-as-of.md)).
 
 ## Edge cases that decide whether you've built this before
 

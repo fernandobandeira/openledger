@@ -180,7 +180,7 @@ CREATE TABLE ledger_accounts (
     metadata       jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at     timestamptz NOT NULL DEFAULT now(),
 
-    -- composite key: tenant leads every key in the schema (ADR-0007). Free now,
+    -- composite key: tenant leads every key in the schema (ADR-0002). Free now,
     -- expensive later -- it is the prerequisite for both partitioning and sharding.
     CONSTRAINT pk_accounts PRIMARY KEY (tenant_id, id),
     CONSTRAINT ck_accounts__house_has_no_owner
@@ -208,14 +208,14 @@ CREATE UNIQUE INDEX uq_accounts__owned
     ON ledger_accounts (tenant_id, owner_type, owner_id, purpose, currency)
     WHERE owner_type <> 'house';
 
--- House accounts are PER TENANT, not per deployment (ADR-0007): a deployment-global
+-- House accounts are PER TENANT, not per deployment (ADR-0002): a deployment-global
 -- house account makes every tenant contend on one row and blocks tenant-locality.
 CREATE UNIQUE INDEX uq_accounts__house
     ON ledger_accounts (tenant_id, purpose, currency)
     WHERE owner_type = 'house';
 
 
--- ------------------------------------------------------------ events (ADR-0004)
+-- ------------------------------------------------------------ events (ADR-0005)
 -- The idempotency spine. Most of the lifecycle writes NO ledger transaction --
 -- authorizations, declines, hold expiry, reversals, limit changes -- so idempotency
 -- cannot live on ledger_transactions.
@@ -276,7 +276,7 @@ CREATE TABLE ledger_transactions (
     -- AND IT IS NOT ENFORCED TODAY. The guard was a trigger, and 0012 deleted it.
     -- This column is a bare DEFAULT, which the comment above argues is exactly not
     -- enough -- verified: an ordinary INSERT supplying xact_id = 42 is accepted.
-    -- The seal belongs to the writer (ADR-0013), which is not built. Two earlier
+    -- The seal belongs to the writer (ADR-0005), which is not built. Two earlier
     -- versions of this comment pointed at `ck_entries__sealed` and
     -- `assign_xact_id()` as if they were below; neither has existed since 0012, and
     -- a comment naming a guard that is not there is worse than no comment.
@@ -333,7 +333,7 @@ CREATE TABLE ledger_entries (
     currency       char(3) NOT NULL,
     account_seq    bigint NOT NULL,             -- monotonic per account
     -- Running balance on the RECORDED axis only. It cannot answer a business-date
-    -- question once anything is backdated (ADR-0003).
+    -- question once anything is backdated (ADR-0006).
     --
     -- SIGN CONVENTION: debit-positive. balance_after is SUM(debits) - SUM(credits)
     -- for this account, so a credit-normal account carries a negative running
@@ -368,7 +368,7 @@ CREATE TABLE ledger_entries (
         REFERENCES ledger_accounts (tenant_id, id, currency),
     -- effective_at is denormalised from the transaction, and nothing held it
     -- honest: a transaction dated 2026-06-15 accepted 1,000 entries dated
-    -- 1999-01-01. This column is the entire basis of ADR-0003 and every
+    -- 1999-01-01. This column is the entire basis of ADR-0006 and every
     -- business-date report. Same trick as the currency FK above -- make the
     -- denormalised copy part of a composite key so it CANNOT disagree.
     CONSTRAINT fk_entries__txn_effective FOREIGN KEY (tenant_id, transaction_id, effective_at)
@@ -407,7 +407,7 @@ CREATE TABLE ledger_account_balances (
 
 
 -- ----------------------------------------------------------------------
--- indexes -- the hot reads named in ADR-0003 and docs/reference-product.md
+-- indexes -- the hot reads named in ADR-0006 and docs/reference-product.md
 
 
 
@@ -478,7 +478,7 @@ CREATE TABLE card_auth_events (
     -- an opaque constraint error.
     -- A totals event MUST keep its wire amount. The only recovery from a message
     -- mis-grouped into a totals group is to split it to a new, empty group and
-    -- recompute `delta = raw_amount - 0` (ADR-0010, Known #1). That recovery is
+    -- recompute `delta = raw_amount - 0` (ADR-0008, Known #1). That recovery is
     -- unavailable if raw_amount is null, and nothing else in the schema would
     -- notice, so it is a constraint rather than a convention.
     CONSTRAINT ck_auth_events__totals_keep_wire
@@ -531,7 +531,7 @@ CREATE TABLE card_auth_event_group (
     -- Identity is a uuidv7, NOT (event_id, assigned_at). now() is TRANSACTION
     -- time, so it is constant across a transaction: an operator correcting the
     -- same event twice in one transaction collided on the primary key. This is
-    -- the same lesson as ADR-0005 -- a timestamp is not an ordering key -- and
+    -- the same lesson as ADR-0006 -- a timestamp is not an ordering key -- and
     -- uuidv7 is time-ordered, so the trail still reads chronologically.
     id           uuid NOT NULL DEFAULT uuidv7(),
     event_id     uuid NOT NULL,
@@ -695,7 +695,7 @@ GROUP BY a.tenant_id, a.id, a.owner_id, a.purpose, t.category, t.normal_balance,
 
 -- The income statement, enumerated the same way. Its absence was itself a gap:
 -- the completeness defence covered only the balance sheet, while revenue
--- understatement -- the thing ADR-0009 is about -- had no chart-outward report.
+-- understatement -- the thing ADR-0007 is about -- had no chart-outward report.
 CREATE VIEW income_statement AS
 WITH dp AS (
     SELECT e.tenant_id, e.currency, t.fs_line,
@@ -727,7 +727,7 @@ ORDER BY tenant_id, currency, sort_order;
 
 -- ------------------------------------------------------------ the balance sheet
 --
--- ADR-0009 claimed "reports enumerate from the chart outward, so there is no
+-- ADR-0007 claimed "reports enumerate from the chart outward, so there is no
 -- parameter in which to pass an incomplete account list." That was ASPIRATIONAL:
 -- trial_balance starts FROM ledger_entries and
 -- enumerate INWARD, so an account with no entries is simply absent. This view is
@@ -760,7 +760,7 @@ WITH dp AS (
     -- accounts at all remains invisible. balance_sheet is a plain view and takes no
     -- parameters; the moment a tenant parameter is added to it -- the obvious next
     -- step -- that parameter is exactly the "parameter in which to pass an incomplete
-    -- list" ADR-0009 says should not exist. Completeness here is guaranteed WITHIN a
+    -- list" ADR-0007 says should not exist. Completeness here is guaranteed WITHIN a
     -- scope, not across them.
     SELECT DISTINCT tenant_id, currency FROM ledger_accounts
 ), lines AS (
@@ -785,7 +785,7 @@ UNION ALL
 -- `retained_earnings` sits in the chart at sort_order 800 and stays at zero
 -- forever, because nothing routes to it.
 --
--- The honest fix is a period close, which is designed and unbuilt (ADR-0009, and
+-- The honest fix is a period close, which is designed and unbuilt (ADR-0007, and
 -- "Still open" in the decision log). Until then the caption says what the number
 -- is. `income_statement` has the same shape and no parameter at all: it reports
 -- every posted entry ever, so it is a since-inception statement too.
@@ -810,7 +810,7 @@ ORDER BY tenant_id, currency, sort_order;
 --
 -- The rule: a trigger states (1) the invariant it holds, (2) why nothing
 -- declarative can hold it, and (3) what it does NOT protect against. Two clear
--- that bar, as eight trigger objects; ADR-0012 records what happened to the other
+-- that bar, as eight trigger objects; ADR-0004 records what happened to the other
 -- nineteen.
 --
 -- The evidence for drawing the line here rather than elsewhere is spike 009.
@@ -932,7 +932,7 @@ ALTER TABLE card_auth_events ENABLE ALWAYS TRIGGER ck_auth_events__no_truncate;
 --     cannot express one leg, so any Go caller gets a balanced pair or nothing.
 --     Ours has to be the same shape. Until it is, NOTHING enforces balance at all --
 --     `ledger_entries` stores independent rows carrying a direction, so an
---     unbalanced transaction is fully expressible today. See ADR-0013.
+--     unbalanced transaction is fully expressible today. See ADR-0005.
 --   * chart integrity -- two foreign keys, above. Strictly better than the triggers
 --     they replaced: declarative, visible in \d, and impossible to forget.
 
@@ -941,11 +941,11 @@ ALTER TABLE card_auth_events ENABLE ALWAYS TRIGGER ck_auth_events__no_truncate;
 -- ----------------------------------------------------------------------
 -- THE CARD ALARMS
 --
--- RESTORED. These two are VIEWS -- declarative, no PL/pgSQL -- and ADR-0012's own
+-- RESTORED. These two are VIEWS -- declarative, no PL/pgSQL -- and ADR-0004's own
 -- rule keeps views; it kept the three report views. They were lost because the
 -- script that extracted this file from the old migrations selected report views by
 -- name and never looked for these. Nobody noticed until an adversarial reviewer
--- pointed out that ADR-0010 names `card_hold_drift` EIGHT TIMES as the alarm that
+-- pointed out that ADR-0008 names `card_hold_drift` EIGHT TIMES as the alarm that
 -- catches every failure it records -- including the three it declines to fix on the
 -- grounds that the alarm sees them -- while the schema had no such object.
 --
@@ -984,7 +984,7 @@ WITH live AS (
            -- Decreases that moved NO MONEY. A clearing posts to the ledger, so a
            -- group whose total went negative from clearings is not under-reserving
            -- -- the cleared amount is a receivable in the journal, and exposure is
-           -- posted + held. ADR-0010 declines the over-capture report on exactly
+           -- posted + held. ADR-0008 declines the over-capture report on exactly
            -- that argument, and the argument covers `clearing` AND NOTHING ELSE.
            -- `reversal` and negative `advice` post nothing. Two reversals against
            -- one authorization left total_minor at -10000 with zero clearings in
@@ -1085,7 +1085,7 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
    -- deliberately does not model -- 0010 argues that grouping is a revisable
    -- inference precisely because that linkage is unreliable. So the alarm reports
    -- the precursor state, `low_water_minor` keeps the durable evidence that the
-   -- group was ever there, and the ambiguity is recorded in ADR-0010 rather than
+   -- group was ever there, and the ambiguity is recorded in ADR-0008 rather than
    -- papered over with a guard that would fire on honest traffic.
    --
    -- AND A CLEARING BLINDED IT COMPLETELY. `total_minor` is
@@ -1098,7 +1098,7 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
    -- times over: 300.00 under-reserved, and the hidden residue is bounded only by
    -- the group's cleared amount.
    --
-   -- That falsifies the precise restatement ADR-0010 wrote to close the declined
+   -- That falsifies the precise restatement ADR-0008 wrote to close the declined
    -- over-capture report -- "an over-capture never makes the reported hold smaller
    -- than the un-cleared exposure of that group" -- in a state the system itself
    -- flags as an over-capture.
@@ -1153,14 +1153,14 @@ GRANT SELECT, INSERT, UPDATE ON ledger_account_balances TO openledger_app;
 -- The card tables: the hold flow appends events and rewrites its own materialised
 -- group rows.
 --
--- NOTE, AND IT IS A REAL GAP: ADR-0010's fix for the attach/regroup deadlock is
+-- NOTE, AND IT IS A REAL GAP: ADR-0008's fix for the attach/regroup deadlock is
 -- "take the event row lock first, explicitly" -- and `SELECT ... FOR UPDATE` on
 -- card_auth_events requires UPDATE privilege, which this role is NOT granted and is
 -- explicitly revoked below. The application role cannot currently execute the ADR's
 -- own remedy. Deciding between
 -- granting UPDATE (and leaning on the append-only trigger to keep it a lock rather
 -- than mutability) and finding a lock that does not need it is open work, recorded
--- in ADR-0010's *What it costs*, beside the re-grouping lock order it makes unavailable.
+-- in ADR-0008's *What it costs*, beside the re-grouping lock order it makes unavailable.
 GRANT SELECT, INSERT ON card_auth_events, card_auth_event_group TO openledger_app;
 GRANT SELECT, INSERT, UPDATE ON card_auth_event_group TO openledger_app;
 GRANT SELECT, INSERT, UPDATE ON card_hold_groups TO openledger_app;

@@ -1,0 +1,21 @@
+[package]
+name    = "openledger"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# A ledger has no business panicking on a value it read from the database.
+# These are the Rust half of ADR-0001: the reason for this stack is that the
+# compiler refuses what Go accepted, so the escape hatches are denied too.
+unwrap_used      = "deny"
+expect_used      = "deny"
+panic            = "deny"
+indexing_slicing = "deny"
+integer_division = "deny"

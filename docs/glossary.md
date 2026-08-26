@@ -2,7 +2,7 @@
 
 Every term this project uses that you'd only know if you'd built a ledger before. Examples are real
 — they come from the [reference product](./reference-product.md), the
-[design board](./design-board.html), or something we measured.
+[decisions](./decisions/), or something we measured.
 
 ## Accounting
 
@@ -17,7 +17,7 @@ CR interchange_revenue          9.00  ← we keep 9
 
 500 out, 500 in. A transaction that doesn't balance is meant to be *unrepresentable* rather than
 rejected — the writer never builds one. That writer does not exist yet, so today nothing refuses an
-unbalanced transaction; [ADR-0013](./decisions/0013-the-write-path.md) is the plan.
+unbalanced transaction; [ADR-0005](./decisions/0005-event-log-and-write-path.md) is the plan.
 
 **Debit / credit** — the two sides. Not "money in / money out": which one *increases* an account
 depends on the account. Debits increase assets and expenses; credits increase liabilities, equity
@@ -75,7 +75,7 @@ Monday. Keeping both is called **bitemporal**.
 **Backdating** — an entry arriving with an effective date earlier than entries already recorded.
 Normal in payments: late clearings and chargebacks are inherently backdated. It's why
 `balance_after` answers "balance as recorded at T" but *not* "balance as of business date T" — see
-[ADR-0003](./decisions/0003-bitemporal-balances.md).
+[ADR-0006](./decisions/0006-time-and-as-of.md).
 
 **Idempotency key** — a key on an incoming event so a retry doesn't post it twice. The network
 *will* send the same clearing more than once.
@@ -119,7 +119,7 @@ pump authorization clearing at $95. **Forced post** — a clearing with no autho
 
 An authorization is not one message. A purchase can produce an authorization, several increments, a
 reversal and several clearings, arriving in any order and sometimes twice. The shipped model
-([ADR-0010](./decisions/0010-authorization-holds.md)) keeps every message as an immutable row in
+([ADR-0008](./decisions/0008-authorization-holds.md)) keeps every message as an immutable row in
 `card_auth_events` and derives the hold from them.
 
 **`group_key`** — the identifier that ties those messages together as *one* authorization. It is not

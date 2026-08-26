@@ -33,13 +33,13 @@ psql: ## Open a psql shell
 	psql "$(DB_URL)"
 
 .PHONY: test
-test: ## Run the Go tests
-	go test ./...
+test: ## Run the tests
+	cargo test
 
 .PHONY: build
 build: ## Build the binary
-	go build -o bin/openledger ./cmd/openledger
+	cargo build --release
 
 .PHONY: tidy
-tidy: ## Tidy modules
-	go mod tidy
+tidy: ## Check formatting and lints
+	cargo fmt --check && cargo clippy -- -D warnings

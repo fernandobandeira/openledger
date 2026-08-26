@@ -5,7 +5,7 @@ business-specific — a card program funded by a warehouse line has them, a mark
 not. A general ledger cannot ship a fixed chart of accounts. So what *does* it ship, and how does
 it guarantee the math is right when it doesn't know what the accounts are?
 
-**Status:** closed. Feeds [ADR-0007](../../docs/decisions/0007-open-source-positioning.md) and
+**Status:** closed. Feeds [ADR-0002](../../docs/decisions/0002-scaling.md) and
 M0/M1.
 
 ---
@@ -45,8 +45,8 @@ accounting equation                                   BALANCED
 
 **Revenue understated by a third, equation perfectly happy** — but *not* for the reason this line
 gave for several rounds. It said omitting an account "removes it from both sides", which
-[ADR-0009](../../docs/decisions/0009-chart-and-completeness.md) shows is false and checkably so:
-drop `interchange_revenue` from the shipped trace and the two sides differ by exactly that account's balance (measured against the current trace: t1/USD 120326 against 69426). *An earlier version of this line quoted 276 against -624; those came from a smaller trace and do not reproduce, and [ADR-0009](../../docs/decisions/0009-chart-and-completeness.md) struck them while this file kept them*. What
+[ADR-0007](../../docs/decisions/0007-schema-conventions-and-chart.md) shows is false and checkably so:
+drop `interchange_revenue` from the shipped trace and the two sides differ by exactly that account's balance (measured against the current trace: t1/USD 120326 against 69426). *An earlier version of this line quoted 276 against -624; those came from a smaller trace and do not reproduce, and [ADR-0007](../../docs/decisions/0007-schema-conventions-and-chart.md) struck them while this file kept them*. What
 happens here is narrower — the demo omits a whole *tenant*, and a tenant's sub-book balances on its
 own, so both sides move together. The numbers stand; the stated mechanism was wrong. This is the audit finding to engineer against: a tenant is onboarded, its
 account row is created, the reporting mapping misses it, and nothing imbalances.
@@ -145,7 +145,7 @@ equity 66 + 9.00 − 2.70. Both sides 500."* Liabilities 427.70, equity plus rev
 The first run ordered steps *alphabetically*. All 13 transactions posted in one `COMMIT`, so
 `now()` — transaction-**start** time — gave every one an identical `recorded_at` and the sort fell
 through to the idempotency key. That is
-[ADR-0005](../../docs/decisions/0005-reproducible-as-of.md) demonstrating itself by accident, on a
+[ADR-0006](../../docs/decisions/0006-time-and-as-of.md) demonstrating itself by accident, on a
 13-row table, with no concurrency involved.
 
 **And the equation held under the wrong order anyway** — which is the theorem doing its job. Order
@@ -232,7 +232,7 @@ invisible to everyone. But three things follow.
 leads every key; house accounts carry a real tenant too. The reasoning below is why, and it stands:
 tenant would otherwise be reachable only by joining `ledger_accounts`, and an RLS policy containing
 a subquery runs **per row** — a well-known planner trap. Denormalize it, as
-[ADR-0003](../../docs/decisions/0003-bitemporal-balances.md) did for `effective_at`. It is also the
+[ADR-0006](../../docs/decisions/0006-time-and-as-of.md) did for `effective_at`. It is also the
 column a future `PARTITION BY HASH (tenant_id)` would need.
 
 ### 2. Every transaction must be tenant-local, or tenants see an UNBALANCED ledger

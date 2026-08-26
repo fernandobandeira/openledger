@@ -4,9 +4,9 @@
 
 The project needs timers that survive restarts: a card authorization *hold* must expire after
 ~7 days, an ACH return window closes ~2 banking days after funds land, statements close monthly.
-[ADR-0001](../../docs/decisions/0001-go-and-postgres.md) planned to use **Temporal** for these —
+[ADR-0001](../../docs/decisions/0001-rust-and-postgres.md) planned to use **Temporal** for these —
 but Temporal is a server cluster with its own datastore, which contradicts
-[ADR-0007](../../docs/decisions/0007-open-source-positioning.md)'s pitch of *one binary and a
+[ADR-0002](../../docs/decisions/0002-scaling.md)'s pitch of *one binary and a
 database you already run*.
 
 ## The answer
@@ -29,7 +29,7 @@ running workflows, child workflows, or workflow versioning.
 
 **And the decisive point:** Temporal's headline guarantee is exactly-once *effects*, delivered as
 at-least-once execution plus idempotent activities. But
-[ADR-0004](../../docs/decisions/0004-event-log.md) already requires every handler to be idempotent
+[ADR-0005](../../docs/decisions/0005-event-log-and-write-path.md) already requires every handler to be idempotent
 — that is the entire purpose of the event log. **Temporal would be a second implementation of a
 guarantee the ledger already provides**, bought with a cluster's worth of operations.
 
@@ -71,7 +71,7 @@ Every property the ledger needs, confirmed:
 
 **Operationally, nothing.** River is a library, not a server — no `cmd/`, it runs inside our
 binary. It adds 5 tables and 7 migrations to the same database. It is built on **pgx v5**, already
-our driver under [ADR-0002](../../docs/decisions/0002-data-access-layer.md), and generates its own
+our driver under [ADR-0001](../../docs/decisions/0001-rust-and-postgres.md), and generates its own
 SQL with **sqlc**, already our codegen.
 
 **What we give up**, honestly: workflow-as-code (a multi-step process reads as sequential Go with

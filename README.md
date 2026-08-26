@@ -1,6 +1,6 @@
 # openledger
 
-An open-source **double-entry ledger** — Postgres for storage, Go for the service. A single
+An open-source **double-entry ledger** — Postgres for storage, Rust for the service. A single
 binary and a database you already know how to operate.
 
 Double-entry means every money movement is recorded as debits and credits that sum to the same
@@ -22,24 +22,16 @@ demanding acceptance test. It is not the project.
 
 **Status: design stage.** The deliverable is [`docs/decisions/`](./docs/decisions/).
 `schema/schema.sql` holds the ledger core, the chart of accounts and the card hold model — it exists
-to show that shape is expressible, and it loads. **There is no test suite and no Go service yet**: a
-SQL implementation and its harness were deleted, and why is [ADR-0012](./docs/decisions/0012-where-logic-lives.md).
+to show that shape is expressible, and it loads. **There is no test suite and no service yet**: a
+SQL implementation and its harness were deleted, and why is [ADR-0004](./docs/decisions/0004-where-logic-lives.md).
 
 ## Start here
 
-**[docs/design-board.html](./docs/design-board.html) — the system design, in six sections.** Open it
-in a browser. Sizing, architecture, the auth hot path, the data model, state machines, and a
-row-by-row trace of one $500 purchase through every account it touches.
-
-It is the design **as first drawn**, and it is the clearest thing here on sizing, on the
-authorization deadline and on the shape of the lifecycle. Three of its decisions have since been
-made differently — the durable timer, the hold model, and how append-only is enforced — and
-[docs/README.md](./docs/README.md) lists every divergence
-before you hit one. Read the board first; read that list second, not later.
+**Never built a ledger? Start with [docs/glossary.md](./docs/glossary.md).** It defines every term
+the rest of this uses, so nothing else has to stop and re-explain.
 
 | | |
 | --- | --- |
-| [docs/design-board.html](./docs/design-board.html) | **The design, as first drawn.** Read this first — then the divergence list in [docs/README.md](./docs/README.md). |
 | [docs/glossary.md](./docs/glossary.md) | Every term, for someone who has never built a ledger |
 | [docs/vision.md](./docs/vision.md) | Why this exists when Formance already does |
 | [docs/roadmap.md](./docs/roadmap.md) | What gets built next, and why in that order |
@@ -50,15 +42,15 @@ before you hit one. Read the board first; read that list second, not later.
 ## Layout
 
 ```
-docs/             THE DELIVERABLE — design board, decisions, vision, glossary,
+docs/             THE DELIVERABLE — decisions, vision, glossary, diagrams,
                   roadmap, reference product.
 schema/           the design schema: 11 tables, CHECKs, foreign keys, 5 views and
                   8 triggers over 2 functions -- each justified in place, per
-                  decisions/0012. chart.sql seeds an example chart of accounts.
-spikes/           timeboxed investigations, one directory each. Separate Go
-                  modules; there is no CI.
-cmd/openledger/   entrypoint. Prints "nothing to run yet".
-internal/         empty. Where the Go service will go.
+                  decisions/0004. chart.sql seeds an example chart of accounts.
+spikes/           timeboxed investigations, one directory each. Self-contained;
+                  there is no CI.
+src/               entrypoint. Prints "nothing to run yet". Where the
+                  service will go.
 ```
 
 ## Performance

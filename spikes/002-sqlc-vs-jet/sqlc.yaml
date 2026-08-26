@@ -1,4 +1,4 @@
-# Spike 002 — the configuration ADR-0002 recommends, verified end to end.
+# Spike 002 — the configuration ADR-0001 recommends, verified end to end.
 version: "2"
 sql:
   - engine: postgresql

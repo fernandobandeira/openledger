@@ -3,7 +3,7 @@
 
 > ⚠️ **The verification in this spike does not run, and its headline survey was
 > invented.** Both are recorded here rather than quietly repaired, because this
-> spike is the evidence base for [ADR-0010](../../docs/decisions/0010-authorization-holds.md).
+> spike is the evidence base for [ADR-0008](../../docs/decisions/0008-authorization-holds.md).
 >
 >   *(This bullet has itself been corrected. It previously listed three schema
 >   mismatches, two of which describe `schema/schema.sql` and not the file in this
@@ -101,7 +101,7 @@ so the scan is bounded by *events per authorization*, not by history. But it is 
 authorization hot path, which has a ~1s deadline, and it has **not been benchmarked here**. If it
 proves too slow the standard answer applies: a materialised per-group total maintained on write,
 with the event log staying the source of truth — the same relationship
-[ADR-0003](../../docs/decisions/0003-bitemporal-balances.md) sets up between `balance_after` and
+[ADR-0006](../../docs/decisions/0006-time-and-as-of.md) sets up between `balance_after` and
 recomputation.
 
 **More rows.** Five to ten per authorization instead of one. At this volume, irrelevant.

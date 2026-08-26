@@ -2,7 +2,7 @@
 
 **Status:** closed
 
-**Question.** [ADR-0012](../../docs/decisions/0012-where-logic-lives.md) removed 25 of 27 triggers on
+**Question.** [ADR-0004](../../docs/decisions/0004-where-logic-lives.md) removed 25 of 27 triggers on
 the grounds that triggers are a maintainability problem. Is that true of real ledgers, or folklore?
 
 **Method.** Nine open-source ledgers — six SQL or ORM-backed, one document-store, and the plain-text family as a contrast, read from source at a pinned commit. Where
@@ -22,7 +22,7 @@ SOX/GLBA by name. The ThoughtWorks Technology Radar has no entry against them; t
 
 **2. But not one of the nine enforces "debits equal credits" with a trigger or a constraint.** Every
 one makes it either structurally unrepresentable or checks it in application code. That is the real
-line, and it is the one [ADR-0013](../../docs/decisions/0013-the-write-path.md) now follows.
+line, and it is the one [ADR-0005](../../docs/decisions/0005-event-log-and-write-path.md) now follows.
 
 | | Triggers | Balance invariant lives | Append-only mechanism |
 | --- | --- | --- | --- |
@@ -100,7 +100,7 @@ Someone else hit "nothing declarative can stop a `TRUNCATE`" and reached the sam
 **One difference matters, and we are on the right side of it.** Midaz uses
 `RULE … DO INSTEAD NOTHING` for UPDATE and DELETE, which **silently discards** the write — a caller
 gets `UPDATE 0` and no error. Ours raises. Silence read as assent is the exact failure mode
-[ADR-0011](../../docs/decisions/0011-what-the-database-enforces.md) is about.
+[ADR-0004](../../docs/decisions/0004-where-logic-lives.md) is about.
 
 ---
 

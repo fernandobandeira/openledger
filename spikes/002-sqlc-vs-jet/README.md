@@ -5,13 +5,13 @@ emits typed functions. **go-jet** generates a type-safe query *builder* plus one
 table. Which one survives our hardest queries, and does go-jet's requirement of `database/sql`
 (rather than native `pgx`) cost too much?
 
-**Status:** closed. Produced [ADR-0002](../../docs/decisions/0002-data-access-layer.md).
+**Status:** closed. Produced [ADR-0001](../../docs/decisions/0001-rust-and-postgres.md).
 
 ---
 
 ## The answer
 
-**sqlc, on native `pgxpool`** — reversing ADR-0002's own proposal. Recommended configuration:
+**sqlc, on native `pgxpool`** — reversing ADR-0001's own proposal. Recommended configuration:
 [`sqlc.yaml`](./sqlc.yaml), verified end to end against a live database.
 
 The pre-registered decision rule was *"if arrays and jsonb are ugly under `database/sql` → sqlc."*
