@@ -11,6 +11,20 @@
 \o /dev/null
 BEGIN;
 
+-- MODE GUARD. `SET LOCAL session_replication_role = 'replica'` prepended to this
+-- file's BEGIN made the whole suite run on the replication apply path, where a
+-- guard marked ENABLE REPLICA fires and the ordinary write path is untested. That
+-- is how an earlier leak went unnoticed for two hundred lines of negative
+-- controls. One line per suite, at both ends.
+DO $$ BEGIN
+    IF current_setting('session_replication_role') <> 'origin' THEN
+        RAISE EXCEPTION
+            'this suite is running as %, not origin: every guard it exercises may be '
+            'the replica-path one', current_setting('session_replication_role');
+    END IF;
+    RAISE NOTICE 'ok  running on the ordinary write path';
+END $$;
+
 CREATE FUNCTION must_fail(p_label text, p_sql text, p_expect text) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE v_msg text;
@@ -635,16 +649,23 @@ SELECT record_auth_event('t1','ar_auth','g_ar','zeta','card_ar',
 SELECT expire_hold_group('t1','zeta','g_ar');
 SELECT record_auth_event('t1','ar_rev', NULL,'zeta','card_ar',
         'expiry_reversal', 10000,'USD',false, now());
+-- ...to the amount that was live BEFORE the premature release, not that amount
+-- doubled. expiry_reversal used to carry +remaining as a delta against a total the
+-- flag had never reduced, so one 100.00 authorization held 200.00 and, after the
+-- full 100.00 capture, still held 100.00 -- with drift silent, because the log
+-- genuinely contained the +10000. This assertion asserted the 200.00.
 SELECT eq('an expiry_reversal re-delivered with its group re-opens the hold',
           (SELECT record_auth_event('t1','ar_rev','g_ar','zeta','card_ar',
-                   'expiry_reversal', 10000,'USD',false, now())), 20000);
+                   'expiry_reversal', 10000,'USD',false, now())), 10000);
 SELECT eq('...and what ingest returned is what the company actually holds',
-          held_for_company('t1','zeta','USD'), 20000);
+          held_for_company('t1','zeta','USD'), 10000);
 SELECT no_drift('re-delivery onto an expired group');
 
 -- ...and the same message on the FRESH-INGEST path. The two paths have separate
 -- un-expire lists, so a test that only covers one leaves the other deletable --
 -- which it was: dropping expiry_reversal from the main list changed nothing.
+-- The hold comes back to what it was, 40.00, NOT 40.00 plus the message's wire
+-- amount: expiry never subtracted anything, so its reversal adds nothing back.
 SELECT record_auth_event('t1','fr_auth','g_fr','zeta','card_fr',
         'authorization', 4000,'USD',false, now());
 SELECT expire_hold_group('t1','zeta','g_fr');
@@ -652,7 +673,11 @@ SELECT eq('expired', (SELECT held_minor FROM card_hold_groups WHERE group_key='g
 SELECT record_auth_event('t1','fr_rev','g_fr','zeta','card_fr',
         'expiry_reversal', 1000,'USD',false, now());
 SELECT eq('an expiry_reversal on first delivery re-opens the hold',
-          (SELECT held_minor FROM card_hold_groups WHERE group_key='g_fr'), 5000);
+          (SELECT held_minor FROM card_hold_groups WHERE group_key='g_fr'), 4000);
+SELECT eq('...and its wire amount is recorded without being added to the hold',
+          (SELECT raw_amount FROM card_auth_events WHERE processor_msg_id='fr_rev'), 1000);
+SELECT eq('...with a zero delta, because the flag is what it reverses',
+          (SELECT amount_delta FROM card_auth_events WHERE processor_msg_id='fr_rev'), 0);
 
 -- a cumulative RESTATEMENT is itself the liveness signal: its delta is zero
 SELECT record_auth_event('t1','sr_auth','g_sr','hotel','card_sr',
@@ -911,7 +936,9 @@ SELECT must_fail('a stored DELTA re-delivered as a total, into a totals group', 
 $q$, 'reports a delta, but group');
 
 -- the sharpest one: an expiry_reversal normalised as a clearing by a second
--- adapter, landing on an expired group and swallowed by the clamp
+-- adapter, landing on an expired group and swallowed by the clamp. It re-opens the
+-- group to the 1000.00 that was live before the premature release -- its own wire
+-- amount adds nothing, because expiry never subtracted anything.
 SELECT record_auth_event('t1','sv_ea','g_rev','zeta','card_s',
         'authorization', 100000,'USD',false, now());
 SELECT expire_hold_group('t1','zeta','g_rev');
@@ -919,10 +946,10 @@ SELECT record_auth_event('t1','sv_er', NULL,'zeta','card_s',
         'expiry_reversal', 90000,'USD',false, now());
 SELECT eq('a stored expiry_reversal re-opens even when re-delivered as a clearing',
           (SELECT record_auth_event('t1','sv_er','g_rev','zeta','card_s',
-                   'clearing', 90000,'USD',false, now())), 190000);
+                   'clearing', 90000,'USD',false, now())), 100000);
 -- zeta already holds from earlier blocks, so assert the GROUP, not the company
 SELECT eq('...and the group holds what ingest returned',
-          (SELECT held_minor FROM card_hold_groups WHERE group_key='g_rev'), 190000);
+          (SELECT held_minor FROM card_hold_groups WHERE group_key='g_rev'), 100000);
 SELECT no_drift('the stored-event guards');
 
 -- =========================================================== the alarm, again
@@ -1320,6 +1347,100 @@ BEGIN
         RAISE EXCEPTION 'an event that did not say so was stored as a cumulative total';
     END IF;
     RAISE NOTICE 'ok  an amount is a DELTA unless the message says otherwise';
+END $$;
+
+-- ============ round 6: a decrease that moved no money, and a NULL that meant zero
+
+-- AN OVER-REVERSAL IS NOT AN OVER-CAPTURE. ADR-0010 declines the over-capture
+-- report on the argument that a clearing has already POSTED to the ledger, so the
+-- cleared money is a receivable and exposure is posted + held. That argument is
+-- sound and it covers `clearing` and nothing else: `reversal` and negative
+-- `advice` post nothing at all. Two reversals against one authorization left the
+-- total at -10000 with ZERO clearings in the log, and the next genuine incremental
+-- was absorbed by the residue -- 100.00 live, 0.00 held, 0.00 posted, drift
+-- silent, and the non-latching over-capture flag erased by the very message that
+-- hid the money.
+SELECT record_auth_event('t1','r6_ov_a','g_overrev','omega','card_ov','authorization',10000,'USD',false,now());
+SELECT record_auth_event('t1','r6_ov_b','g_overrev','omega','card_ov','reversal',10000,'USD',false,now());
+SELECT must_fail('reversing more than was ever authorized', $q$
+    SELECT record_auth_event('t1','r6_ov_c','g_overrev','omega','card_ov','reversal',10000,'USD',false,now());
+    DO $d$ BEGIN
+        IF EXISTS (SELECT 1 FROM card_hold_drift WHERE group_key='g_overrev') THEN
+            RAISE EXCEPTION 'OVER-REVERSED GROUP DETECTED';
+        END IF;
+    END $d$;
+$q$, 'over-reversed group detected');
+-- ...and a genuine over-CAPTURE, which the ledger does account for, is not flagged
+SELECT record_auth_event('t1','r6_oc2_a','g_realoc','omega','card_oc','authorization',100,'USD',false,now());
+SELECT record_auth_event('t1','r6_oc2_b','g_realoc','omega','card_oc','clearing',9500,'USD',false,now());
+-- scoped: earlier fixtures in this file leave deliberate drift elsewhere
+SELECT eq('no drift on g_realoc -- a real over-capture, whose money posted to the ledger',
+          (SELECT count(*) FROM card_hold_drift WHERE group_key='g_realoc'), 0);
+
+-- EXPIRY IS A FLAG, SO ITS REVERSAL ADDS NOTHING BACK. Carrying +remaining as a
+-- delta against a total the flag never reduced made one 100.00 authorization hold
+-- 200.00, and after the full 100.00 capture it still held 100.00 -- with drift
+-- silent, because the log genuinely contained the +10000 and the alarm can only
+-- compare the total against the log.
+SELECT record_auth_event('t1','r6_xr_a','g_xrev','omega','card_xr','authorization',10000,'USD',false,now());
+SELECT expire_hold_group('t1','omega','g_xrev');
+SELECT eq('an expiry_reversal restores the hold that was live, not that plus its own amount',
+          record_auth_event('t1','r6_xr_b','g_xrev','omega','card_xr','expiry_reversal',10000,'USD',false,now()),
+          10000);
+SELECT eq('...so the full capture closes it out at zero',
+          record_auth_event('t1','r6_xr_c','g_xrev','omega','card_xr','clearing',10000,'USD',false,now()), 0);
+-- scoped: earlier fixtures in this file leave deliberate drift elsewhere
+SELECT eq('no drift on g_xrev -- expiry reversal',
+          (SELECT count(*) FROM card_hold_drift WHERE group_key='g_xrev'), 0);
+
+-- WHAT INGEST RETURNS IS THE NUMBER THE DECISION IS MADE ON, so it must be the
+-- clamped hold and never the raw total. It returned -9400 on an over-capture while
+-- held_for_company reported 0: 94.00 of phantom credit for an adapter computing
+-- `available = limit - returned`. The file calls this its strongest single
+-- assertion and was exercising it on one branch only.
+SELECT record_auth_event('t1','r6_rt_a','g_rettot','omega','card_rt','authorization',100,'USD',false,now());
+SELECT eq('ingest never returns a negative hold',
+          record_auth_event('t1','r6_rt_b','g_rettot','omega','card_rt','clearing',9500,'USD',false,now()), 0);
+SELECT eq('...and it agrees with what that group actually holds',
+          (SELECT held_minor FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='omega' AND group_key='g_rettot'), 0);
+
+-- A NULL CURRENCY IS THE DEFAULTED CURRENCY THIS FUNCTION REFUSES TO HAVE, and it
+-- returned the most dangerous possible answer: `currency = NULL` matches no row,
+-- so live exposure came back as 0.
+SELECT must_fail('asking what is held, without saying in what currency', $q$
+    DO $d$ BEGIN PERFORM held_for_company('t1','omega',NULL); END $d$;
+$q$, 'requires tenant, company and currency');
+
+-- ADVICE IS BIDIRECTIONAL, which is the sole stated reason it is exempt from
+-- ck_auth_events__sign -- and nothing passed a negative amount anywhere, so
+-- `p_amount` could be replaced by `abs(p_amount)` with the suite green, turning a
+-- 50.00 decline advice into a 50.00 INCREASE.
+SELECT record_auth_event('t1','r6_ab_a','g_advneg','omega','card_ab','authorization',10000,'USD',false,now());
+SELECT eq('a NEGATIVE advice reduces the hold',
+          record_auth_event('t1','r6_ab_b','g_advneg','omega','card_ab','advice',-4000,'USD',false,now()), 6000);
+SELECT eq('...and is stored with its sign intact',
+          (SELECT amount_delta FROM card_auth_events WHERE processor_msg_id='r6_ab_b'), -4000);
+SELECT eq('...without moving the authorized subtotal',
+          (SELECT authorized_minor FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='omega' AND group_key='g_advneg'), 10000);
+-- scoped: earlier fixtures in this file leave deliberate drift elsewhere
+SELECT eq('no drift on g_advneg -- a negative advice',
+          (SELECT count(*) FROM card_hold_drift WHERE group_key='g_advneg'), 0);
+
+-- ...and again at the end, because a SET LOCAL in a DO block that SUCCEEDS
+-- persists for the rest of the transaction. MODE GUARD. `SET LOCAL session_replication_role = 'replica'` prepended to this
+-- file's BEGIN made the whole suite run on the replication apply path, where a
+-- guard marked ENABLE REPLICA fires and the ordinary write path is untested. That
+-- is how an earlier leak went unnoticed for two hundred lines of negative
+-- controls. One line per suite, at both ends.
+DO $$ BEGIN
+    IF current_setting('session_replication_role') <> 'origin' THEN
+        RAISE EXCEPTION
+            'this suite is running as %, not origin: every guard it exercises may be '
+            'the replica-path one', current_setting('session_replication_role');
+    END IF;
+    RAISE NOTICE 'ok  running on the ordinary write path';
 END $$;
 
 ROLLBACK;

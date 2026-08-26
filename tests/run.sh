@@ -25,12 +25,19 @@ done
 # `bool_and(balanced)` is NULL, and a report that printed nothing at all reads as a
 # report that found nothing wrong. No suite file can check this -- each one creates
 # accounts in order to have something to break.
+# ...and it must fail for the RIGHT REASON. Testing only the exit status meant a
+# function that did not exist, or one with a syntax error, counted as "refused".
 for fn in "accounting_equation()" "balance_sheet_balances()"; do
-    if psql "$URL" -qAt -c "SELECT count(*) FROM $fn" >/dev/null 2>&1; then
-        echo "── empty-ledger guard"
-        echo "   FAIL $fn reported on a ledger with no accounts instead of refusing"
-        echo "FAIL"; exit 1
-    fi
+    why=$(psql "$URL" -qAt -c "SELECT count(*) FROM $fn" 2>&1) && why=""
+    case "$why" in
+        *"no accounts exist"*) : ;;
+        "")  echo "── empty-ledger guard"
+             echo "   FAIL $fn reported on a ledger with no accounts instead of refusing"
+             echo "FAIL"; exit 1 ;;
+        *)   echo "── empty-ledger guard"
+             echo "   FAIL $fn failed, but not as the empty-ledger guard: $why"
+             echo "FAIL"; exit 1 ;;
+    esac
 done
 echo "── empty-ledger guard"
 echo "   ok  both report functions refuse a ledger with no accounts"
@@ -72,10 +79,16 @@ fi
 # many assertion CALL SITES its source actually contains. A stub that prints 160
 # `ok` lines from one loop has two. To forge this you have to write the
 # assertions, at which point you have written the test.
+#
+# COMMENTS ARE STRIPPED FIRST, because they are not call sites. Counting raw
+# grep matches meant a file of 200 lines reading `-- must_fail(  fake site` and
+# one loop raising 200 notices satisfied the manifest, both floors and the
+# sentinel: 1,756 lines of controls replaced by 204 lines of nothing, build green.
 sites_for() {
     case "$1" in
-        *.sh) grep -cE 'chk "|echo "   ok' "$1" ;;
-        *)    grep -cE "must_fail\(|SELECT eq\(|SELECT eqv\(|no_drift\(|expect_state\(|plan_uses\(|on_origin\(|RAISE NOTICE 'ok" "$1" ;;
+        *.sh) grep -v '^[[:space:]]*#' "$1" | grep -cE 'chk "|echo "   ok' ;;
+        *)    grep -v '^[[:space:]]*--' "$1" \
+                | grep -cE "must_fail\(|SELECT eq\(|SELECT eqv\(|no_drift\(|expect_state\(|plan_uses\(|on_origin\(|RAISE NOTICE 'ok" ;;
     esac
 }
 # EXACT, not slack. Seven assertions of headroom on negative_controls.sql was
@@ -86,11 +99,11 @@ sites_for() {
 # them, which is the point.
 floor_for() {
     case "$1" in
-        *bitemporal.sql)        echo 21 ;;
-        *card_holds.sql)        echo 148 ;;
-        *golden_trace.sql)      echo 33 ;;
-        *negative_controls.sql) echo 140 ;;
-        *query_plans.sql)       echo  7 ;;
+        *bitemporal.sql)        echo 23 ;;
+        *card_holds.sql)        echo 164 ;;
+        *golden_trace.sql)      echo 35 ;;
+        *negative_controls.sql) echo 139 ;;
+        *query_plans.sql)       echo  9 ;;
         *)                      echo  1 ;;
     esac
 }
@@ -144,5 +157,11 @@ if ! echo "$cout" | grep -q "SUITE-COMPLETE concurrency"; then
     echo "   FAIL tests/concurrency.sh did not run to its last line"
     fail=1
 fi
+
+# ...and finally, a verdict from OUTSIDE the suite. Everything above counts what
+# the suite says about itself; canary.sh breaks the schema on purpose and requires
+# the suite to notice. See its header for what that is worth.
+echo "── tests/canary.sh"
+if ! ./tests/canary.sh "$ADMIN"; then fail=1; fi
 
 [ "$fail" -eq 0 ] && echo "PASS" || { echo "FAIL"; exit 1; }

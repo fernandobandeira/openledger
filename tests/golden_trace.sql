@@ -18,6 +18,20 @@
 \o /dev/null
 BEGIN;
 
+-- MODE GUARD. `SET LOCAL session_replication_role = 'replica'` prepended to this
+-- file's BEGIN made the whole suite run on the replication apply path, where a
+-- guard marked ENABLE REPLICA fires and the ordinary write path is untested. That
+-- is how an earlier leak went unnoticed for two hundred lines of negative
+-- controls. One line per suite, at both ends.
+DO $$ BEGIN
+    IF current_setting('session_replication_role') <> 'origin' THEN
+        RAISE EXCEPTION
+            'this suite is running as %, not origin: every guard it exercises may be '
+            'the replica-path one', current_setting('session_replication_role');
+    END IF;
+    RAISE NOTICE 'ok  running on the ordinary write path';
+END $$;
+
 -- ------------------------------------------------------------------ scopes
 --
 -- Two scopes, because the tenant-locality rule is a correctness rule: a
@@ -927,6 +941,21 @@ BEGIN
     RAISE NOTICE 'ok  refused  resolving a transaction that does not exist';
 END $$;
 SET CONSTRAINTS ALL DEFERRED;
+
+-- ...and again at the end, because a SET LOCAL in a DO block that SUCCEEDS
+-- persists for the rest of the transaction. MODE GUARD. `SET LOCAL session_replication_role = 'replica'` prepended to this
+-- file's BEGIN made the whole suite run on the replication apply path, where a
+-- guard marked ENABLE REPLICA fires and the ordinary write path is untested. That
+-- is how an earlier leak went unnoticed for two hundred lines of negative
+-- controls. One line per suite, at both ends.
+DO $$ BEGIN
+    IF current_setting('session_replication_role') <> 'origin' THEN
+        RAISE EXCEPTION
+            'this suite is running as %, not origin: every guard it exercises may be '
+            'the replica-path one', current_setting('session_replication_role');
+    END IF;
+    RAISE NOTICE 'ok  running on the ordinary write path';
+END $$;
 
 ROLLBACK;
 

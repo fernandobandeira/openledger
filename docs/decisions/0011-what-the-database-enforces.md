@@ -160,21 +160,26 @@ were then fixed with an assignment trigger. **The third was not** — and it is 
 calls "the seal's whole basis".
 
 A `DEFAULT` fires only when the client omits the column, and `GRANT INSERT ON ledger_transactions`
-covers every column. `assert_entry_seals` opens when the parent's stored `xact_id` equals the
-appending transaction's live xid. So: insert an ordinary, balanced, correctly-dated transaction with
-a **future** `xact_id`, let the global counter reach it — any workload does that unaided — and then
-append. Reproduced end to end as `openledger_app`, using nothing but the INSERT grants: 555.00 of
-revenue added to a transaction committed in an earlier database transaction, restating a closed
-period upward, with the accounting equation, the income statement, the balance sheet and **both**
-drift views agreeing.
+covers every column, so `xact_id` was **accepted** rather than assigned. `ck_txn__xact_id` now
+assigns it, exactly as `assign_recorded_at` does. The `DEFAULT` stays so the column is never null
+under a bulk load with triggers off; it is not the mechanism.
 
-The immutability trigger already refused an `UPDATE` to `xact_id`; the round-5 tuple walk covers all
-ten columns of it. Neither touches an INSERT. And the suite could not have found this: it runs as one
-transaction, so it can only construct seals stored with a *past* xid — its own comment says so —
-while landing a *future*-forged one needs many real commits to march the counter.
+**And a claim that came with it is struck.** A reviewer reported a live escape: plant a transaction
+carrying a *future* `xact_id`, wait for the global counter to reach it, then append legs while the
+live xid matches, so `assert_entry_seals` reads equal and opens — 555.00 of revenue added to a
+closed period with every report agreeing. It was written into this ADR and into the migration on
+that report alone, and **it does not work.** Checked against the pre-fix schema: the forged value
+seals the transaction against *its own* legs at plant time (`is already committed; its entries are
+sealed`), and a leg-less transaction cannot commit because `ck_txn__has_entries` fires at COMMIT. A
+second reviewer, asked to verify the same claim independently, also failed to reproduce it and said
+so rather than assuming.
 
-`ck_txn__xact_id` now assigns it, exactly as `assign_recorded_at` does. The `DEFAULT` stays so the
-column is never null under a bulk load with triggers off; it is not the mechanism.
+That is the sourcing rule of [the decision log](./README.md#on-sourcing) applied to a *finding*
+rather than to a citation, and it was violated in the direction nobody watches for: not by inventing
+a number, but by adopting an adversary's demonstration without re-running it. **A finding is a
+claim.** The fix stands on the principle this ADR is named for — a column whose integrity rests on a
+`DEFAULT` is not defended, and leaving the seal's own basis as the single exception to a rule
+`recorded_at` and `account_seq` both follow was an inconsistency waiting for a use.
 
 ### `ENABLE ALWAYS` on every trigger, and on the foreign keys
 

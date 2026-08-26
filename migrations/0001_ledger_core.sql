@@ -307,21 +307,27 @@ END $$;
 -- column it calls "the seal's whole basis". A DEFAULT only fires when the client
 -- omits the column, and `GRANT INSERT ON ledger_transactions` covers every column.
 --
--- The seal opens when the parent's stored xact_id equals the appending
--- transaction's live xid. So: INSERT a perfectly ordinary balanced transaction
--- with a xact_id set to a FUTURE value, let the global counter reach it -- any
--- workload does that on its own -- and then append. Reproduced end to end as
--- openledger_app, using nothing but the INSERT grants this file describes as the
--- app role's ordinary privilege: 555.00 of revenue appended to a transaction
--- committed in an earlier database transaction, restating a closed period upward,
--- with the accounting equation, the income statement, the balance sheet and BOTH
--- drift views agreeing with it. No UPDATE, no DELETE, no TRUNCATE.
+-- A reviewer reported this as a live escape: plant a transaction carrying a FUTURE
+-- xact_id, let the global counter reach it, then append legs while the live xid
+-- equals the forged one, so the seal reads equal and opens. THAT ATTACK DOES NOT
+-- WORK, and the retraction is worth as much as the fix.
 --
--- The immutability trigger already refused an UPDATE to xact_id; nothing refused a
--- forged one at INSERT, and the suite could not see it -- negative_controls.sql
--- runs as ONE transaction, so it can only probe seals stored with a PAST xid, and
--- its own comment says so. Landing a future-forged xid needs many real commits to
--- march the counter, which a single-transaction suite structurally cannot do.
+-- Checked directly against the schema as it stood before this trigger existed: the
+-- forged value seals the transaction against ITS OWN legs immediately. The plant
+-- fails at step one -- `is already committed; its entries are sealed` -- and a
+-- transaction with no legs cannot commit, because ck_txn__has_entries fires at
+-- COMMIT. A second reviewer, asked to verify the same claim, also could not
+-- reproduce it. It was written into this comment on one agent's say-so and is
+-- struck.
+--
+-- The trigger stays, because the principle is this file's own and does not depend
+-- on that exploit: a column whose integrity rests on a DEFAULT is not defended.
+-- A DEFAULT fires only when the client omits the column, `GRANT INSERT` covers
+-- every column, and recorded_at and account_seq were both moved from accepted to
+-- assigned for exactly this reason. Leaving the seal's basis as the one exception
+-- was an inconsistency waiting for someone to find a use for. What is now true is
+-- narrow and checkable: no client can choose the value at INSERT, and the
+-- immutability trigger already refused to let one change it afterwards.
 CREATE FUNCTION assign_xact_id() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
