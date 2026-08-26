@@ -32,8 +32,10 @@ put it behind a feature flag that's off in their own minimal configuration.
 *Backdating* means an entry arriving today that is economically dated last week — routine in
 payments, because a clearing carries the network's business date. On the **effective** axis a
 backdated entry invalidates every later running balance, so their trigger runs an unbounded
-`UPDATE … WHERE effective_date > new.effective_date`. Migration 10 sets `fillfactor = 80` on the
-journal purely because it became UPDATE-heavy, Six migrations touch volume/pcv aggregation
+`UPDATE … WHERE effective_date > new.effective_date`. Migration 10 sets `fillfactor = 80` on the journal. The fill factor is verified at the pinned
+commit; the REASON is OUR INFERENCE -- `notes.yaml` reads only "Define fill factor of moves table"
+-- and we infer it is because the table became UPDATE-heavy. Six migrations touch volume/pcv
+aggregation
 afterwards — **three of them repairing data** (19, 20, 28), two replacing functions, and one
 (`27-fix-invalid-pcv`) a no-op stub. An earlier version of this line said all six "exist solely to
 repair volume data"; fetched at the pinned commit, that is not what they do.
@@ -317,7 +319,7 @@ migrations. Column names drift badly too: `date`, `timestamp`, `insertion_date`,
   on one source account serializes. They are *said* to target 1K writes/sec -- **unverified**, no
   URL was ever recorded and an authenticated code search across their org returns zero hits for the
   phrase, as `spikes/003` records. Issue #1363 documents
-  a real user hitting a knee at **~8–12 TPS** on a single ledger. →
+  a knee at **~8-12 TPS** -- but the issue is titled "Concurrent-write throughput regression v2.4.5 -> v2.4.7" and reports it AS A REGRESSION, the same binary being far faster serially. Reading it as an inherent single-ledger ceiling drops the load-bearing qualifier. →
   [spike 003](../003-throughput-ceiling/README.md).
 - **Every table needs a PK / replica identity from day one.** Migration 45 is
   `fix-missing-primary-keys` — they shipped releases with no PK on `transactions`, `accounts` or

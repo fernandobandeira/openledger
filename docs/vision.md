@@ -3,7 +3,9 @@
 An open-source **double-entry ledger**. Postgres for storage, Go for the service.
 
 **The whole project is about correctness.** Not throughput, not deployment convenience — those are
-solved problems and the measurements say so. Correctness here means specific, testable claims:
+solved problems -- a bet about where the difficulty lies, not a measured result: nothing here has
+been measured over a network, and this repository's README opens by saying no number in it is a
+benchmark. Correctness here means specific, testable claims:
 every cent accounted for, the books provably balanced at every instant, any number reproducible as
 of any date, and no manual fixes ever. Those properties are cheap to design in and painful to
 retrofit.

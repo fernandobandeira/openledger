@@ -132,6 +132,13 @@ review demonstrably does not.
 
 ## Consequences
 
+> **The sourcing banner above sits inside `## Why` and does not reach this section.** The
+> third-party claims below — River's commercial tier gating durable periodic jobs, its MPL-2.0
+> §3.2 obligations, and `gue`'s feature list — carry no URL and are **unverified** on the same
+> rule. One of them is contradicted in this repository: `spikes/005` says flatly that "River
+> supports periodic jobs; not exercised here."
+
+
 - The ledger core has no scheduler dependency. ADR-0001's Go argument no longer rests on Temporal
   SDK quality; it rests on `int64` money, static binaries, and pgx/sqlc.
 - One driver ships. A Temporal driver is *possible* via an outbox — document it, and let the first

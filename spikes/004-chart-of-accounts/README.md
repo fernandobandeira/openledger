@@ -46,7 +46,7 @@ accounting equation                                   BALANCED
 **Revenue understated by a third, equation perfectly happy** — but *not* for the reason this line
 gave for several rounds. It said omitting an account "removes it from both sides", which
 [ADR-0009](../../docs/decisions/0009-chart-and-completeness.md) shows is false and checkably so:
-drop `interchange_revenue` from the shipped trace and assets read 276 against L+E+R-X of -624. What
+drop `interchange_revenue` from the shipped trace and the two sides differ by exactly that account's balance (measured against the current trace: t1/USD 120326 against 69426). *An earlier version of this line quoted 276 against -624; those came from a smaller trace and do not reproduce, and [ADR-0009](../../docs/decisions/0009-chart-and-completeness.md) struck them while this file kept them*. What
 happens here is narrower — the demo omits a whole *tenant*, and a tenant's sub-book balances on its
 own, so both sides move together. The numbers stand; the stated mechanism was wrong. This is the audit finding to engineer against: a tenant is onboarded, its
 account row is created, the reporting mapping misses it, and nothing imbalances.
@@ -168,7 +168,8 @@ the complete set?* — which is what [`completeness.sql`](./completeness.sql) an
 
 ### The framing that dissolves most of the objection
 
-An accountant sees **`account_types` = the chart of accounts (16 entries)** and
+An accountant sees **`account_types` = the chart of accounts** -- 16 entries in this spike's own
+`chart.sql`, 19 in the shipped seed -- and
 **`ledger_accounts` = dimensioned instances**. `interchange_revenue` is *one* account in the chart
 no matter how many rows carry that `purpose`.
 

@@ -25,7 +25,7 @@ can be answered with numbers. Durable settings throughout, stock Postgres, one 1
 | --- | --- |
 | baseline (one shared account row, no batching) | ~800 |
 | + coalesced batching | 3,420 |
-| + **striping** 64 ways **and** single-call posting, *instead of* batching | **7,897** |
+| + **striping** 64 ways **and** single-call posting, *instead of* batching | **7,897** (2 GB table; 7,816 at 43 MB) |
 
 Three findings shape the decision:
 
@@ -131,7 +131,8 @@ about what it does, because the naming misleads:
   [ADR-0010](./0010-authorization-holds.md)) — never a ledger entry. Nothing is owed until
   clearing.
 - It **reads** one number from the ledger: the `customer_receivable` balance. Unstriped that is a
-  single index lookup (0.018 ms). **Striped, it is a sum over the stripes**, so it grows with the
+  single index lookup (often quoted at 0.018 ms; that figure has no harness in this repo, and every
+  other site in the tree now says so). **Striped, it is a sum over the stripes**, so it grows with the
   stripe count — the same knob this ADR recommends turning up. *The specific per-stripe timings
   previously quoted here are struck: they appear nowhere else in the repository and no method was
   recorded. Striping is not implemented, so there is nothing to measure yet.* Still trivial against a ~1s deadline, but the read

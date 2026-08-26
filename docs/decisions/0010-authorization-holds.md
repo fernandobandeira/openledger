@@ -95,8 +95,11 @@ All three were reproduced with two interleaved sessions and are now covered by
 | **Worse: a live authorization joined a group being expired.** `held_for_company` then reported **0 against real exposure of 1000**, and `card_hold_drift` could not see it, because the clamp lives in `held_minor` while the alarm compares `total_minor` — and those agreed. Invisible to the unmatched queue too, since the event had a live membership row. | Same fix. The alarm now also reports any event assigned to a group *after* it expired, because the clamp is the thing hiding the number. |
 | **The lock that fixed the lost update introduced a deadlock.** Re-grouping locked the destination, then `recompute_hold_group` locked the source — so two operators moving events in opposite directions between the same two groups took the same two locks backwards. 198 deadlocks under mixed load. | Lock both groups up front, in `group_key` order. The same lesson as sorting the legs in `post()`. |
 
-*The deadlock counts in the table above (198) and under "Recorded rather than closed" (91), and
-the figures in the paragraph below, all come from one-off adversarial runs, not from the shipped
+*EVERY quantitative figure in this section comes from one-off adversarial runs, not from the
+shipped suite* — the deadlock counts in the table above (198) and under "Recorded rather than
+closed" (91); the 2.96 s block and 3,600 concurrent calls below; and, further down, "18 of 20
+trials", "seven of the eight" and "1,304 of 1,800". An earlier version of this note said "the
+paragraph below", singular, and left the last three unmarked. They all come from one-off runs, not from the shipped
 suite: `tests/concurrency.sh` defaults to 6 workers x 15 operations. They are recorded as
 observations, not as reproducible benchmarks — the harness that produced them is not in the repo.*
 
@@ -182,7 +185,7 @@ the unmatched queue and `regroup_auth_event` exist to correct — it is not the 
 
 ## Known, and not fixed
 
-Three findings from adversarial review are recorded rather than closed, because
+Four findings from adversarial review are recorded rather than closed, because
 each needs a design decision rather than a guard:
 
 - **A cumulative restatement that DECREASES is refused, and the refusal is sticky.**
