@@ -96,8 +96,9 @@ accounts and the completeness layer ([ADR-0009](./decisions/0009-chart-and-compl
 
 Landed with it: composite `(tenant_id, …)` keys throughout, the cross-tenant guard as a composite
 foreign key, an immutability trigger on the journal, and the drift views both ADR-0003 and
-ADR-0010 rely on. **Striping is not built** — it is still one integer on the account row and a
-`SUM` on read, and nothing in `migrations/` implements it yet.
+ADR-0010 rely on. **Striping is not built.** The design is one integer on the account row and a `SUM` on read;
+there is no such column in `migrations/` and nothing implements it. An earlier version of this
+sentence read as though the column existed.
 
 Carried forward: balanced-per-currency enforced by the database; append-only via an immutability
 trigger (the `REVOKE` narrows the blast radius; it is not the mechanism); `amount_minor bigint CHECK (> 0)` so direction carries
@@ -117,11 +118,10 @@ in [ADR-0009](./decisions/0009-chart-and-completeness.md).
 
 **This was the one irreversible decision on the list, and it was free.** It is the prerequisite for
 row-level security, partitioning, and ever splitting across instances — none work without it, all
-are expensive to retrofit. A large SaaS sharding post-mortem named exactly this omission as its regret —
-`spikes/003` attributes the same lesson to Nubank and this line once said Notion. Neither
-attribution has a source in the repo, so **the company is unverified**; the lesson stands on its
-own mechanics. It is in
-before there is data, which was the whole point.
+are expensive to retrofit. A widely-cited sharding post-mortem named exactly this omission as its regret —
+`spikes/003` attributes the lesson to Nubank and this line once said Notion. Neither attribution
+has a source in the repo, so **the company is unverified**; the mechanics are the load-bearing
+part. The column is in before there is data, which was the whole point.
 
 **Tenant-local transactions, via intercompany clearing.** Some accounts genuinely cannot be
 per-tenant: `operating_cash` mirrors *one real bank account*. A treasury transaction therefore
@@ -167,7 +167,14 @@ RETURNING b.last_seq, b.input - b.output;
 The row lock *is* the serialization point — no `SELECT max()`, no advisory lock, no retry loop.
 
 **That last clause holds only under READ COMMITTED, and that had never been written down.**
-Measured, same sorted workload, no retry: READ COMMITTED **1200/1200 committed**; REPEATABLE READ
+*The figures in this paragraph have **no harness in the repository** — nothing in `tests/`,
+`spikes/` or `migrations/` sets an isolation level, and spike 003 never varied one. They come from
+a one-off adversarial run and are recorded as observations, not as reproducible measurements. The
+conclusion does not depend on the numbers: `ON CONFLICT DO UPDATE` under a stricter isolation
+level fails with `could not serialize access due to concurrent update`, which is a property of
+Postgres, not of this workload.*
+
+Observed, same sorted workload, no retry: READ COMMITTED **1200/1200 committed**; REPEATABLE READ
 **369**, with 831 serialization failures; SERIALIZABLE **244**, with 956. The failure is the
 `ON CONFLICT DO UPDATE` itself — `could not serialize access due to concurrent update`. It fails
 closed, so nothing corrupts, but a deployment that sets a stricter default silently loses most of
@@ -185,7 +192,10 @@ Two traps from Formance's bug history:
   exist. But `INSERT … ON CONFLICT DO UPDATE` *is* the insert-and-lock, so there is no gap to race
   through. Attacked with 25 independent races, each a fresh tenant with no balance row and 32
   writers released simultaneously on a start barrier: **800/800 committed, zero deadlocks, zero
-  unique violations**, every sequence gapless from 1. This is a genuine strength of the design.
+  unique violations**, every sequence gapless from 1. *That harness is **not in the repo** —
+  `tests/concurrency.sh` uses fixed tenants and no start barrier — so treat it as a one-off
+  observation.* What IS shipped and does hold: `concurrency.sh` asserts `max(seq) = count(*) =
+  count(distinct seq)` per account under concurrent load, on every run.
 - **Deterministic lock ordering, batch-wide.** Sort accounts by id on read and write paths. Spike
   003 found that sorting within a single clearing does *not* order locks across a batch —
   throughput collapsed 10× into deadlocks.
@@ -274,7 +284,9 @@ The adoption surface, and the milestone that decides whether any of the above ge
 - `docker compose up` for local development, already half-done.
 - A worked deployment example — the smallest thing that stands up a working ledger.
 - Documentation stating **which throughput lever applies to which write path**. Recommending both
-  is actively harmful: the combination measured 3× *worse* than either alone.
+  is actively harmful: the combination measured **worse than either alone** -- 2,356 clearings/s
+  against 6,850 for striping by itself and 3,338 for batching by itself. An earlier version of this
+  line said "3x worse than either", which is true of striping and false of batching.
 
 **Done when:** someone who has never seen this repository can stand up a working ledger against
 RDS from the README alone.

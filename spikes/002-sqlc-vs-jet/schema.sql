@@ -11,7 +11,7 @@
 -- catalog query. Formance names two of their composite PKs `accounts_ledger` and
 -- `logs_ledger`, and named a migration `accounts-metadata-index` that indexes a
 -- DIFFERENT table -- which is precisely how a missing index on the hot write path
--- went unnoticed for thirty migrations.
+-- went unnoticed for sixteen migrations.
 
 BEGIN;
 

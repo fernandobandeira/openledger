@@ -39,8 +39,11 @@ threat.
 
 It said: *"a report that enumerates only some accounts still satisfies the equation, because the
 missing account drops out of both sides."* **That is false, and checkably so.** Omit one account
-and it drops out of exactly *one* side: dropping `interchange_revenue` from the golden trace gives
-assets 276 against L+E+R−X of −624. Omitting a single account is one of the few completeness
+and it drops out of exactly *one* side: dropping `interchange_revenue` from the golden trace leaves
+the two sides differing by **exactly that account's balance**, which is the whole point — the
+equation catches it and says by how much. (The figures this line used to quote, 276 against −624,
+came from a smaller earlier trace and do not reproduce against the shipped one; the mechanism does,
+and is the claim.) Omitting a single account is one of the few completeness
 failures the equation *does* catch, loudly.
 
 The true proposition — and what the original demonstration actually showed — is that omitting a

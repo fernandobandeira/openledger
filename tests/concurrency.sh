@@ -391,5 +391,88 @@ chk "...and every racing caller was told the true exposure" "$rd_bad" 0
 chk "...with nothing left unmatched" \
     "$(q "select count(*) from card_auth_unmatched where tenant_id='rd'")" 0
 
+# ---------------------------------------------------------------- workload H
+# TWO OPERATORS, ONE EVENT. `regroup_auth_event` locks the event row FOR UPDATE
+# before reading which group it is currently in, and that lock was completely
+# untested: workload C shuttles events picked with `ORDER BY random() LIMIT 1`
+# between two groups, so it essentially never puts two operators on the SAME
+# event -- which is the only case the lock exists for. Deleting it left a phantom
+# hold in 40 of 40 trials, and the shipped suite found it 0 times in 40.
+#
+# X -> Y and X -> Z at once. Whichever loses must see the event has already moved
+# and recompute the group it actually left, not the one it read before waiting.
+psql "$URL" -q -v ON_ERROR_STOP=1 -c \
+  "DO \$d\$ BEGIN PERFORM record_auth_event('tw','tw_e','gX','co1','c1','authorization',10000,'USD',false,now()); END \$d\$;"
+tw_id=$(q "select id from card_auth_events where tenant_id='tw' and processor_msg_id='tw_e'")
+for dst in gY gZ; do
+    ( psql "$URL" -qAt -c "SELECT regroup_auth_event('tw','$tw_id','$dst','operator')" \
+        >"$TMPD/tw_$dst.out" 2>&1 ) &
+done
+wait
+chk "two operators moving one event: exactly one live membership" \
+    "$(q "select count(*) from card_auth_event_group where tenant_id='tw' and event_id='$tw_id' and superseded_at is null")" 1
+chk "...and the exposure is counted once, not twice" \
+    "$(q "select coalesce(sum(held_minor),0) from card_hold_groups where tenant_id='tw'")" 10000
+chk "...and no group is left holding a phantom" \
+    "$(q "select count(*) from card_hold_drift where tenant_id='tw'")" 0
+
+# ---------------------------------------------------------------- workload I
+# THE ATTACH PATH TAKES TWO LOCKS, AND A FOREIGN KEY TAKES ONE OF THEM FOR YOU.
+# `record_auth_event`'s re-delivery attach took the card_hold_groups row FOR
+# UPDATE and then, through fk_event_group__event, an implicit FOR KEY SHARE on the
+# event when inserting the membership. `regroup_auth_event` takes those two in the
+# OPPOSITE order. A matcher attaching a queued event against an operator moving
+# the same event deadlocked in 18 of 20 trials -- each one aborting the adapter's
+# whole webhook transaction. ADR-0010 claimed a single-group ingest "cannot
+# deadlock -- it takes exactly one row lock".
+psql "$URL" -q -v ON_ERROR_STOP=1 -c \
+  "DO \$d\$ BEGIN PERFORM record_auth_event('at','at_e',NULL,'co1','c1','authorization',7000,'USD',false,now());
+            PERFORM record_auth_event('at','at_seed','gH','co1','c1','authorization',100,'USD',false,now()); END \$d\$;"
+at_id=$(q "select id from card_auth_events where tenant_id='at' and processor_msg_id='at_e'")
+at_dl_before=$(q "select deadlocks from pg_stat_database where datname=current_database()")
+for i in $(seq 1 10); do
+    ( psql "$URL" -qAt -c "SELECT record_auth_event('at','at_e','gH','co1','c1','authorization',7000,'USD',false,now())" \
+        >"$TMPD/at_a$i.out" 2>&1 ) &
+    ( psql "$URL" -qAt -c "SELECT regroup_auth_event('at','$at_id','gH$i','operator')" \
+        >"$TMPD/at_r$i.out" 2>&1 ) &
+done
+wait
+at_dl_after=$(q "select deadlocks from pg_stat_database where datname=current_database()")
+chk "matcher against operator on one event: deadlocks" "$(( at_dl_after - at_dl_before ))" 0
+chk "...still exactly one live membership" \
+    "$(q "select count(*) from card_auth_event_group where tenant_id='at' and event_id='$at_id' and superseded_at is null")" 1
+chk "...and no drift" "$(q "select count(*) from card_hold_drift where tenant_id='at'")" 0
+
+# ---------------------------------------------------------------- workload J
+# EIGHT RE-DELIVERIES OF ONE UNMATCHED EVENT, ALL NAMING THE SAME GROUP. Workload
+# G covers the FRESH-insert race, where the event does not yet exist. This is the
+# other one -- the case the thirty-line "THE RE-DELIVERY ATTACH" comment block
+# exists for -- and it was uncovered: all eight callers read the membership with
+# no lock held, all eight saw NULL, and seven got a raw
+# `duplicate key value violates unique constraint "uq_event_group__current"`
+# instead of the exposure they asked for.
+psql "$URL" -q -v ON_ERROR_STOP=1 -c \
+  "DO \$d\$ BEGIN PERFORM record_auth_event('rj','rj_e',NULL,'co1','c1','authorization',81000,'USD',false,now()); END \$d\$;"
+for w in $(seq 1 8); do
+    ( psql "$URL" -qAt -c "SELECT record_auth_event('rj','rj_e','gJ','co1','c1','authorization',81000,'USD',false,now())" \
+        >"$TMPD/rj$w.out" 2>"$TMPD/rj$w.err" ) &
+done
+wait
+rj_true=$(q "select total_minor from card_hold_groups where tenant_id='rj' and group_key='gJ'")
+chk "eight concurrent attaches of one unmatched event: one live membership" \
+    "$(q "select count(*) from card_auth_event_group m join card_auth_events e on e.tenant_id=m.tenant_id and e.id=m.event_id where e.tenant_id='rj' and e.processor_msg_id='rj_e' and m.superseded_at is null")" 1
+chk "...and the group holds it once" "$rj_true" 81000
+rj_bad=0
+for w in $(seq 1 8); do
+    got=$(tr -d ' \n' < "$TMPD/rj$w.out")
+    if [ "$got" != "$rj_true" ]; then
+        echo "   .. attacher $w was told '$got' against a true exposure of $rj_true"
+        rj_bad=$((rj_bad+1))
+    fi
+done
+chk "...and every racing attacher was told the true exposure, not a constraint error" "$rj_bad" 0
+chk "...with nothing left in the review queue" \
+    "$(q "select count(*) from card_auth_unmatched where tenant_id='rj'")" 0
+
 echo "   ok  SUITE-COMPLETE concurrency"
 exit "$fail"

@@ -414,7 +414,7 @@ cannot be split per tenant without destroying the reconciliation the design is b
 for `facility_borrowings` — one warehouse line, one lender, one number.
 
 **7 transactions touch `operating_cash`.** (Of 13 in this spike's own trace; the shipped
-`tests/golden_trace.sql` that supersedes it runs 21, still 7 of them on `operating_cash`.) But the four *clearing*
+`tests/golden_trace.sql` that supersedes it runs 24, still 7 of them on `operating_cash`.) But the four *clearing*
 transactions do not. So:
 
 > **Clearings become tenant-local. Treasury does not.**
@@ -475,7 +475,7 @@ stress case. Our `network_settlement_payable` is TPC-B's branch record.
 | --- | --- | --- |
 | **Uber** | 250 ms batch windows, one read + one write per batch | 3–4 → **30+ ops/sec per account**; bulk jobs 21–24 h → minutes |
 | **Modern Treasury** | Sync/async router; hot entries queued and coalesced | p90 processing 1 s; **1,200 txn/s** in production |
-| **TigerBeetle** | Batching up to 8,190 transfers per query | — |
+| **TigerBeetle** | Batching up to 8,189 transfers per query ([docs](https://docs.tigerbeetle.com/coding/requests/)) | — |
 | **Fragment** | Coalesced balance updates | p95 staleness 10 s at 10k entries/s |
 
 Uber: *"Using multiple DynamoDB rows for a single account complicates the single-balance concept

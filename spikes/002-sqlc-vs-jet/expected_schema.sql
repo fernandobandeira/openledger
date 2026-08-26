@@ -2,7 +2,7 @@
 --
 -- WHY: dropping a column silently drops its indexes and constraints. Formance lost
 -- their running-balance index this way (migration 37 dropped `accounts_seq`, taking
--- two indexes with it) and nobody noticed for thirty migrations -- their
+-- two indexes with it) and nobody noticed for sixteen migrations -- their
 -- point-in-time balance read has been a scan-and-sort ever since. Four separate
 -- regressions traced to that one mechanism.
 --

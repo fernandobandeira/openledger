@@ -1141,6 +1141,101 @@ SELECT must_fail('a group whose members have all moved away', $q$
 $q$, 'stale group detected');
 
 
+-- ============================== round 5: what a ZERO-amount message may decide
+--
+-- A $0.00 authorization is a real message -- account verification, AVS,
+-- card-on-file -- and it says NOTHING about whether the processor reports
+-- increases as deltas or as cumulative totals. Letting one fix the convention
+-- locked a group to 'delta', after which the processor's own opening cumulative
+-- total and its incremental were BOTH refused forever: 200.00 live, 0.00 held,
+-- drift 0 rows, and nothing in the review queue either, because a refused message
+-- is never stored. The same two messages in the other order held 150.00.
+--
+-- This was already fixed for `advice` on reasoning that applies identically to
+-- all three increase-side kinds. It was not applied to the other two.
+SELECT eq('a $0.00 authorization holds nothing',
+          record_auth_event('t1','z_avs','g_zero','acme','card_z','authorization',
+                            0,'USD',false, now()), 0);
+DO $$ BEGIN
+    IF (SELECT total_convention FROM card_hold_groups
+         WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_zero') IS NOT NULL THEN
+        RAISE EXCEPTION 'a $0.00 authorization fixed the group''s convention';
+    END IF;
+    RAISE NOTICE 'ok  ...and does not decide the convention';
+END $$;
+SELECT eq('...so the processor''s own cumulative total is still accepted',
+          record_auth_event('t1','z_tot','g_zero','acme','card_z','authorization',
+                            10000,'USD',true, now()), 10000);
+SELECT eq('...and its incremental total after it',
+          record_auth_event('t1','z_inc','g_zero','acme','card_z','incremental',
+                            15000,'USD',true, now()), 15000);
+
+-- ...and the mirror image: a $0.00 CUMULATIVE TOTAL must not lock a group to
+-- 'total' and refuse every real delta after it.
+SELECT eq('a $0.00 cumulative total holds nothing',
+          record_auth_event('t1','z_ztot','g_zero2','acme','card_z2','authorization',
+                            0,'USD',true, now()), 0);
+SELECT eq('...and the processor''s real delta is still accepted',
+          record_auth_event('t1','z_delta','g_zero2','acme','card_z2','authorization',
+                            5000,'USD',false, now()), 5000);
+
+-- ...and a GENUINE mix is still refused, or the fix above is just a hole
+SELECT must_fail('a real convention mix, after the zero-amount fix', $q$
+    SELECT record_auth_event('t1','z_m1','g_zmix','acme','card_z3','authorization',
+                             5000,'USD',false, now());
+    SELECT record_auth_event('t1','z_m2','g_zmix','acme','card_z3','incremental',
+                             9000,'USD',true, now());
+$q$, 'cannot mix the two');
+
+-- ...and a repair must not put back what ingest declined to decide
+SELECT recompute_hold_group('t1','acme','g_zero2');
+SELECT eq('a repair derives the convention from real messages only',
+          (SELECT CASE total_convention WHEN 'delta' THEN 1 ELSE 0 END
+             FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_zero2'), 1);
+SELECT no_drift('zero-amount messages');
+
+-- ================================ round 5: guards that survived mutation
+--
+-- Each of these could be deleted with the whole suite green.
+
+-- A cumulative total cannot be re-grouped: its stored delta is relative to the
+-- SOURCE group's base, so re-summing it against another base is arithmetic on two
+-- unrelated numbers. Deleting the refusal reproduced ADR-0010's own scenario --
+-- 100.00 under-reserved, drift 0 rows -- and no test noticed.
+SELECT record_auth_event('t1','r5t_a','g_r5t','acme','card_r5','authorization',10000,'USD',true,now());
+SELECT record_auth_event('t1','r5t_b','g_r5t','acme','card_r5','authorization',25000,'USD',true,now());
+SELECT must_fail('re-grouping a cumulative-total event', $q$
+    SELECT regroup_auth_event('t1',
+        (SELECT id FROM card_auth_events WHERE tenant_id='t1' AND processor_msg_id='r5t_b'),
+        'g_r5t_dest','operator');
+$q$, 'delivered as a cumulative total');
+
+-- A re-delivery naming a DIFFERENT group than the one the event was corrected
+-- into is the processor and the operator disagreeing about where the message
+-- belongs. Swallowing it silently is what regroup_auth_event exists to prevent.
+SELECT record_auth_event('t1','r5g_a','g_r5g','acme','card_r5g','authorization',6000,'USD',false,now());
+SELECT must_fail('re-delivering an already-grouped event under another key', $q$
+    SELECT record_auth_event('t1','r5g_a','g_r5g_other','acme','card_r5g',
+                             'authorization',6000,'USD',false,now());
+$q$, 'already grouped as');
+
+-- low_water_minor is the DURABLE evidence of over-capture, and the repair is the
+-- only writer of it for an over-capture produced by re-grouping. Its ratchet in
+-- recompute_hold_group was asserted nowhere: the ingest path had already set the
+-- mark in every existing control.
+SELECT record_auth_event('t1','r5w_a','g_r5w','acme','card_r5w','authorization',1000,'USD',false,now());
+SELECT record_auth_event('t1','r5w_b','g_r5w_other','acme','card_r5w','clearing',4000,'USD',false,now());
+UPDATE card_hold_groups SET low_water_minor = 0
+ WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_r5w';
+SELECT regroup_auth_event('t1',
+        (SELECT id FROM card_auth_events WHERE tenant_id='t1' AND processor_msg_id='r5w_b'),
+        'g_r5w','operator');
+SELECT eq('re-grouping a clearing in records the low-water mark it creates',
+          (SELECT low_water_minor FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_r5w'), -3000);
+SELECT no_drift('re-grouping into an over-capture');
+
 ROLLBACK;
 
 DO $$ BEGIN RAISE NOTICE 'ok  SUITE-COMPLETE card_holds'; END $$;

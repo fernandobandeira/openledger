@@ -251,6 +251,7 @@ DECLARE v_delta bigint; v_current bigint; v_authorized bigint;
         v_evt_ccy char(3); v_evt_kind auth_event_kind; v_evt_delta bigint;
         v_evt_is_total boolean; v_evt_conv text;
         v_conv text; v_incoming text; v_increases boolean; v_live text;
+        v_fixes_conv boolean;
 BEGIN
     -- A cumulative total is converted against the GROUP's authorized subtotal, so
     -- with no group there is no base and the wire value was stored verbatim as a
@@ -294,6 +295,31 @@ BEGIN
               'route to the review queue', p_msg_id, v_evt_company, p_company
               USING ERRCODE = 'data_exception';
         END IF;
+
+        -- LOCK THE EVENT, AND LOCK IT BEFORE ANY GROUP. Two defects, one cause:
+        -- this path moves an event between groups just as regroup_auth_event does,
+        -- and it was the only mover that did not lock the thing being moved.
+        --
+        --   * DEADLOCK. It took the card_hold_groups row FOR UPDATE and then, via
+        --     fk_event_group__event, an implicit FOR KEY SHARE on the event when
+        --     inserting the membership. regroup_auth_event takes those two in the
+        --     OPPOSITE order -- event first, deliberately. A matcher attaching a
+        --     queued event against an operator re-grouping the same event
+        --     deadlocked in 18 of 20 trials, aborting the adapter's whole webhook
+        --     transaction. ADR-0010 claimed "concurrent ingest on a single group
+        --     cannot deadlock -- it takes exactly one row lock". It takes two, and
+        --     the second one is invisible because a foreign key takes it for you.
+        --   * LOST RACE. v_live was read with no lock held, so eight concurrent
+        --     re-deliveries of one unmatched event all saw NULL and all tried to
+        --     insert a live membership: uq_event_group__current arbitrated, the
+        --     final state was right, and SEVEN CALLERS got a raw duplicate-key
+        --     error instead of the exposure they asked for.
+        --
+        -- Locking the event first and re-reading the membership under that lock
+        -- fixes both: the order now matches regroup_auth_event, and a loser waits,
+        -- then sees the winner's membership and reports the true total.
+        PERFORM 1 FROM card_auth_events
+         WHERE tenant_id = p_tenant AND id = v_event FOR UPDATE;
 
         SELECT m.group_key INTO v_live FROM card_auth_event_group m
          WHERE m.tenant_id = p_tenant AND m.event_id = v_event
@@ -343,6 +369,23 @@ BEGIN
         v_increases := p_kind IN ('authorization','incremental')
                     OR (p_kind = 'advice' AND p_amount > 0);
 
+        -- ...and a message of ZERO says nothing about which convention the
+        -- processor uses, whatever its kind. This was fixed for `advice` and not
+        -- for the other two, on reasoning that applies identically to all three --
+        -- and this same file insists eighty lines up that "a $0.00 authorization
+        -- is a real message: account verification / AVS / card-on-file".
+        --
+        -- Measured with the asymmetry in place: a $0.00 AVS authorization locked a
+        -- group to 'delta', after which the processor's own opening cumulative
+        -- total AND its incremental were both refused forever -- 200.00 live,
+        -- 0.00 held, drift 0 rows, and nothing in the review queue either, because
+        -- refused messages are never stored. The same two messages in the other
+        -- order held 150.00. An order-tolerance fuzz found 12 of 25 permutation
+        -- sets order-dependent once a $0.00 message was in the mix, against 0 of
+        -- 25 without one. The mirror image reproduced too: a $0.00 cumulative
+        -- total locked a group to 'total' and refused every real delta after it.
+        v_fixes_conv := v_increases AND p_amount <> 0;
+
         -- A cumulative total restates the AUTHORIZED subtotal, so it is only
         -- meaningful on a message that moves that subtotal. Applied to a clearing
         -- or a reversal the conversion computed `amount - authorized_minor` against
@@ -358,7 +401,7 @@ BEGIN
 
         -- one convention per group, fixed by the first message that moves the subtotal
         v_incoming  := CASE WHEN p_is_total THEN 'total' ELSE 'delta' END;
-        IF v_increases AND v_conv IS NOT NULL AND v_conv <> v_incoming THEN
+        IF v_fixes_conv AND v_conv IS NOT NULL AND v_conv <> v_incoming THEN
             RAISE EXCEPTION
               'group % reports increases as %s, but this message is a %; a group '
               'cannot mix the two -- route to the review queue',
@@ -405,6 +448,7 @@ BEGIN
             v_evt_conv := CASE WHEN v_evt_is_total THEN 'total' ELSE 'delta' END;
             IF (v_evt_kind IN ('authorization','incremental')
                 OR (v_evt_kind = 'advice' AND v_evt_delta > 0))
+               AND v_evt_delta <> 0
                AND v_conv IS NOT NULL AND v_conv <> v_evt_conv THEN
                 RAISE EXCEPTION
                   'stored event % reports a %, but group % reports increases as %s',
@@ -533,7 +577,7 @@ BEGIN
            -- separately, this line let a $0.00 advice fix the convention after the
            -- guard above had been taught not to.
            total_convention = COALESCE(total_convention,
-               CASE WHEN v_increases
+               CASE WHEN v_fixes_conv
                     THEN CASE WHEN p_is_total THEN 'total' ELSE 'delta' END END),
            open_events  = open_events + 1,
            last_event_seq = last_event_seq + 1,
@@ -607,12 +651,17 @@ BEGIN
            -- 100.00 under-reserved, through the public API alone, drift silent.
            -- Derive it from the log instead, so every path that recomputes also
            -- re-arms the guard.
+           -- `amount_delta <> 0`: a zero-amount message is convention-neutral at
+           -- ingest, so deriving a convention from one here would put back exactly
+           -- what ingest now declines to fix.
            bool_or(e.raw_is_total) FILTER (
-               WHERE e.kind IN ('authorization','incremental')
-                  OR (e.kind = 'advice' AND e.amount_delta > 0)),
+               WHERE e.amount_delta <> 0
+                 AND (e.kind IN ('authorization','incremental')
+                  OR (e.kind = 'advice' AND e.amount_delta > 0))),
            bool_or(NOT e.raw_is_total) FILTER (
-               WHERE e.kind IN ('authorization','incremental')
-                  OR (e.kind = 'advice' AND e.amount_delta > 0))
+               WHERE e.amount_delta <> 0
+                 AND (e.kind IN ('authorization','incremental')
+                  OR (e.kind = 'advice' AND e.amount_delta > 0)))
       INTO v_total, v_auth, v_n, v_any_total, v_any_delta
       FROM card_auth_event_group m
       JOIN card_auth_events e ON e.tenant_id=m.tenant_id AND e.id=m.event_id
@@ -847,11 +896,13 @@ WITH live AS (
                WHERE e.kind IN ('authorization','incremental')
                   OR (e.kind = 'advice' AND e.amount_delta > 0)) AS recomputed_auth,
            bool_or(e.raw_is_total) FILTER (
-               WHERE e.kind IN ('authorization','incremental')
-                  OR (e.kind = 'advice' AND e.amount_delta > 0)) AS any_total,
+               WHERE e.amount_delta <> 0
+                 AND (e.kind IN ('authorization','incremental')
+                  OR (e.kind = 'advice' AND e.amount_delta > 0))) AS any_total,
            bool_or(NOT e.raw_is_total) FILTER (
-               WHERE e.kind IN ('authorization','incremental')
-                  OR (e.kind = 'advice' AND e.amount_delta > 0)) AS any_delta
+               WHERE e.amount_delta <> 0
+                 AND (e.kind IN ('authorization','incremental')
+                  OR (e.kind = 'advice' AND e.amount_delta > 0))) AS any_delta
       FROM card_auth_event_group m
       JOIN card_auth_events e ON e.tenant_id = m.tenant_id AND e.id = m.event_id
      WHERE m.superseded_at IS NULL

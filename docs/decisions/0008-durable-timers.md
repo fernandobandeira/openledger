@@ -60,7 +60,7 @@ reviewer reported Temporal's docs call this recommended-for-production, another 
 required — and the second later retracted its external verification as fabricated, so neither
 reading is confirmed here. Treat as unverified); `numHistoryShards`
 is fixed at deploy time and changing it requires a cluster rebuild; minor versions must be upgraded
-sequentially with a schema migration each; and self-hosted Temporal ships no RBAC or audit logging
+sequentially with a schema migration each; and self-hosted Temporal ships RBAC **off by default** (four roles -- read, write, worker, admin -- behind a `ClaimMapper` and `NewDefaultAuthorizer`, but the default is `noopAuthorizer`) and no audit logging at all
 — notable for the component driving money-movement timers. Its tested Postgres matrix also stops at
 16.6, while we target 18. All of this to service roughly **0.05 jobs per second**.
 

@@ -65,8 +65,11 @@ it.** Here, accounts are typed, and the accounting equation `A = L + E + (R − 
 **2. Its effective-date balance is mutable, and that cost it.** Formance keeps running balances on
 both time axes. The effective-axis one is *not* immutable — a backdated transaction triggers an
 unbounded `UPDATE` of every later row for that account. Their `moves` table carries
-`fillfactor = 80` purely because of it, and **four migrations exist solely to repair volume data**,
-with two more patching the functions that produced it.
+`fillfactor = 80` (the fill factor is verified at their pinned commit; the *reason* is our
+inference, not their stated one), and **three migrations repair volume data** -- 19, 20 and 28 --
+with two more replacing the aggregation functions and a sixth that is a no-op stub. An earlier
+version of this line said four and six; [ADR-0003](./decisions/0003-bitemporal-balances.md) carried
+that correction and this file did not.
 [ADR-0003](./decisions/0003-bitemporal-balances.md) declines to build that: the running balance is
 immutable and lives on the insertion axis only; business-date balances aggregate on read.
 

@@ -180,7 +180,7 @@ prerequisite for correct per-tenant row-level security.
 
 **"No cross-tenant transactions, ever" was wrong.** Some accounts are physically singular:
 `operating_cash` mirrors *one* real bank account, and the facility is one line from one lender.
-Neither can be split per tenant. **7 of the reference trace's transactions touch `operating_cash`** — 21
+Neither can be split per tenant. **7 of the reference trace's transactions touch `operating_cash`** — 24
 transactions in the shipped trace; the spike this came from had 13, and only the 7 survived the
 move. The four *clearing* transactions do not — so the honest claim is **clearings
 are tenant-local; treasury is not.** Clearings are the volume and treasury is a daily batch, so

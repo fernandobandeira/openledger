@@ -177,7 +177,11 @@ Three findings only the apply-and-dump method surfaces:
    scan-and-sort of the account's whole history** — measured at 809 buffers with
    `Sort Key: asset, seq DESC`.
 2. **Zero foreign keys in the entire bucket schema.** Not one.
-3. **All four CHECK constraints are `NOT VALID` and none was ever validated.** They constrain new
+3. **Five of their nine CHECK constraints are `NOT VALID` and were never validated.** An earlier
+   version of this line said "all four ... none was ever validated", which is wrong twice: there
+   are nine, and **four of them WERE validated**, in migration 40, using precisely the
+   `ADD ... NOT VALID -> VALIDATE CONSTRAINT -> SET NOT NULL -> DROP CONSTRAINT` dance this file
+   recommends stealing sixty lines above. The five that were not constrain new
    rows only.
 
 The pattern behind most of their schema debt is one mechanism: **dropping a column silently drops
@@ -281,7 +285,7 @@ migrations. Column names drift badly too: `date`, `timestamp`, `insertion_date`,
    revision history. The transactions side was fixed; this side never was.
 3. No unique constraint on `(ledger, id, revision)` in either metadata table. Revision uniqueness
    rests on an unsynchronised `max()+1` inside a trigger; two concurrent updates produce duplicates.
-4. Four `NOT VALID` CHECK constraints, none validated.
+4. Five `NOT VALID` CHECK constraints never validated, out of nine (four others were validated in migration 40).
 5. Zero foreign keys.
 6. Redundant indexes on the hottest tables — `moves_account_address` is a strict prefix of
    `moves_range_dates`; `moves_ledger` and `moves_asset` are near-zero cardinality.
@@ -310,7 +314,9 @@ migrations. Column names drift badly too: `date`, `timestamp`, `insertion_date`,
   mutable with no history. If any of it feeds collateral reporting it needs history — cheapest path
   is to make metadata changes *be* log entries.
 - **Benchmark the hot account.** Their docs warn locks are per (account, asset) and high concurrency
-  on one source account serializes. Their design target is 1K writes/sec, but issue #1363 documents
+  on one source account serializes. They are *said* to target 1K writes/sec -- **unverified**, no
+  URL was ever recorded and an authenticated code search across their org returns zero hits for the
+  phrase, as `spikes/003` records. Issue #1363 documents
   a real user hitting a knee at **~8–12 TPS** on a single ledger. →
   [spike 003](../003-throughput-ceiling/README.md).
 - **Every table needs a PK / replica identity from day one.** Migration 45 is
