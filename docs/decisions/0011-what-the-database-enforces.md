@@ -152,6 +152,30 @@ entries. The referential integrity was real; the semantic linkage was assumed.
 This is decidable at INSERT because a transaction's status can never change: `ck_txn__immutable`
 refuses every UPDATE, and pending → posted is a *new row* pointing back through `resolves_id`.
 
+### `xact_id` is assigned, never accepted — the thesis, applied to itself
+
+This ADR's one-line summary is *a column with a `DEFAULT` is not a constraint*. It was written after
+`recorded_at`, `account_seq` and `xact_id` each turned out forgeable by an INSERT. Two of those three
+were then fixed with an assignment trigger. **The third was not** — and it is the one the schema
+calls "the seal's whole basis".
+
+A `DEFAULT` fires only when the client omits the column, and `GRANT INSERT ON ledger_transactions`
+covers every column. `assert_entry_seals` opens when the parent's stored `xact_id` equals the
+appending transaction's live xid. So: insert an ordinary, balanced, correctly-dated transaction with
+a **future** `xact_id`, let the global counter reach it — any workload does that unaided — and then
+append. Reproduced end to end as `openledger_app`, using nothing but the INSERT grants: 555.00 of
+revenue added to a transaction committed in an earlier database transaction, restating a closed
+period upward, with the accounting equation, the income statement, the balance sheet and **both**
+drift views agreeing.
+
+The immutability trigger already refused an `UPDATE` to `xact_id`; the round-5 tuple walk covers all
+ten columns of it. Neither touches an INSERT. And the suite could not have found this: it runs as one
+transaction, so it can only construct seals stored with a *past* xid — its own comment says so —
+while landing a *future*-forged one needs many real commits to march the counter.
+
+`ck_txn__xact_id` now assigns it, exactly as `assign_recorded_at` does. The `DEFAULT` stays so the
+column is never null under a bulk load with triggers off; it is not the mechanism.
+
 ### `ENABLE ALWAYS` on every trigger, and on the foreign keys
 
 `session_replication_role = 'replica'` is the logical-replication apply path and what

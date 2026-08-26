@@ -188,7 +188,11 @@ $q$, 'fewer than two entries');
 --     This whole file is ONE transaction, so every statement shares an xact id and
 --     "already committed" cannot occur naturally here. The transaction row is
 --     written with an EARLIER xact_id instead, which is exactly the state a
---     genuinely prior commit leaves behind.
+--     genuinely prior commit leaves behind -- and since round 6 that value is
+--     ASSIGNED by ck_txn__xact_id rather than accepted, so the fixture has to
+--     disable the assignment to plant it. That is the fixture doing openly what
+--     the attack it models had to do covertly.
+ALTER TABLE ledger_transactions DISABLE TRIGGER ck_txn__xact_id;
 SELECT must_fail('appending a leg to an already-committed transaction', $q$
     INSERT INTO ledger_events (tenant_id,kind,source,idempotency_key,idempotency_hash,
                                payload,effective_at)
@@ -204,6 +208,11 @@ SELECT must_fail('appending a leg to an already-committed transaction', $q$
            (SELECT effective_at FROM ledger_transactions
              WHERE id='0f0f0f0f-0000-7000-8000-00000000f00d');
 $q$, 'sealed');
+SET CONSTRAINTS ALL IMMEDIATE;
+SET CONSTRAINTS ALL DEFERRED;
+ALTER TABLE ledger_transactions ENABLE ALWAYS TRIGGER ck_txn__xact_id;
+
+
 
 -- 1c-quater. TRUNCATE is not covered by DELETE and fires no row trigger. After a
 --     careless GRANT ALL the shipped REVOKEs left it in place, and truncating the
@@ -875,6 +884,7 @@ SELECT must_fail('replica: a transaction with too few entries', $q$
 $q$, 'needs at least two');
 RESET ROLE;
 
+ALTER TABLE ledger_transactions DISABLE TRIGGER ck_txn__xact_id;
 SELECT must_fail('replica: appending to a committed transaction', $q$
     SET LOCAL session_replication_role = 'replica';
     INSERT INTO ledger_events (tenant_id,kind,source,idempotency_key,idempotency_hash,
@@ -892,6 +902,7 @@ SELECT must_fail('replica: appending to a committed transaction', $q$
              WHERE id='0c0c0c0c-0000-7000-8000-00000000c0de');
 $q$, 'sealed');
 RESET ROLE;
+ALTER TABLE ledger_transactions ENABLE ALWAYS TRIGGER ck_txn__xact_id;
 
 SELECT must_fail('replica: an account disagreeing with its type', $q$
     SET LOCAL session_replication_role = 'replica';
@@ -1132,6 +1143,15 @@ RESET ROLE;
 -- An account's OWNER was mutable while its purpose and currency were frozen.
 -- 110,000 of receivable became owed by nobody: every balance identical, the trial
 -- balance still balanced, drift silent -- none of them read the owner.
+-- ...including created_at, which no report reads -- so mutating it cannot make a
+-- report lie, and it was left out of the walk on that argument. It is in the
+-- guard's tuple, and a guard tested through five of six members is a guard tested
+-- through five of six members.
+SELECT must_fail('back-dating an account''s creation', $q$
+    UPDATE ledger_accounts SET created_at = '1999-01-01'
+     WHERE tenant_id='t1' AND purpose='customer_receivable';
+$q$, 'cannot be re-owned');
+
 SELECT must_fail('re-owning an account that has entries', $q$
     UPDATE ledger_accounts SET owner_id = NULL, owner_type = 'house'
      WHERE tenant_id='t1' AND purpose='customer_receivable';
@@ -1624,6 +1644,45 @@ BEGIN
      WHERE id = t;
     RAISE NOTICE 'ok  ...while metadata and external_ref stay writable, as its message says';
 END $$;
+
+-- ...AND THE SEAL'S OWN BASIS IS ASSIGNED, NEVER ACCEPTED. This is the whole
+-- thesis of 0001 applied to the one column it had not applied it to. A DEFAULT
+-- fires only when the client omits the column, and the app role's GRANT INSERT
+-- covers every column -- so a client could plant a FUTURE xact_id, wait for the
+-- global counter to reach it (any workload does that on its own), and then append
+-- legs to that already-committed, already-reported transaction with the seal
+-- silent. Demonstrated as openledger_app: 555.00 of revenue added to a closed
+-- period, with the equation, the income statement, the balance sheet and BOTH
+-- drift views agreeing.
+DO $$
+DECLARE t uuid; v_stored bigint; v_now bigint;
+BEGIN
+    INSERT INTO ledger_transactions (tenant_id,kind,status,effective_at,xact_id)
+    VALUES ('t1','neg','posted',now(), 9223372036854775807) RETURNING id INTO t;
+    SELECT xact_id INTO v_stored FROM ledger_transactions WHERE id = t;
+    v_now := pg_current_xact_id()::text::bigint;
+    IF v_stored <> v_now THEN
+        RAISE EXCEPTION 'a client-supplied xact_id SURVIVED: stored %, live % -- the '
+                        'seal can be opened by whoever wrote the row', v_stored, v_now;
+    END IF;
+    PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  20);
+    PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 20);
+    RAISE NOTICE 'ok  a client-supplied xact_id is overwritten with the live xid (%)', v_stored;
+END $$;
+
+SELECT must_fail('replica: a forged xact_id at INSERT', $q$
+    DO $d$ DECLARE t uuid; v_stored bigint; BEGIN
+        SET LOCAL session_replication_role = 'replica';
+        INSERT INTO ledger_transactions (tenant_id,kind,status,effective_at,xact_id)
+        VALUES ('t1','neg','posted',now(), 9223372036854775807) RETURNING id INTO t;
+        SELECT xact_id INTO v_stored FROM ledger_transactions WHERE id = t;
+        IF v_stored = 9223372036854775807 THEN
+            RAISE EXCEPTION 'FORGED XACT_ID SURVIVED THE REPLICA PATH';
+        END IF;
+        RAISE EXCEPTION 'assigned on replica too (%)', v_stored;
+    END $d$;
+$q$, 'assigned on replica too');
+RESET ROLE;
 
 -- A transaction may not resolve ITSELF. Doing so permanently consumes its own
 -- uq_txn__one_resolution slot, so the genuine resolution can never be recorded.

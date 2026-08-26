@@ -115,6 +115,10 @@ CREATE TABLE ledger_transactions (
     -- and reported months earlier. February revenue went from 500.00 to 1,166.00
     -- with the drift view, the accounting equation and the balance sheet all
     -- green, because every constraint in this file was satisfied.
+    -- ASSIGNED by ck_txn__xact_id, never accepted. The DEFAULT is kept so the
+    -- column is never null if the trigger is ever disabled for a bulk load, but it
+    -- is not the mechanism -- see assign_xact_id() below for what a forged value
+    -- bought before the trigger existed.
     xact_id         bigint NOT NULL DEFAULT pg_current_xact_id()::text::bigint,
 
     CONSTRAINT pk_txn PRIMARY KEY (tenant_id, id),
@@ -296,6 +300,38 @@ BEGIN
     NEW.recorded_at := now();
     RETURN NEW;
 END $$;
+
+-- ---- ...AND SO IS xact_id, FOR THE SAME REASON --------------------------------
+-- This file's whole thesis is that a column with a DEFAULT is not a constraint. It
+-- applied that to recorded_at and to account_seq, and left it unapplied to the one
+-- column it calls "the seal's whole basis". A DEFAULT only fires when the client
+-- omits the column, and `GRANT INSERT ON ledger_transactions` covers every column.
+--
+-- The seal opens when the parent's stored xact_id equals the appending
+-- transaction's live xid. So: INSERT a perfectly ordinary balanced transaction
+-- with a xact_id set to a FUTURE value, let the global counter reach it -- any
+-- workload does that on its own -- and then append. Reproduced end to end as
+-- openledger_app, using nothing but the INSERT grants this file describes as the
+-- app role's ordinary privilege: 555.00 of revenue appended to a transaction
+-- committed in an earlier database transaction, restating a closed period upward,
+-- with the accounting equation, the income statement, the balance sheet and BOTH
+-- drift views agreeing with it. No UPDATE, no DELETE, no TRUNCATE.
+--
+-- The immutability trigger already refused an UPDATE to xact_id; nothing refused a
+-- forged one at INSERT, and the suite could not see it -- negative_controls.sql
+-- runs as ONE transaction, so it can only probe seals stored with a PAST xid, and
+-- its own comment says so. Landing a future-forged xid needs many real commits to
+-- march the counter, which a single-transaction suite structurally cannot do.
+CREATE FUNCTION assign_xact_id() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.xact_id := pg_current_xact_id()::text::bigint;
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER ck_txn__xact_id BEFORE INSERT ON ledger_transactions
+    FOR EACH ROW EXECUTE FUNCTION assign_xact_id();
+ALTER TABLE ledger_transactions ENABLE ALWAYS TRIGGER ck_txn__xact_id;
 
 CREATE TRIGGER ck_entries__recorded_at BEFORE INSERT ON ledger_entries
     FOR EACH ROW EXECUTE FUNCTION assign_recorded_at();
