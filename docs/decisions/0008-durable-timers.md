@@ -83,14 +83,20 @@ the specialised backend.
 
 ## The reframe that lowers the bar
 
-The deadline is already stored on the event (`card_auth_events.hold_expires_at`), and available
-credit is computed from `card_hold_groups.held_minor` — **not** from a timer. So a hold that has
-passed its deadline but has not yet been swept still counts against available credit.
+Available credit is computed from `card_hold_groups.held_minor` — **not** from a timer. So a hold
+that has passed its deadline but has not yet been swept still counts against available credit.
+
+*This paragraph used to open "the deadline is already stored on the event
+(`card_auth_events.hold_expires_at`)". The column exists and nothing writes it — `record_auth_event`
+names eleven columns and that is not one of them — so no deadline is stored anywhere. See the
+amendment below. The part of the argument that survives is the part that never needed a stored
+deadline: the timer is an actuator, and a hold that is not swept keeps reserving.*
 
 Every timer here **fails conservatively when it fires late**: a late expiry under-reports available
 credit, a late ACH finalization keeps a receivable open longer. Nothing produces a wrong ledger,
-only a temporarily pessimistic one. The deadline is durable in our own table regardless; the
-scheduler is an *actuator*, not a correctness-critical component.
+only a temporarily pessimistic one. The scheduler is an *actuator*, not a correctness-critical
+component — which holds because an unswept hold keeps reserving, and **not**, as this sentence used
+to say, because "the deadline is durable in our own table regardless". It is not stored.
 
 So we also add a **reconciliation sweep** — groups that are past their deadline and still holding:
 
@@ -172,9 +178,9 @@ has been wrong.
   exist anyway.
 - The architecture diagram was updated and this item was not: `01-architecture.svg` reads
   "durable jobs (Postgres)", and the string "Postgres · Temporal" appears nowhere in the tree. The
-  one surviving Temporal reference is in a file this line never named --
-  `docs/diagrams/03-state-machines.svg`, "This is the Temporal boundary" -- and that is what needs
-  updating.
+  one surviving Temporal reference was in a file this line never named --
+  `docs/diagrams/03-state-machines.svg`, "This is the Temporal boundary". **Now updated**: it reads
+  "Durable-job boundary (ADR-0008: River on Postgres, not Temporal)".
 
 ## The bet, named
 

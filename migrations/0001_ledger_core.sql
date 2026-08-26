@@ -795,6 +795,27 @@ GRANT SELECT, INSERT, UPDATE ON ledger_account_balances TO openledger_app;
 --
 -- `ddl_command_end` fires after the child exists, so pg_inherits already shows the
 -- link and the whole statement rolls back. Ordinary DDL is unaffected.
+-- THE LIST OF PROTECTED PARENTS IS A TABLE, NOT A LITERAL IN THIS FUNCTION, because
+-- a later migration adds tables with the same exposure and cannot edit this one.
+-- It was a literal naming four tables while tests/negative_controls.sql's census
+-- named six -- and the two the guard did not name are 0003's. Reproduced: a child
+-- of card_hold_groups accepted an INSERT, held_for_company('t9','c9','USD') went
+-- from 0 to 999900 through the parent, and ck_hold_groups__no_delete did not apply
+-- to the child, so the row could be removed again. held_for_company is the
+-- authorization decision, which makes that fabricated credit.
+--
+-- Each migration declares its own tables here, the same rule this file already
+-- states for foreign keys and ENABLE ALWAYS.
+CREATE TABLE ledger_uninheritable (
+    relname text PRIMARY KEY,
+    reason  text NOT NULL
+);
+INSERT INTO ledger_uninheritable (relname, reason) VALUES
+  ('ledger_entries',      'the journal; every view reads it'),
+  ('ledger_transactions', 'the journal; every view reads it'),
+  ('ledger_events',       'the log every accepted operation lands in'),
+  ('ledger_accounts',     'every report joins it, so a child multiplies every number');
+
 CREATE FUNCTION refuse_ledger_inheritance() RETURNS event_trigger
 LANGUAGE plpgsql AS $$
 DECLARE r record;
@@ -806,8 +827,7 @@ BEGIN
           JOIN pg_class p ON p.oid = i.inhparent
           JOIN pg_namespace n ON n.oid = p.relnamespace
          WHERE n.nspname = 'public'
-           AND p.relname IN ('ledger_entries','ledger_transactions',
-                             'ledger_events','ledger_accounts')
+           AND p.relname IN (SELECT u.relname FROM ledger_uninheritable u)
            -- 'f' is a foreign table and 'p' a partitioned one; 'r' alone was the
            -- second half of the foreign-table escape. relpersistence is
            -- deliberately not filtered: an UNLOGGED child persists across an

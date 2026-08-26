@@ -74,7 +74,7 @@
         <rect class="s-fill-hot" x="580" y="46" width="180" height="46"/>
       </g>
       <text class="t-lbl" x="670" y="66" text-anchor="middle" fill="currentColor">availability + holds</text>
-      <text class="t-hot" x="670" y="82" text-anchor="middle">one row per company</text>
+      <text class="t-hot" x="670" y="82" text-anchor="middle">one row per hold group</text>
 
       <g class="s-stroke" stroke-width="1.25">
         <rect class="s-fill-card" x="580" y="176" width="180" height="46"/>

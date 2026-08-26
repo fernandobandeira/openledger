@@ -9,16 +9,18 @@
 >   mismatches, two of which describe `migrations/0003` and not the file in this
 >   directory: `holds.sql` does have `group_key` and does have `expires_at`. The
 >   conclusion was right; two of its three reasons were not.)*
-> * **`cases.sql` is dead against `holds.sql`.** It writes `event_id`; the schema
->   in `holds.sql` has `processor_msg_id` and no `event_id` column at all. Every
->   INSERT fails with `column "event_id" ... does not exist`,
->   the results view prints `(0 rows)`, and `held_for_company` prints 0.00. The
->   README's "**Measured**" table and its "**all eight cases**, plus idempotency and
->   sign guards" were never executed against this schema. `cases.sql` is v1;
->   `holds.sql` is v2.
-> * **It contains six cases, not eight.** G ("clearing arrives before the auth")
->   and H ("forced post") — the two this README flags as most interesting — are not
->   in the file.
+> * **`cases.sql` was dead against `holds.sql`, and has been deleted.** It wrote
+>   `event_id`; the schema in `holds.sql` has `processor_msg_id` and no `event_id`
+>   column at all, so every INSERT failed with `column "event_id" ... does not
+>   exist`, the results view printed `(0 rows)`, and `held_for_company` printed
+>   0.00. It also contained six cases where the "**Measured**" table below claims
+>   eight — G ("clearing arrives before the auth") and H ("forced post"), the two
+>   this README calls most interesting, were never in the file. So the table and
+>   the "**all eight cases**, plus idempotency and sign guards" line were never
+>   executed against anything. A file whose only property is "this does not run"
+>   costs a reader a visit and teaches nothing the sentence above does not; the
+>   live attestation of every one of these cases is
+>   [`tests/card_holds.sql`](../../tests/card_holds.sql).
 > * **"Surveying eleven issuer-processors" was fabricated**, and "six of eleven"
 >   with it. Three processors are surveyed below. They disagree, which is the real
 >   finding and the reason the design exists; the sample size was invented.
@@ -274,5 +276,4 @@ composite, sentinel-polluted, day-scoped, and mid-migration on Mastercard. The o
 
 ```sh
 psql "$DSN" -f holds.sql    # schema + the derived view
-psql "$DSN" -f cases.sql    # DEAD -- six cases, none of which run. See the banner.
 ```

@@ -166,6 +166,51 @@ BEGIN
         v_before, v_at;
 END $$;
 
+-- ...AND THAT BOUNDARY IS `now()`, WHICH IS WHY IT WAS NOT ENOUGH. Everything this
+-- file writes shares one recorded_at -- `now()` is transaction-START time and this
+-- file is one transaction -- so the block above has exactly one boundary to aim at,
+-- and at that boundary `now()` IS `recorded_at`. Replacing `en.recorded_at <=
+-- p_as_of` with `now() <= p_as_of`, a predicate that reads NO COLUMN OF THE ROW,
+-- satisfied every assertion above and every other suite. Only tests/canary.sh saw
+-- it, and one canary standing in for a whole axis is not attestation.
+--
+-- tests/fixtures/recorded_axis.sql is a committed ledger write applied by run.sh
+-- (and by canary.sh into each canary database) in a psql invocation of its OWN, so
+-- it carries a recorded_at strictly earlier than this transaction's. That second
+-- value is the only thing that can distinguish reading the column from reading the
+-- clock, and it cannot be manufactured inside a suite.
+DO $$
+DECLARE v_prior timestamptz; v_at bigint; v_before bigint;
+BEGIN
+    SELECT max(en.recorded_at) INTO v_prior FROM ledger_entries en WHERE en.tenant_id='bt0';
+    IF v_prior IS NULL THEN
+        RAISE EXCEPTION 'the committed prior-transaction fixture is absent -- '
+                        'tests/fixtures/recorded_axis.sql was not applied, and without '
+                        'it the recorded axis has no boundary except now()';
+    END IF;
+    IF v_prior >= now() THEN
+        RAISE EXCEPTION 'the fixture carries this transaction''s own recorded_at '
+                        '(% vs %) -- it was not applied in a transaction of its own, '
+                        'so it distinguishes nothing', v_prior, now();
+    END IF;
+    SELECT assets INTO v_at     FROM accounting_equation('bt0', v_prior, 'recorded');
+    SELECT assets INTO v_before FROM accounting_equation('bt0',
+        v_prior - interval '1 microsecond', 'recorded');
+    -- IS DISTINCT FROM, not <>: with no rows the SELECT INTO leaves NULL, and
+    -- `NULL <> 5000` is NULL, which would skip the guard and pass.
+    IF v_at IS DISTINCT FROM 5000 THEN
+        RAISE EXCEPTION 'as of a recording instant STRICTLY EARLIER than now(), the '
+                        'recorded axis reports % assets and not 5000 -- the predicate '
+                        'is reading the clock, not recorded_at', COALESCE(v_at::text,'nothing');
+    END IF;
+    IF COALESCE(v_before, 0) <> 0 THEN
+        RAISE EXCEPTION 'one microsecond before that recording the ledger already '
+                        'reports % assets', v_before;
+    END IF;
+    RAISE NOTICE 'ok  the recorded axis turns over at a recording that is NOT now() (% -> %)',
+        COALESCE(v_before,0), v_at;
+END $$;
+
 -- THE POINT, as an assertion: on the same instant the two axes disagree, and each
 -- holds something the other does not. Effective knows February (backdated, not yet
 -- recorded on 28 Feb); recorded knows May (post-dated, already recorded).
@@ -211,8 +256,14 @@ SELECT eqv('p_tenant filters, recorded axis',
     (SELECT revenue FROM accounting_equation('bt', now(), 'recorded')), 527);
 SELECT eqv('...and the other tenant is genuinely there',
     (SELECT revenue FROM accounting_equation('bt2','2026-05-31','effective')), 7777);
-SELECT eqv('unfiltered covers both scopes',
-    (SELECT count(*) FROM accounting_equation(NULL,'2026-05-31','effective')), 2);
+-- ...and unfiltered covers EVERY scope, counted from the ledger rather than typed
+-- as a literal: a hardcoded 2 breaks the moment a scope is added for an unrelated
+-- reason, and the claim is "NULL means all of them", not "there are two".
+SELECT eqv('unfiltered covers every scope',
+    (SELECT count(*) FROM accounting_equation(NULL,'2026-05-31','effective')),
+    (SELECT count(*) FROM (SELECT DISTINCT en.tenant_id, en.currency
+                             FROM ledger_entries en
+                            WHERE en.effective_at <= '2026-05-31') z));
 
 -- ============================================================ balance_after
 -- ADR-0003's actual claim: balance_after answers the RECORDED axis and is WRONG

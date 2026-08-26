@@ -114,16 +114,19 @@ pump authorization clearing at $95. **Forced post** — a clearing with no autho
 ## Performance
 
 **Hot account** — an account touched by nearly every transaction, so every writer queues on the
-same row. `network_settlement_payable` is ours. Measured: one shared row caps the whole system at
-~800 clearings/s regardless of hardware — though spike 003 never varied hardware, and its own banner shows the same configuration measuring 833 and then 482 purely from machine load, so read this as a shape. This is a named, forty-year-old problem — it's the branch
-record in the 1985 DebitCredit benchmark.
+same row. `network_settlement_payable` is ours. Measured on one machine: a single shared row put the
+ceiling in the high hundreds of clearings per second — the same configuration measured 833 and then
+482 purely from machine load, and hardware was never varied, so read it as a shape and not a number.
+This is a named, forty-year-old problem — it's the branch record in the 1985 DebitCredit
+benchmark.
 
 **Contention** — writers waiting on the same row. The ceiling above is contention, not CPU or
 disk, which is why a bigger instance doesn't help.
 
 **Striping** — storing one logical account as N physical rows so writers spread across them;
-balance = sum of the stripes. Measured: 872 → 6,970 clearings/s at 64 stripes. Works regardless of
-who's causing the load.
+balance = sum of the stripes. **Not built here**: there is no stripe column in `migrations/`, and
+`uq_accounts__house` would currently prevent one on the accounts that need it. Measured in spike 003
+only, on the same single machine as the figure above: 872 → 6,970 clearings/s at 64 stripes.
 
 **Skew** — how unevenly traffic is spread across customers. Uniform = everyone equal; skewed = one
 customer is most of your volume, which is what real platforms look like. It matters because giving

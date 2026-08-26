@@ -25,7 +25,10 @@ BASE="${ADMIN%/postgres*}"
 WORK="$(mktemp -d)"
 DBS=""
 cleanup() {
-    for d in $DBS; do psql "$ADMIN" -q -c "DROP DATABASE IF EXISTS $d" >/dev/null 2>&1 || true; done
+    # WITH (FORCE): a canary database that a killed concurrency.sh still has sessions
+    # on cannot be dropped otherwise, and `|| true` hid the failure. Leaked canary
+    # databases were visible in the cluster from earlier runs.
+    for d in $DBS; do psql "$ADMIN" -q -c "DROP DATABASE IF EXISTS $d WITH (FORCE)" >/dev/null 2>&1 || true; done
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -72,7 +75,7 @@ canary() {
     # `ok` -- testing nothing. run.sh fixed exactly this shape for its empty-ledger
     # pre-check ("it must fail for the RIGHT REASON") and the lesson was not carried
     # one file over.
-    for f in "$WORK"/m/*.sql "$WORK"/m/seed/*.sql; do
+    for f in "$WORK"/m/*.sql "$WORK"/m/seed/*.sql tests/fixtures/*.sql; do
         if ! psql "$url" -v ON_ERROR_STOP=1 -q -f "$f" >"$WORK/apply.err" 2>&1; then
             echo "   FAIL canary '$name': the mutated schema does not load, so the"
             echo "        suite would go red for the wrong reason: $(head -1 "$WORK/apply.err")"
@@ -86,11 +89,7 @@ canary() {
         echo "        through no longer raises."
         fail=1
     elif ! printf '%s' "$out" | grep -F "$want" | grep -qE 'ERROR|FAIL'; then
-        # THE MATCHED LINE MUST BE A FAILURE LINE. `eqv` and `chk` print their
-        # LABEL on success ("ok  <label> = <value>"), so matching a label alone
-        # degraded two of these canaries to "the suite went red for ANY reason" --
-        # the coin flip this header says it avoids. A gutted bitemporal.sql whose
-        # named control was reduced to a tautology certified green that way.
+        # The matched line must be a FAILURE line -- see the header above.
         echo "   FAIL canary '$name': $suite went red, but not for its own reason."
         echo "        wanted: $want"
         echo "        got:    $(printf '%s' "$out" | grep -iE 'ERROR|FAIL' | head -1)"
@@ -124,8 +123,8 @@ canary regroup_total card_holds.sql 0003_card_holds.sql \
     "s|    IF v_is_total THEN|    IF false THEN|" \
     "NOT CAUGHT -- re-grouping a cumulative-total event"
 
-# ...and the three suites the canary did not cover, because an uncovered suite can
-# be gutted without touching canary.sh at all.
+# 4 and 5. ...and the three suites the canary did not cover, because an uncovered
+# suite can be gutted without touching canary.sh at all.
 canary recorded_axis bitemporal.sql 0002_chart_of_accounts.sql \
     "s|en.recorded_at  <= p_as_of|en.recorded_at  < p_as_of|" \
     "recorded axis, as of now: everything -- expected"
@@ -133,6 +132,24 @@ canary recorded_axis bitemporal.sql 0002_chart_of_accounts.sql \
 canary balance_index query_plans.sql 0001_ledger_core.sql \
     "s|ix_entries__balance_lookup|ix_entries__balance_lookup_renamed|g" \
     "index(es) gone"
+
+# 6. ...AND THE PLAN HELPER ITSELF, WHICH THE CANARY ABOVE DOES NOT REACH.
+#    Renaming an index trips `to_regclass`, a NAME CENSUS that runs before any
+#    plan assertion and aborts the file -- so canary 5 attests the census and says
+#    nothing about `plan_uses`, the helper it was written to protect. Demonstrated:
+#    two `IF false`s inside plan_uses' body, zero call sites touched, all eleven
+#    notices still printed, both floors satisfied, sentinel intact, canary 5 still
+#    green -- and a real regression shipped past it (held_for_company falling off
+#    the partial index onto a seq scan of 20,001 rows).
+#
+#    This mutation is invisible to every census: no index is renamed, dropped or
+#    re-pointed. `AND held_minor > 0` is removed from held_for_company's own body,
+#    which is VALUE-equivalent (held_minor is never negative) and plan-critical, so
+#    only a plan guard can see it -- and the wanted string is plan_uses' own
+#    failure form, not any other block's.
+canary plan_helper query_plans.sql 0003_card_holds.sql \
+    "s|      AND currency = p_currency AND held_minor > 0|      AND currency = p_currency|" \
+    "expected the plan to use ix_hold_groups__held"
 
 # ...and concurrency.sh, which is a shell script rather than a psql file, and which
 # is the ONLY evidence for four locks. It gets the same treatment: break a lock,
@@ -155,16 +172,27 @@ canary_sh() {
             fail=1; return
         fi
     done
-    local out
-    if out=$(./tests/concurrency.sh "$url" 2>&1); then
+    # THE LOST UPDATE DOES NOT MATERIALISE EVERY TIME. Measured on an unloaded box:
+    # 11 kills in 12 trials, i.e. ~8% of runs on a CORRECT tree report the canary
+    # red -- and a build that is red 8% of the time on a correct tree teaches people
+    # to ignore red, which is more expensive than the thing it is guarding. Retry
+    # ONLY the "the suite passed" outcome, which is the one a race can produce by
+    # not happening; a suite that went red for the WRONG reason is not retried,
+    # because that is a defect and repeating it would only hide it.
+    local out attempt=1
+    while :; do
+        out=$(./tests/concurrency.sh "$url" 2>&1) || break
+        if [ "$attempt" -ge 3 ]; then break; fi
+        attempt=$((attempt + 1))
+    done
+    if printf '%s' "$out" | grep -qE '^ +ok  SUITE-COMPLETE concurrency' \
+       && ! printf '%s' "$out" | grep -qE 'FAIL'; then
         echo "   FAIL canary '$name': concurrency.sh PASSED against a broken lock"
+        echo "        in $attempt attempt(s). Either its control for this is gone, or"
+        echo "        the race it needs no longer happens at all."
         fail=1
     elif ! printf '%s' "$out" | grep -F "$want" | grep -qE 'ERROR|FAIL'; then
-        # THE MATCHED LINE MUST BE A FAILURE LINE. `eqv` and `chk` print their
-        # LABEL on success ("ok  <label> = <value>"), so matching a label alone
-        # degraded two of these canaries to "the suite went red for ANY reason" --
-        # the coin flip this header says it avoids. A gutted bitemporal.sql whose
-        # named control was reduced to a tautology certified green that way.
+        # The matched line must be a FAILURE line -- see the header above.
         echo "   FAIL canary '$name': concurrency.sh went red, but not for its own reason."
         echo "        wanted: $want"
         echo "        got:    $(printf '%s' "$out" | grep -iE 'FAIL' | head -1)"

@@ -143,8 +143,12 @@ END $$;
 --    checkpoints are the fix and are not built. Asserting an index here would
 --    manufacture reassurance about the one read path that genuinely has no bound.
 DO $$
-DECLARE v_plan text;
+DECLARE v_plan text; v_rows bigint;
 BEGIN
+    -- SERIALLY, so the numbers below are exact. Under a parallel plan "Actual Rows"
+    -- is a PER-WORKER average, and the assertion would move with the worker count
+    -- rather than with the ledger.
+    SET LOCAL max_parallel_workers_per_gather = 0;
     EXECUTE $q$EXPLAIN (ANALYZE, FORMAT JSON)
         SELECT SUM(CASE WHEN direction='debit' THEN amount_minor ELSE -amount_minor END)
           FROM ledger_entries
@@ -156,13 +160,24 @@ BEGIN
     -- `ok` lines as its floor and the note branch would have tripped it. Adding
     -- one more assertion anywhere in this file re-vacated it. The claim is
     -- ADR-0003's, and it is falsifiable: state it as one.
-    IF v_plan !~ 'Seq Scan' THEN
-        RAISE EXCEPTION E'the business-date aggregate no longer scans. That is not '
-            'a failure -- it means period checkpoints or a new index landed, and '
-            'ADR-0003''s "linear in history, nothing bounds it" is now wrong. '
-            'Update the ADR and assert the new plan here:\n%', v_plan;
+    --
+    -- ...AND IT IS A CLAIM ABOUT WORK DONE, NOT ABOUT WHICH OPERATOR THE PLANNER
+    -- PICKED. Matching the string `Seq Scan` made this assertion a hostage to the
+    -- planner: a Bitmap Heap Scan over the same 200,000 rows is equally unbounded
+    -- and equally the thing ADR-0003 describes, and under machine load the planner
+    -- chose one, turning a correct tree red. Assert the rows READ instead.
+    SELECT max((m[1])::bigint) INTO v_rows
+      FROM regexp_matches(v_plan, '"Actual Rows": ([0-9]+)', 'g') m;
+    IF v_rows IS NULL OR v_rows < 100000 THEN
+        RAISE EXCEPTION E'the business-date aggregate read only % row(s) of a '
+            '200,000-row account. That is not a failure -- it means period '
+            'checkpoints or a bounding index landed, and ADR-0003''s "linear in '
+            'history, nothing bounds it" is now wrong. Update the ADR and assert '
+            'the new plan here:\n%', COALESCE(v_rows::text,'no'), v_plan;
     END IF;
-    RAISE NOTICE 'ok  business-date aggregate is a scan, as ADR-0003 says (unbounded, M5)';
+    RESET max_parallel_workers_per_gather;
+    RAISE NOTICE 'ok  business-date aggregate reads % rows -- linear in history, as '
+                 'ADR-0003 says (unbounded, M5)', v_rows;
 END $$;
 
 -- 5. The indexes the ledger's hot reads depend on must EXIST. Dropping
@@ -214,7 +229,15 @@ BEGIN
     LOOP
         SELECT indexdef INTO got FROM pg_indexes
          WHERE schemaname='public' AND indexname = r.idx;
-        IF got IS NULL OR position(r.needle in got) = 0 THEN
+        -- ...WITH THE INDEX'S OWN NAME REMOVED FIRST. `indexdef` starts with
+        -- `CREATE ... INDEX <name> ON ...`, so a needle that is a substring of the
+        -- name matches the name and never reaches the column list: re-pointing
+        -- uq_entries__account_seq at (tenant_id, account_id, balance_after) still
+        -- printed `ok`, because 'account_seq' was right there in the name. This is
+        -- the same "the object stayed and its usefulness did not" failure the
+        -- census above exists to catch, inside the census.
+        got := replace(COALESCE(got, ''), r.idx, '');
+        IF got = '' OR position(r.needle in got) = 0 THEN
             bad := bad || format('%s (wanted %L in %L) ', r.idx, r.needle, got);
         END IF;
     END LOOP;

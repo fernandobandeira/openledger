@@ -123,10 +123,31 @@ message key space, taken first on every path, was written, measured, and **rever
 carrying an authorization and its increment it produced 6 deadlocks in 6 trials where the
 unmodified code produced 0. A lock taken before the natural one adds an ordering; it does not
 remove one. What shipped instead is narrower and free -- the attach path and `regroup_auth_event`
-lock the *event row* first, explicitly, so every path that touches both takes them event-then-group.
-`tests/concurrency.sh` races that, and the 8-session mutation review that most recently attacked
-this file recorded 61 deadlocks under an unsorted multi-group load with **not one deadlock context
-naming `card_auth_events`** -- the ordering held.
+lock the *event row* first, explicitly. `tests/concurrency.sh` races that, and an 8-session review
+recorded 61 deadlocks under an unsorted multi-group load with not one deadlock context naming
+`card_auth_events`.
+
+**That is not the same as "every path takes them event-then-group", which an earlier version of this
+paragraph claimed, and which is false.** `record_auth_event`'s lost-race recursion takes the group
+row `FOR UPDATE` and only then recurses into a frame that locks the event — group-then-event. A
+later review built the cycle and got the context the sentence above says never appears:
+
+```
+ERROR:  deadlock detected
+CONTEXT:  while locking tuple in relation "card_auth_events"
+          SQL statement "SELECT 1 FROM card_auth_events
+                          WHERE tenant_id = p_tenant AND id = v_event FOR UPDATE"
+          PL/pgSQL function record_auth_event(...)      <-- the event lock
+          PL/pgSQL function record_auth_event(...)      <-- the lost-race recursion
+```
+
+One single-group ingest against one regroup — **not** the recorded "unsorted multi-group caller"
+class. Correctness held throughout (drift 0, the right total, no message landed twice, no double
+membership); availability did not. The honest statement is the one this file makes generally and
+made too strongly here: *deadlocks abort cleanly and cost availability, not correctness.* Two paths
+take the locks in the same order; the recursion is a third and does not. Sorting it means the fresh
+path would have to know the event id before it takes the group lock, which is the thing the dedup
+design exists to avoid, so it is recorded rather than closed.
 
 The advisory lock is gone from the tree, so the 6-of-6 and 0-of-6 counts above are no longer
 reproducible from the code. They are recorded as the reason a fix this ADR twice recommended is

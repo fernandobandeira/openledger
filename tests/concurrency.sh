@@ -621,19 +621,44 @@ chk "...and the alarm sees the running balance they did not maintain" \
 # asserting a lock ordering the product does not have.
 psql "$URL" -q -v ON_ERROR_STOP=1 -c \
   "DO \$d\$ BEGIN PERFORM record_auth_event('ml','ml_seed','GL','co1','c1','authorization',1000,'USD',false,now()); END \$d\$;"
+RCD=$(mktemp -d)
 for i in $(seq 1 5); do
     ( psql "$URL" -qAt -c "BEGIN;
         SELECT record_auth_event('ml','ml_a$i','GL','co1','c1','authorization',10,'USD',false,now());
         SELECT pg_sleep(0.05);
         SELECT record_auth_event('ml','ml_b$i','GL','co1','c1','incremental',10,'USD',false,now());
-        COMMIT;" >/dev/null 2>&1 ) &
+        COMMIT;" >/dev/null 2>&1; echo $? > "$RCD/a$i" ) &
     ( psql "$URL" -qAt -c "BEGIN;
         SELECT record_auth_event('ml','ml_b$i','GL','co1','c1','incremental',10,'USD',false,now());
         SELECT pg_sleep(0.05);
         SELECT record_auth_event('ml','ml_a$i','GL','co1','c1','authorization',10,'USD',false,now());
-        COMMIT;" >/dev/null 2>&1 ) &
+        COMMIT;" >/dev/null 2>&1; echo $? > "$RCD/b$i" ) &
 done
 wait
+
+# LIVENESS FIRST. The three assertions below are all ABSENCE assertions -- no
+# drift, no duplicate, no double membership -- and all three passed against a
+# tenant on which the workload had never run at all. Workload D was rewritten for
+# exactly this reason ("assert that every message actually landed") and the lesson
+# was not carried to L, twenty lines down the same file.
+#
+# The bound has to be the one that HOLDS under every interleaving, not 10: both
+# sides of a pair carry the same two messages in opposite orders, so a pair whose
+# two transactions are both chosen as deadlock victims lands neither. Count the
+# pairs that committed at least one side and require exactly two messages each --
+# that is sound under any number of deadlocks, and it is zero if nothing ran.
+L_PAIRS=0
+for i in $(seq 1 5); do
+    if [ "$(cat "$RCD/a$i")" = 0 ] || [ "$(cat "$RCD/b$i")" = 0 ]; then
+        L_PAIRS=$((L_PAIRS + 1))
+    fi
+done
+rm -rf "$RCD"
+chk "unsorted batch callers: at least one side of some pair committed" \
+    "$([ "$L_PAIRS" -gt 0 ] && echo yes || echo no)" yes
+chk "...and every message from a committed side landed, none from an aborted one" \
+    "$(q "select count(*) from card_auth_events where tenant_id='ml' and processor_msg_id ~ '^ml_[ab][0-9]+\$'")" \
+    "$((L_PAIRS * 2))"
 chk "unsorted batch callers: the materialised total still equals its log" \
     "$(q "select count(*) from card_hold_drift where tenant_id='ml'")" 0
 chk "...and no message landed twice" \
