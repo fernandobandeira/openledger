@@ -43,14 +43,18 @@
 --
 -- PostgreSQL 18 is a floor: uuidv7() is the default on six tables.
 --
--- HOW THIS GETS APPLIED IS NOT DECIDED YET. `make schema` runs it through psql, which is
--- appropriate for a design artefact and is not a migration story -- there is no ordering, no
--- record of what has been applied, and no way to take a change to a database that already has
--- data. Spike 007 is comparing goose, golang-migrate, tern, Atlas and sqldef; see the "Still open"
--- list in docs/decisions/README.md. Until that lands, treat this file as the SHAPE, not as
--- something you migrate to.
-
-BEGIN;
+-- HOW THIS GETS APPLIED: goose, from Go -- ADR-0014. This file becomes
+-- migrations/00001_baseline.sql when the Go service exists; `make schema` runs it through psql
+-- with --single-transaction, which is a development shortcut and not the deployment path.
+--
+-- NO `BEGIN;`/`COMMIT;` IN THIS FILE, and that is not a style choice. Spike 007
+-- measured what they do to a migration runner: goose wraps each migration in its
+-- own transaction, an inner `COMMIT;` ENDS IT, and everything after that line then
+-- runs unprotected. Demonstrated -- a migration that failed on its last statement
+-- left two tables behind AND was not recorded as applied, so the retry died on
+-- `relation already exists`. The same file without the two lines rolled back
+-- cleanly. `make schema` gets atomicity from `psql --single-transaction` instead,
+-- which is the caller's business rather than the file's.
 
 
 
@@ -1037,4 +1041,3 @@ REVOKE UPDATE, DELETE, TRUNCATE ON card_auth_events        FROM openledger_app;
 -- free and because a database created before 15 and upgraded does not get it.
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 
-COMMIT;

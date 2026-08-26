@@ -24,8 +24,8 @@ reset: ## Drop and recreate the local database
 
 .PHONY: schema
 schema: ## Load the design schema and the seed chart
-	@psql "$(DB_URL)" -v ON_ERROR_STOP=1 -q -f schema/schema.sql
-	@psql "$(DB_URL)" -v ON_ERROR_STOP=1 -q -f schema/chart.sql
+	@psql "$(DB_URL)" -v ON_ERROR_STOP=1 --single-transaction -q -f schema/schema.sql
+	@psql "$(DB_URL)" -v ON_ERROR_STOP=1 --single-transaction -q -f schema/chart.sql
 	@echo "  loaded schema/schema.sql + schema/chart.sql"
 
 .PHONY: psql
