@@ -10,7 +10,8 @@ Almost all the load-bearing logic in a ledger lives in SQL, not in application c
 - The authorization decision — the one request with a latency deadline — is a single
   transaction using `FOR UPDATE`, a filtered aggregate, and `ON CONFLICT ... DO NOTHING`.
 - A balance is an index lookup on `(account_id, account_seq DESC)`.
-- Immutability is `REVOKE UPDATE, DELETE` from the app role, not application discipline.
+- Immutability is a trigger that refuses `UPDATE` and `DELETE` on entries for every role, backed
+  by a narrow `GRANT` — not application discipline. See [0011](./0011-what-the-database-enforces.md).
 - Tenant isolation is row-level security.
 
 That narrows the host language's job: run that SQL, drive durable timers, parse webhooks, serve

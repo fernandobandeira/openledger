@@ -55,14 +55,23 @@ is still not monotonic with commit order. [0005](./0005-reproducible-as-of.md) i
 work, and until it lands `balance_after` cannot answer a recorded-axis as-of question — the
 aggregate can. Both axes are now asserted in [`tests/bitemporal.sql`](../../tests/bitemporal.sql).
 
-### `account_seq` must be the number the balance upsert issued
+### `account_seq` is assigned from the journal
 
-`ck_entries__seq` compares the incoming sequence against `ledger_account_balances.last_seq`.
+`assign_entry_seq` is a `BEFORE INSERT` trigger: it sets `NEW.account_seq` to `MAX + 1` over that
+account's existing entries, under the row lock the balance upsert already holds. A client-supplied
+value is **discarded**, not refused.
 
-Uniqueness and positivity were not enough. An app-role INSERT could leave a 48-wide gap and later
-*fill* it with a backdated, balanced, same-account round trip — taking gross turnover from 100 to
-100,000,000 with the journal and the cache written together, so all three copies agreed and the
-alarm stayed silent.
+It took two attempts. Uniqueness and positivity were not enough — an app-role INSERT could leave a
+48-wide gap and later *fill* it with a backdated, balanced, same-account round trip, taking gross
+turnover from 100 to 100,000,000 with the journal and the cache written together, so all three
+copies agreed and the alarm stayed silent.
+
+The first fix *validated* the incoming sequence against `ledger_account_balances.last_seq` — and
+that was the same mistake one level down, because **the app role is granted `UPDATE` on that
+table**. The counter was not issued, it was *asked*: rewind `last_seq` into a reserved gap in one
+transaction, back-fill it in another, put the counter back. It also did nothing at all for a
+brand-new account, where no cache row exists yet and bigint-max was accepted, permanently bricking
+the account. Assignment closes all three.
 
 That is the general limit of the drift view, and it is worth naming: **`ledger_balance_drift`
 detects disagreement, never fabrication.** Sequencing therefore has to be enforced where it is
@@ -127,8 +136,8 @@ Recorded here because the alternative is implying it can.
 - **Table inheritance disarms every constraint.** A child of `ledger_entries` inherits CHECKs and
   nothing else — no FKs, no unique indexes, no triggers — while remaining visible through the
   parent to every view. It needs `CREATE` on the schema, so it is an operator path, not an app one.
-- **Gaplessness is enforced at issue, not verified at rest.** `ck_entries__seq` makes a gap hard to
-  create; nothing scans for one.
+- **Gaplessness is enforced at issue, not verified at rest.** `assign_entry_seq` makes a gap
+  unreachable through an INSERT; nothing scans the journal for one that arrived another way.
 - **The chart is not versioned.** Changing which statement line an account reports under is blocked
   outright while accounts exist, which is a stopgap: IAS 1.41 *requires* reclassifying comparatives.
 - **There is no period close and no period lock**, so a backdated entry can still restate a

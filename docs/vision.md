@@ -109,8 +109,10 @@ That line decides what is configurable. The product layer is meant to be replace
 
 Four properties. None is a setting.
 
-- **Append-only.** Entries are never updated or deleted — enforced by revoking `UPDATE` and
-  `DELETE` from the application role, not by convention.
+- **Append-only.** Entries are never updated or deleted — enforced by a trigger that refuses both
+  outright, for *every* role including the owner. The grant model matters too, but it is not the
+  mechanism: a `REVOKE` is a point-in-time change to a privilege, and a later `GRANT ALL` undoes
+  it ([0011](./decisions/0011-what-the-database-enforces.md)).
 - **Balanced per currency**, enforced by the database on every transaction.
 - **Bitemporal.** Every transaction carries when it happened in the business and when it was
   learned about. These differ constantly: a clearing's business date belongs to the network, not
