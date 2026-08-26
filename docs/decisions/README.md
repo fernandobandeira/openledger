@@ -43,6 +43,7 @@ here, so the ADRs don't each stop to re-explain them.
 | [0011](./0011-what-the-database-enforces.md) | The dozen guards added under adversarial review, and what the database still cannot enforce | A column with a DEFAULT is not a constraint — `recorded_at`, `account_seq` and `xact_id` all had one, and each turned out forgeable by an INSERT | **enforcement half superseded by [0012](./0012-where-logic-lives.md)** |
 | [0012](./0012-where-logic-lives.md) | **The ledger goes in Go. Postgres holds the shape, and a trigger needs a written justification** | The schema had quietly become the ledger — 27 triggers and 26 functions against 11 lines of Go — and ten review rounds went into hardening a validation harness that had turned into an unintended product | accepted |
 | [0013](./0013-the-write-path.md) | **The write primitive is a posting, not an entry** — source, destination, amount, so one leg is unconstructible | "One service owns the writes" is a hope about deployment; a type that cannot express an unbalanced transaction holds for every caller. No established open-source ledger enforces this in the database — Formance deleted its deferred constraint trigger in favour of a unique index | accepted |
+| [0014](./0014-schema-migrations.md) | **goose, applied from Go, never from the CLI** — `schema.sql` becomes migration 00001 | A *blocking* advisory lock deadlocks against `CREATE INDEX CONCURRENTLY`, which kills tern and golang-migrate; goose polls a try-lock. Atlas Community refuses our views outright | accepted |
 
 ## Non-negotiable
 
@@ -65,7 +66,7 @@ No decision may trade these away. They are what makes the numbers trustworthy:
 
 Undecided, listed plainly rather than buried:
 
-- **How schema changes get applied is undecided.** `schema/schema.sql` is loaded by `make schema`
+- ~~**How schema changes get applied is undecided.**~~ **Closed by [0014](./0014-schema-migrations.md)** — goose, from Go. What follows is the reasoning that entry asked for, kept because the alternatives matter: `schema/schema.sql` is loaded by `make schema`
   with plain `psql`, which is fine for a design artefact and is not a migration story. A ledger
   cannot take a schema change by hand, and the choice interacts with two decisions already made:
   [0002](./0002-data-access-layer.md) picked native pgx (several tools are `database/sql`-only), and
