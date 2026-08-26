@@ -434,10 +434,14 @@ SELECT must_fail('re-grouping an event into another currency''s group', $q$
         'g_late', 'operator:fernando');
 $q$, 'only meaningful in one currency');
 
+-- a DELTA event, matching g_late's convention, so the expiry guard is what fires
+-- rather than the convention guard that now precedes it
 SELECT must_fail('re-grouping an event into an EXPIRED group', $q$
+    SELECT record_auth_event('t1','exp_probe', NULL,'acme','card_6',
+            'authorization', 1500,'USD',false, now());
     SELECT expire_hold_group('t1','acme','g_late');
     SELECT regroup_auth_event('t1',
-        (SELECT id FROM card_auth_events WHERE processor_msg_id='msg_tip_inc'),
+        (SELECT id FROM card_auth_events WHERE processor_msg_id='exp_probe'),
         'g_late', 'operator:fernando');
 $q$, 'which expired at');
 
@@ -777,6 +781,85 @@ SELECT eq('...preserves the low-water mark rather than overwriting it',
           (SELECT low_water_minor FROM card_hold_groups WHERE group_key='g_rf'), -2000);
 SELECT eq('...and counts the live events',
           (SELECT open_events FROM card_hold_groups WHERE group_key='g_rf'), 3);
+
+-- =========================================================== the STORED event
+--
+-- The attach path used to validate the CALLER'S PARAMETERS. On fresh ingest those
+-- are the event, so the guards were sound; on re-delivery the event already exists
+-- and is immutable, and checking the caller's claims about it checks the wrong
+-- thing. The suite could not see this because both deliveries in its tests passed
+-- the SAME values -- it only ever varied them together.
+
+SELECT record_auth_event('t1','sv_jpy', NULL,'acme','card_s',
+        'clearing', 50000,'JPY',false, now());
+SELECT record_auth_event('t1','sv_auth','g_stored','acme','card_s',
+        'authorization', 10000,'USD',false, now());
+SELECT must_fail('a stored JPY event re-delivered as USD', $q$
+    SELECT record_auth_event('t1','sv_jpy','g_stored','acme','card_s',
+            'clearing', 50000,'USD',false, now());
+$q$, 'stored event sv_jpy is in JPY');
+
+SELECT record_auth_event('t1','sv_tot','g_conv','acme','card_s',
+        'authorization', 10000,'USD',true, now());
+SELECT record_auth_event('t1','sv_delta', NULL,'acme','card_s',
+        'incremental', 30000,'USD',false, now());
+SELECT must_fail('a stored DELTA re-delivered as a total, into a totals group', $q$
+    SELECT record_auth_event('t1','sv_delta','g_conv','acme','card_s',
+            'incremental', 30000,'USD',true, now());
+$q$, 'reports a delta, but group');
+
+-- the sharpest one: an expiry_reversal normalised as a clearing by a second
+-- adapter, landing on an expired group and swallowed by the clamp
+SELECT record_auth_event('t1','sv_ea','g_rev','zeta','card_s',
+        'authorization', 100000,'USD',false, now());
+SELECT expire_hold_group('t1','zeta','g_rev');
+SELECT record_auth_event('t1','sv_er', NULL,'zeta','card_s',
+        'expiry_reversal', 90000,'USD',false, now());
+SELECT eq('a stored expiry_reversal re-opens even when re-delivered as a clearing',
+          (SELECT record_auth_event('t1','sv_er','g_rev','zeta','card_s',
+                   'clearing', 90000,'USD',false, now())), 190000);
+-- zeta already holds from earlier blocks, so assert the GROUP, not the company
+SELECT eq('...and the group holds what ingest returned',
+          (SELECT held_minor FROM card_hold_groups WHERE group_key='g_rev'), 190000);
+SELECT no_drift('the stored-event guards');
+
+-- =========================================================== the alarm, again
+
+-- authorized_minor is the base every cumulative conversion uses and the sole input
+-- to the out-of-order refusal. Nothing compared it to anything.
+SELECT must_fail('a tampered authorized subtotal', $q$
+    SELECT record_auth_event('t1','am1','g_am','acme','card_a',
+            'authorization', 10000,'USD',false, now());
+    UPDATE card_hold_groups SET authorized_minor = 999999
+     WHERE tenant_id='t1' AND group_key='g_am';
+    SELECT no_drift('authorized subtotal');
+$q$, 'disagrees with the event log');
+
+-- exposure restored by REMOVING a decrease that arrived AFTER the release. The
+-- snapshot taken at expiry never sees it, so the snapshot ratchets down.
+SELECT must_fail('removing a late clearing from an expired group', $q$
+    SELECT record_auth_event('t1','lc1','g_lc','acme','card_l',
+            'authorization', 100000,'USD',false, now());
+    SELECT expire_hold_group('t1','acme','g_lc');
+    SELECT record_auth_event('t1','lc2','g_lc','acme','card_l',
+            'clearing', 100000,'USD',false, now());
+    SELECT regroup_auth_event('t1',
+            (SELECT id FROM card_auth_events WHERE processor_msg_id='lc2'),
+            'g_lc2','operator');
+    SELECT no_drift('exposure restored on an expired group');
+$q$, 'disagrees with the event log');
+
+-- re-grouping must guard convention too: the operator's routine correction
+-- poisoned the authorized subtotal exactly as a mixed ingest does
+SELECT must_fail('re-grouping across conventions', $q$
+    SELECT record_auth_event('t1','rc_t','g_rct','acme','card_r',
+            'authorization', 10000,'USD',true, now());
+    SELECT record_auth_event('t1','rc_d','g_rcd','acme','card_r',
+            'authorization', 20000,'USD',false, now());
+    SELECT regroup_auth_event('t1',
+            (SELECT id FROM card_auth_events WHERE processor_msg_id='rc_d'),
+            'g_rct','operator');
+$q$, 'reports increases as');
 
 DO $$ BEGIN RAISE NOTICE 'ok  card hold flow attested'; END $$;
 

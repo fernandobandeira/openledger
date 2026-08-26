@@ -120,6 +120,31 @@ out-of-order, and the derived total was never wrong.
 - The ledger takes no dependency on any of this: holds are a product-layer concern built on the
   core, and the core does not know they exist.
 
+## Known, and not fixed
+
+Three findings from adversarial review are recorded rather than closed, because
+each needs a design decision rather than a guard:
+
+- **A cumulative restatement that DECREASES is refused, and the refusal is sticky.**
+  A processor reporting cumulative totals restates a *lower* subtotal after a
+  partial reversal. `authorized_minor` only rises, so the message is refused as
+  out-of-order and the group can never accept a total below its high-water mark
+  again — measured: 60.00 held against 90.00 real. Representing a decreasing
+  authorized subtotal is the missing piece.
+- **A refused convention mix leaves an order-dependent number in service.** Only
+  the *second* message is refused; the first is already applied. The same two
+  messages therefore leave 50.00 or 100.00 held depending on arrival order. If
+  refusing the mix is the answer, the *group* should be quarantined, not just the
+  message.
+- **`regroup_auth_event` can deadlock against a multi-group adapter transaction.**
+  It sorts its two locks by `group_key`; `record_auth_event` takes its single lock
+  in call order, so a batch touching `ZZZ` then `AAA` takes them backwards.
+  Measured at 91 deadlocks under mixed load. Opposite-direction regroups are fine —
+  it is regroup versus an unsorted multi-statement caller. A single-group ingest
+  cannot sort a lock it does not know about, so the fix belongs in a batch API or
+  in an advisory lock over the same key space. Every deadlock aborted cleanly, so
+  this costs availability, not correctness.
+
 ## Not decided here
 
 - **Hold expiry windows are policy, not protocol.** Our release timer is not the network's clearing
