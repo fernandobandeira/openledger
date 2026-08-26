@@ -75,7 +75,7 @@ accounts and the completeness layer ([ADR-0009](./decisions/0009-chart-and-compl
 ([ADR-0010](./decisions/0010-authorization-holds.md)). No API, no Go beyond migrations.
 
 Landed with it: composite `(tenant_id, …)` keys throughout, the cross-tenant guard as a composite
-foreign key, `REVOKE UPDATE, DELETE` on the journal, and the drift views both ADR-0003 and
+foreign key, an immutability trigger on the journal, and the drift views both ADR-0003 and
 ADR-0010 rely on. **Striping is not built** — it is still one integer on the account row and a
 `SUM` on read, and nothing in `migrations/` implements it yet.
 

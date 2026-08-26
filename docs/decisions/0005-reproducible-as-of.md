@@ -9,7 +9,7 @@ A report must be **reproducible**: re-running "as of June 30" next year must ret
 number it returned last year. That is the entire point of recording two time axes
 ([0003](./0003-bitemporal-balances.md)).
 
-**`recorded_at` does not provide it.** It defaults to `now()`, which in Postgres is *transaction
+**`recorded_at` does not provide it.** It is assigned `now()` by a trigger, and `now()` in Postgres is *transaction
 start* time — not commit order:
 
 | Transaction | starts | commits | writes `recorded_at` |

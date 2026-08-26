@@ -99,6 +99,7 @@ recomputation*, which is what Modern Treasury does when a cached balance drifts.
 
 ## Blocked on 0005
 
-`recorded_at` defaults to `now()`, which is *transaction start* time, so it is not monotonic with
+`recorded_at` is assigned `now()` by a trigger (it is no longer accepted from a caller — see
+[0011](./0011-what-the-database-enforces.md)), and `now()` is *transaction start* time, so it is not monotonic with
 commit order — an "as of T" report can return different numbers when re-run.
 [0005](./0005-reproducible-as-of.md) takes that up, and it blocks M5.
