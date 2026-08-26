@@ -1,70 +1,60 @@
 # 0002 — Data access: native pgx + sqlc
 
 **Status:** accepted
-**Date:** 2026-08-25
 
-## Context
+## The decision
 
-[0001](./0001-go-and-postgres.md) rules out an ORM, leaving two very different tools:
+**Native `pgxpool` + sqlc.** We write the SQL; sqlc generates typed Go functions and a result
+struct per query. Configuration in
+[`spikes/002-sqlc-vs-jet/sqlc.yaml`](../../spikes/002-sqlc-vs-jet/sqlc.yaml). Generated models
+*are* the domain entities — no mapper layer, and the only DTO boundary is at the HTTP edge.
 
-- **sqlc** — you write SQL; it generates typed Go functions and a result struct per query.
-- **go-jet** — generates a model and a type-safe query *builder*; you compose queries in Go.
+## Why
 
-The codebase has two query populations with opposite needs. The **hot path** is a small fixed set
-of hand-tuned statements that must stay readable as SQL. **Reporting** is many queries with
-dynamic filters, where a builder pays for itself.
+**go-jet is hard-wired to `database/sql`.** Its `Queryable` interface returns `*sql.Rows`, so it
+cannot run on a native `pgxpool`. Choosing it means choosing a driver stack, not just a generator,
+and losing `pgx.Batch` and `CopyFrom` with it. `CopyFrom` is load-bearing rather than a free extra:
+spike 003's coalesced-batching path, worth **4.4×**, is built on it.
 
-## Decision
+**go-jet has a silent-zero scan trap.** It keys result columns as
+`<structTypeName>.<fieldName>`, so a bare alias scanned into a named struct returns **zeros with
+`err == nil`** — measured on a money query in
+[spike 002](../../spikes/002-sqlc-vs-jet/README.md). The guard is off by default and *panics*
+rather than erroring. sqlc structurally cannot fail this way: struct and column list are generated
+together from the same query text. For a ledger a silently-zero balance is worse than a crash,
+because it reconciles.
 
-**Native `pgxpool` + sqlc.** Configuration in
-[`spikes/002-sqlc-vs-jet/sqlc.yaml`](../../spikes/002-sqlc-vs-jet/sqlc.yaml).
+**go-jet's generator needs a live, migrated Postgres.** There is no DDL parser and the maintainer
+has declined to add one, so Docker becomes a permanent hard dependency of codegen. sqlc parses the
+migrations directory offline.
 
-The decisive structural fact: **go-jet is hard-wired to `database/sql`** — its `Queryable`
-interface returns `*sql.Rows`, so it cannot run on a native `pgxpool`. Choosing it means choosing
-a driver stack, not just a generator, and losing `pgx.Batch` and `CopyFrom` with it.
+Everything else was close to a wash — go-jet handled every hard query we have, arrays and jsonb
+included.
 
-## What changed since
+## Alternatives
 
-This ADR originally proposed go-jet, on the theory that arrays and jsonb would be painful under
-`database/sql` and that go-jet's one-struct-per-table model beat sqlc's per-query structs.
-[Spike 002](../../spikes/002-sqlc-vs-jet/README.md) reversed it. The array premise was simply
-wrong — both tools handle arrays well. Two unanticipated findings decided it instead:
+| | Why not |
+| --- | --- |
+| **go-jet** | `database/sql` only; silent-zero scan; codegen needs a live database. Its query builder is genuinely better for dynamic reporting filters — that is the cost we accept below. |
+| **An ORM** | Ruled out by [0001](./0001-go-and-postgres.md): the hot queries must stay reviewable as SQL. |
+| **Hand-written pgx everywhere** | Kept as the escape hatch for dynamic queries, not as the default — no generated types means no compile-time check that the struct matches the column list. |
 
-**1. go-jet has a silent-zero scan trap.** It keys result columns as
-`<structTypeName>.<fieldName>`. A bare alias scanned into a named struct returns **zeros with
-`err == nil`**. Measured on a money query. The guard is off by default and *panics* rather than
-erroring. sqlc structurally cannot fail this way — struct and column list are generated together
-from the same query text. For a ledger a silently-zero balance is worse than a crash, because it
-reconciles.
+## What it costs
 
-**2. go-jet's generator needs a live, migrated Postgres.** There is no DDL parser and the
-maintainer has declined to add one, so Docker becomes a permanent hard dependency of codegen.
-sqlc parses the migrations directory offline.
+Five sharp edges, all silent when you get them wrong, and one thing that is not what it looks like:
 
-Everything else was close to a wash — go-jet handled every hard query we have.
-
-## Consequences
-
-- **`CopyFrom` turned out load-bearing, not a free extra.** Spike 003's coalesced-batching path,
-  worth 4.4×, is built on it. This is the clearest retrospective vindication of the reversal.
-- **Struct sprawl was overstated.** sqlc returns the bare table struct for `SELECT *`,
-  `SELECT alias.*`, and `RETURNING *`. **Always `SELECT *`, never a hand-listed full column
-  set** — re-ordering silently forces a per-query `Row` struct.
-- **Generated models are the domain entities.** The `overrides` block yields `uuid.UUID`,
-  `time.Time`, `*string`, `json.RawMessage`. No mapper layer; the only DTO boundary is at the
-  HTTP edge.
-- **Use `sqlc.embed` on INNER JOINs only.** On a LEFT JOIN it generates non-nullable fields and
-  fails at runtime. It cannot embed a CTE at all.
+- **Always `SELECT *`, never a hand-listed full column set.** sqlc returns the bare table struct
+  for `SELECT *`, `SELECT alias.*` and `RETURNING *`; re-ordering columns by hand silently forces
+  a per-query `Row` struct.
+- **`sqlc.embed` on INNER JOINs only.** On a LEFT JOIN it generates non-nullable fields and fails
+  at runtime. It cannot embed a CTE at all.
 - **Every aggregate needs `COALESCE(...)` *and* an explicit cast.** `SUM(x)::bigint` types as
-  non-nullable `int64` but returns NULL over zero rows, and neither sqlc engine catches it.
-  **This wants a CI lint over the query files** — it is the one landmine the tooling misses.
+  non-nullable `int64` but returns NULL over zero rows, and neither sqlc engine catches it. This
+  wants a CI lint over the query files — the one landmine the tooling misses.
 - **Verify each `overrides` entry actually landed.** The `db_type` spelling is unpredictable
   (`bigint` needs `pg_catalog.int8`; `uuid` and `jsonb` take the bare name) and a miss is silent.
 - **Dynamic queries** use `sqlc.narg` + `IS NULL OR`, escalating to hand-written SQL scanned by
   `pgx.RowToStructByNameLax` into the same generated structs.
-
-**Not blocked by this:** M1 is schema — pure SQL. The spike schema applies cleanly with its
-invariants enforced by Postgres. **It did not graduate**, and an earlier version of this sentence
-said it did: `spikes/002-sqlc-vs-jet/schema.sql` puts `idempotency_key` on `ledger_transactions`,
-which [0004](./0004-event-log.md) moved to `ledger_events`. `schema/schema.sql` was written by
-hand. `spikes/README.md` has said so all along; this line disagreed with it.
+- **The spike schema did not graduate.** `spikes/002-sqlc-vs-jet/schema.sql` puts
+  `idempotency_key` on `ledger_transactions`, which [0004](./0004-event-log.md) moved to
+  `ledger_events`. `schema/schema.sql` was written by hand.

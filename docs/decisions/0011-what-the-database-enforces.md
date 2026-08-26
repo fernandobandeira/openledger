@@ -1,285 +1,78 @@
-# 0011 — What the database enforces, and what it cannot
+# 0011 — A column with a DEFAULT is not a constraint
 
-**Status:** **superseded in part by [0012](./0012-where-logic-lives.md)** — read that first
-
-> **Most of the mechanisms described below no longer exist.** This ADR is written in the present
-> tense about a PL/pgSQL implementation that [0012](./0012-where-logic-lives.md) deleted: the
-> deferred balance trigger, the sequence and `xact_id` assignment triggers, the correction-target
-> guard, the inheritance event trigger, both drift views on the ledger side, and roughly fifteen
-> named objects besides. **Its findings stand** — it is a good catalogue of what a database can and
-> cannot be made to guarantee, and every counterexample in it was real. **Its conclusion does not.**
-> What ships today is eleven tables, five views, ten foreign keys, eight triggers over two
-> functions, and no policies.
+**Status:** **superseded in part by [0012](./0012-where-logic-lives.md)** — the findings stand, the
+conclusion does not
 **Date:** 2026-08-26
 
-## Context
+## The decision
 
-Between [0009](./0009-chart-and-completeness.md) and this ADR, the schema grew about a dozen
-guards. Every one of them was added because an adversarial reviewer produced a counterexample: a
-state the design claimed was impossible, reached in SQL, with every existing check green.
+This ADR records what a PL/pgSQL implementation could and could not be made to guarantee. **The
+mechanisms described here no longer exist** — [0012](./0012-where-logic-lives.md) deleted the
+deferred balance trigger, the sequence and `xact_id` assignment triggers, the correction-target
+guard, the inheritance event trigger, both ledger-side drift views and roughly fifteen named objects
+besides. What ships today is eleven tables, five views, ten foreign keys, eight triggers over two
+functions, and no policies.
 
-None of them was recorded here. The front page of this log claims to hold *"everything we've
-decided,"* and a repeated finding was that it did not — the most consequential correctness
-mechanisms in the project existed only as trigger definitions. This ADR is the record.
-
-The pattern in the counterexamples is worth stating first, because it is more useful than the list:
+The finding that survives it all, and the reason the file is kept:
 
 > **A column with a `DEFAULT` is not a constraint.** `effective_at` was made honest by putting it
-> inside a composite key. `recorded_at`, `account_seq`, `xact_id` and `uuidv7()` ids all had
-> defaults and nothing else, and every one of them turned out to be forgeable by an INSERT.
+> inside a composite key. `recorded_at`, `account_seq`, `xact_id` and `uuidv7()` ids all had defaults
+> and nothing else, and every one of them turned out forgeable by an `INSERT`.
 
-## Decisions
+Each entry below was added because an adversarial reviewer produced a counterexample: a state the
+design claimed was impossible, reached in SQL, with every existing check green.
 
-### The journal is sealed at commit
+## Why — the counterexamples
 
-`ledger_transactions.xact_id` records the database transaction that created the row, and
-`ck_entries__sealed` refuses an entry whose transaction was created by a *different, already
-committed* one.
+| What had to be enforced | What was reached without it |
+| --- | --- |
+| **The journal sealed at commit.** `xact_id` recorded the creating database transaction; `ck_entries__sealed` refused an entry whose transaction was created by a *different, already committed* one. | Append-only protected the **entry**, not the **journal**: the app role, holding nothing but its ordinary `INSERT` grant, added a balanced, correctly-dated, correctly-sequenced pair of legs to a transaction committed and reported months earlier — February revenue 500.00 → **1,166.00**, with the drift view, the equation and the balance sheet all green. Deleting a transaction's legs *and* its row together erased 50,000 of revenue past the min-entries guard; a one-line `UPDATE` of `xact_id` re-opened a sealed transaction. |
+| **`recorded_at` assigned, never accepted** — and assignment was still not enough. | Client-supplied insertion times let an already-issued recorded-axis report be rewritten months later, let one transaction's two legs carry different recording times (a balanced journal reporting **unbalanced**), and produced a green report that was 50% wrong. Assigning `now()` shrank the window without closing it: `now()` is transaction-*start* time, so a writer that begins before a report and commits after it inserts rows claiming to predate it — same query, same as-of, either side of one `COMMIT`, revenue 110,000.00 → **160,000.00**, balanced both times, zero drift. **A timestamp cannot order commits**; [0005](./0005-reproducible-as-of.md) is the outstanding work. |
+| **`account_seq` *issued*, not validated.** | Uniqueness and positivity were not enough: an `INSERT` left a 48-wide gap and later filled it with a backdated, balanced, same-account round trip — gross turnover 100 → **100,000,000**, all three copies of the balance agreeing. Validating the incoming value against the balance cache was the same mistake one level down, because the app role holds `UPDATE` on that table: the counter was not issued, it was *asked*. **A drift view detects disagreement, never fabrication.** |
+| **`TRUNCATE` refused.** | `TRUNCATE ledger_entries, ledger_account_balances` left eleven transactions standing with zero entries, every currency `balanced = t`, drift at zero rows, the equation satisfied. Nothing was wrong with any report; there was nothing left to disagree with — **silence read as assent.** The deferred `ck_txn__has_entries` could not speak: it fires at the commit of a statement that *touched* a transaction, and `TRUNCATE` is not one. The schema comment beside the `REVOKE`s said *"Nothing in SQL can stop that."* A reviewer disproved it in four lines. **A "cannot" is a claim like any other.** |
+| **Immutability on the event log**, not just assignment. | `ledger_events` stamped `recorded_at` on insert and let an `UPDATE` rewrite it afterwards — and `idempotency_hash` with it, the column whose entire job is *same key, different body, refuse*. Rewrite the hash and the next replay of that key returns the wrong stored result. |
+| **An account's owner frozen.** `purpose`, `currency` and `tenant_id` were frozen by unique indexes and composite foreign keys; the owner was not. | One `UPDATE` moved 110,000 of receivable from a named company to `owner_id NULL`: every balance identical, trial balance balanced, drift silent — because no report reads the owner. A receivable owed by nobody is not a receivable, and there is no entry to reverse. |
+| **A correction pointing at something it can correct.** `resolves_id` and `reverses_id` had foreign keys, so the target had to *exist*. | Nothing required the target to be in a state the correction means anything against. A posted transaction "resolved" by another posted one, and a pending one "reversed", took revenue to **−49,223** with drift at 0 and the equation balanced. The referential integrity was real; the semantic linkage was assumed. |
+| **`ENABLE ALWAYS` on triggers — including the foreign keys' own.** | `session_replication_role = 'replica'` (the logical-replication apply path, and what `pg_restore --disable-triggers` sets) skips triggers left in the default `ENABLE ORIGIN` state, **and foreign keys are implemented as triggers**. Before the FK triggers were swept too, a transaction spanning two tenants, both legs in a currency their account does not hold, dated 27 years before its own transaction, committed cleanly on that path. *(Not true of the shipped schema — all 26 internal FK triggers are `ENABLE ORIGIN` again; the sweep went with the PL/pgSQL. In [Still open](./README.md).)* |
+| **A chart that cannot contradict itself.** | Pointing a `revenue` type at a cost-of-revenue line put 6,000 of revenue on the expense side of the income statement — the harm [0009](./0009-chart-and-completeness.md) is about — with every check green. A balance-sheet line carrying side `debit` was counted on *neither* side and vanished: 90% of a sheet missing, reporting balanced. Now a composite foreign key rather than a trigger, which is strictly better ([0012](./0012-where-logic-lives.md)). |
+| **One convention per hold group; expiry measured against a snapshot.** | Mixing deltas with cumulative totals is *irreconcilable*, not merely awkward. And `assigned_at > expired_at` compares two `now()` values, so any writer whose transaction opened before the release timer fired was invisible. Both are [0010](./0010-authorization-holds.md)'s, and both survive in the shipped schema. |
 
-Without it, append-only protected the **entry** and not the **journal**: the app role, holding
-nothing but its ordinary `INSERT` grant, added a balanced, correctly-dated, correctly-sequenced
-pair of legs to a transaction committed and reported months earlier. February revenue went from
-500.00 to 1,166.00 with the drift view, the accounting equation and the balance sheet all green,
-because every constraint in the schema was satisfied.
+**A finding is a claim, too.** One escape recorded here — plant a transaction carrying a *future*
+`xact_id`, wait for the global counter to reach it, then append legs — was written into this ADR and
+into a migration on a reviewer's report alone, and it does not reproduce: the forged value seals the
+transaction against its own legs at plant time, and a leg-less transaction cannot commit. Adopting an
+adversary's demonstration without re-running it is the sourcing failure nobody watches for.
 
-`ck_txn__immutable` completes it: a transaction row cannot be deleted, and cannot be updated
-outside `metadata` and `external_ref`. That closed two more escapes — deleting a transaction's
-legs *and* the transaction row together (which erased 50,000 of revenue past the min-entries
-guard), and re-opening a sealed transaction with a one-line `UPDATE` of `xact_id`.
+## Alternatives
 
-### `recorded_at` is assigned, never accepted
+- **Validate rather than assign.** Tried for `account_seq` against the balance cache, and it failed
+  for a reason that generalises: the app role could write the thing being validated against, and a
+  brand-new account had no cache row at all, so bigint-max was accepted and the account was
+  permanently bricked. Assignment closes all three holes.
+- **`REVOKE` instead of a trigger.** A `REVOKE` is a point-in-time change to a privilege, not a
+  standing prohibition; one `GRANT ALL` undoes it. What survives in [0012](./0012-where-logic-lives.md)
+  is both — the grant binds the application role, the trigger binds a backfill script or a human at a
+  psql prompt.
+- **Defend against every writer** — this ADR's own conclusion, and the part
+  [0012](./0012-where-logic-lives.md) supersedes. Twenty-five triggers were the measurement of how
+  much ledger had leaked into the schema, not of how much safety was bought.
 
-A `BEFORE INSERT` trigger stamps `now()` on entries, transactions and events, discarding whatever
-the caller supplied.
+## What it costs — what the database still cannot enforce
 
-The insertion axis is what every "reproducible as of any date, forever" claim rests on, and it was
-client-supplied and unconstrained. Three consequences, all reproduced: an already-issued
-recorded-axis report could be rewritten months later by a transaction *claiming* to predate it; one
-transaction's two legs could carry different recording times, so a recorded-axis report of a
-perfectly balanced journal came back **unbalanced**; and, arranged more carefully, a **green report
-that was 50% wrong**.
+Recorded because the alternative is implying it can.
 
-**What this does not fix**, and it matters: **neither `balance_after` nor the aggregate answers a
-recorded-axis as-of question reproducibly.** Not one of them, not the other — both.
-
-`recorded_at` is assigned as `now()`, and `now()` is transaction-*start* time, so it is not
-monotonic with commit order: a writer that begins before a report and commits after it inserts rows
-claiming to predate the report. Demonstrated with nothing but the app role's INSERT grants — the
-same query, the same as-of, the same axis, run either side of one `COMMIT`, moved revenue from
-110,000.00 to 160,000.00, balanced both times, zero drift. Assigning `now()` in the engine rather
-than accepting it from the client shrank the window from "any instant the caller invents" to "the
-duration of the writer's transaction", which the writer still chooses. **A timestamp cannot order
-commits.** `xact_id` is already stored for the fix; [0005](./0005-reproducible-as-of.md) is the
-outstanding work.
-
-Both axes were asserted in the deleted `tests/bitemporal.sql` suite — as *separation*,
-which holds; not as reproducibility under concurrent writes, which does not.
-
-*(An earlier version of this paragraph said the aggregate could answer the question, retracted that
-mid-sentence, and stated the same fact about `now()` twice in fourteen lines. The position above is
-the one that survived; the sequence is not worth reading.)*
-
-### `account_seq` is assigned from the journal
-
-`assign_entry_seq` is a `BEFORE INSERT` trigger: it sets `NEW.account_seq` to `MAX + 1` over that
-account's existing entries. A client-supplied value is **discarded**, not refused.
-
-This sentence used to end "under the row lock the balance upsert already holds", which was a
-**caller convention stated as a property of the mechanism**. Nothing obliged a caller to touch
-`ledger_account_balances` first, and a reviewer ran 6 workers x 20 balanced postings that did not:
-100 of 120 died on `uq_entries__account_seq` with a `23505`, indistinguishable from a genuine
-idempotency conflict and retried by no serialization-failure loop. The trigger now takes that lock
-itself — it upserts the `(account, currency)` cache row and locks it before reading `MAX` — so the
-serialization is something the database provides rather than something the caller is trusted to
-have done.
-
-It took two attempts. Uniqueness and positivity were not enough — an app-role INSERT could leave a
-48-wide gap and later *fill* it with a backdated, balanced, same-account round trip, taking gross
-turnover from 100 to 100,000,000 with the journal and the cache written together, so all three
-copies agreed and the alarm stayed silent.
-
-The first fix *validated* the incoming sequence against `ledger_account_balances.last_seq` — and
-that was the same mistake one level down, because **the app role is granted `UPDATE` on that
-table**. The counter was not issued, it was *asked*: rewind `last_seq` into a reserved gap in one
-transaction, back-fill it in another, put the counter back. It also did nothing at all for a
-brand-new account, where no cache row exists yet and bigint-max was accepted, permanently bricking
-the account. Assignment closes all three.
-
-That is the general limit of the drift view, and it is worth naming: **`ledger_balance_drift`
-detects disagreement, never fabrication.** Sequencing therefore has to be enforced where it is
-issued, not reconciled afterwards.
-
-The alarm's scope also grew, for the same reason — it now compares per-row running balances (not
-just the last one), the cached net balance, `input` and `output` *individually*, and `last_seq`.
-Each of those was a state that had been reachable while the view stayed empty.
-
-### The journal cannot be emptied
-
-`TRUNCATE ledger_entries, ledger_account_balances` left eleven transactions standing with zero
-entries, all three currencies reporting `balanced = t`, drift at zero rows, and the accounting
-equation satisfied. Nothing was wrong with any report; there was simply nothing left to disagree
-with. **Silence read as assent** — the same shape as an empty report that "found no problems".
-
-`ck_txn__has_entries` could not speak, and this is worth being precise about, because it looks
-like the guard that should have: it is a DEFERRED constraint trigger, so it fires at the commit of
-a statement that *touched* a transaction. `TRUNCATE` is not such a statement. The transactions were
-never touched; their entries just stopped existing.
-
-Two things changed. `BEFORE TRUNCATE ... FOR EACH STATEMENT` triggers, `ENABLE ALWAYS`, on
-`ledger_entries`, `ledger_transactions`, `ledger_events` and `ledger_accounts` — verified to hold
-against `GRANT ALL`, `SET ROLE openledger_app`, `CASCADE`, and `session_replication_role =
-'replica'`. And `ledger_transaction_drift`, a standing cross-check of the two journal tables
-against each other, because the two of them agreeing with a *third* thing is not the same as
-agreeing with each other.
-
-The comment beside the `REVOKE`s said, in as many words, *"Nothing in SQL can stop that."* A
-reviewer disproved it in four lines. **A "cannot" in this repository is a claim like any other**,
-and this one had been sitting there being believed.
-
-### An event log with no immutability guard
-
-`ledger_events` was the one table with an assign-on-insert trigger and nothing to stop an UPDATE
-afterwards, so `recorded_at` was assigned and then rewritable — and so was `idempotency_hash`, the
-column whose entire job is *same key, different body, refuse*. Rewrite the hash and the next replay
-of that key returns the wrong stored result. The same guard now covers `card_auth_events`.
-
-### An account's owner is part of what its history means
-
-`purpose`, `currency` and `tenant_id` were frozen — by the unique indexes and the composite foreign
-keys entries carry. **Who the account belongs to was not.** One UPDATE moved 110,000 of receivable
-from a named company to `owner_id NULL`: every balance identical, the trial balance still balanced,
-`ledger_balance_drift` silent. None of them read the owner. A receivable owed by nobody is not a
-receivable, and there is no journal entry to reverse, because nothing was posted.
-
-`metadata` stays mutable: it is annotation. `purpose` deliberately stays with 0002's entry-aware
-guard rather than being frozen here too — duplicating it would shadow the better message and leave
-the richer guard permanently unreachable.
-
-### A correction must point at something it can correct
-
-`resolves_id` and `reverses_id` each had a foreign key, so the target had to **exist**. Nothing
-required it to be in a state the correction means anything against. A posted transaction
-"resolved" by another posted one, and a pending one "reversed", took revenue to **−49,223** with
-drift at 0 and the equation balanced — because both halves were internally consistent journal
-entries. The referential integrity was real; the semantic linkage was assumed.
-
-This is decidable at INSERT because a transaction's status can never change: `ck_txn__immutable`
-refuses every UPDATE, and pending → posted is a *new row* pointing back through `resolves_id`.
-
-### `xact_id` is assigned, never accepted — the thesis, applied to itself
-
-This ADR's one-line summary is *a column with a `DEFAULT` is not a constraint*. It was written after
-`recorded_at`, `account_seq` and `xact_id` each turned out forgeable by an INSERT. Two of those three
-were then fixed with an assignment trigger. **The third was not** — and it is the one the schema
-calls "the seal's whole basis".
-
-A `DEFAULT` fires only when the client omits the column, and `GRANT INSERT ON ledger_transactions`
-covers every column, so `xact_id` was **accepted** rather than assigned. `ck_txn__xact_id` now
-assigns it, exactly as `assign_recorded_at` does. The `DEFAULT` stays so the column is never null
-under a bulk load with triggers off; it is not the mechanism.
-
-**And a claim that came with it is struck.** A reviewer reported a live escape: plant a transaction
-carrying a *future* `xact_id`, wait for the global counter to reach it, then append legs while the
-live xid matches, so `assert_entry_seals` reads equal and opens — 555.00 of revenue added to a
-closed period with every report agreeing. It was written into this ADR and into the migration on
-that report alone, and **it does not work.** Checked against the pre-fix schema: the forged value
-seals the transaction against *its own* legs at plant time (`is already committed; its entries are
-sealed`), and a leg-less transaction cannot commit because `ck_txn__has_entries` fires at COMMIT. A
-second reviewer, asked to verify the same claim independently, also failed to reproduce it and said
-so rather than assuming.
-
-That is the sourcing rule of [the decision log](./README.md#on-sourcing) applied to a *finding*
-rather than to a citation, and it was violated in the direction nobody watches for: not by inventing
-a number, but by adopting an adversary's demonstration without re-running it. **A finding is a
-claim.** The fix stands on the principle this ADR is named for — a column whose integrity rests on a
-`DEFAULT` is not defended, and leaving the seal's own basis as the single exception to a rule
-`recorded_at` and `account_seq` both follow was an inconsistency waiting for a use.
-
-### `ENABLE ALWAYS` on every trigger, and on the foreign keys
-
-`session_replication_role = 'replica'` is the logical-replication apply path and what
-`pg_restore --disable-triggers` sets. Under it, a trigger in the default `ENABLE ORIGIN` state does
-not fire.
-
-This was applied to one trigger, then to all of them, and finally — after a reviewer pointed out
-that referential integrity *is* implemented as triggers — to the internal FK triggers as well.
-Before that last step a transaction spanning two tenants, with both legs carrying a currency their
-account does not hold, dated 27 years before their own transaction, committed cleanly on the
-replication path. **A subscriber must enforce what its publisher enforces, or replication is a
-laundering channel for corrupt rows.**
-
-> **NOT TRUE OF THE SHIPPED SCHEMA.** All 26 internal FK triggers on `ledger_entries`,
-> `ledger_transactions` and `ledger_accounts` are `ENABLE ORIGIN`. Under
-> `session_replication_role = 'replica'` **every foreign key is skipped** — verified by inserting a
-> two-tenant entry, in a currency its account does not hold, dated 1999: it committed. The
-> `ENABLE ALWAYS` sweep went with the PL/pgSQL in [0012](./0012-where-logic-lives.md); only the eight
-> hand-written triggers kept it. Listed in *Still open*.
-
-### One convention per hold group
-
-`card_hold_groups.total_convention` is fixed by the first message that moves the authorized
-subtotal, and a group may not mix deltas with cumulative totals.
-
-This is **the honest limit of the order-tolerance claim** [0010](./0010-authorization-holds.md)
-headlines, and it deserves to be stated plainly rather than buried: mixing them is *irreconcilable*,
-not merely awkward. `{authorization +100.00 as a delta, incremental 120.00 as a total}` yields
-120.00 in one arrival order and 220.00 in the other, because a total arriving before the delta it
-restates carries no information saying it already includes it. No derivation can fix that. Only
-refusing the mix can.
-
-### Expiry is reversible, and the alarm measures against a snapshot
-
-An expired hold re-opens on any increase-side message — including an `expiry_reversal`, and
-including a cumulative restatement whose delta is *zero*, because the restatement itself is the
-liveness signal. A late clearing does not resurrect it.
-
-`expire_hold_group` snapshots `expired_authorized` and `expired_total`, and the drift alarm flags
-exposure that grew past either. Timestamps could not do this job: `assigned_at > expired_at`
-compares two `now()` values, so any writer whose transaction opened before the release timer fired
-was invisible.
-
-### The chart cannot contradict itself
-
-An account type's category must agree with its statement line's `statement` and `side`
-(`ck_types__matches_fs_line`), and `fs_lines.side` must belong to its statement. Pointing a
-`revenue` type at a cost-of-revenue line put 6,000 of revenue on the expense side of the income
-statement — the exact harm 0009 is about — with every check green. A balance-sheet line carrying
-side `debit` was counted on *neither* side of `balance_sheet_balances` and simply vanished: 90% of
-a sheet missing, reporting balanced.
-
-## What the database still cannot enforce
-
-Recorded here because the alternative is implying it can.
-
-- **`REVOKE CREATE ON SCHEMA public FROM PUBLIC` is a no-op here.** Since PostgreSQL 15, PUBLIC has
-  no `CREATE` on `public` to revoke — verified on a database that never ran these migrations. The
-  line is load-bearing only on PG ≤ 14, and this project's floor is 18. Kept as documentation of
-  intent, recorded here so nobody counts it as a defence.
-- **`GRANT ALL` re-grants everything.** A `REVOKE` is a point-in-time change to a privilege, not a
-  standing prohibition, so the narrow `GRANT` is a matter of discipline. This entry used to end
-  "including `TRUNCATE`", and to say that nothing in SQL could stop that — see the new section
-  above, which is what happens when a reviewer takes a "cannot" literally.
-- **`session_replication_role` can still be set by a superuser to something no trigger sees.**
-  Every internal trigger here is `ENABLE ALWAYS`, which covers the replica path, but nothing covers
-  a superuser who drops the triggers outright. At that point the defence is backups and audit, not
-  the schema.
-- **Table inheritance disarms every constraint — OPEN AGAIN.** It was closed by an event trigger,
-  and [0012](./0012-where-logic-lives.md) deleted it: `pg_event_trigger` is empty. Verified on the
-  shipped schema — a child of `ledger_entries` plus one `INSERT … SELECT * FROM ONLY` took an
-  income statement from 900 to 1,800. `CHECK`s are inherited; foreign keys, unique indexes and the
-  append-only trigger are not. *(This bullet said "Closed" for several rounds while it was true, and
-  then for several hours while it was not.)* The rest of the original text: A child of `ledger_entries` would inherit CHECKs and nothing else — no FKs, no
-  unique indexes, no triggers — while remaining visible through the parent to every view.
-  `ck_no_ledger_inheritance`, an `ddl_command_end` event trigger marked `ENABLE ALWAYS`, now refuses
-  the statement; the deleted `tests/negative_controls.sql` suite carried nine controls for it, including an `UNLOGGED`
-  child, a `FOREIGN TABLE` child and one attempted on the replication apply path. The list of
-  protected parents is a table (`ledger_uninheritable`) rather than a literal, because it was a
-  literal naming four tables while the test census named six — and the two it missed were the card
-  tables, where a child of `card_hold_groups` took an INSERT and moved
-  `held_for_company` from 0 to 999900 through the parent.
-- **Gaplessness is enforced at issue, not verified at rest.** `assign_entry_seq` makes a gap
-  unreachable through an INSERT; nothing scans the journal for one that arrived another way.
-- **The chart is not versioned.** Changing which statement line an account reports under is blocked
-  outright while accounts exist, which is a stopgap: IAS 1.41 *requires* reclassifying comparatives.
-- **There is no period close and no period lock**, so a backdated entry can still restate a
-  reported period. See [0009](./0009-chart-and-completeness.md).
+- **`REVOKE CREATE ON SCHEMA public FROM PUBLIC` is a no-op here.** Since PostgreSQL 15, PUBLIC has no
+  `CREATE` on `public` to revoke. The line is load-bearing only on PG ≤ 14 and this project's floor is
+  18; kept as documentation of intent, and nobody should count it as a defence.
+- **`GRANT ALL` re-grants everything**, and a superuser can set `session_replication_role` or drop the
+  triggers outright. At that point the defence is backups and audit, not the schema.
+- **Table inheritance disarms every constraint — open again.** `CHECK`s are inherited; foreign keys,
+  unique indexes and triggers are not. A child of `ledger_entries` plus one `INSERT … SELECT * FROM
+  ONLY` took an income statement from 900 to 1,800, and the child remains visible through the parent
+  to every view. The event trigger that closed it went with the PL/pgSQL; `pg_event_trigger` is empty.
+- **Gaplessness is enforced at issue, not verified at rest.** Nothing scans the journal for a gap that
+  arrived some other way.
+- **The chart is not versioned**, and changing an account's statement line is blocked outright while
+  accounts exist — a stopgap, since IAS 1.41 *requires* reclassifying comparatives.
+- **There is no period close and no period lock**, so a backdated entry can still restate a reported
+  period. See [0009](./0009-chart-and-completeness.md).

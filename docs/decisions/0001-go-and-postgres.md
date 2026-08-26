@@ -1,100 +1,63 @@
-# 0001 — Go + Postgres, no ORM
+# 0001 — Go on one Postgres, no ORM
 
 **Status:** accepted
-**Date:** 2026-08-25
 
-## Context
+## The decision
 
-Almost all the load-bearing logic in a ledger lives in SQL, not in application code:
+**Go, on a single Postgres instance, with no ORM.** Queries are hand-written SQL compiled to typed
+Go by sqlc ([0002](./0002-data-access-layer.md)). The ledger's procedural logic lives in Go;
+Postgres holds the shape ([0012](./0012-where-logic-lives.md)).
 
-- The authorization decision — the one request with a latency deadline — is a single
-  transaction using `FOR UPDATE`, a filtered aggregate, and `ON CONFLICT ... DO NOTHING`.
-- A balance is an index lookup on `(account_id, account_seq DESC)`.
-- Immutability is a trigger that refuses `UPDATE` and `DELETE` on entries for every role, backed
-  by a narrow `GRANT` — not application discipline. See [0011](./0011-what-the-database-enforces.md).
-- Tenant isolation is **meant to be** row-level security. `tenant_id` leading every key is the
-  prerequisite and it is built; the policies are **not** -- `schema/` contains no
-  `CREATE POLICY` and no `ENABLE ROW LEVEL SECURITY`. This line read as present tense for three
-  rounds while the decision log's front page recorded the gap and named this file.
-
-That narrows the host language's job: run that SQL, drive durable timers, parse webhooks, serve
-an API.
-
-## Decision
-
-**Go, on Postgres, with no ORM.**
+## Why
 
 **Go** because `int64` minor units are native, so no float ever comes near money; because
-deployment is a static binary with no runtime to install; and because the Postgres tooling we
-depend on — pgx and sqlc — is first-class there.
+deployment is a static binary with no runtime to install; and because pgx and sqlc are
+first-class there. Go is also the lowest-friction language for outside contributors, which matters
+for an open-source project.
 
-**Postgres** because one instance is enough — see the measured ceiling below.
+**Postgres** because the headroom is measured, not assumed.
+[Spike 003](../../spikes/003-throughput-ceiling/README.md) recorded **~800 clearings/s unsharded
+and 6,212–7,405 striped at 64**, with durability on, on one 16-core machine — 17–40× the volume the
+reference product needs. (The ~7,900 figure quoted elsewhere is striping *plus* single-call
+posting: a different configuration, not a better measurement of the same one.) At the top of the
+ladder the spike is explicit that the curve "plateaus **because the machine ran out of cores rather
+than because of a lock**. The ceiling moved from the design to the hardware."
 
-**No ORM** because the hot queries are hand-tuned artifacts meant to be read and reviewed *as
-SQL*, by us and plausibly by an auditor.
+**No ORM** because the hot queries are hand-tuned artifacts meant to be read and reviewed *as SQL*,
+by us and plausibly by an auditor. The authorization decision is one transaction using
+`FOR UPDATE`, a filtered aggregate and `ON CONFLICT ... DO NOTHING`; a balance is an index lookup on
+`(account_id, account_seq DESC)`; immutability is a trigger that refuses `UPDATE` and `DELETE` on
+the immutable logs ([0011](./0011-what-the-database-enforces.md)), not application discipline.
 
-### Alternatives
+**Formance reached the same "no procedural logic in the database" position, expensively.** Their v1
+put the ledger *in* plpgsql — triggers cascading from a log table into transactions, moves and
+balances; their migration 37 drops 27 stored functions and moves it all into Go
+([spike 001](../../spikes/001-formance/README.md)). Note what they *kept*: the constraints. It is
+procedural logic they reversed, not database-enforced correctness.
+
+**The trap that follows from that, and it is ours alone.** Formance's posting primitive is a
+source/destination pair — balanced *by construction*, so no CHECK is needed anywhere. Our entries
+are independent rows carrying a direction, so we *can* express an unbalanced transaction and
+therefore *must* prevent it. [0013](./0013-the-write-path.md) makes it unconstructible in the write
+API rather than refusing it in SQL, and that writer is not built, so today nothing enforces balance
+at all.
+
+## Alternatives
 
 | | Why not |
 | --- | --- |
 | **Kotlin/JVM** | Strongest runner-up — sealed classes give exhaustive state machines. Rejected on stack weight, not merit. |
 | **TypeScript** | Default numeric type is a float. Every boundary would need `bigint` discipline forever. |
-| **Rust** | Strong on correctness, but slower to iterate and a smaller pool of contributors for an OSS project. |
+| **Rust** | Strong on correctness, slower to iterate, smaller contributor pool for an OSS project. |
 | **TigerBeetle** | See [0007](./0007-open-source-positioning.md#why-not-tigerbeetle), which makes the case properly. |
+| **Temporal for durable timers** | A server cluster with its own databases, against one binary and one database. [0008](./0008-durable-timers.md) runs timers in-process on Postgres instead. |
 
-Go also remains the lowest-friction language for outside contributors, which matters more for an
-open-source project than stack weight did for a small team.
+## What it costs
 
-## What changed since
-
-**The sizing argument is superseded.** This ADR originally justified Postgres by *knowing* the
-workload (under 1 TPS). [0007](./0007-open-source-positioning.md) removes that knowledge.
-The conclusion holds on better grounds: [spike 003](../../spikes/003-throughput-ceiling/README.md)
-measured **~800 clearings/s unsharded, and 6,212-7,405 striped at 64**, with durability on. The
-~7,900 figure quoted elsewhere is striping *plus* single-call posting — a different configuration,
-not a better measurement of the same one. (An earlier version of this paragraph said that
-distinction was "stated correctly further down". It was not stated anywhere else in this file.)
-Postgres is now
-chosen on measured headroom and a known bottleneck, not on an assumption.
-
-**Formance reached the same "no procedural logic in the database" position, expensively.** Their
-v1 put the ledger *in* plpgsql — triggers cascading from a log table into transactions, moves and
-balances. Their migration 37 drops 27 stored functions and moves all of it into Go. Note
-what they *kept*: the constraints. It is procedural logic they reversed, not database-enforced
-correctness.
-
-**Constraints matter more for us than for them.** Formance's posting primitive is a
-source/destination pair — balanced *by construction*, so no CHECK is needed anywhere. Our entries
-are independent rows carrying a direction, so we *can* express an unbalanced transaction and
-therefore *must* prevent it. The decision is to make the illegal state unrepresentable in the write
-API ([0013](./0013-the-write-path.md)) rather than to refuse it in SQL — and **that API is not
-built**, so today neither half is in place. **[0012](./0012-where-logic-lives.md) removed the trigger backstop
-entirely** — the write path is the only enforcement now, and the schema keeps only declarative
-constraints. Spike 003 ran its entire benchmark with the trigger active and never found it to be
-the bottleneck, which is the part of this paragraph that still matters: at the top of its ladder —
-6,524 clearings/s at 64 stripes and c=32 — the spike is explicit that the curve "plateaus
-**because the machine ran out of cores rather than because of a lock**. The ceiling moved from the
-design to the hardware."
-
-*Two numbers in this paragraph used to be wrong.* The 6,524 figure carries no table-size qualifier
-in spike 003; it is the ordinary small-table fixture. The 2 GB measurement for striped-64 is
-**6,212** (−8% against 43 MB). And "striping alone at 64 measures 6,524–6,970" excluded two
-striped-64 values in the same spike — 6,212 at 2 GB and 7,405 with 32 tenants. The range is
-6,212–7,405.
-
-## Resolved — Temporal is gone
-
-Half this ADR's original case for Go was Temporal SDK quality. Temporal is not a library: it is a
-server cluster with its own databases, which contradicts
-[0007](./0007-open-source-positioning.md)'s promise of one binary and one database.
-
-[**0008**](./0008-durable-timers.md) resolves it: durable timers run in-process on Postgres, and
-the ledger core takes no scheduler dependency at all. **The case for Go now rests on `int64` money,
-static binaries, and pgx/sqlc quality** — not on an SDK we no longer use.
-
-## Consequences
-
-- Correctness pressure moves into SQL, migrations, and tests.
-- Go's lack of sum types makes state machines verbose. Mitigate with generated enum constants and
+- Correctness pressure moves into Go, SQL, migrations and tests rather than into a framework.
+- Go has no sum types, so state machines are verbose. Mitigate with generated enum constants and
   exhaustiveness tests.
+- **Tenant isolation is meant to be row-level security and is not built.** `tenant_id` leading
+  every key is the prerequisite and it exists; the policies do not — `schema/` contains no
+  `CREATE POLICY` and no `ENABLE ROW LEVEL SECURITY`.
 - The data-access layer is the next decision — [0002](./0002-data-access-layer.md).

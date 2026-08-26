@@ -1,123 +1,58 @@
 # Roadmap
 
-Ordered by what unblocks what, not by size. No estimates — the risk here is correctness, and
-correctness does not estimate well.
-
-**The ledger core is the product.** Cards, spend controls, and credit lines are a *reference
-implementation* built on it ([ADR-0007](./decisions/0007-open-source-positioning.md)). So the core
-must be verifiable by strangers before a reference product matters, and the deployment story is
-part of the product — something unrunnable is not adoptable, however correct it is.
+Ordered by what unblocks what, not by size. No estimates — the risk is correctness, and correctness
+does not estimate well. **The ledger core is the product**; cards, spend controls and credit lines
+are a *reference implementation* built on it
+([ADR-0007](./decisions/0007-open-source-positioning.md)). So the core must be verifiable by
+strangers before a reference product matters, and the deployment story is part of the product.
 
 ---
 
 # Phase 1 — the core
 
-## M0 · Validating the decisions — **done, and then some**
+## M0 · Validating the decisions — **done, and deleted**
 
-A SQL implementation and a conformance suite existed here: a full card lifecycle asserted
-state-by-state, the hold flow, both time axes, query-plan assertions, a concurrency suite, and
-every deliberate breakage we could think of, each of which had to be refused *for the stated
-reason*. Ten adversarial rounds attacked it by mutation — change the schema so it is wrong, and
-does anything fail?
-
-**It found real defects in the design, several of which under-reserved credit**, and those findings
-are the output that mattered: they are recorded in
-[ADR-0009](./decisions/0009-chart-and-completeness.md),
+A SQL implementation and its conformance suite proved the design and then outgrew it. Ten
+adversarial rounds found real defects, several of which under-reserved credit; those findings are
+recorded in [ADR-0009](./decisions/0009-chart-and-completeness.md),
 [ADR-0010](./decisions/0010-authorization-holds.md) and
-[ADR-0011](./decisions/0011-what-the-database-enforces.md). Order tolerance under out-of-order
-delivery, cumulative-total versus delta conventions, an over-capture leaving a negative residue
-that swallows the next increment, an authorization writing no ledger entry while a clearing posts,
-the recorded and effective axes as genuinely separate questions — all of it came from building the
-thing and attacking it.
-
-**It has been deleted.** [ADR-0012](./decisions/0012-where-logic-lives.md) explains why: the validation
-code had grown into an unintended product — 27 triggers, 26 PL/pgSQL functions and 10,000 lines of
-SQL and bash against eleven lines of Go — and by the last rounds the review was finding defects in
-the harness rather than in the design. A dead `WHERE` disjunct, a catalog census that repaired the
-mutant it was measuring, a bash command substitution that aborted under `set -e`. None of those are
-ledger problems.
-
-What survives is [`schema/schema.sql`](../schema/schema.sql): 11 tables, 3 report views, zero
-triggers, zero functions, and it loads. It shows the shape is expressible declaratively, which is
-all a design-stage schema needs to show.
-
-Two lessons worth keeping, both learned the hard way:
-
-- **Counting errors is not a pass criterion.** An early suite expected "seven failures" and got
-  eight, and the extra one was a *different* invariant failing for an unrelated reason. Every
-  assertion must name what it asserts, and every refusal must check the reason.
-- **A test suite that grades itself grades nothing.** Every guard we added read something the file
-  it policed controlled — the floor read output the file printed, the sentinel read a string the
-  file emitted. Each was forged in the next round. The durable answer is a check the thing under
-  test cannot produce.
-
-**What M0 becomes:** the same assertions, as Go tests, next to the Go that implements them — after
-M1.
+[ADR-0011](./decisions/0011-what-the-database-enforces.md). It has been deleted, and
+[ADR-0012](./decisions/0012-where-logic-lives.md) is why. **The same assertions come back as Go
+tests, after M1.**
 
 ## M1 · Schema, invariants, and the snapshot test — **schema landed**
 
-[`schema/schema.sql`](../schema/schema.sql) is the core —  `ledger_accounts`,
-`ledger_transactions`, `ledger_entries`, `ledger_account_balances`, `ledger_events` — written by
-hand rather than promoted from the spikes, which held three competing posting engines and two
-competing hold models. `schema/schema.sql` adds the chart of
-accounts and the completeness layer ([ADR-0009](./decisions/0009-chart-and-completeness.md));
-`schema/schema.sql` the hold model
-([ADR-0010](./decisions/0010-authorization-holds.md)). No API, no Go beyond migrations.
+[`schema/schema.sql`](../schema/schema.sql) is the core — `ledger_accounts`,
+`ledger_transactions`, `ledger_entries`, `ledger_account_balances`, `ledger_events` — plus the
+chart of accounts and completeness layer ([ADR-0009](./decisions/0009-chart-and-completeness.md))
+and the hold model ([ADR-0010](./decisions/0010-authorization-holds.md)). Eleven tables, 5 report
+views, 8 triggers over 2 functions each justified in place per
+[ADR-0012](./decisions/0012-where-logic-lives.md). It was written by hand rather than promoted from
+the spikes, which held three competing posting engines and two competing hold models. No API, no Go
+beyond migrations. Balanced-per-currency is deliberately *not* in there: it belongs to the writer
+([0013](./decisions/0013-the-write-path.md)).
 
-Landed with it: composite `(tenant_id, …)` keys throughout, the cross-tenant guard as a composite
-foreign key, an immutability trigger on the journal, and the drift views both ADR-0003 and
-ADR-0010 rely on. **Striping is not built.** The design is one integer on the account row and a `SUM` on read;
-there is no such column in `schema/` and nothing implements it. An earlier version of this
-sentence read as though the column existed.
+**Tenant-leading keys were the one irreversible decision on the list, and they were free.** Every
+ledger table carries `tenant_id NOT NULL`, primary keys are `(tenant_id, id)`, and every index and
+foreign key on those tables carries the prefix — the prerequisite for row-level security,
+partitioning and ever splitting across instances, all expensive to retrofit. A widely-cited
+sharding post-mortem named exactly this omission as its regret; **which company is unverified** —
+no source for the attribution exists in this tree, and the mechanics are the load-bearing part.
+The chart's two foreign keys deliberately lack the prefix because the chart is
+deployment-global, so a tenant cannot add an account type without a migration — a real limitation, listed in ADR-0009. Tenant-locality follows
+from the same keys and is a conformance property: `operating_cash` mirrors one real bank account
+and cannot be per-tenant, so treasury movements split into a `due_from_treasury` /
+`due_to_tenants` pair rather than one transaction that leaves a tenant's own books short by the
+full amount ([measured](../spikes/004-chart-of-accounts/README.md)).
 
-Carried forward: balanced-per-currency, enforced by construction in the writer ([0013](./decisions/0013-the-write-path.md)) rather than by the database; append-only via an immutability
-trigger (the `REVOKE` narrows the blast radius; it is not the mechanism); `amount_minor bigint CHECK (> 0)` so direction carries
-the sign; idempotency keyed to the **event**, not the business object.
+**Striping — not built.** An account would declare a stripe count and a balance read would `SUM`
+across stripes. There is no such column, and `uq_accounts__house` makes it impossible anyway, since
+`network_settlement_payable` cannot have a second row under `UNIQUE (tenant_id, purpose,
+currency)`. Worth roughly 8×, and it is *striping* that removes contention, not per-tenant
+splitting: at 90/10 skew per-tenant accounts gave 1.07× while striping still gave 7.8× ([spike
+003](../spikes/003-throughput-ceiling/README.md)).
 
-**`ledger_events`** ([ADR-0004](./decisions/0004-event-log.md)) — the idempotency spine for the
-majority of the lifecycle that writes no ledger transaction: authorizations, declines, hold
-expiry, reversals, statement close, limit changes. None of those can be made idempotent today,
-because idempotency lives on a table they never touch.
-
-**Composite `(tenant_id, …)` keys — done.** Every ledger table carries `tenant_id NOT NULL`,
-primary keys are `(tenant_id, id)`, and every index and foreign key on the ledger tables carries the
-prefix. Two foreign keys deliberately do not: `ledger_accounts.purpose → account_types` and
-`account_types.fs_line → fs_lines`. The chart is **deployment-global**, not per tenant — which is a
-real limitation, not an oversight: a tenant cannot add an account type without a migration. Listed
-in [ADR-0009](./decisions/0009-chart-and-completeness.md).
-
-**This was the one irreversible decision on the list, and it was free.** It is the prerequisite for
-row-level security, partitioning, and ever splitting across instances — none work without it, all
-are expensive to retrofit. A widely-cited sharding post-mortem named exactly this omission as its regret —
-`spikes/003` attributes the lesson to Nubank and this line once said Notion. Neither attribution
-has a source in the repo, so **the company is unverified**; the mechanics are the load-bearing
-part. The column is in before there is data, which was the whole point.
-
-**Tenant-local transactions, via intercompany clearing.** Some accounts genuinely cannot be
-per-tenant: `operating_cash` mirrors *one real bank account*. A treasury transaction therefore
-spans a tenant account and a shared one — and under row-level security the tenant sees only their
-half, leaving their books out by the full amount
-([measured](../spikes/004-chart-of-accounts/README.md)). The fix is a `due_from_treasury` /
-`due_to_tenants` pair, splitting one cross-scope transaction into two, each balanced *within* one
-scope. That is why "no transaction spans a tenant" is a conformance property, not an optimization.
-
-The golden trace (deleted) now runs on that pair rather than describing it: the
-facility draw, the network settlement and the ACH collection are all cross-scope, both scopes
-balance independently at every step, and the two sides are asserted to eliminate exactly. The
-program's profit turns out to equal its claim on treasury, from opposite directions.
-
-**Striping as a schema concept — not built.** The design is that an account declares a stripe
-count and a balance read `SUM`s across stripes. There is no such column in `schema/`, and
-`uq_accounts__house` currently makes it impossible anyway: it is `UNIQUE (tenant_id, purpose,
-currency)` for house accounts, so `network_settlement_payable` — one of the two accounts spike 003
-identifies as hot — cannot have a second row. Striping needs a stripe number in that key before it
-can exist at all. Worth roughly 8×. Note *striping* is the contention
-mechanism, not per-tenant splitting — at 90/10 skew per-tenant gave 1.07× while striping still gave
-7.8×. Per-tenant accounts earn their place for reconciliation and tenant-locality, not throughput.
-
-**Done when:** the schema snapshot test is in CI, and striping exists. The rest is done — every
-invariant listed above has a migration and a negative control that is refused *by Postgres*, and
-`fk_entries__txn` makes a cross-tenant transaction structurally unrepresentable.
+**Done when:** the schema snapshot test is in CI, and striping exists.
 
 ## M2 · The concurrency proof
 
@@ -135,131 +70,91 @@ RETURNING b.last_seq, b.input - b.output;
 ```
 
 The row lock *is* the serialization point — no `SELECT max()`, no advisory lock, no retry loop.
+`tenant_id` leads the conflict target because it leads the primary key; without it the statement
+does not run at all. Three traps:
 
-**That last clause holds only under READ COMMITTED, and that had never been written down.**
-*The figures in this paragraph have **no harness in the repository** — nothing in `schema/`,
-`spikes/` or `schema/` sets an isolation level, and spike 003 never varied one. They come from
-a one-off adversarial run and are recorded as observations, not as reproducible measurements. The
-conclusion does not depend on the numbers: `ON CONFLICT DO UPDATE` under a stricter isolation
-level fails with `could not serialize access due to concurrent update`, which is a property of
-Postgres, not of this workload.*
+- **It holds only under READ COMMITTED.** Stricter isolation makes `ON CONFLICT DO UPDATE` fail
+  with `could not serialize access due to concurrent update` — a property of Postgres, not of this
+  workload. It fails closed, so nothing corrupts, but a deployment that sets a stricter default
+  silently loses most of its writes, and a retry loop does not rescue it. *How many is
+  **unmeasured** — no harness in this tree varies an isolation level.*
+- **Deterministic lock ordering, batch-wide.** Sort accounts by id on both paths. [Spike
+  003](../spikes/003-throughput-ceiling/README.md) found that sorting within a single clearing does
+  *not* order locks across a batch — throughput collapsed 10× into deadlocks. A test that does not
+  fail when the sort is removed is not testing the sort, and it needs more than two accounts: with
+  two, the planner emits the legs in account order for free and no deadlock can be produced at all.
+- **The first-entry race does not apply to the upsert form.** The warning is real for
+  `SELECT … FOR UPDATE` — you cannot lock a row that does not exist — but
+  `INSERT … ON CONFLICT DO UPDATE` *is* the insert-and-lock, so there is no gap to race through.
 
-Observed, same sorted workload, no retry: READ COMMITTED **1200/1200 committed**; REPEATABLE READ
-**369**, with 831 serialization failures; SERIALIZABLE **244**, with 956. The failure is the
-`ON CONFLICT DO UPDATE` itself — `could not serialize access due to concurrent update`. It fails
-closed, so nothing corrupts, but a deployment that sets a stricter default silently loses most of
-its writes. Adding an external retry loop does not rescue it either: at REPEATABLE READ with 25
-retries it still takes 2.8 retries per posting and leaves 28 permanent failures. **The write path
-requires READ COMMITTED**, or it needs a different concurrency primitive.
-`tenant_id` leads the conflict target because it leads the primary key; without it this statement
-does not run at all (`there is no unique or exclusion constraint matching the ON CONFLICT
-specification`). The working version is `post()` in [the golden trace](../schema/schema.sql).
-Spike 003 ran it over 1,721 accounts: zero mismatches, zero gaps, zero unbalanced transactions.
-Two traps from Formance's bug history:
-
-- **The first-entry race does not apply to the upsert form, and this was worth testing rather than
-  assuming.** The warning is real for `SELECT … FOR UPDATE` — you cannot lock a row that does not
-  exist. But `INSERT … ON CONFLICT DO UPDATE` *is* the insert-and-lock, so there is no gap to race
-  through. Attacked with 25 independent races, each a fresh tenant with no balance row and 32
-  writers released simultaneously on a start barrier: **800/800 committed, zero deadlocks, zero
-  unique violations**, every sequence gapless from 1. *That harness is **not in the repo** —
-  the concurrency harness used fixed tenants and no start barrier — so treat it as a one-off
-  observation.* What IS shipped and does hold: `concurrency.sh` asserts `max(seq) = count(*) =
-  count(distinct seq)` per account under concurrent load, on every run.
-- **Deterministic lock ordering, batch-wide.** Sort accounts by id on read and write paths. Spike
-  003 found that sorting within a single clearing does *not* order locks across a batch —
-  throughput collapsed 10× into deadlocks.
-
-**Was partly done, and the harness is gone** ([ADR-0012](./decisions/0012-where-logic-lives.md)). It ran N writers against
-overlapping account sets, half of them posting the legs in reverse order, and asserts zero
-deadlocks, gapless per-account sequences, every transaction balanced, and both drift views empty.
-It also hammers one hold group through `record_auth_event`, which is where the ingest lock either
-serialises the read-modify-write or does not.
-
-That found a live gap: **the deterministic lock ordering this section prescribes was not
-implemented.** `post()` locked balance rows in whatever order the legs arrived, so two writers
-touching the same two accounts in opposite order deadlocked — 138 deadlocks and 138 rollbacks out
-of 320 postings, every failure a deadlock. (That run is not in the repo:
-`concurrency.sh` ships a 6x15 workload over **six** accounts, because with two the planner drives a
-nested loop that emits the legs in account order for free, and the deadlock cannot be produced at
-all.) Sorting the legs by account id takes it to **zero**, and
-the test fails if the sort is removed.
-
-**Done when:** the same holds with **batching** enabled, which does not exist yet — batch-wide
-ordering is the harder half of this milestone and is untested.
+**Done when:** N writers against overlapping account sets, half posting their legs in reverse
+order, produce zero deadlocks, gapless per-account sequences, balanced transactions and empty drift
+views — **with batching enabled**, which does not exist yet. Batch-wide ordering is the harder half
+of this milestone and is untested.
 
 ## M3 · The posting engine
 
 Given a balanced set of entries and an idempotency key: post atomically or return the stored
-result. Pending → posted is a **new** transaction with `resolves_id`, never an UPDATE.
-
-Three design constraints, not later optimizations:
+result. Pending → posted is a **new** transaction with `resolves_id`, never an UPDATE. Three design
+constraints, not later optimizations:
 
 - **Coalesced batching.** N postings to one account collapse into a single upsert advancing the
   balance by the total and `last_seq` by the count; each entry's running balance is derived by
   walking backwards from the returned totals. This is the only batching that does not deadlock.
-- **Single-call posting.** The whole operation in one server-side call rather than six round
-  trips. Worth ~14% on localhost, decisive on RDS where five saved round trips cost ~2.5 ms
-  against ~1.3 ms of real work.
+- **Single-call posting.** The whole operation in one server-side call rather than six round trips
+  — worth ~14% on localhost, decisive on RDS where five saved round trips cost ~2.5 ms against
+  ~1.3 ms of real work ([spike 003](../spikes/003-throughput-ceiling/README.md)).
 - **Striping and batching must not both be applied blindly.** Random stripe selection makes them
-  *cancel* — measured worse than either alone. Tenant- or worker-affinity stripe selection makes
-  them compose.
+  *cancel*, measured worse than either alone; tenant- or worker-affinity selection composes.
 
-**Decision needed here: `COPY FROM` is not supported on tables with row-level security.**
-Measured, a hard error. Coalesced batching uses `CopyFrom`, so RLS on `ledger_entries` and bulk
-batching are mutually exclusive. Likely resolution is posting as a `BYPASSRLS` role so RLS guards
-only the read path — but it must be decided, not discovered.
+**Decision needed: `COPY FROM` is not supported on tables with row-level security** —
+`ERROR: COPY FROM not supported with row-level security` on PG 18.6
+([spike 004](../spikes/004-chart-of-accounts/README.md)). Coalesced batching uses `CopyFrom`, so
+RLS on `ledger_entries` and bulk batching are mutually exclusive. Likely resolution is posting as a
+`BYPASSRLS` role so RLS guards only the read path — but it must be decided, not discovered.
 
-**Done when:** M0's conformance suite passes under concurrent load, with and without batching, and
-with striping on and off.
+**Done when:** M0's conformance suite, rebuilt in Go, passes under concurrent load, with and
+without batching, and with striping on and off.
 
 ## M4 · The RDS benchmark
 
-**Nothing has been measured over a network**, and that is now the largest open caveat in the
-project. Every number is from localhost, where a round trip costs 0.05 ms; on RDS it is roughly
-ten times that, which *reorders* the tuning levers rather than merely scaling them.
+**Nothing has been measured over a network**, and that is the largest open caveat in the project.
+Every number is from localhost, where a round trip costs 0.05 ms; on RDS it is roughly ten times
+that, which *reorders* the tuning levers rather than merely scaling them. This comes before
+bitemporal reads because it is **unblocked** — it needs only M3 and a DSN — while M5 is blocked on
+an open decision. Point spike 003's harness at real RDS, re-run the ladder, and add what localhost
+cannot show: Multi-AZ synchronous replication cost per commit, across instance classes.
 
-Placed before bitemporal reads because it is **unblocked** — it needs only M3 and a DSN — while M5
-is blocked on an open decision.
-
-Point spike 003's harness at real RDS and re-run the ladder, plus what localhost cannot show:
-Multi-AZ synchronous replication cost per commit, across plausible instance classes.
-
-**Done when:** there is a measured, reproducible number for a named instance class, with the method
-published alongside it. Only then does any throughput figure go in a README.
+**Done when:** a measured, reproducible number for a named instance class, with its method
+published alongside. Only then does any throughput figure go in a README.
 
 ## M5 · Bitemporal reads
 
-Two axes, two mechanisms ([ADR-0003](./decisions/0003-bitemporal-balances.md)). Current and
-recorded-axis balances come from `balance_after`; business-date balances aggregate over
-`effective_at`. Every reporting function names its axis explicitly.
+Two axes, two mechanisms ([ADR-0003](./decisions/0003-bitemporal-balances.md)): current and
+recorded-axis balances come from `balance_after`, business-date balances aggregate over
+`effective_at`, and every reporting function names its axis explicitly.
 
 **Blocked on [ADR-0005](./decisions/0005-reproducible-as-of.md), still `proposed`.** `recorded_at`
 defaults to transaction *start* time and is not monotonic with commit order, so the same as-of
-query can return different answers when re-run. A reproducible cursor must be commit-ordered.
-Decide it before writing code against `recorded_at <= :as_of`.
-
-Also unbounded: the effective-axis aggregate grows linearly with history — observed (one-off, no harness in repo) at 105.91 ms at
-1M entries in range. Period-close checkpoints are the bound — materialize each account's closing balance per
-period so a business-date query reads "prior close + entries since."
+query can return different answers when re-run; a reproducible cursor must be commit-ordered.
+Decide that before writing code against `recorded_at <= :as_of`. The effective-axis aggregate is
+also unbounded, growing linearly with history at a cost that is **unmeasured**; period-close
+checkpoints are the bound, so a business-date query reads "prior close + entries since".
 
 **Done when:** an as-of query at instant T returns the same answer when re-run under concurrent
 writes, and the backdating case (insertion order ≠ effective order) is correct on both axes.
 
 ## M6 · Drop it into AWS
 
-The adoption surface, and the milestone that decides whether any of the above gets used.
+The adoption surface, and the milestone that decides whether any of the above gets used: a
+container image and migration runner an adopter can point at RDS without reading our source;
+`docker compose up` for local development, already half-done; a worked deployment example; and
+documentation stating **which throughput lever applies to which write path**. Recommending both is
+actively harmful — [spike 003](../spikes/003-throughput-ceiling/README.md) measured the combination
+at 2,356 clearings/s against 6,850 for striping alone and 3,338 for batching alone.
 
-- A container image and migration runner an adopter can point at RDS without reading our source.
-- `docker compose up` for local development, already half-done.
-- A worked deployment example — the smallest thing that stands up a working ledger.
-- Documentation stating **which throughput lever applies to which write path**. Recommending both
-  is actively harmful: the combination measured **worse than either alone** -- 2,356 clearings/s
-  against 6,850 for striping by itself and 3,338 for batching by itself. An earlier version of this
-  line said "3x worse than either", which is true of striping and false of batching.
-
-**Done when:** someone who has never seen this repository can stand up a working ledger against
-RDS from the README alone.
+**Done when:** someone who has never seen this repository can stand up a working ledger against RDS
+from the README alone.
 
 ---
 
@@ -269,39 +164,32 @@ Only after Phase 1 holds. A *consumer* of the ledger, not part of it.
 
 ## M7 · Cards
 
-`credit_lines`, `spend_controls`, `card_holds` — the transaction from
-[the reference product spec §03](./reference-product.md), against a fake processor. Read-only with respect to the ledger:
-an authorization writes no entry.
+`credit_lines`, `spend_controls` and the clearing path — the auth transaction from the [design
+board](./design-board.html) §03, against a fake processor. Read-only with respect to the ledger: an
+authorization writes no entry. The hold model itself is already in `schema/schema.sql`
+([ADR-0010](./decisions/0010-authorization-holds.md)); `credit_lines` and `spend_controls` are not,
+and nothing reads a limit today.
 
-[The reference product's](./reference-product.md) balance table is this milestone's acceptance
-test, and it has been replayed once already — a deleted SQL suite asserted the complete state
-after every step, and a second covered
-the hold flow including over-capture clamping, expiry, re-delivery and re-grouping.
-
-What is **not** covered, and is the real remaining work here: forced posts, negative available
+The [lifecycle trace](./reference-product.md#the-card-lifecycle) is this milestone's acceptance
+test. Not yet covered anywhere, and the real remaining work: forced posts, negative available
 credit as a **legal state**, duplicate auths returning the **stored** decision rather than
-re-evaluating against a limit that may have moved, and STIP. Those need `credit_lines` and
-`spend_controls`, which do not exist.
+re-evaluating against a limit that may have moved, and STIP.
 
-**Done when:** the branch cases replay too, against a fake processor.
+**Done when:** the trace and its branch cases replay against a fake processor.
 
 ## M8 · Durable timers
 
-Durable timers enter here and not before — hold expiry and the ACH return window are the first
-two things that genuinely need them. They run **in-process on Postgres**, in the same transaction
-as the ledger write, so a hold and its expiry timer commit together or not at all
-([ADR-0008](./decisions/0008-durable-timers.md)). Handlers are idempotent already, which M3 gives
-us.
-
-Ship the reconciliation sweep alongside it: groups past their deadline that are still holding,
-behind `ix_hold_groups__held`. The deadline lives on the event, so a lost job becomes recoverable
-rather than silent — [ADR-0008](./decisions/0008-durable-timers.md) has the query, executed against
-the shipped schema. (This line previously quoted `WHERE state = 'open' AND expires_at < now()`
-against a table migration 0003 deleted.)
+Hold expiry and the ACH return window are the first two things that genuinely need a timer, which
+is why timers enter here and not before. They run **in-process on Postgres**, in the same
+transaction as the ledger write, so a hold and its expiry timer commit together or not at all
+([ADR-0008](./decisions/0008-durable-timers.md)). Handlers are idempotent already, which M3 gives.
+Ship the reconciliation sweep alongside — groups past their deadline that are still holding, behind
+`ix_hold_groups__held`. The deadline lives on the event, so a lost job becomes recoverable rather
+than silent; ADR-0008 has the query, executed against the shipped schema.
 
 **A scheduler is not a throughput mechanism.** A contended row lock is held for the duration of a
-transaction; making the write asynchronous relocates who waits rather than removing it. Its place
-is owning the *sweep* that consolidates suspense accounts, and draining event streams in batches.
+transaction, so making the write asynchronous relocates who waits rather than removing it. Its
+place is owning the *sweep* that consolidates suspense accounts, and draining events in batches.
 
 ---
 
@@ -312,7 +200,7 @@ is owning the *sweep* that consolidates suspense accounts, and draining event st
 - **The suspense sweep** for affinity striping. Workflow-shaped, so it wants M8.
 - **The auth path has never been measured.** It writes no ledger entry and serializes per company,
   so it should scale far better than clearing — but it has a latency deadline rather than a
-  throughput target. No claim until it has its own spike.
+  throughput target, and gets no claim until it has its own spike.
 - **Metadata history**, if metadata ever feeds reporting. Cheapest path is making metadata changes
   *be* event-log entries.
 - **Replica identity on every table**, if reporting is ever fed by CDC. Also the precondition for
@@ -327,18 +215,14 @@ is owning the *sweep* that consolidates suspense accounts, and draining event st
 
 ## Deliberately not now
 
-- **Sharding across instances.** Striping *within* one instance is in scope because it is the
-  lever that matters. The composite keys in M1 keep the door open.
-- **Partitioning by tenant.** **Not illegal** — an earlier version of this line said it was, and
-  said so "(measured)". Re-run on the shipped schema, `PARTITION BY HASH (tenant_id)` succeeds on
-  `ledger_entries`, `ledger_transactions` and `ledger_accounts` carrying every constraint they
-  actually have, including the composite FKs and both partial unique indexes. `tenant_id` leading
-  every key is precisely what makes it legal — which was the point of putting it there. What is
-  true: there is no in-place `ALTER TABLE` conversion, and it buys per-tenant `DETACH` rather than
-  throughput, since table size barely affects an append-only workload. The planning-cost figure
-  that accompanied the illegality claim has no method recorded anywhere and is struck.
-- **Caching balances.** `posted` is read straight off the ledger by construction, so there is no
-  second copy to drift.
+- **Sharding across instances.** Striping *within* one instance is the lever that matters, and the
+  composite keys in M1 keep the door open.
+- **Partitioning by tenant.** Legal on the shipped schema — `PARTITION BY HASH (tenant_id)`
+  succeeds on `ledger_entries`, `ledger_transactions` and `ledger_accounts` carrying every
+  constraint they actually have, which is precisely what tenant-leading keys bought. Not now
+  because there is no in-place `ALTER TABLE` conversion, and it buys per-tenant `DETACH` rather
+  than throughput: table size barely affects an append-only workload.
+- **Caching balances.** `posted` is read straight off the ledger, so there is no copy to drift.
 - **Multi-currency FX.** The schema carries currency and balances per currency; conversion is a
   separate problem with its own ADR.
 - **A scripting language for transactions**, and configurable correctness in any form.

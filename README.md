@@ -27,43 +27,32 @@ SQL implementation and its harness were deleted, and why is [ADR-0012](./docs/de
 
 ## Start here
 
+**[docs/design-board.html](./docs/design-board.html) — the system design, in six sections.** Open it
+in a browser. Sizing, architecture, the auth hot path, the data model, state machines, and a
+row-by-row trace of one $500 purchase through every account it touches.
+
 | | |
 | --- | --- |
-| [docs/vision.md](./docs/vision.md) | What this is, what is non-negotiable, and a primer if you have never built a ledger. **Read this first.** |
-| [docs/roadmap.md](./docs/roadmap.md) | What gets built, in what order, and why that order |
-| [docs/decisions/](./docs/decisions/) | ADRs — every architectural decision and its reasoning |
-| [docs/glossary.md](./docs/glossary.md) | Every term used here, defined for someone who has never built a ledger |
-| [schema/schema.sql](./schema/schema.sql) | The design schema — tables, constraints, keys, report views, and the two triggers that earn their place |
-| [spikes/](./spikes/) | Timeboxed investigations — brief, findings, and code together |
-| [docs/reference-product.md](./docs/reference-product.md) | The reference card product this ledger was designed against |
-
-## Local development
-
-Requires Go 1.26+, Docker, and `psql`. **PostgreSQL 18 or later** — `uuidv7()` is the default on
-six tables and does not exist before 18.
-
-```sh
-make up        # start postgres on :5433
-make schema    # load schema/schema.sql + the seed chart
-make test      # go test ./...
-make help      # everything else
-```
-
-**Nothing is built yet.** This repository is at the design stage: the deliverable is
-[`docs/decisions/`](./docs/decisions/), and `schema/schema.sql` exists to show that the shape those
-decisions describe is expressible with declarative constraints alone. `go test ./...` covers
-nothing so far.
+| [docs/design-board.html](./docs/design-board.html) | **The design.** Read this first. |
+| [docs/glossary.md](./docs/glossary.md) | Every term, for someone who has never built a ledger |
+| [docs/vision.md](./docs/vision.md) | Why this exists when Formance already does |
+| [docs/roadmap.md](./docs/roadmap.md) | What gets built next, and why in that order |
+| [docs/decisions/](./docs/decisions/) | One file per decision, and what is still open |
+| [schema/schema.sql](./schema/schema.sql) | The schema the decisions describe — it loads |
+| [spikes/](./spikes/) | Timeboxed investigations: brief, findings, sources |
 
 ## Layout
 
 ```
-docs/             THE DELIVERABLE — vision, decisions, reference product spec
-schema/           the design schema: tables, CHECKs, foreign keys, 5 views, and
+docs/             THE DELIVERABLE — design board, decisions, vision, glossary,
+                  roadmap, reference product.
+schema/           the design schema: 11 tables, CHECKs, foreign keys, 5 views and
                   8 triggers over 2 functions -- each justified in place, per
                   decisions/0012. chart.sql seeds an example chart of accounts.
-spikes/           timeboxed investigations, one directory each.
-                  Separate Go modules, not built by CI.
+spikes/           timeboxed investigations, one directory each. Separate Go
+                  modules; there is no CI.
 cmd/openledger/   entrypoint. Prints "nothing to run yet".
+internal/         empty. Where the Go service will go.
 ```
 
 ## Performance

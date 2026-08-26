@@ -1,24 +1,12 @@
-# 0008 — Durable timers in Postgres, not Temporal
+# 0008 — Durable timers live in Postgres, not Temporal
 
 **Status:** accepted
 **Date:** 2026-08-25
 
-## Context
+## The decision
 
-The reference product needs timers that survive restarts: a card authorization *hold* expires
-after ~7 days, an ACH return window closes ~2 banking days after funds land, statements close
-monthly, disputes have deadlines.
-
-[ADR-0001](./0001-go-and-postgres.md) planned to use **Temporal**, and half its case for Go was
-Temporal SDK quality. [ADR-0007](./0007-open-source-positioning.md) promises a small team can drop
-this into AWS — a claim about *one* managed database. Temporal is a server cluster with its own
-datastore. Those two positions were in tension and no decision owned it.
-
-## Decision
-
-**No Temporal.** Durable timers live in the application binary, backed by the same Postgres.
-
-The product layer gets a narrow interface, and the **`tx` parameter is the point**:
+**No Temporal.** Durable timers run inside the application binary, backed by the same Postgres the
+ledger writes to. The product layer gets a narrow interface, and the **`tx` parameter is the point**:
 
 ```go
 type Scheduler interface {
@@ -31,74 +19,60 @@ Exactly **one** driver ships: [River](https://github.com/riverqueue/river), veri
 [spike 005](../../spikes/005-durable-timers/README.md). The ledger core takes no scheduler
 dependency at all.
 
+The reference product needs timers that survive restarts: a card authorization hold expires after
+~7 days, an ACH return window closes ~2 banking days after funds land, statements close monthly,
+disputes have deadlines. [ADR-0001](./0001-go-and-postgres.md) had planned on Temporal, and half its
+case for Go was Temporal SDK quality; [ADR-0007](./0007-open-source-positioning.md) promises a small
+team can drop this into AWS, which is a claim about *one* managed database. This ADR resolves that
+tension in favour of the one database.
+
 ## Why
 
-> **Sourcing note.** Every Temporal, Rails/Solid Queue and pricing claim below has
-> no fetchable source recorded next to it, so by this log's own rule they are
-> **unverified**. An earlier version of this banner exempted "the four that were
-> checked against primary sources and are marked inline" — there are no such
-> markings, and a reader was told four claims were sourced with no way to find
-> which. One claim here was later found overstated ("ships no RBAC" — it ships RBAC
-> *off by default*), which is what an unsourced claim looks like when it fails.
+> Every Temporal, Rails and pricing figure in this section is **unverified** — no fetchable source
+> sits next to it. Treat them as the reasoning that was persuasive at the time, not as evidence.
 
+**The requirement is durable *scheduling*, not workflow *orchestration*.** The longest chain in the
+design is two steps (ACH settles → wait → post). Nothing uses Temporal's distinguishing features:
+workflow-as-code with replay, signals into running workflows, child workflows, or versioning.
 
-**The requirement is durable *scheduling*, not workflow *orchestration*.** The longest chain in
-the design is two steps (ACH settles → wait → post). Nothing uses Temporal's distinguishing
-features: workflow-as-code with replay, signals into running workflows, child workflows, or
-versioning.
+**The exactly-once guarantee is already ours.** Temporal delivers exactly-once *effects* as
+at-least-once execution plus idempotent handlers. [ADR-0004](./0004-event-log.md) already requires
+every handler to be idempotent — that is what the event log is for. Temporal would be a second
+implementation of a guarantee the ledger already provides.
 
-**The guarantee is already ours.** Temporal delivers exactly-once *effects* as at-least-once
-execution plus idempotent handlers. [ADR-0004](./0004-event-log.md) already requires every handler
-to be idempotent — that is what the event log is for. Temporal would be a second implementation of
-a guarantee the ledger already provides.
-
-**Temporal cannot enqueue transactionally, and that matters here.** River inserts the job in the
+**Temporal cannot enqueue transactionally, and here that decides it.** River inserts the job in the
 *same Postgres transaction* as the ledger write, so "the hold row and its expiry timer both exist,
-or neither" is a database guarantee. Temporal's `StartWorkflow` is a gRPC call to another service
-and cannot join our transaction — using it means building an outbox, i.e. building a Postgres
-queue *and then* putting Temporal behind it.
+or neither" is a database guarantee. `StartWorkflow` is a gRPC call to another service and cannot
+join our transaction — using it means building an outbox, i.e. building a Postgres queue *and then*
+putting Temporal behind it.
 
-**Long timers are harder under Temporal, not easier.** Temporal's own documentation uses our exact
-shape — sleep on a timer, then run an activity — as its worked example of what breaks: reordering
-those commands between deploys makes replay non-deterministic. Every deploy during a 7-day hold
-window becomes a versioning exercise. A job row is inert JSON handed to whatever code is current.
+**Long timers are harder under Temporal, not easier.** Its own documentation uses our exact shape —
+sleep on a timer, then run an activity — as the worked example of what breaks: reordering those
+commands between deploys makes replay non-deterministic. Every deploy during a 7-day hold window
+becomes a versioning exercise. A job row is inert JSON handed to whatever code is current.
 
-**The footprint is disproportionate.** Temporal Server is four services (frontend, history, matching, worker); it needs its own
-persistence database with its own migrations, plus a separate visibility store (**contested:** one
-reviewer reported Temporal's docs call this recommended-for-production, another reported it
-required — and the second later retracted its external verification as fabricated, so neither
-reading is confirmed here. Treat as unverified); `numHistoryShards`
-is fixed at deploy time and changing it requires a cluster rebuild; minor versions must be upgraded
-sequentially with a schema migration each; and self-hosted Temporal ships RBAC **off by default** (four roles -- read, write, worker, admin -- behind a `ClaimMapper` and `NewDefaultAuthorizer`, but the default is `noopAuthorizer`) and no audit logging at all
-— notable for the component driving money-movement timers. Its tested Postgres matrix also stops at
-16.6, while we target 18. All of this to service roughly **0.05 jobs per second**.
+**The footprint is disproportionate to 0.05 jobs per second.** Temporal Server is four services
+(frontend, history, matching, worker) with its own persistence database and migrations, plus a
+separate visibility store; `numHistoryShards` is fixed at deploy time and changing it requires a
+cluster rebuild; minor versions must be upgraded sequentially with a schema migration each; RBAC
+ships **off by default** (four roles behind a `ClaimMapper` and `NewDefaultAuthorizer`, but the
+default is `noopAuthorizer`) and there is no audit logging — notable for the component driving
+money-movement timers. Its tested Postgres matrix stops at 16.6; we target 18.
 
-Temporal Cloud is not an option for an open-source project: the plan floor is $100/month, against
-an actual consumption cost here of about $14 — an OSS user should not have to buy a SaaS
-subscription to get hold expiry.
+**Precedent.** Rails 8 made Solid Queue — a database-backed queue — its default, moving *away* from
+Redis, and runs 20M jobs/day for HEY at 37signals. Removing the accessory service was worth more
+than the specialised backend.
 
-**Precedent.** Rails 8 made Solid Queue — a database-backed queue — its default, moving *away*
-from Redis, and runs 20M jobs/day for HEY at 37signals. Removing the accessory service was worth more than
-the specialised backend.
+### The reframe that lowers the bar — and why the scheduler is not correctness-critical
 
-## The reframe that lowers the bar
+Available credit is computed from `card_hold_groups.held_minor`, **not** from a timer. A hold past
+its deadline that has not yet been swept still counts against available credit. So every timer here
+**fails conservatively when it fires late**: a late expiry under-reports available credit, a late
+ACH finalization keeps a receivable open longer. Nothing produces a wrong ledger, only a temporarily
+pessimistic one. The scheduler is an *actuator*, not a correctness-critical component.
 
-Available credit is computed from `card_hold_groups.held_minor` — **not** from a timer. So a hold
-that has passed its deadline but has not yet been swept still counts against available credit.
-
-*This paragraph used to open "the deadline is already stored on the event
-(`card_auth_events.hold_expires_at`)". The column exists and nothing writes it — `record_auth_event`
-names eleven columns and that is not one of them — so no deadline is stored anywhere. See the
-amendment below. The part of the argument that survives is the part that never needed a stored
-deadline: the timer is an actuator, and a hold that is not swept keeps reserving.*
-
-Every timer here **fails conservatively when it fires late**: a late expiry under-reports available
-credit, a late ACH finalization keeps a receivable open longer. Nothing produces a wrong ledger,
-only a temporarily pessimistic one. The scheduler is an *actuator*, not a correctness-critical
-component — which holds because an unswept hold keeps reserving, and **not**, as this sentence used
-to say, because "the deadline is durable in our own table regardless". It is not stored.
-
-So we also add a **reconciliation sweep** — groups that are past their deadline and still holding:
+A reconciliation sweep makes a lost job recoverable rather than silent — groups past their deadline
+and still holding:
 
 ```sql
 SELECT g.tenant_id, g.company_id, g.group_key
@@ -112,89 +86,47 @@ WHERE g.expired_at IS NULL AND g.held_minor > 0
         AND e.hold_expires_at < now());
 ```
 
-`ix_hold_groups__held` covers the `held_minor > 0` half of the outer predicate -- it is
-`(tenant_id, company_id) WHERE held_minor > 0`, and the sweep filters on `expired_at IS NULL AND
-held_minor > 0` with no tenant or company equality, so the partial predicate is what earns it here,
-not the key columns. It costs almost nothing and makes a lost
-job recoverable rather than silent.
+`ix_hold_groups__held` is what earns this — it is `(tenant_id, company_id) WHERE held_minor > 0`,
+and the sweep filters on the partial predicate with no tenant or company equality, so the `WHERE`
+clause is the useful half of the index, not the key columns.
 
-## Amendment — the schema moved, twice
+**The sweep is inert today, and executing it will not tell you that.** It parses and runs; it
+matches zero rows on every database this API can build, because nothing writes
+`card_auth_events.hold_expires_at` — the column exists, the ingest path has no parameter for it, so
+the predicate is NULL for every row. Making it live means modelling the deadline a processor
+actually sends. Until then the recovery this section describes does not exist, which matters less
+than it sounds (an unswept hold over-reserves) and more than nothing (the sweep was load-bearing in
+the argument for not needing a durable scheduler).
 
-This ADR was written against `card_holds`, which had a `state` column. Migration 0003 replaced it
-with `card_auth_events` + `card_hold_groups`, so the prescribed sweep predicate no longer existed.
+## Alternatives
 
-The first repair was **also wrong**: it moved the predicate to `card_hold_groups` but kept
-`hold_expires_at`, a column that lives on `card_auth_events`. `ERROR: column "hold_expires_at" does
-not exist`. So this ADR contained two successive dead queries, in the section whose own conclusion
-is that dead queries are the problem.
+| | Why not |
+| --- | --- |
+| **Temporal Cloud** | Not an option for an open-source project: the plan floor is $100/month against an actual consumption cost here of about $14. An OSS user should not have to buy a SaaS subscription to get hold expiry. *(Unverified — no source.)* |
+| **Self-hosted Temporal** | The four reasons above. The one thing it would buy — a real multi-month workflow engine — is the bet named below. |
+| **`gue` instead of River** | MIT rather than MPL-2.0, and it has delayed jobs, `SKIP LOCKED`, backoff and transactional enqueue. Kept as the fallback if MPL ever becomes unacceptable; uniqueness would be hand-rolled on the event log's idempotency keys, which exist anyway. *(Feature list unverified — no source.)* |
+| **A scheduler abstraction with two drivers** | An abstraction with one implementation is a seam; with two speculative ones it is a tax. A Temporal driver is *possible* via an outbox — document it, and let the first user who actually runs Temporal contribute it. |
 
-The *conclusion* survives, and for the same reason: an unswept expired hold still counts toward
-`held_minor` until the flag is set, so a lost timer job leaves the ledger temporarily
-**pessimistic**, never wrong. But the reframe rested on a specific predicate, and that predicate was
-dead — twice, and the second time in the very amendment that fixed the first. The query above was
-executed against `schema/schema.sql`–`0003` before being written down, which is now the standard: the
-schema snapshot test in [0006](./0006-schema-conventions.md) must cover ADR-quoted SQL, because
-review demonstrably does not.
+## What it costs
 
-**And the third repair was dead too, in a way executing it could not reveal.** The query above
-parses and runs against 0001-0003 -- `hold_expires_at` exists on `card_auth_events`. It matches
-zero rows, on every database the shipped API can build. `record_auth_event` is the only path that
-inserts into `card_auth_events`, it names eleven columns, and `hold_expires_at` is not one of them;
-the function has no parameter for it either. So the column is permanently NULL, `e.hold_expires_at < now()` is
-NULL for every row, and the sweep is a query that runs, costs nothing, and can never fire.
-`README.md` already lists `hold_expires_at` and `clearing_deadline` under "shipped surface nothing
-reads" -- but this ADR *reads* one of them, as its safety net.
-
-Recorded, not repaired. Making it live means an ingest that sets a deadline, and the deadline a
-processor actually sends is a field this project has not modelled. Until then the sweep is inert
-and the recovery it describes does not exist -- which matters less than it sounds, for the reason
-this section already gives (an unswept hold over-reserves), and more than nothing, because "we have
-a reconciliation sweep" was load-bearing in the argument for not needing a durable scheduler.
-Executing a query is not evidence it can match. That is the third distinct way this one paragraph
-has been wrong.
-
-## Consequences
-
-> **The sourcing banner above sits inside `## Why` and does not reach this section.** The
-> third-party claims below — River's commercial tier gating durable periodic jobs, its MPL-2.0
-> §3.2 obligations, and `gue`'s feature list — carry no URL and are **unverified** on the same
-> rule. One of them is contradicted in this repository: `spikes/005` says flatly that "River
-> supports periodic jobs; not exercised here."
-
-
-- The ledger core has no scheduler dependency. ADR-0001's Go argument no longer rests on Temporal
-  SDK quality; it rests on `int64` money, static binaries, and pgx/sqlc.
-- One driver ships. A Temporal driver is *possible* via an outbox — document it, and let the first
-  user who actually runs Temporal contribute it. An abstraction with one implementation is a seam;
-  with two speculative ones it is a tax.
+- **ADR-0001's Go argument no longer rests on Temporal SDK quality.** It rests on `int64` money,
+  static binaries, and pgx/sqlc.
 - **Statement close is a self-rescheduling one-shot job**, not a periodic job — per-customer
   timezones make it one anyway, and it avoids River's commercial tier, which gates durable periodic
-  jobs.
-- **River is MPL-2.0**, which is *file-level* copyleft and so does not constrain this project's
-  licence (the repo is MIT). Two obligations do survive: shipping a static binary means telling
-  recipients how to obtain River's source (§3.2), and any River file we *modify* stays MPL. If MPL
-  ever becomes unacceptable, `gue` (MIT) is the fallback — delayed jobs, `SKIP LOCKED`, backoff,
-  transactional enqueue; uniqueness would be hand-rolled on the event log's idempotency keys, which
-  exist anyway.
-- The architecture diagram was updated and this item was not: `01-architecture.svg` reads
-  "durable jobs (Postgres)", and the string "Postgres · Temporal" appears nowhere in the tree. The
-  one surviving Temporal reference was in a file this line never named --
-  `docs/diagrams/03-state-machines.svg`, "This is the Temporal boundary". **Now updated**: it reads
-  "Durable-job boundary (ADR-0008: River on Postgres, not Temporal)".
+  jobs. *(Unverified — no source; `spikes/005` says only that River supports periodic jobs and did
+  not exercise them.)*
+- **River is MPL-2.0**, which is *file-level* copyleft and does not constrain this MIT project. Two
+  obligations survive: shipping a static binary means telling recipients how to obtain River's
+  source (§3.2), and any River file we *modify* stays MPL. *(Unverified — no source.)*
+- **The dispute bet.** Four of the five timers are genuinely one-shot. **Disputes are not** — a real
+  chargeback lifecycle is a multi-month state machine (filed, representment, pre-arbitration,
+  arbitration, ruling) with external events arriving early, late, or never, and human steps between.
+  That is exactly the shape Temporal exists for. If dispute handling grows into it, migrating means
+  moving live in-flight state across a 120-day window during which both systems are authoritative.
 
-## The bet, named
-
-Four of the five timers are genuinely one-shot. **Disputes are not.** A real chargeback lifecycle
-is a multi-month state machine — filed, representment, pre-arbitration, arbitration, ruling — with
-external events arriving early, late, or never, and human steps in between. That is exactly the
-shape Temporal exists for, and it is already on our list.
-
-If dispute handling grows into that, migrating means moving **live in-flight state across a 120-day
-window** during which both systems are authoritative. That is a genuinely painful retrofit.
-
-We take the bet for two reasons. A hand-rolled state machine over a `disputes` table with
-deadline-driven jobs is boring, well-understood, and **auditable** — a reviewer or an actual auditor
-can read a table and a transition function, where reconstructing a dispute from a Temporal event
-history is strictly harder. And the risk is confined to the reference product layer, which
-[ADR-0007](./0007-open-source-positioning.md) already declares replaceable. The ledger core — the
-actual project — touches a scheduler either way: never.
+  We take the bet for two reasons. A hand-rolled state machine over a `disputes` table with
+  deadline-driven jobs is boring, well-understood, and **auditable** — a reviewer or an actual
+  auditor can read a table and a transition function, where reconstructing a dispute from a Temporal
+  event history is strictly harder. And the risk is confined to the reference product layer, which
+  [ADR-0007](./0007-open-source-positioning.md) already declares replaceable. The ledger core — the
+  actual project — touches a scheduler either way: never.
