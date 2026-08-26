@@ -28,7 +28,7 @@ here, so the ADRs don't each stop to re-explain them.
 | [0004](./0004-event-log.md) | Add an append-only `ledger_events` table | Most accepted operations write no ledger transaction, so idempotency can't live on the transactions table | accepted |
 | [0005](./0005-reproducible-as-of.md) | Pin reports to a commit-ordered cursor, not a timestamp | `recorded_at` is transaction-*start* time, so the same "as of" query re-runs to a different answer | **proposed** |
 | [0006](./0006-schema-conventions.md) | Naming rules, a CI schema-snapshot test, keep FKs and enums | Dropping a column silently drops its indexes — Formance lost a hot-path index that way for thirty migrations | accepted |
-| [0007](./0007-open-source-positioning.md) | Reframe as a general open-source ledger; keep Postgres | The bottleneck is one contended row, not the hardware — and striping fixes it | **proposed** |
+| [0007](./0007-open-source-positioning.md) | Reframe as a general open-source ledger; keep Postgres | The bottleneck is one contended row, not the hardware — and striping fixes it | accepted |
 | [0008](./0008-durable-timers.md) | Durable timers in Postgres, not Temporal | The need is durable *scheduling*, not workflow orchestration — and a job row commits in the same transaction as the ledger write, which Temporal cannot do | accepted |
 | [0009](./0009-chart-and-completeness.md) | Chart of accounts as data; completeness is a separate invariant | A report missing one account still satisfies the accounting equation — the missing account drops out of both sides | accepted |
 | [0010](./0010-authorization-holds.md) | A hold is a SUM over an append-only event log, not a mutable amount | Grouping a clearing to its authorization is a revisable inference, and processors disagree on whether an increment carries a delta or a cumulative total | accepted |
@@ -51,9 +51,13 @@ No decision may trade these away. They are what makes the numbers trustworthy:
 
 Undecided, listed plainly rather than buried:
 
-- **[0005](./0005-reproducible-as-of.md) and [0007](./0007-open-source-positioning.md) are
-  `proposed`**, not accepted. The as-of cursor blocks **M5**, not M4 — M4 is the RDS benchmark and
-  is unblocked.
+- **[0005](./0005-reproducible-as-of.md) is `proposed`**, not accepted. The as-of cursor blocks
+  **M5**, not M4 — M4 is the RDS benchmark and is unblocked. Both time axes are now asserted
+  ([`tests/bitemporal.sql`](../../tests/bitemporal.sql)); what 0005 still owes is *reproducibility
+  under concurrent writes*, which needs a commit-ordered cursor.
+- **`counterparty_scope` and `is_perimeter` are declarative.** Both are documented at length, both
+  carry CHECK constraints, and no view or function reads either. The offsetting rule ADR-0009 §5
+  states as a mechanism is not implemented.
 - **Row-level security conflicts with bulk loading.** Postgres refuses `COPY FROM` on a table with
   RLS enabled — and `COPY` is what makes batched posting fast. Likely resolution: post through a
   role that bypasses RLS, so RLS guards reads only. Not yet decided.

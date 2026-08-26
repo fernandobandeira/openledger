@@ -95,6 +95,10 @@ All three were reproduced with two interleaved sessions and are now covered by
 | **Worse: a live authorization joined a group being expired.** `held_for_company` then reported **0 against real exposure of 1000**, and `card_hold_drift` could not see it, because the clamp lives in `held_minor` while the alarm compares `total_minor` — and those agreed. Invisible to the unmatched queue too, since the event had a live membership row. | Same fix. The alarm now also reports any event assigned to a group *after* it expired, because the clamp is the thing hiding the number. |
 | **The lock that fixed the lost update introduced a deadlock.** Re-grouping locked the destination, then `recompute_hold_group` locked the source — so two operators moving events in opposite directions between the same two groups took the same two locks backwards. 198 deadlocks under mixed load. | Lock both groups up front, in `group_key` order. The same lesson as sorting the legs in `post()`. |
 
+*The figures in the paragraph below come from one-off adversarial runs, not from the shipped
+suite: `tests/concurrency.sh` defaults to 6 workers x 15 operations. They are recorded as
+observations, not as reproducible benchmarks — the harness that produced them is not in the repo.*
+
 **What held under the same attack**, and is worth recording as attested rather than assumed:
 `record_auth_event` has no window — `INSERT … ON CONFLICT DO NOTHING` waits on a concurrent
 inserter (measured: a second session blocked 2.96 s, then saw the row and locked it). 3,600
