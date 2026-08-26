@@ -1,3 +1,36 @@
+> ### ⚠️ SUPERSEDED IN PART — read this first
+>
+> A second, deeper read of `formancehq/ledger` was done at **`335bd03c`** (2026-08-26), applying all
+> 54 migrations to a live PostgreSQL and dumping the result rather than reading migration files.
+> **Ten claims below were wrong at our own pin** — not overtaken by events: `git log 25f8708..HEAD`
+> is two commits, both CI and dependency bumps.
+>
+> | Claim below | Correction |
+> | --- | --- |
+> | "Five of their nine CHECK constraints are `NOT VALID`; four WERE validated in migration 40" | The end state has **four CHECK constraints and all four are unvalidated**. Migration 40's four were the *transient* half of a zero-downtime `NOT NULL` dance and are dropped in the same migration. There is no "nine". |
+> | "Their point-in-time balance read is a scan-and-sort of the account's whole history — 809 buffers" | Backwards. The **effective-date** read is indexed (`moves_range_dates`, 16 buffers). It is the **insertion-date** read that has no index and degrades to a full backward scan — measured at **15,486 buffers, 89.6 ms** on 500k rows, because migration 37 dropped `moves_post_commit_volumes` along with the column it named and nothing replaced it. |
+> | "Ship a test with every data-repair migration" (given as their practice) | **8 of 54** migrations ship `up_tests_*`; **7 of 19** data-mutating repairs do — not including migration 28, the third attempt at their most important backfill. Worth stealing; not their practice. |
+> | "Every write takes `pg_advisory_xact_lock(ledger_id)` and serialises" | Only when `HASH_LOGS = SYNC`. Under `ASYNC` or `DISABLED` there is no lock — which is what `logs_blocks` exists for. |
+> | "Formance has no accounting semantics at all; its chart of accounts is an address naming grammar" | Second clause exactly right, and now sharper: `type ChartAccountRules struct{}` with `// Never emitted for now`. First clause overreaches — since v2.3 there is a first-class versioned `schemas(chart jsonb)` table, and v3 adds typed account patterns. The differentiator is **normal balance and the accounting equation**, not "chart of accounts". |
+> | "Issue #1416: a PIT query silently returns `{}` when a historization flag is off" | Much narrower: `/aggregate/balances` × a metadata filter × `ACCOUNT_METADATA_HISTORY=DISABLED`, closed in two days. The lesson survives under a different name — their query layer's failure mode is *silently-wrong empty results instead of errors*, and it recurs **independently of feature flags** (issues #1687, #1612). |
+> | "They are *said* to target 1K writes/sec — unverified, no URL" | **Verified**, in their own docs: *"optimized for 1K writes per second on an underlying commodity storage instance."* The figure is unqualified while the same page explains why it cannot hold unqualified (hot source accounts, and the hashing advisory lock). Their competitive page claims 5,000 TPS. Treat all their throughput numbers as marketing. |
+> | "`27-fix-invalid-pcv` is a no-op stub" | True *today*, and the reason matters more than the fact: it shipped as a real migration, was superseded the same day by 28, and was **retroactively neutered fourteen months later**. **Their migration files are edited after release.** Any future read must use `git show <first-commit>:<path>`, not the tree. |
+> | Missing entirely | Migrations **47/48/49** — `schemas`, transaction templates, query templates — the most significant addition since our read and the one that bears on our DSL question. Also 51/52 re-adding indexes 37 dropped; migration 44's real mechanism (a `numeric` vs `bigint` comparison making an index unusable, so every metadata update seq-scanned); migration 34 rewriting **every memento**, i.e. the hash-chain input for all history. |
+> | Missing | The metadata-revision uniqueness indexes were **dropped by migration 37** with the `*_seq` columns and never recreated. Revision uniqueness now rests on an unsynchronised `max(revision)+1` inside a trigger. |
+>
+> **The three findings from that read that changed our own decisions**, recorded where they belong:
+> the **740×** backdating measurement on their effective-volume trigger → [ADR-0003](../../docs/decisions/0003-bitemporal-balances.md);
+> their rule for what earns a trigger → [ADR-0012](../../docs/decisions/0012-where-logic-lives.md);
+> and `pit` resolving to six different columns despite being a named axis →
+> [ADR-0005](../../docs/decisions/0005-reproducible-as-of.md).
+>
+> Two more worth carrying: **migration 53** exists because `logs_blocks` had primary key
+> `(previous)` and two ledgers in one bucket both wrote block `previous = 0` — *the tenant must be in
+> every natural key*. And **migration 37 dropped four indexes and two unique constraints as a side
+> effect of dropping three columns**, two of which were never recreated — which is the strongest
+> argument anyone has made for [ADR-0006](../../docs/decisions/0006-schema-conventions.md)'s
+> still-unbuilt schema snapshot test.
+
 # Spike 001 — Learn from Formance
 
 **The question.** Formance Ledger is an open-source double-entry ledger run against real money in

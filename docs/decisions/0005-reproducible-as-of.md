@@ -3,6 +3,42 @@
 **Status:** proposed — blocks roadmap M5
 **Date:** 2026-08-25
 
+
+## The closest prior art has the same hole, and knows it
+
+Formance's `transaction_date()` seeds from `statement_timestamp()` into a session temp table, so
+every row in one SQL transaction shares a timestamp — intra-transaction consistency, and **nothing
+about commit order**. Their per-ledger sequence carries this comment, which appears three times in
+their tree:
+
+```sql
+-- create a sequence for transactions by ledger instead of a sequence of the table as we want to
+-- have contiguous ids
+-- notes: we can still have "holes" on ids since a sql transaction can be reverted after a usage
+-- of the sequence
+```
+
+Note the contradiction inside one comment: *"as we want to have contiguous ids"* immediately
+followed by *"we can still have holes."* They wanted a gapless total order, built a sequence for it,
+and wrote down that it does not deliver one. **They do nothing further about it** —
+`WHERE recorded_at <= T` is not reproducible for them either, and their transaction PIT filter is on
+the *business* date, so they have no "as we knew it at T" read for transactions at all.
+
+**That raises confidence that this is a real problem and lowers confidence that a clever solution
+exists.** It also points at the answer this ADR already leans toward: make "as of" mean *as of log
+id N* and hand the counterparty an id rather than a timestamp. Their `logs (ledger, id)` primary key
+is exactly that cursor. They just never use it that way.
+
+**And a stricter rule than "name the axis", which they learned the expensive way.** Formance *does*
+name it — `pit` plus a `useInsertionDate` selector — and `pit` still resolves to **six different
+columns** across seven endpoints, with the selector spelled three different ways
+(`useInsertionDate`, `insertionDate`, and hardcoded in v1). Their OpenAPI gives `pit` no description
+at all. A maintainer confirms the fix is still pending: *"This is going to be fixed in order to have
+the same behavior as /volumes endpoint."* So:
+
+> Naming the axis on the *parameter* is not enough. An as-of query must name the **column** it
+> filters, and a resource must have exactly one such column.
+
 ## Context
 
 **This is no longer hypothetical.** Assigning `recorded_at` from `now()` closed three of the four

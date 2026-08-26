@@ -108,6 +108,27 @@ to police.
 So the category that gets removed is **orchestration and derivation-with-backfill**, not integrity.
 That is the bar this ADR now states, and it is why two triggers survived.
 
+**Formance's own line is sharper than ours, and it is worth adopting.** Reading what they dropped
+against what they kept:
+
+> **A trigger survived if it needs to read or write rows OTHER than the one being written. It was
+> deleted if it was a pure function of the new row.**
+
+Everything they dropped in migrations 11, 37 and 46 — `sources`, `destinations`, `address_array`,
+`sources_arrays` — is computable from the row's own columns. Everything they kept needs a *different*
+row: `set_log_hash` needs the predecessor's hash under a lock; the effective-volume pair needs the
+neighbouring moves in business-date order; the metadata-history triggers need `max(revision)+1` for
+that entity. The dropped kind is free to do in Go. The kept kind costs a round trip and a race.
+
+That rule is a better predictor than "no business logic", and it explains our own two: refusing an
+`UPDATE` reads only `OLD`, so by Formance's rule it should be in Go — **and it cannot be, because
+the writer we are protecting against is not ours.** The rule is about *cost*; ours is about *who*.
+Both of ours are there for a caller Go does not mediate, which is the case the rule does not cover.
+
+Their kept triggers are not free, either, and they say so: `set_log_hash` is why every write takes
+`pg_advisory_xact_lock(ledger_id)` and serialises — *"that lock, not the hashing, is what limits
+write throughput"*.
+
 ## What this costs, stated plainly
 
 The write-path invariants — balance, sequence assignment, the hold flow — hold only against writers

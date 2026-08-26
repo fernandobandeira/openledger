@@ -80,11 +80,24 @@ moving money to a hold account. For anything card-shaped that is the core of the
 detail.
 
 One more worth knowing: **Formance does not enforce that transactions balance.** Its primitive is
-a source→destination posting, balanced by construction, so there is no constraint and no trigger.
-That is a legitimate design — make the illegal state unrepresentable — but it means the claim
-"debits always equal credits" has no runtime check behind it. Here, entries are independent rows
-carrying a direction, so an unbalanced transaction *is* expressible and is therefore
-[refused by the database](../schema/schema.sql).
+a `Posting{Source, Destination, Amount, Asset}`, balanced by construction, so there is no
+constraint and no trigger — `Postings.Validate()` contains no balance check at all, because there
+is nothing left to check. Verified against their applied schema: a single unbalanced row inserted
+straight into `moves` commits silently.
+
+That is a legitimate design, and [0013](./decisions/0013-the-write-path.md) adopts it — make the
+illegal state unrepresentable. **What we do NOT yet have is the enforcing code path**, and this
+sentence used to end "…is therefore refused by the database", which stopped being true when
+[0012](./decisions/0012-where-logic-lives.md) removed the deferred balance trigger. Our entries are
+independent rows carrying a direction, so an unbalanced transaction is expressible *and currently
+unrefused*. That is stated in 0013 and it is the next thing to build.
+
+**They do enforce a different invariant, and the way they enforce it is the interesting part.**
+Formance refuses a negative account balance by default — `ErrInsufficientFunds`, per source account
+per asset, with `@world` hardcoded as the only exemption. But their own docs say it checks the
+*final* state only: *"the ledger does not validate the intermediate states of the ledger, only the
+final state."* For a card product that is the gap that matters — a backdated authorization can drive
+a credit limit negative mid-history and still be accepted.
 
 **And the honest part:** this is a personal project. Building a ledger is how you find out what a
 ledger actually is — every correction in these docs came from measuring something we had asserted.
