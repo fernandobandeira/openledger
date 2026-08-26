@@ -89,7 +89,7 @@ floor_for() {
         *bitemporal.sql)        echo 21 ;;
         *card_holds.sql)        echo 148 ;;
         *golden_trace.sql)      echo 33 ;;
-        *negative_controls.sql) echo 136 ;;
+        *negative_controls.sql) echo 140 ;;
         *query_plans.sql)       echo  7 ;;
         *)                      echo  1 ;;
     esac
