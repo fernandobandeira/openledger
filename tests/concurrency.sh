@@ -195,14 +195,36 @@ race_guard() {  # tenant, setup-sql-in-open-txn, event-msg, dest, expect-substri
     # transaction holds, so running it synchronously would wait for a COMMIT that
     # is issued after it. It has to be in flight when the other side commits --
     # that IS the race.
+    #
+    # And the elapsed time is ASSERTED below. Without that, this function cannot
+    # distinguish "the guard held under contention" from "there was no contention":
+    # move the COMMIT before the racer starts and both checks still print ok,
+    # because the guards refuse serially too. Two sleeps were the whole mechanism.
     ( psql "$URL" -qAt -c "SELECT regroup_auth_event('$t',(SELECT id FROM card_auth_events WHERE tenant_id='$t' AND processor_msg_id='$msg'),'$dest','operator')" \
         >"$TMPD/g_$t.out" 2>&1 ) &
     local racer=$!
-    sleep 1
+    # PROVE THE RACE. Wall-clock timing cannot: it measures this function's own
+    # sleep, not the racer's block. Ask the server instead -- while the racer is in
+    # flight it must be visibly WAITING ON A LOCK. Without this the function cannot
+    # tell "the guard held under contention" from "there was no contention", because
+    # the guards refuse serially too.
+    sleep 0.6
+    local blocked
+    blocked=$(psql "$URL" -qAt -c "select count(*) from pg_stat_activity
+        where datname = current_database() and wait_event_type = 'Lock'
+          and query like '%regroup_auth_event%'")
+    sleep 0.5
     echo "COMMIT;" >&9; exec 9>&-
     wait "$racer" 2>/dev/null
-    if grep -qi "$expect" "$TMPD/g_$t.out"; then echo "   ok  $label refused under the race"
-    else echo "   FAIL $label was ALLOWED under the race: $(head -1 "$TMPD/g_$t.out")"; fail=1; fi
+    if ! grep -qi "$expect" "$TMPD/g_$t.out"; then
+        echo "   FAIL $label was ALLOWED under the race: $(head -1 "$TMPD/g_$t.out")"; fail=1
+    elif [ "${blocked:-0}" -lt 1 ]; then
+        echo "   FAIL $label refused, but no backend was ever seen waiting on a lock"
+        echo "        -- it was refused SERIALLY and this proved nothing about concurrency"
+        fail=1
+    else
+        echo "   ok  $label refused under the race (racer observed blocked on a lock)"
+    fi
 }
 psql "$URL" -q -c "SELECT record_auth_event('xg','m-usd','gU','co1','c1','authorization',500,'USD',false,now())" -o /dev/null
 race_guard xg "SELECT record_auth_event('xg','m-eur','gN','co1','c1','authorization',1000,'EUR',false,now());" \
