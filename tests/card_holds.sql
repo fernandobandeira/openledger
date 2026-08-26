@@ -309,8 +309,14 @@ $q$, 'card_auth_event_group is history');
 -- privileged role." An unmatched event has no membership, so the foreign key is
 -- not a second defence for it either -- and unmatched events are exactly what the
 -- review queue is made of.
+-- ...on an UNMATCHED event, which has no membership, so `fk_event_group__event` is
+-- not a second defence and the trigger is the only thing that can refuse. On a
+-- matched event the FK answers first and the control names the wrong guard.
+-- Unmatched events are exactly what the review queue is made of.
+SELECT record_auth_event('t1','del_probe', NULL,'acme','card_del',
+        'clearing', 50000,'USD',false, now());
 SELECT must_fail('deleting a stored auth event as the table OWNER', $q$
-    DELETE FROM card_auth_events WHERE processor_msg_id='msg_orphan';
+    DELETE FROM card_auth_events WHERE processor_msg_id='del_probe';
 $q$, 'card_auth_events is an event log and is immutable: DELETE');
 
 SELECT must_fail('rewriting a stored auth event', $q$
@@ -1366,18 +1372,27 @@ SELECT eq('...and its incremental total after it',
 -- routine repair after a $0.00 AVS authorization then locks the group to 'delta',
 -- after which every real cumulative total from that processor is refused FOREVER.
 -- Refused messages are never stored, so they never reach the review queue either.
+-- The group must carry ONLY the zero-amount message when the repair runs: with a
+-- real message of either convention already in it the derivation has something
+-- else to read and the filter is not the thing under test.
+SELECT eq('a $0.00 AVS authorization on a group of its own holds nothing',
+          record_auth_event('t1','zc_a','g_zconv','acme','card_zc','authorization',
+                            0,'USD',false, now()), 0);
 SELECT eq('a repair does not let a $0.00 message decide the convention',
-          recompute_hold_group('t1','acme','g_zero'), 15000);
+          recompute_hold_group('t1','acme','g_zconv'), 0);
 DO $$ BEGIN
     IF (SELECT total_convention FROM card_hold_groups
-         WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_zero') <> 'total' THEN
-        RAISE EXCEPTION 'the repair re-derived the convention from a zero-amount message: %',
+         WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_zconv') IS NOT NULL THEN
+        RAISE EXCEPTION 'the repair fixed the convention from a zero-amount message: %',
             (SELECT total_convention FROM card_hold_groups
-              WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_zero');
+              WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_zconv');
     END IF;
-    RAISE NOTICE 'ok  ...and the group is still on the convention its real messages set';
+    RAISE NOTICE 'ok  ...and the group is still convention-neutral after the repair';
 END $$;
-SELECT no_drift('a repair on a group carrying a zero-amount message');
+SELECT eq('...so the processor''s real cumulative total is still accepted after a repair',
+          record_auth_event('t1','zc_b','g_zconv','acme','card_zc','authorization',
+                            7000,'USD',true, now()), 7000);
+SELECT no_drift('a repair on a group carrying only a zero-amount message');
 
 -- ...and the mirror image: a $0.00 CUMULATIVE TOTAL must not lock a group to
 -- 'total' and refuse every real delta after it.

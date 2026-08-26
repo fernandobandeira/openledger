@@ -271,6 +271,18 @@ running a pinned configuration the branch cannot edit. **CI now exists**
 in-tree guards were a substitute for, and it was written only after a round asked why the substitute
 kept being rebuilt instead of the thing itself.
 
+**A census must read state the file it lives in has not touched.** Round 10 deleted one line from
+`migrations/0001` — the `ENABLE ALWAYS` on the transaction seal's trigger — and the whole build
+printed PASS. The catalog census that exists to catch exactly that sat at the *end* of
+`tests/negative_controls.sql`, and by then the file had issued thirteen `ALTER TABLE … ENABLE
+ALWAYS` statements of its own as part of unrelated controls: **the suite had repaired the mutant it
+was measuring.** It runs immediately after `BEGIN;` now. The same round found the other half of the
+rule: **a census filter must be as wide as the guard it audits.** The inheritance guard names three
+relkinds because a *foreign table* child reproduced the harm verbatim; the census filtered ordinary
+tables, so a foreign-table child of `ledger_accounts` was invisible to it — and one
+`INSERT … SELECT * FROM ONLY ledger_accounts` then doubled every number in every report with both
+drift views empty.
+
 The one guard in this tree that a test file cannot forge is not in the tests. `assert_type_matches_fs_line`
 refused two mutants at **seed time**: the wrong chart could not be loaded, so the wrong system could
 not be built, and no test had to notice. That is the shape worth generalising — **prefer a constraint
