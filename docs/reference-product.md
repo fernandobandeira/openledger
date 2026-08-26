@@ -68,8 +68,12 @@ authorization deadline](./diagrams/01-architecture.svg)
 The only synchronous work inside the auth deadline is one short transaction against a single
 company's row.
 
-**An authorization moves no money and writes no ledger entry.** It records a hold and starts
-an expiry timer. The ledger first hears about the purchase at the **clearing** event, which is
+**An authorization moves no money and writes no *posted* ledger entry.** It records a hold and
+starts an expiry timer. That is **our choice, not the field's** — Stripe, Adyen, Highnote, Treasury
+Prime, Column, Galileo and Pismo all post a row at authorization time; Increase, Marqeta, Lithic and
+Unit keep it outside the ledger as we do. See
+[spike 008](../spikes/008-processor-hold-semantics/README.md) and
+[ADR-0010](./decisions/0010-authorization-holds.md). The ledger first hears about the purchase at the **clearing** event, which is
 also when interchange is recognized — and that is what reaches back to close the hold. The
 hold row carries its own `expires_at`, so nothing has to be handed forward at auth time.
 
