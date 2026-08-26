@@ -17,6 +17,12 @@ set -uo pipefail
 URL="${1:?usage: concurrency.sh <database-url>}"
 WORKERS="${WORKERS:-6}"
 PER="${PER:-15}"
+# A single worker means no opposing lock order and no race, and the file would
+# still print every "ok" -- a serial smoke test wearing a concurrency suite's
+# output. Refuse rather than mislead.
+if [ "$WORKERS" -lt 2 ] || [ "$PER" -lt 2 ]; then
+    echo "   FAIL concurrency needs WORKERS>=2 and PER>=2 (got $WORKERS/$PER)"; exit 1
+fi
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 fail=0
 
@@ -24,12 +30,18 @@ q() { psql "$URL" -qAt -c "$1"; }
 
 # ---------------------------------------------------------------- fixtures
 psql "$URL" -q -v ON_ERROR_STOP=1 <<'SQL'
+-- SIX accounts, not two. With two, the planner drives a Nested Loop from an index
+-- scan on ledger_accounts, so post()'s legs emerge in account-id order whether or
+-- not it sorts them -- and the deadlock this workload exists to detect could not be
+-- produced by removing the sort. The property was attested by accident.
 INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
 SELECT 'c1','company','acme',code,category,normal_balance,'USD'
   FROM account_types WHERE code='customer_receivable';
 INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
 SELECT 'c1','house',NULL,code,category,normal_balance,'USD'
-  FROM account_types WHERE code='interchange_revenue';
+  FROM account_types
+ WHERE code IN ('interchange_revenue','fee_revenue','network_settlement_payable',
+                'facility_borrowings','accrued_interest_payable');
 DO $d$ BEGIN PERFORM record_auth_event('c1','seed','hot','co1','card1','authorization',0,'USD',false,now()); END $d$;
 SQL
 
@@ -44,10 +56,13 @@ before_dl=$(q "select deadlocks from pg_stat_database where datname=current_data
 for w in $(seq 1 "$WORKERS"); do
     : > "$TMP/a$w.sql"
     for i in $(seq 1 "$PER"); do
+        # four legs over four of the six accounts, and half the workers submit them
+        # in the exact reverse order -- so without a deterministic sort two writers
+        # take the same four row locks backwards
         if (( w % 2 == 0 )); then
-            echo "SELECT post('c1','a${w}_${i}',ARRAY['customer_receivable','debit','10','interchange_revenue','credit','10']);" >> "$TMP/a$w.sql"
+            echo "SELECT post('c1','a${w}_${i}',ARRAY['customer_receivable','debit','10','interchange_revenue','credit','10','facility_borrowings','credit','10','accrued_interest_payable','debit','10']);" >> "$TMP/a$w.sql"
         else
-            echo "SELECT post('c1','a${w}_${i}',ARRAY['interchange_revenue','credit','10','customer_receivable','debit','10']);" >> "$TMP/a$w.sql"
+            echo "SELECT post('c1','a${w}_${i}',ARRAY['accrued_interest_payable','debit','10','facility_borrowings','credit','10','interchange_revenue','credit','10','customer_receivable','debit','10']);" >> "$TMP/a$w.sql"
         fi
     done
 done
@@ -69,7 +84,11 @@ done
 wait
 
 after_dl=$(q "select deadlocks from pg_stat_database where datname=current_database()")
-errs=$(cat "$TMP"/*.err 2>/dev/null | grep -c "^ERROR" || true)
+# `grep -c "^ERROR"` NEVER MATCHED: psql -f prefixes every diagnostic with
+# "psql:<file>:<line>: ". Injecting SELECT 1/0 into every worker left this printing
+# "failed statements = 0" and the suite printing PASS. Counted after ALL workloads,
+# too -- it used to be computed before D and C wrote their .err files at all.
+count_errs() { cat "$TMP"/*.err 2>/dev/null | grep -cE '(^|: )ERROR:' || true; }
 expected=$(( WORKERS * PER ))
 
 chk() {  # label, actual, expected
@@ -79,7 +98,7 @@ chk() {  # label, actual, expected
 
 echo "   ($WORKERS workers x $PER postings, half with legs reversed)"
 chk "deadlocks"                     "$(( after_dl - before_dl ))" 0
-chk "failed statements"             "$errs" 0
+chk "failed statements (workload A)" "$(count_errs)" 0
 chk "postings committed"            "$(q "select count(*) from ledger_transactions where kind='trace'")" "$expected"
 chk "auth events recorded"          "$(q "select count(*) from card_auth_events where processor_msg_id like 'b%'")" "$expected"
 chk "hold total matches the log"    "$(q "select total_minor from card_hold_groups where group_key='hot'")" "$(( expected * 10 ))"
@@ -175,6 +194,10 @@ wait
 dl_after=$(q "select deadlocks from pg_stat_database where datname=current_database()")
 chk "regroup deadlocks"          "$(( dl_after - dl_before ))" 0
 chk "regroup conserves the total" "$(q "select sum(total_minor) from card_hold_groups where tenant_id='rg'")" 800
+# Conservation alone is not liveness: 400 + 400 = 800 holds just as well if every
+# regroup raised. Assert that the work actually happened.
+chk "regroup actually moved events" \
+    "$(q "select count(*) > 0 from card_auth_event_group where tenant_id='rg' and superseded_at is not null")" "t"
 chk "regroup leaves no drift"     "$(q "select count(*) from card_hold_drift where tenant_id='rg'")" 0
 
 # C2/C3: the destination group's guards must hold even when the destination is
@@ -233,5 +256,8 @@ psql "$URL" -q -c "SELECT record_auth_event('xe','m-live','gU','co1','c1','autho
 race_guard xe "SELECT record_auth_event('xe','m-seed','gX','co1','c1','authorization',100,'USD',false,now()); SELECT expire_hold_group('xe','co1','gX');" \
     m-live gX "expired at" "regroup into an expiring group"
 chk "no hidden exposure after the races" "$(q "select count(*) from card_hold_drift where tenant_id in ('xg','xe')")" 0
+
+# ...and once more, now that every workload has written its .err files.
+chk "failed statements (all workloads)" "$(count_errs)" 0
 
 exit "$fail"

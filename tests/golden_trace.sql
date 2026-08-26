@@ -94,11 +94,19 @@ BEGIN
     -- ordering" -- it was documented as a requirement and not implemented here,
     -- which is exactly the sort of gap a single-threaded suite cannot see.
     FOR r IN
+        -- MATERIALIZED so the leg list drives the join. Without it the planner
+        -- scans ledger_accounts on its primary key and hands back account-id order
+        -- for free -- which meant `ORDER BY a.id` below could be deleted with no
+        -- deadlock and no test failure. The property was being attested by the
+        -- planner, not by the code.
+        WITH legs AS MATERIALIZED (
+            SELECT i AS ord,
+                   p_legs[(i-1)*3+1] AS purpose,
+                   p_legs[(i-1)*3+2]::ledger_direction AS dir,
+                   p_legs[(i-1)*3+3]::bigint AS amt
+            FROM generate_series(1, array_length(p_legs,1)/3) AS i)
         SELECT a.id AS account_id, l.dir, l.amt
-        FROM (SELECT p_legs[(i-1)*3+1] AS purpose,
-                     p_legs[(i-1)*3+2]::ledger_direction AS dir,
-                     p_legs[(i-1)*3+3]::bigint AS amt
-              FROM generate_series(1, array_length(p_legs,1)/3) AS i) l
+        FROM legs l
         -- currency is part of the lookup: once the same purpose exists in two
         -- currencies, a purpose alone no longer identifies an account, and posting
         -- a USD leg against the EUR row is a foreign-key violation at best
@@ -151,16 +159,21 @@ BEGIN
     -- would SUM into a single row here, so a leg mis-routed between them would be
     -- invisible. Rather than widen every expectation, refuse the ambiguity: if it
     -- ever arises, this assertion stops describing the books and must be rewritten.
+    -- Enumerated from ledger_ACCOUNTS, not from trial_balance. trial_balance is
+    -- built from entries, so a version keyed on it only fired once BOTH accounts
+    -- had activity -- and the dangerous case is routing EVERY leg to the wrong
+    -- owner, which leaves the right one empty and the guard silent. Proven: the
+    -- whole $500 purchase booked against the wrong customer, entire suite green.
     IF EXISTS (
-        SELECT 1 FROM trial_balance
-         GROUP BY tenant_id, purpose, currency HAVING count(DISTINCT account_id) > 1) THEN
+        SELECT 1 FROM ledger_accounts
+         GROUP BY tenant_id, purpose, currency HAVING count(*) > 1) THEN
         RAISE EXCEPTION
             'step % -- two accounts share (tenant, purpose, currency), so expect_state '
             'can no longer identify them: %', p_step,
             (SELECT string_agg(tenant_id||'/'||purpose||'/'||currency, ', ')
-               FROM (SELECT tenant_id, purpose, currency FROM trial_balance
+               FROM (SELECT tenant_id, purpose, currency FROM ledger_accounts
                       GROUP BY tenant_id, purpose, currency
-                     HAVING count(DISTINCT account_id) > 1) q);
+                     HAVING count(*) > 1) q);
     END IF;
 
     -- Force the DEFERRED balance trigger to fire NOW. Without this the whole file
