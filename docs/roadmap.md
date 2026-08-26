@@ -36,16 +36,24 @@ The properties the core must hold, at any point, against any history:
 - An as-of query at instant T returns the same answer whenever it is re-run.
 - **No transaction's entry set spans more than one tenant.** New, and load-bearing — see M1.
 
-Three of these are **not yet asserted**, and saying "the rest are" would be the kind of claim this
+Two of these are **not yet asserted**, and saying "the rest are" would be the kind of claim this
 project exists to avoid:
 
-- **As-of reproducibility** — blocked on [ADR-0005](./decisions/0005-reproducible-as-of.md), still
-  `proposed`.
 - **Gaplessness.** `uq_entries__account_seq` gives duplicate-freedom, and `ck_entries__seq_positive`
   now rules out the worst case, but nothing asserts there are no *holes*.
 - **Idempotency replay.** There is no replay path to test: `idempotency_hash` is written and
   **never read**. The negative control proves only that a unique index fires — identically for a
   replay and for a different body, which is exactly the distinction the ADR says matters.
+
+**The as-of property is now asserted**, on both axes, by
+[`tests/bitemporal.sql`](../tests/bitemporal.sql). It builds a fixture that separates the axes in
+both directions — a February transaction learned about in April, and a May transaction learned
+about in February — and pins the numbers at five instants. The file's last assertion is the one
+[ADR-0003](./decisions/0003-bitemporal-balances.md) is about: the running balance reports **520**
+for a business-date question whose truth is **120**, and the test fails if the fixture ever stops
+separating the axes. What remains open is *reproducibility* under concurrent writes, which is
+[ADR-0005](./decisions/0005-reproducible-as-of.md)'s commit-ordered cursor and is still
+`proposed`.
 
 **Done when:** the suite is in CI alongside the schema snapshot test, and the as-of property is
 covered.
