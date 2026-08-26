@@ -20,13 +20,13 @@
 >   executed against anything. A file whose only property is "this does not run"
 >   costs a reader a visit and teaches nothing the sentence above does not; the
 >   live attestation of every one of these cases is
->   [`tests/card_holds.sql`](../../schema/schema.sql).
+>   the deleted `tests/card_holds.sql`.
 > * **"Surveying eleven issuer-processors" was fabricated**, and "six of eleven"
 >   with it. Three processors are surveyed below. They disagree, which is the real
 >   finding and the reason the design exists; the sample size was invented.
 >
 > The live attestation of this design is
-> [`tests/card_holds.sql`](../../schema/schema.sql), which runs on every
+> the deleted `tests/card_holds.sql`, which runs on every
 > `make test-sql` against `schema/schema.sql`. Nothing in this directory is executed
 > by CI, and it is kept as a record of how the design was reached.
 

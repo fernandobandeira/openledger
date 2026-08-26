@@ -15,8 +15,10 @@ Read in this order.
 
 A **ledger** answers one question — *who is owed what* — in a way that cannot quietly go wrong.
 It does that with **double entry**: every amount is written twice, once as a debit and once as a
-credit, and the two sides must sum to zero. If they ever do not, something is broken, and the
-database refuses the write rather than storing a number nobody can trust.
+credit, and the two sides must sum to zero. If they ever do not, something is broken — so the
+system is built so that an unbalanced write **cannot be expressed**, rather than being caught after
+the fact. That guarantee lives in the Go writer, not in the database, and the Go writer is not built
+yet. See [decisions/0013](./decisions/0013-the-write-path.md).
 
 This project is that ledger, in Go and PostgreSQL, with a **B2B charge card** built on top of it as
 the reference product. The card is not a demo: it is the thing that forced the hard parts —
@@ -25,8 +27,10 @@ of order or twice or never.
 
 Two rules run through everything here:
 
-- **Correctness is not configurable.** The invariants are enforced by the database, on every write,
-  for every caller, including the replication apply path. There is no flag that turns them off.
+- **Correctness is not configurable.** No flag turns an invariant off. *Where* each one is enforced
+  is a decision in its own right — some in the database, some by construction in the writer — and
+  [decisions/README](./decisions/README.md#what-the-schema-enforces-today) keeps the honest
+  inventory of which is which today. There is no flag that turns them off.
 - **A claim needs evidence next to it.** Where a document states a number, it should be
   reproducible from this tree. Where it is not, the document says so. See
   [decisions/README.md](./decisions/README.md#on-sourcing).
@@ -35,7 +39,7 @@ Two rules run through everything here:
 
 ```
 make up        # PostgreSQL 18 in Docker
-make migrate   # apply migrations/ and the seed chart
+make schema    # load schema/schema.sql and the seed chart
 make schema    # load schema/schema.sql and the seed chart
 make test      # go test ./...
 ```

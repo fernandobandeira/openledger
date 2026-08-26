@@ -16,21 +16,31 @@ code is its own Go module so its dependencies never leak into the root `go.mod`.
 | [005](./005-durable-timers/) | Can Postgres replace Temporal for durable timers? | Yes — verified with River; the need is durable *scheduling*, not workflow orchestration, and idempotency already comes from the event log. | **closed** |
 | [004](./004-chart-of-accounts/) | What does a general ledger ship when the chart of accounts is business-specific? | Ship the chart as **data** plus constraints that make the accounting identity a theorem. But the identity does **not** prove completeness — that needs its own guard. | **closed** |
 
+**Nine spikes, and this index listed six of them.** 007, 008 and 009 were missing — including the
+two that reversed [ADR-0012](../docs/decisions/0012-where-logic-lives.md) and produced
+[ADR-0014](../docs/decisions/0014-schema-migrations.md).
+
+| | question | outcome | fed |
+| --- | --- | --- | --- |
+| [007](./007-schema-migrations/) | How do schema changes get applied? | goose, from Go, as a pre-deploy job. A *blocking* advisory lock deadlocks against `CREATE INDEX CONCURRENTLY`; goose polls a try-lock | [0014](../docs/decisions/0014-schema-migrations.md) |
+| [008](./008-processor-hold-semantics/) | What do card processors actually do? | No convention for delta-vs-total; grouping is a revisable inference; our "authorization writes no ledger entry" is a minority choice, not a domain law | [0010](../docs/decisions/0010-authorization-holds.md) |
+| [009](./009-how-other-ledgers-enforce/) | Do real ledgers use triggers, and where does the balance invariant live? | Triggers are widely used for immutability and hash chaining; **nobody** enforces debits-equal-credits in the database | [0012](../docs/decisions/0012-where-logic-lives.md), [0013](../docs/decisions/0013-the-write-path.md) |
+
 Outcomes fed the decision log from [ADR-0002](../docs/decisions/0002-data-access-layer.md) through
-[ADR-0010](../docs/decisions/0010-authorization-holds.md) — spike 004 fed 0009, spike 005 fed 0008,
-and spike 006 fed 0010. (This line used to say "through ADR-0011". ADR-0011 mentions no spike and
-took no spike input: it came out of adversarial review of the schema, not out of this directory.)
+[ADR-0014](../docs/decisions/0014-schema-migrations.md).
 
 ## Artifacts worth knowing about
 
 Spike 002 and 004 left behind files worth reading, because they were built against a real database
-rather than sketched. **None of them ships, and none of them runs.** Every `.sql` file in `spikes/` fails against the
-shipped schema -- on an object that already exists, a column that no longer exists, or a `NOT NULL`
-that did not exist when it was written. An earlier version of this paragraph named two files as the
-exceptions; there are no exceptions, and naming two was the same "a banner is a claim about scope"
-error [the decision log](../docs/decisions/README.md) records against itself. Nothing in `spikes/`
+rather than sketched. **None of them ships, and nearly none of them runs.** Nine of the eleven `.sql` files in `spikes/`
+fail against the shipped schema -- on an object that already exists, a column that no longer exists, or a `NOT NULL`
+that did not exist when it was written. **There are exactly two exceptions**, and they are the two files that contain no DDL:
+`002-sqlc-vs-jet/expected_schema.sql` and `003-throughput-ceiling/bench_schema.sql` both run clean.
+An earlier version of this paragraph named two exceptions, a later one claimed there were none and
+invoked "a banner is a claim about scope" to justify itself — **the over-correction was the error.**
+Verified by loading the shipped schema and running all eleven. Nothing in `spikes/`
 is executed by CI, so "measured" in this directory means "was measured once, against something".
-**The live attestation is [`tests/`](../schema/).**
+**The live attestation is the deleted test suites.**
 
 | File | What it is |
 | --- | --- |
@@ -40,4 +50,4 @@ is executed by CI, so "measured" in this directory means "was measured once, aga
 | [`002-sqlc-vs-jet/sqlc.yaml`](./002-sqlc-vs-jet/sqlc.yaml) | The verified codegen config. |
 | [`004-chart-of-accounts/chart.sql`](./004-chart-of-accounts/chart.sql) | Account types as data, with the constraints that keep them honest. |
 | [`004-chart-of-accounts/completeness.sql`](./004-chart-of-accounts/completeness.sql) | The guard against a report silently omitting an account. |
-| [`004-chart-of-accounts/golden_trace.sql`](./004-chart-of-accounts/golden_trace.sql) | **Superseded** by [`tests/golden_trace.sql`](../schema/schema.sql). Still runs against spike 002's schema; against the shipped one it fails on the very first statement, with `null value in column "tenant_id" of relation "ledger_accounts"` — it never reaches a unique index. It also writes `idempotency_key` to a table that no longer has it. |
+| [`004-chart-of-accounts/golden_trace.sql`](./004-chart-of-accounts/golden_trace.sql) | **Superseded** by the deleted `tests/golden_trace.sql`. Still runs against spike 002's schema; against the shipped one it fails on the very first statement, with `null value in column "tenant_id" of relation "ledger_accounts"` — it never reaches a unique index. It also writes `idempotency_key` to a table that no longer has it. |

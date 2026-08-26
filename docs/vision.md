@@ -57,8 +57,10 @@ production this quarter, use Formance.
 
 **Three things it structurally does not do**, each verified in its source rather than inferred:
 
-**1. It has no accounting semantics.** There is no account category and no normal balance anywhere
-in the schema. A balance is `input - output`, so a liability reads negative. Its "chart of
+**1. It has no accounting semantics.** There is no normal balance anywhere in the schema, and no
+accounting equation. *(This used to say "no account category" and "no chart of accounts" — since
+v2.3 Formance ships a versioned `schemas(chart jsonb)` table and v3 adds typed account patterns. The
+差 is normal balance and the equation, not the chart.)* A balance is `input - output`, so a liability reads negative. Its "chart of
 accounts" is an address *naming grammar*, and the rules type is literally `struct{}`. **You cannot
 get a trial balance or a balance sheet out of Formance without building a mapping layer beside
 it.** Here, accounts are typed, and the accounting equation `A = L + E + (R − X)` is
@@ -131,7 +133,7 @@ Four properties. None is a setting.
   outright, for *every* role including the owner. The grant model matters too, but it is not the
   mechanism: a `REVOKE` is a point-in-time change to a privilege, and a later `GRANT ALL` undoes
   it ([0011](./decisions/0011-what-the-database-enforces.md)).
-- **Balanced per currency**, enforced by the database on every transaction.
+- **Balanced per currency**, enforced by construction in the writer, not by the database — see [0013](./decisions/0013-the-write-path.md).
 - **Bitemporal.** Every transaction carries when it happened in the business and when it was
   learned about. These differ constantly: a clearing's business date belongs to the network, not
   to the webhook's arrival.
@@ -219,5 +221,4 @@ the whole problem and you are willing to operate a cluster for it, it is the bet
 | [`roadmap.md`](./roadmap.md) | What gets built, in what order, and why that order |
 | [`glossary.md`](./glossary.md) | Every domain term, with a real example |
 | [`reference-product.md`](./reference-product.md) | The embedded card ledger, in full |
-| the deleted acceptance suites | The acceptance suites — the lifecycle they replay, and the breakages they refuse |
 | [`../spikes/`](../spikes/) | Timeboxed investigations — question, answer, and the code that proved it |

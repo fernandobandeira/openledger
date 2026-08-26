@@ -38,8 +38,7 @@ justify a deletion rather than decided on evidence. Spike 007 and spike 009 sett
   invariant is not a validation bolted onto the model — it is the thing that *completes* it.
 
 And the negative result, which is what makes this a decision rather than a preference: **no
-established open-source ledger enforces debits-equal-credits in the database.** Not one of the nine
-SQL and ORM-backed systems surveyed. Modern Treasury asserts it at the API with a 422; Fragment
+established open-source ledger enforces debits-equal-credits in the database.** Not one of the nine systems surveyed — six of them SQL or ORM-backed. Modern Treasury asserts it at the API with a 422; Fragment
 makes it a schema-compile-time error; everyone else checks it in application code or makes it
 structural. Formance *did* once enforce a different invariant with a
 `CREATE CONSTRAINT TRIGGER … DEFERRABLE INITIALLY DEFERRED` — and **deleted it in migration 15 in

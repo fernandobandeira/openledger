@@ -11,8 +11,15 @@ they true?
 
 **Method.** Thirteen systems, read from their own published API references. Where a vendor serves
 Markdown source (Modern Treasury, Lithic, Marqeta, Stripe, Increase, Adyen, Galileo, Pismo) that
-was read directly; otherwise HTML with tags stripped. All 51 cited URLs returned HTTP 200 when
-checked. **No search results, no blogs, no third-party summaries** — with one labelled exception
+was read directly; otherwise HTML with tags stripped.
+
+**Six URLs are cited in this document.** An earlier version of this line said "all 51 cited URLs
+returned HTTP 200 when checked" — 51 pages were *read*; six were *cited*. That is exactly the
+distinction this spike exists to police, missed by the spike itself: a claim about work a reader
+cannot repeat is not a source, and this document's entire reason for existing is that an earlier
+agent claimed a survey nobody could repeat. **Treat every quote below that carries no link as
+unverified.** The six that are linked have been independently re-fetched and confirmed verbatim by a
+second reviewer — who also found two of them overstated, which is what checking is for. **No search results, no blogs, no third-party summaries** — with one labelled exception
 (Fragment's storage layer, which only appears on their blog).
 
 ---

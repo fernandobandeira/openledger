@@ -1,6 +1,15 @@
 # 0011 — What the database enforces, and what it cannot
 
-**Status:** accepted
+**Status:** **superseded in part by [0012](./0012-where-logic-lives.md)** — read that first
+
+> **Most of the mechanisms described below no longer exist.** This ADR is written in the present
+> tense about a PL/pgSQL implementation that [0012](./0012-where-logic-lives.md) deleted: the
+> deferred balance trigger, the sequence and `xact_id` assignment triggers, the correction-target
+> guard, the inheritance event trigger, both drift views on the ledger side, and roughly fifteen
+> named objects besides. **Its findings stand** — it is a good catalogue of what a database can and
+> cannot be made to guarantee, and every counterexample in it was real. **Its conclusion does not.**
+> What ships today is eleven tables, five views, ten foreign keys, eight triggers over two
+> functions, and no policies.
 **Date:** 2026-08-26
 
 ## Context
@@ -199,6 +208,13 @@ account does not hold, dated 27 years before their own transaction, committed cl
 replication path. **A subscriber must enforce what its publisher enforces, or replication is a
 laundering channel for corrupt rows.**
 
+> **NOT TRUE OF THE SHIPPED SCHEMA.** All 26 internal FK triggers on `ledger_entries`,
+> `ledger_transactions` and `ledger_accounts` are `ENABLE ORIGIN`. Under
+> `session_replication_role = 'replica'` **every foreign key is skipped** — verified by inserting a
+> two-tenant entry, in a currency its account does not hold, dated 1999: it committed. The
+> `ENABLE ALWAYS` sweep went with the PL/pgSQL in [0012](./0012-where-logic-lives.md); only the eight
+> hand-written triggers kept it. Listed in *Still open*.
+
 ### One convention per hold group
 
 `card_hold_groups.total_convention` is fixed by the first message that moves the authorized
@@ -247,8 +263,12 @@ Recorded here because the alternative is implying it can.
   Every internal trigger here is `ENABLE ALWAYS`, which covers the replica path, but nothing covers
   a superuser who drops the triggers outright. At that point the defence is backups and audit, not
   the schema.
-- ~~**Table inheritance disarms every constraint.**~~ **Closed, and this bullet was stale for
-  several rounds.** A child of `ledger_entries` would inherit CHECKs and nothing else — no FKs, no
+- **Table inheritance disarms every constraint — OPEN AGAIN.** It was closed by an event trigger,
+  and [0012](./0012-where-logic-lives.md) deleted it: `pg_event_trigger` is empty. Verified on the
+  shipped schema — a child of `ledger_entries` plus one `INSERT … SELECT * FROM ONLY` took an
+  income statement from 900 to 1,800. `CHECK`s are inherited; foreign keys, unique indexes and the
+  append-only trigger are not. *(This bullet said "Closed" for several rounds while it was true, and
+  then for several hours while it was not.)* The rest of the original text: A child of `ledger_entries` would inherit CHECKs and nothing else — no FKs, no
   unique indexes, no triggers — while remaining visible through the parent to every view.
   `ck_no_ledger_inheritance`, an `ddl_command_end` event trigger marked `ENABLE ALWAYS`, now refuses
   the statement; the deleted `tests/negative_controls.sql` suite carried nine controls for it, including an `UNLOGGED`

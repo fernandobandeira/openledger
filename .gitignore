@@ -1,7 +1,12 @@
 # Binaries
 /bin/
 /dist/
-openledger
+# ...the built binary at the ROOT, and only there. Without the leading slash this
+# pattern matches at any depth, so it also ignored the directory cmd/openledger/ --
+# and `cmd/` was never committed at all. `make build` and `make test` both failed on
+# a fresh clone, and ADR-0012's central framing ("10,053 lines of SQL against eleven
+# lines of Go") rested on a file no reader could see.
+/openledger
 # ...including the spike binaries. spike003 was listed and spike005 was not, so a
 # 16 MB compiled ELF sat in the tree -- in a directory whose own README says the
 # code there is throwaway and is not built by CI.

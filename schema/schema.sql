@@ -58,12 +58,6 @@
 
 
 
-
--- ----------------------------------------------------------------------
--- types
-
-
-
 -- ----------------------------------------------------------------------
 -- types
 
@@ -319,19 +313,23 @@ CREATE TABLE ledger_transactions (
     reverses_id     uuid,
     external_ref    jsonb NOT NULL DEFAULT '{}'::jsonb,
     metadata        jsonb NOT NULL DEFAULT '{}'::jsonb,
-    -- The database transaction that created this row. Entries may only be added
-    -- by that same transaction (ck_entries__sealed below).
+    -- The database transaction that created this row -- the SEAL. Entries are
+    -- meant to be addable only by that same transaction.
     --
-    -- Without this, append-only protected the ENTRY and not the JOURNAL: the app
-    -- role, holding nothing but its ordinary INSERT grant, could add a balanced,
-    -- correctly-dated, correctly-sequenced pair of legs to a transaction committed
-    -- and reported months earlier. February revenue went from 500.00 to 1,166.00
-    -- with the drift view, the accounting equation and the balance sheet all
-    -- green, because every constraint in this file was satisfied.
-    -- ASSIGNED by ck_txn__xact_id, never accepted. The DEFAULT is kept so the
-    -- column is never null if the trigger is ever disabled for a bulk load, but it
-    -- is not the mechanism -- see assign_xact_id() below for what a forged value
-    -- bought before the trigger existed.
+    -- WHY IT MATTERS. Without it, append-only protects the ENTRY and not the
+    -- JOURNAL: the app role, holding nothing but its ordinary INSERT grant, can add
+    -- a balanced, correctly-dated, correctly-sequenced pair of legs to a
+    -- transaction committed and reported months earlier. Measured, before the
+    -- guard existed: February revenue went from 500.00 to 1,166.00 with every
+    -- constraint in this file satisfied and every report green.
+    --
+    -- AND IT IS NOT ENFORCED TODAY. The guard was a trigger, and 0012 deleted it.
+    -- This column is a bare DEFAULT, which the comment above argues is exactly not
+    -- enough -- verified: an ordinary INSERT supplying xact_id = 42 is accepted.
+    -- The seal belongs to the writer (ADR-0013), which is not built. Two earlier
+    -- versions of this comment pointed at `ck_entries__sealed` and
+    -- `assign_xact_id()` as if they were below; neither has existed since 0012, and
+    -- a comment naming a guard that is not there is worse than no comment.
     xact_id         bigint NOT NULL DEFAULT pg_current_xact_id()::text::bigint,
 
     CONSTRAINT pk_txn PRIMARY KEY (tenant_id, id),
@@ -523,9 +521,12 @@ CREATE TABLE card_auth_events (
     -- for 'USD' reported 1000 while 500 more was live under 'usd'. Same failure the
     -- 0001 comment describes, in the number the authorization decision is made on.
     CONSTRAINT ck_auth_events__currency_iso CHECK (currency ~ '^[A-Z]{3}$'),
-    -- sign is a property of the kind. 'advice' and 'expiry_reversal' are exempt:
-    -- advice is bidirectional on some processors, and an expiry reversal is a
-    -- positive delta on a release.
+    -- sign is a property of the kind. 'advice' is exempt because it is bidirectional
+    -- on some processors. 'expiry_reversal' is NOT exempt -- it is pinned to ZERO,
+    -- for the reason given fifteen lines down. (This header used to say an expiry
+    -- reversal "is a positive delta on a release", stating as fact the position the
+    -- constraint below exists to forbid. A reader who stopped at the header took
+    -- away the exact behaviour that made one 100.00 authorization hold 200.00.)
     -- amount_delta = 0 is legal ONLY for a cumulative total that restates the
     -- amount already applied. A processor re-sending the same total under a new
     -- message id is a routine re-delivery; before this it produced a delta of 0
@@ -636,8 +637,14 @@ CREATE TABLE card_hold_groups (
     total_convention text CONSTRAINT ck_hold_groups__total_convention
                           CHECK (total_convention IN ('delta','total')),
     -- GREATEST(total,0): an over-capture ($1 fuel auth clearing at $95) must
-    -- contribute 0, never raise available credit. Increase ships the same clamp as
-    -- pending_transaction.held_amount.
+    -- contribute 0, never raise available credit. LITHIC ships the same clamp:
+    -- "if there is an over-reversal, Lithic will cap the amounts.hold.amount to $0."
+    -- (This comment used to cite Increase's pending_transaction.held_amount. That is
+    -- a credit-DIRECTION guard -- it differs from `amount` "if the amount is
+    -- positive", so a pending refund does not raise spending power -- not an
+    -- over-capture floor. ADR-0010 recorded the correction and named a file that had
+    -- already been deleted, so the false sentence survived here. Correcting a claim
+    -- in the document that discovered it is not the same as correcting the claim.)
     held_minor  bigint GENERATED ALWAYS AS (
         CASE WHEN expired_at IS NOT NULL THEN 0 ELSE GREATEST(total_minor, 0) END) STORED,
     open_events int  NOT NULL DEFAULT 0,
@@ -857,7 +864,7 @@ ORDER BY tenant_id, currency, sort_order;
 -- that bar. An earlier version of this schema had twenty-seven; ADR-0012 records
 -- what happened to the other twenty-five.
 --
--- The evidence for drawing the line here rather than elsewhere is spike 007.
+-- The evidence for drawing the line here rather than elsewhere is spike 009.
 -- Formance -- Go, PostgreSQL, in production, the closest analogue there is -- built
 -- a full PL/pgSQL write engine and then demolished it: migration 11
 -- `make-stateless` dropped five triggers that dispatched business flow, and
@@ -981,6 +988,189 @@ ALTER TABLE card_auth_events ENABLE ALWAYS TRIGGER ck_auth_events__no_truncate;
 --     they replaced: declarative, visible in \d, and impossible to forget.
 
 
+
+-- ----------------------------------------------------------------------
+-- THE CARD ALARMS
+--
+-- RESTORED. These two are VIEWS -- declarative, no PL/pgSQL -- and ADR-0012's own
+-- rule keeps views; it kept the three report views. They were lost because the
+-- script that extracted this file from the old migrations selected report views by
+-- name and never looked for these. Nobody noticed until an adversarial reviewer
+-- pointed out that ADR-0010 names `card_hold_drift` EIGHT TIMES as the alarm that
+-- catches every failure it records -- including the three it declines to fix on the
+-- grounds that the alarm sees them -- while the schema had no such object.
+--
+-- Every sentence of the form "the alarm catches this" was false for as long as they
+-- were absent. That is the most expensive kind of deletion: not a lost guard, a lost
+-- guard that several documents still promise.
+--
+-- `card_auth_unmatched` is the review queue: an event with no live assignment.
+-- `card_hold_drift` compares the materialised group against a re-aggregation of its
+-- live event log, and reports the ways they can disagree.
+CREATE VIEW card_auth_unmatched AS
+SELECT e.* FROM card_auth_events e
+WHERE NOT EXISTS (SELECT 1 FROM card_auth_event_group g
+                  WHERE g.tenant_id = e.tenant_id AND g.event_id = e.id
+                    AND g.superseded_at IS NULL);
+
+CREATE VIEW card_hold_drift AS
+WITH live AS (
+    SELECT m.tenant_id, e.company_id, m.group_key,
+           SUM(e.amount_delta) AS recomputed,
+           -- authorized_minor is the base every cumulative conversion is computed
+           -- against and the sole input to the out-of-order refusal. A wrong value
+           -- there refuses real increases forever, and nothing compared it to
+           -- anything.
+           SUM(GREATEST(e.amount_delta,0)) FILTER (
+               WHERE e.kind IN ('authorization','incremental')
+                  OR (e.kind = 'advice' AND e.amount_delta > 0)) AS recomputed_auth,
+           bool_or(e.raw_is_total) FILTER (
+               WHERE e.amount_delta <> 0
+                 AND (e.kind IN ('authorization','incremental')
+                  OR (e.kind = 'advice' AND e.amount_delta > 0))) AS any_total,
+           bool_or(NOT e.raw_is_total) FILTER (
+               WHERE e.amount_delta <> 0
+                 AND (e.kind IN ('authorization','incremental')
+                  OR (e.kind = 'advice' AND e.amount_delta > 0))) AS any_delta,
+           -- Decreases that moved NO MONEY. A clearing posts to the ledger, so a
+           -- group whose total went negative from clearings is not under-reserving
+           -- -- the cleared amount is a receivable in the journal, and exposure is
+           -- posted + held. ADR-0010 declines the over-capture report on exactly
+           -- that argument, and the argument covers `clearing` AND NOTHING ELSE.
+           -- `reversal` and negative `advice` post nothing. Two reversals against
+           -- one authorization left total_minor at -10000 with zero clearings in
+           -- the log, and the next genuine incremental was absorbed by the
+           -- residue: 100.00 live, 0.00 held, 0.00 posted, drift silent. The
+           -- non-latching overcaptured_at was erased by the very message that hid
+           -- the money.
+           COALESCE(-SUM(e.amount_delta) FILTER (
+               WHERE e.amount_delta < 0 AND e.kind <> 'clearing'), 0) AS bloodless_decreases,
+           COALESCE(SUM(GREATEST(e.amount_delta,0)) FILTER (
+               WHERE e.kind IN ('authorization','incremental','advice')), 0) AS increases,
+           COALESCE(-SUM(e.amount_delta) FILTER (WHERE e.kind = 'clearing'), 0) AS cleared
+      FROM card_auth_event_group m
+      JOIN card_auth_events e ON e.tenant_id = m.tenant_id AND e.id = m.event_id
+     WHERE m.superseded_at IS NULL
+     GROUP BY m.tenant_id, e.company_id, m.group_key
+)
+SELECT COALESCE(g.tenant_id,  l.tenant_id)  AS tenant_id,
+       COALESCE(g.company_id, l.company_id) AS company_id,
+       COALESCE(g.group_key,  l.group_key)  AS group_key,
+       g.total_minor          AS stored,      -- NULL = no materialised group
+       g.authorized_minor     AS stored_authorized,
+       COALESCE(l.recomputed_auth, 0) AS recomputed_authorized,
+       COALESCE(l.recomputed, 0) AS recomputed
+FROM card_hold_groups g
+FULL OUTER JOIN live l
+  ON  l.tenant_id  = g.tenant_id
+  AND l.company_id = g.company_id
+  AND l.group_key  = g.group_key
+WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
+   OR g.authorized_minor IS DISTINCT FROM COALESCE(l.recomputed_auth, 0)
+   -- ...or the group's declared currency disagrees with any of its live events.
+   -- The alarm compared total_minor and nothing else, so a group holding two
+   -- currencies -- the state regroup_auth_event used to be able to create --
+   -- reported no drift at all.
+   OR EXISTS (
+        SELECT 1 FROM card_auth_event_group m
+        JOIN card_auth_events e ON e.tenant_id=m.tenant_id AND e.id=m.event_id
+        WHERE m.tenant_id = g.tenant_id AND m.group_key = g.group_key
+          AND m.superseded_at IS NULL AND e.company_id = g.company_id
+          AND e.currency <> g.currency)
+   -- ...or an event was attached to a group AFTER it expired. held_minor is
+   -- GENERATED to 0 once expired_at is set, so exposure attached later is
+   -- invisible to held_for_company while total_minor and the log still agree --
+   -- the alarm compared exactly those two and therefore reported nothing. The
+   -- clamp is the thing hiding the number, so the alarm has to look past it.
+   -- (An earlier version of this comment said the branch was "keyed on the
+   -- monotonic counter, not on now()". It is keyed on the expired_* snapshots.
+   -- `last_event_seq` is read by nothing at all -- see the open list.)
+   -- Exposure added to a group AFTER it was expired. held_minor is GENERATED to 0
+   -- once expired_at is set, so anything attached later is invisible to
+   -- held_for_company while total_minor and the log still agree -- the two columns
+   -- the alarm compares. Keyed on the monotonic counter, not on now().
+   OR (g.expired_at IS NOT NULL
+       AND (g.authorized_minor > COALESCE(g.expired_authorized, g.authorized_minor)
+         OR g.total_minor      > COALESCE(g.expired_total,      g.total_minor)))
+   -- ...or the group's declared convention disagrees with its own log. The alarm
+   -- compared totals and currency and never this, so a group holding one
+   -- raw_is_total=false event and one raw_is_total=true event -- the state the
+   -- header calls IRRECONCILABLE -- reported nothing at all.
+   -- ...or the group dipped further negative than its clearings can account for.
+   --
+   -- THE FIRST VERSION OF THIS ALARM WENT SILENT AT THE MOMENT THE MONEY WAS HIDDEN.
+   -- It compared `bloodless_decreases > increases`, which is true in the precursor
+   -- state -- two reversals against one authorization -- and FALSE the instant the
+   -- next genuine incremental is absorbed by the residue, because that increase
+   -- raises `increases` by exactly the amount it swallowed. The guard was defeated
+   -- by the event it exists to protect against, and could only ever report the
+   -- state where the money was not yet lost.
+   --
+   -- low_water_minor is written only as `LEAST(low_water_minor, ...)`, so it is
+   -- monotone non-increasing THROUGH THESE FUNCTIONS, and group rows cannot be
+   -- deleted. It is NOT unerasable: the app role holds UPDATE on this table --
+   -- granted so record_auth_event can maintain it -- and one statement sets both
+   -- low_water_minor and overcaptured_at back to a clean state with drift silent,
+   -- because drift reads neither column. An earlier version of this comment said
+   -- "it cannot be erased", which is true of the code and false of the table.
+   -- It is also ORDER-DEPENDENT: across 720 permutations of one six-message set,
+   -- total_minor, authorized_minor and held_minor each took ONE value and
+   -- low_water_minor took TWELVE -- which is the mechanical reason the latching
+   -- alarm attempted here false-positived on permutation 4,3,2,1. A dip below what clearings explain
+   -- LATCHES. A genuine over-capture (a $1 authorization clearing at $95: low water
+   -- -9400 against 9500 cleared) does not fire, and an out-of-order clearing that
+   -- lands before its authorization does not either, because that dip never
+   -- exceeds what the clearing itself accounts for.
+   --
+   -- AND IT SELF-HEALS, WHICH IS A REAL LIMIT AND NOT A FIXABLE ONE. The instant a
+   -- genuine incremental is absorbed by the residue, `increases` rises by exactly
+   -- the amount swallowed and this predicate goes false. A reviewer reported that
+   -- as an under-reservation: 100.00 live, 0.00 held, drift silent.
+   --
+   -- I tried to latch it on low_water_minor -- monotone, unerasable -- comparing
+   -- the dip against what clearings could explain. That FALSE-POSITIVES on the
+   -- central claim of this whole design: a group whose messages arrive
+   -- decrease-first dips below any clearing that has landed yet, which is exactly
+   -- the order tolerance the file exists to provide. `tests/card_holds.sql`
+   -- permutation 4,3,2,1 catches it immediately.
+   --
+   -- The reason no predicate works is that THE LOG CANNOT DECIDE THE QUESTION. A
+   -- reversal that arrives before its authorization and a reversal that should
+   -- never have been sent are the same three columns. Deciding it needs the
+   -- processor's own reversal-to-authorization linkage, which this design
+   -- deliberately does not model -- 0010 argues that grouping is a revisable
+   -- inference precisely because that linkage is unreliable. So the alarm reports
+   -- the precursor state, `low_water_minor` keeps the durable evidence that the
+   -- group was ever there, and the ambiguity is recorded in ADR-0010 rather than
+   -- papered over with a guard that would fire on honest traffic.
+   --
+   -- AND A CLEARING BLINDED IT COMPLETELY. `total_minor` is
+   -- `increases - cleared - bloodless`, so a group can sit BELOW ZERO from a
+   -- bloodless reversal while `bloodless <= increases` -- and then the predicate
+   -- above never fires, not in the precursor state and not after. Measured:
+   -- authorization 100.00, clearing 100.00 (which POSTS), spurious reversal
+   -- 100.00, then a genuine incremental 100.00. True exposure 200.00 (100 posted +
+   -- 100 un-cleared), reported 100.00, drift 0 rows at every step. Scaled three
+   -- times over: 300.00 under-reserved, and the hidden residue is bounded only by
+   -- the group's cleared amount.
+   --
+   -- That falsifies the precise restatement ADR-0010 wrote to close the declined
+   -- over-capture report -- "an over-capture never makes held_for_company smaller
+   -- than the un-cleared exposure of that group" -- in a state the system itself
+   -- flags as an over-capture.
+   --
+   -- The second disjunct is strictly stronger than the first (bloodless >
+   -- increases implies total < 0 and bloodless > 0), so it loses nothing, and the
+   -- genuine $1-authorization-clearing-at-$95 over-capture still does not fire,
+   -- because it has no bloodless decrease at all.
+   OR l.bloodless_decreases > l.increases
+   OR (g.total_minor < 0 AND l.bloodless_decreases > 0)
+   OR (l.any_total AND l.any_delta)
+   OR g.total_convention IS DISTINCT FROM
+        (CASE WHEN l.any_total AND l.any_delta THEN g.total_convention
+              WHEN l.any_total THEN 'total'
+              WHEN l.any_delta THEN 'delta' END);
+
 -- ----------------------------------------------------------------------
 -- THE APPLICATION ROLE
 --
@@ -1017,9 +1207,17 @@ GRANT SELECT, INSERT ON ledger_accounts, ledger_events, ledger_transactions,
 GRANT SELECT, INSERT, UPDATE ON ledger_account_balances TO openledger_app;
 
 -- The card tables: the hold flow appends events and rewrites its own materialised
--- group rows. UPDATE on card_auth_events is deliberate and narrow -- it is what
--- lets a caller take a row lock with SELECT ... FOR UPDATE; the append-only trigger
--- is what stops that privilege becoming mutability.
+-- group rows.
+--
+-- NOTE, AND IT IS A REAL GAP: ADR-0010's fix for the attach/regroup deadlock is
+-- "take the event row lock first, explicitly" -- and `SELECT ... FOR UPDATE` on
+-- card_auth_events requires UPDATE privilege, which this role is NOT granted and is
+-- explicitly revoked below. An earlier version of this comment claimed the grant was
+-- "deliberate and narrow"; it was describing a privilege that is not there. The
+-- application role cannot currently execute the ADR's own remedy. Deciding between
+-- granting UPDATE (and leaning on the append-only trigger to keep it a lock rather
+-- than mutability) and finding a lock that does not need it is open work, recorded
+-- in the decision log rather than papered over here.
 GRANT SELECT, INSERT ON card_auth_events, card_auth_event_group TO openledger_app;
 GRANT SELECT, INSERT, UPDATE ON card_auth_event_group TO openledger_app;
 GRANT SELECT, INSERT, UPDATE ON card_hold_groups TO openledger_app;
