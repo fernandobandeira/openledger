@@ -9,9 +9,17 @@ A report resolves a business date to a **gap-free watermark over a global sequen
 per accepted event — stores the watermark alongside the report, and re-runs against the stored
 watermark forever after. The date picks a cursor; the cursor is what the query uses.
 
-The watermark is not `max(seq)`. It is the highest **N such that every entry ≤ N has committed**,
-computable from `pg_snapshot_xmin(pg_current_snapshot())`, since every transaction below the
-snapshot's xmin has resolved. Standard CDC technique.
+The watermark is not `max(seq)`. It is the highest **N such that every entry ≤ N has committed**.
+`pg_snapshot_xmin(pg_current_snapshot())` is what makes that computable: xmin is the lowest
+transaction id still in progress, so **every transaction below it has already finished** and the set
+of rows below it can never grow again. Above it, a transaction may still be in flight, and a row
+invisible now can appear later. Standard CDC technique.
+
+That is a horizon in *transaction ids*, and the watermark is a position on the *event sequence*, so
+one does not give the other directly. The conversion needs each event to record the transaction that
+wrote it, and then `W = min(seq) - 1` over events whose xid ≥ xmin. **Neither column exists**:
+`ledger_events` today has no global sequence and no xid, so this ADR has no substrate in the shipped
+schema. That is the first thing M5 builds, not a detail of it.
 
 With it, a rule: **an as-of query must name the column it filters, and a resource must have exactly
 one such column.** Naming the axis on the *parameter* is not enough.
@@ -96,4 +104,12 @@ The watermark has to be built and tested against concurrent writers. Unverified:
    [0008](./0008-durable-timers.md)'s timers are one-shot jobs with short transactions.
 2. The watermark's lag under such a run: one transaction open for minutes pins every report in that
    window behind it.
-3. That the watermark advances past aborted transactions automatically. It should; confirm.
+3. ~~That the watermark advances past aborted transactions automatically.~~ **Verified** on
+   PostgreSQL 18.6. A session took xid8 5325039 and held it open; a concurrent snapshot read
+   `5325039:5325039:`, xmin pinned at exactly that id. On `ROLLBACK` the next snapshot read
+   `5325040:5325040:`. xmin tracks what is still *running*, and an aborted transaction is not, so it
+   stops holding the horizon back with no sweep and no intervention. The same transcript is a
+   demonstration of risk 2: one open transaction pinned the horizon for its whole lifetime, and on
+   RDS the holders are not only our writers — `pg_dump`, an idle-in-transaction session, a logical
+   replication slot, `hot_standby_feedback` from a replica, and any prepared transaction all pin
+   xmin, and a report that trails the oldest of them is a report that can trail by hours.
