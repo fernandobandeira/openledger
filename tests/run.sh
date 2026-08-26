@@ -44,9 +44,9 @@ fi
 floor_for() {
     case "$1" in
         *bitemporal.sql)        echo 18 ;;
-        *card_holds.sql)        echo 60 ;;
+        *card_holds.sql)        echo 100 ;;
         *golden_trace.sql)      echo 18 ;;
-        *negative_controls.sql) echo 60 ;;
+        *negative_controls.sql) echo 90 ;;
         *query_plans.sql)       echo  4 ;;
         *)                      echo  1 ;;
     esac

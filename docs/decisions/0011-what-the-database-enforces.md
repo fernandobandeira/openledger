@@ -58,8 +58,16 @@ aggregate can. Both axes are now asserted in [`tests/bitemporal.sql`](../../test
 ### `account_seq` is assigned from the journal
 
 `assign_entry_seq` is a `BEFORE INSERT` trigger: it sets `NEW.account_seq` to `MAX + 1` over that
-account's existing entries, under the row lock the balance upsert already holds. A client-supplied
-value is **discarded**, not refused.
+account's existing entries. A client-supplied value is **discarded**, not refused.
+
+This sentence used to end "under the row lock the balance upsert already holds", which was a
+**caller convention stated as a property of the mechanism**. Nothing obliged a caller to touch
+`ledger_account_balances` first, and a reviewer ran 6 workers x 20 balanced postings that did not:
+100 of 120 died on `uq_entries__account_seq` with a `23505`, indistinguishable from a genuine
+idempotency conflict and retried by no serialization-failure loop. The trigger now takes that lock
+itself — it upserts the `(account, currency)` cache row and locks it before reading `MAX` — so the
+serialization is something the database provides rather than something the caller is trusted to
+have done.
 
 It took two attempts. Uniqueness and positivity were not enough — an app-role INSERT could leave a
 48-wide gap and later *fill* it with a backdated, balanced, same-account round trip, taking gross

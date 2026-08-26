@@ -2,7 +2,7 @@
 --
 -- A suite that only ever runs the happy path proves nothing: it can pass because
 -- everything is right, or because nothing is being checked. This file breaks the
--- ledger thirteen ways and requires each break to be REFUSED, with the error we
+-- ledger sixty-odd ways and requires each break to be REFUSED, with the error we
 -- expect rather than merely some error.
 --
 -- Case 2 is the reason this file exists. Re-routing interchange to fee_revenue --
@@ -276,10 +276,23 @@ SELECT must_fail('a cached balance in a currency its account does not hold', $q$
     VALUES ('t1', acct('t1','customer_receivable'), 'EUR', 500, 0, 1);
 $q$, 'fk_balances__account');
 
+-- Two constraints enforce this, and which one fires first is now decided by
+-- assign_entry_seq, which materialises the cache row for (account, currency)
+-- before the entry lands. Both are asserted; neither is left to ordering.
 SELECT must_fail('entry currency <> account currency', $q$
     INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
                                 currency,account_seq,balance_after,effective_at)
     SELECT 't1', txn('t1','n4b'), acct('t1','customer_receivable'), 'debit', 500, 'EUR', 1, 500,
+           now();
+$q$, 'fk_balances__account');
+
+SELECT must_fail('an entry whose currency its account does not hold, cache pre-seeded', $q$
+    -- with the cache row already present for the WRONG currency's account, the
+    -- entries FK is the one that must speak
+    ALTER TABLE ledger_entries DISABLE TRIGGER ck_entries__seq;
+    INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
+                                currency,account_seq,balance_after,effective_at)
+    SELECT 't1', txn('t1','n4c'), acct('t1','customer_receivable'), 'debit', 500, 'EUR', 1, 500,
            now();
 $q$, 'fk_entries__account');
 
@@ -690,10 +703,20 @@ $q$, 'ck_entries__amount_positive');
 
 -- the ENTRY-level currency check, distinct from the account-level one: it is what
 -- stops 'usd' entries splitting an account's per-currency balance
-SELECT must_fail('a lowercase currency on an entry', $q$
+-- assign_entry_seq materialises the cache row first, so its ISO check speaks
+-- first. Both are asserted rather than depending on trigger order.
+SELECT must_fail('a lowercase currency, via the cache', $q$
     INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
                                 currency,account_seq,balance_after,effective_at)
     SELECT 't1', txn('t1','lc_entry'), acct('t1','customer_receivable'), 'debit', 5,'usd',
+           1, 5, now();
+$q$, 'ck_balances__currency_iso');
+
+SELECT must_fail('a lowercase currency on an entry', $q$
+    ALTER TABLE ledger_entries DISABLE TRIGGER ck_entries__seq;
+    INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
+                                currency,account_seq,balance_after,effective_at)
+    SELECT 't1', txn('t1','lc_entry2'), acct('t1','customer_receivable'), 'debit', 5,'usd',
            1, 5, now();
 $q$, 'ck_entries__currency_iso');
 
@@ -1032,6 +1055,161 @@ SELECT must_fail('a cached balance for an account with no journal', $q$
         END IF;
     END $d$;
 $q$, 'orphan cache detected');
+
+-- ===================================== round 4: erasure, and false linkage
+--
+-- Four of these made every report GREEN while the books were false. That is the
+-- shape worth the most controls: not an error, but a silence.
+
+-- The journal cannot be emptied. TRUNCATE left 11 transactions standing with zero
+-- entries, all three currencies reporting balanced = t, and every drift view at
+-- zero rows -- there was nothing left to disagree with. The comment beside the
+-- REVOKEs used to say "nothing in SQL can stop that", which was false.
+SELECT must_fail('truncating the entries', $q$ TRUNCATE ledger_entries CASCADE; $q$, 'is history');
+SELECT must_fail('truncating the transactions', $q$ TRUNCATE ledger_transactions CASCADE; $q$, 'is history');
+SELECT must_fail('truncating the event log', $q$ TRUNCATE ledger_events CASCADE; $q$, 'is history');
+SELECT must_fail('truncating the accounts', $q$ TRUNCATE ledger_accounts CASCADE; $q$, 'is history');
+SELECT must_fail('truncating as the app role', $q$
+    GRANT ALL ON ledger_entries TO openledger_app;
+    SET LOCAL ROLE openledger_app;
+    TRUNCATE ledger_entries CASCADE;
+$q$, 'is history');
+RESET ROLE;
+SELECT must_fail('truncating on the replication apply path', $q$
+    SET LOCAL session_replication_role = 'replica';
+    TRUNCATE ledger_entries CASCADE;
+$q$, 'is history');
+RESET ROLE;
+
+-- ...and the standing cross-check that would have SEEN it, since a deferred
+-- constraint trigger cannot: TRUNCATE is not a statement it fires on.
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM ledger_transaction_drift) THEN
+        RAISE EXCEPTION 'a transaction stands without its entries';
+    END IF;
+    RAISE NOTICE 'ok  no transaction stands without its entries';
+END $$;
+
+-- ledger_events was the ONE table with an assign-on-insert trigger and no
+-- immutability guard, so idempotency_hash -- the column whose whole job is
+-- "same key, DIFFERENT body -> refuse" -- was freely rewritable, and so was the
+-- recorded_at the engine had just assigned.
+SELECT must_fail('rewriting an event''s idempotency hash', $q$
+    UPDATE ledger_events SET idempotency_hash = sha256(convert_to('other','UTF8'));
+$q$, 'is immutable');
+SELECT must_fail('rewriting an event''s recorded_at', $q$
+    UPDATE ledger_events SET recorded_at = '2001-01-01';
+$q$, 'is immutable');
+SELECT must_fail('deleting an event', $q$ DELETE FROM ledger_events; $q$, 'is immutable');
+SELECT must_fail('replica: rewriting an event', $q$
+    SET LOCAL session_replication_role = 'replica';
+    UPDATE ledger_events SET payload = '{"x":1}';
+$q$, 'is immutable');
+RESET ROLE;
+
+-- An account's OWNER was mutable while its purpose and currency were frozen.
+-- 110,000 of receivable became owed by nobody: every balance identical, the trial
+-- balance still balanced, drift silent -- none of them read the owner.
+SELECT must_fail('re-owning an account that has entries', $q$
+    UPDATE ledger_accounts SET owner_id = NULL, owner_type = 'house'
+     WHERE tenant_id='t1' AND purpose='customer_receivable';
+$q$, 'cannot be re-owned');
+SELECT must_fail('moving an account to another tenant', $q$
+    UPDATE ledger_accounts SET tenant_id='t2'
+     WHERE tenant_id='t1' AND purpose='customer_receivable';
+$q$, 'cannot be re-owned');
+SELECT must_fail('re-denominating an account', $q$
+    UPDATE ledger_accounts SET currency='EUR'
+     WHERE tenant_id='t1' AND purpose='customer_receivable';
+$q$, 'cannot be re-owned');
+SELECT must_fail('replica: re-owning an account', $q$
+    SET LOCAL session_replication_role = 'replica';
+    UPDATE ledger_accounts SET owner_id = NULL WHERE tenant_id='t1';
+$q$, 'cannot be re-owned');
+RESET ROLE;
+-- ...and annotation is still annotation
+DO $$ BEGIN
+    UPDATE ledger_accounts SET metadata = '{"note":"still writable"}'
+     WHERE tenant_id='t1' AND purpose='customer_receivable';
+    RAISE NOTICE 'ok  metadata stays mutable -- it is annotation, not identity';
+END $$;
+
+-- resolves_id and reverses_id had a foreign key, so the target had to EXIST.
+-- Nothing required it to be in a state the correction makes sense against:
+-- revenue went to -49,223 with drift 0 and the equation balanced, because both
+-- halves were internally consistent journal entries.
+SELECT must_fail('resolving an already-posted transaction', $q$
+    DO $d$ DECLARE a uuid := txn('t1','r4_posted'); b uuid; BEGIN
+        PERFORM entry('t1', a, acct('t1','customer_receivable'), 'debit',  100);
+        PERFORM entry('t1', a, acct('t1','interchange_revenue'), 'credit', 100);
+        INSERT INTO ledger_transactions (tenant_id,kind,status,effective_at,resolves_id)
+        VALUES ('t1','neg','posted',now(),a) RETURNING id INTO b;
+    END $d$;
+$q$, 'cannot resolve');
+
+SELECT must_fail('reversing a transaction that was never posted', $q$
+    DO $d$ DECLARE a uuid; BEGIN
+        INSERT INTO ledger_transactions (tenant_id,kind,status,effective_at)
+        VALUES ('t1','neg','pending',now()) RETURNING id INTO a;
+        PERFORM entry('t1', a, acct('t1','customer_receivable'), 'debit',  100);
+        PERFORM entry('t1', a, acct('t1','interchange_revenue'), 'credit', 100);
+        INSERT INTO ledger_transactions (tenant_id,kind,status,effective_at,reverses_id)
+        VALUES ('t1','neg','posted',now(),a);
+    END $d$;
+$q$, 'cannot reverse');
+
+SELECT must_fail('replica: reversing a pending transaction', $q$
+    SET LOCAL session_replication_role = 'replica';
+    DO $d$ DECLARE a uuid; BEGIN
+        INSERT INTO ledger_transactions (tenant_id,kind,status,effective_at)
+        VALUES ('t1','neg','pending',now()) RETURNING id INTO a;
+        PERFORM entry('t1', a, acct('t1','customer_receivable'), 'debit',  100);
+        PERFORM entry('t1', a, acct('t1','interchange_revenue'), 'credit', 100);
+        INSERT INTO ledger_transactions (tenant_id,kind,status,effective_at,reverses_id)
+        VALUES ('t1','neg','posted',now(),a);
+    END $d$;
+$q$, 'cannot reverse');
+RESET ROLE;
+
+-- ...and the legitimate shapes still work, or the guard above is just a wall
+DO $$ DECLARE a uuid; b uuid; BEGIN
+    INSERT INTO ledger_transactions (tenant_id,kind,status,effective_at)
+    VALUES ('t1','neg','pending',now()) RETURNING id INTO a;
+    PERFORM entry('t1', a, acct('t1','customer_receivable'), 'debit',  100);
+    PERFORM entry('t1', a, acct('t1','interchange_revenue'), 'credit', 100);
+    INSERT INTO ledger_transactions (tenant_id,kind,status,effective_at,resolves_id)
+    VALUES ('t1','neg','posted',now(),a) RETURNING id INTO b;
+    PERFORM entry('t1', b, acct('t1','customer_receivable'), 'debit',  100);
+    PERFORM entry('t1', b, acct('t1','interchange_revenue'), 'credit', 100);
+    INSERT INTO ledger_transactions (tenant_id,kind,status,effective_at,reverses_id)
+    VALUES ('t1','neg','posted',now(),b);
+    RAISE NOTICE 'ok  pending->resolved and posted->reversed are both still legal';
+END $$;
+
+-- One event, at most one transaction. Without this the "idempotency spine" does
+-- not by itself prevent double-posting.
+SELECT must_fail('two transactions from one event', $q$
+    DO $d$ DECLARE e uuid; BEGIN
+        SELECT event_id INTO e FROM ledger_transactions
+         WHERE tenant_id='t1' AND event_id IS NOT NULL LIMIT 1;
+        INSERT INTO ledger_transactions (tenant_id,event_id,kind,status,effective_at)
+        VALUES ('t1',e,'neg','posted',now());
+    END $d$;
+$q$, 'uq_txn__one_per_event');
+
+-- The derived balance-sheet plug may not be shadowed by a real chart line.
+SELECT must_fail('declaring a real line called current_year_earnings', $q$
+    INSERT INTO fs_lines (code,caption,statement,side,sort_order)
+    VALUES ('current_year_earnings','Earnings','balance_sheet','liability_equity',999);
+$q$, 'ck_fs_lines__code_reserved');
+
+-- An EMPTY report is not a balanced one. On a freshly migrated and seeded
+-- database this returned zero rows, and bool_and over zero rows is NULL.
+SELECT must_fail('asking an empty ledger whether it balances', $q$
+    DO $d$ BEGIN
+        CREATE TEMP TABLE _probe AS SELECT * FROM accounting_equation('nobody');
+    END $d$;
+$q$, 'unknown tenant');
 
 DO $$ BEGIN RAISE NOTICE 'ok  every breakage above was refused, for the stated reason'; END $$;
 

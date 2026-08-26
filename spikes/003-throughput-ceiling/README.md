@@ -413,7 +413,8 @@ perimeter account has exactly one external balance that must agree with it". `op
 cannot be split per tenant without destroying the reconciliation the design is built around. Same
 for `facility_borrowings` — one warehouse line, one lender, one number.
 
-**7 of the golden trace's 13 transactions touch `operating_cash`.** But the four *clearing*
+**7 transactions touch `operating_cash`.** (Of 13 in this spike's own trace; the shipped
+`tests/golden_trace.sql` that supersedes it runs 21, still 7 of them on `operating_cash`.) But the four *clearing*
 transactions do not. So:
 
 > **Clearings become tenant-local. Treasury does not.**
@@ -506,16 +507,20 @@ escrow degenerates to "don't take the lock at all", which is exactly lock-free a
 - **Modern Treasury degrades automatically on cache drift**: they verify cached balances against
   the sum of entries and *"automatically turn off cache reads for Accounts that have drifted"* —
   strengthening ADR-0003's self-audit from "alarm" to "alarm and fall back to truth".
-- **Nubank's #1 published regret** is a missing customer ID on every transaction, which
-  *"dramatically"* complicated later sharding. That is our `tenant_id NULL` problem exactly.
+- **A widely-cited sharding regret** is a missing customer ID on every transaction, which
+  *"dramatically"* complicated later sharding — our `tenant_id NULL` problem exactly. This line
+  attributed it to Nubank and `docs/roadmap.md` attributed the same lesson to Notion; neither has a
+  source, so **the company is unverified**. The mechanics are the load-bearing part.
 
 **The counter-argument to engage:** Adyen rejected domain-based sharding, shards round-robin
 instead — *"if we would put each processing merchant in one database, you still need to go to
 every shard when you need aggregate data."* Weaker for a ledger (balances, statements and a
 tenant's own P&L are all tenant-local) but worth answering.
 
-**Formance self-reports** being *"optimized for 1K writes per second on commodity storage."* Our
-unsharded ~840/s with durability on is in the same league as the closest comparable system.
+**Formance is said to self-report** being *"optimized for 1K writes per second on commodity
+storage"* — **unverified**. No URL was recorded next to it, and an authenticated code search across
+the whole `formancehq` org returns zero hits for "1K writes", "writes per second" or "commodity
+storage". Treat the comparison as unsupported until someone finds the page.
 
 ## Reproduce
 

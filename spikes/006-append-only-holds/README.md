@@ -5,10 +5,13 @@
 > invented.** Both are recorded here rather than quietly repaired, because this
 > spike is the evidence base for [ADR-0010](../../docs/decisions/0010-authorization-holds.md).
 >
-> * **`cases.sql` is dead against `holds.sql`.** It writes `event_id`, `group_key`
->   and `expires_at`; the schema in `holds.sql` has `processor_msg_id`, no
->   `group_key` column at all (grouping moved to its own table), and no
->   `expires_at`. Every INSERT fails with `column "event_id" ... does not exist`,
+>   *(This bullet has itself been corrected. It previously listed three schema
+>   mismatches, two of which describe `migrations/0003` and not the file in this
+>   directory: `holds.sql` does have `group_key` and does have `expires_at`. The
+>   conclusion was right; two of its three reasons were not.)*
+> * **`cases.sql` is dead against `holds.sql`.** It writes `event_id`; the schema
+>   in `holds.sql` has `processor_msg_id` and no `event_id` column at all. Every
+>   INSERT fails with `column "event_id" ... does not exist`,
 >   the results view prints `(0 rows)`, and `held_for_company` prints 0.00. The
 >   README's "**Measured**" table and its "**all eight cases**, plus idempotency and
 >   sign guards" were never executed against this schema. `cases.sql` is v1;
@@ -80,7 +83,8 @@ already cleared. No state machine had to anticipate the sequence.
 
 ### Idempotency and sign are database constraints
 
-- A redelivered webhook is refused by `UNIQUE (tenant_id, event_id)` — not by application logic.
+- A redelivered webhook is refused by `uq_auth_events__msg UNIQUE (tenant_id, processor_msg_id)`
+  — not by application logic. (This line said `event_id`; there is no such column.)
 - A clearing carrying a *positive* delta is refused by a `CHECK`. The sign is a property of the
   event kind, so it cannot be got wrong.
 
@@ -270,5 +274,5 @@ composite, sentinel-polluted, day-scoped, and mid-migration on Mastercard. The o
 
 ```sh
 psql "$DSN" -f holds.sql    # schema + the derived view
-psql "$DSN" -f cases.sql    # all eight cases, plus idempotency and sign guards
+psql "$DSN" -f cases.sql    # DEAD -- six cases, none of which run. See the banner.
 ```

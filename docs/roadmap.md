@@ -39,14 +39,18 @@ The properties the core must hold, at any point, against any history:
 - An as-of query at instant T returns the same answer whenever it is re-run.
 - **No transaction's entry set spans more than one tenant.** New, and load-bearing — see M1.
 
-Two of these are **not yet asserted**, and saying "the rest are" would be the kind of claim this
+One of these is **not yet asserted**, and saying "the rest are" would be the kind of claim this
 project exists to avoid:
 
-- ~~**Gaplessness.**~~ Now both enforced and asserted: `ck_entries__seq` requires an entry's
-  sequence to be the one the balance upsert issued, and
+- ~~**Gaplessness.**~~ Now both enforced and asserted — but *not* the way an earlier correction
+  here claimed. It said `ck_entries__seq` "requires an entry's sequence to be the one the balance
+  upsert issued". It does not require anything of the client: `assign_entry_seq` **overwrites**
+  whatever arrives with `MAX + 1` over that account's own entries, read from the journal and never
+  from the cache. Validating against the cached `last_seq` is the design
+  [ADR-0011](./decisions/0011-what-the-database-enforces.md) calls "the same mistake one level
+  down" — trusting a writable column. What holds: the trigger assigns, and
   [`tests/concurrency.sh`](../tests/concurrency.sh) asserts `max(seq) = count(*) = count(distinct
-  seq)` per account under concurrent load. This line previously said nothing asserted it, while the
-  same file said 120 lines later that concurrency.sh did.
+  seq)` per account under concurrent load.
 - **Idempotency replay.** There is no replay path to test: `idempotency_hash` is written and
   **never read**. The negative control proves only that a unique index fires — identically for a
   replay and for a different body, which is exactly the distinction the ADR says matters.
@@ -79,8 +83,8 @@ foreign key, an immutability trigger on the journal, and the drift views both AD
 ADR-0010 rely on. **Striping is not built** — it is still one integer on the account row and a
 `SUM` on read, and nothing in `migrations/` implements it yet.
 
-Carried forward: balanced-per-currency enforced by the database; append-only via
-`REVOKE UPDATE, DELETE` from the app role; `amount_minor bigint CHECK (> 0)` so direction carries
+Carried forward: balanced-per-currency enforced by the database; append-only via an immutability
+trigger (the `REVOKE` narrows the blast radius; it is not the mechanism); `amount_minor bigint CHECK (> 0)` so direction carries
 the sign; idempotency keyed to the **event**, not the business object.
 
 **`ledger_events`** ([ADR-0004](./decisions/0004-event-log.md)) — the idempotency spine for the
@@ -97,7 +101,10 @@ in [ADR-0009](./decisions/0009-chart-and-completeness.md).
 
 **This was the one irreversible decision on the list, and it was free.** It is the prerequisite for
 row-level security, partitioning, and ever splitting across instances — none work without it, all
-are expensive to retrofit. Notion named exactly this omission as their sharding regret. It is in
+are expensive to retrofit. A large SaaS sharding post-mortem named exactly this omission as its regret —
+`spikes/003` attributes the same lesson to Nubank and this line once said Notion. Neither
+attribution has a source in the repo, so **the company is unverified**; the lesson stands on its
+own mechanics. It is in
 before there is data, which was the whole point.
 
 **Tenant-local transactions, via intercompany clearing.** Some accounts genuinely cannot be
@@ -176,7 +183,10 @@ serialises the read-modify-write or does not.
 That found a live gap: **the deterministic lock ordering this section prescribes was not
 implemented.** `post()` locked balance rows in whatever order the legs arrived, so two writers
 touching the same two accounts in opposite order deadlocked — 138 deadlocks and 138 rollbacks out
-of 320 postings, every failure a deadlock. Sorting the legs by account id takes it to **zero**, and
+of 320 postings, every failure a deadlock. (That run is not in the repo:
+`concurrency.sh` ships a 6x15 workload over **six** accounts, because with two the planner drives a
+nested loop that emits the legs in account order for free, and the deadlock cannot be produced at
+all.) Sorting the legs by account id takes it to **zero**, and
 the test fails if the sort is removed.
 
 **Done when:** the same holds with **batching** enabled, which does not exist yet — batch-wide

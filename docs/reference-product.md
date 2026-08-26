@@ -195,7 +195,9 @@ WHERE tenant_id = :tenant AND account_id = :acct AND recorded_at <= :as_of
 ORDER BY recorded_at DESC, account_seq DESC LIMIT 1;
 ```
 
-**Two corrections, both measured on a 2M-entry account.**
+**Two corrections. The shape below is asserted by `tests/query_plans.sql`; the millisecond figures
+are not** — they came from a 2M-entry account whose harness is not in the repo. The shipped plan
+test builds 200,000 rows and reports ~36,000 rows removed by filter: same shape, smaller numbers.
 
 This block previously wrote the second query with `ORDER BY account_seq DESC` and called it *"the
 same lookup, one more predicate"*. It is not. Once `recorded_at` is a range predicate, that ordering
@@ -384,7 +386,9 @@ enumerates are the real ones; the schema below is not what was built.
 Other rails get the same shape: `ach_transfers`, `disputes`, `statements`. The ledger is the
 permanent record; these are what's still in flight.
 
-> Append-only is **enforced, not documented**: revoke `UPDATE` and `DELETE` from the app role.
+> Append-only is **enforced, not documented** — by triggers that refuse `UPDATE`, `DELETE` and
+> `TRUNCATE` outright. The narrow grant matters too, but a `REVOKE` is undone by one `GRANT ALL`,
+> so it is not the mechanism.
 
 ---
 

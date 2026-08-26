@@ -251,8 +251,31 @@ SELECT eq('...and the superseded assignment is retained',
               AND superseded_at IS NOT NULL), 1);
 SELECT no_drift('splitting into a new group');
 
+-- A group row may not be DELETED: expired_at, its expired_* snapshots and
+-- low_water_minor are not in the event log, so a recompute rebuilds the row WRONG
+-- rather than failing -- an expired group came back live with its post-expiry drift
+-- branch disarmed, and an ordinary incremental after a delete had ingest report
+-- 70.00 against 1070.00 of live exposure.
+SELECT must_fail('deleting a materialised hold group', $q$
+    DELETE FROM card_hold_groups WHERE tenant_id='t1' AND group_key='g_split';
+$q$, 'cannot be deleted');
+
+SELECT must_fail('truncating the auth event log', $q$
+    TRUNCATE card_auth_events CASCADE;
+$q$, 'is history');
+
+SELECT must_fail('rewriting a stored auth event', $q$
+    UPDATE card_auth_events SET amount_delta = 1 WHERE processor_msg_id='msg_orphan';
+$q$, 'is immutable');
+
+-- The three fixtures below still need the missing-group state, which the guard
+-- above now makes unreachable through any API. They disable the trigger for the
+-- length of one statement -- the state is defended in production and still
+-- attested here, rather than the branch going untested because it became legal
+-- nowhere.
 -- and the alarm must SEE a group that exists only as membership
 SELECT must_fail('membership pointing at a group that was never materialised', $q$
+    ALTER TABLE card_hold_groups DISABLE TRIGGER ck_hold_groups__no_delete;
     DELETE FROM card_hold_groups WHERE group_key='g_split';
     SELECT no_drift('missing group');
 $q$, 'disagrees with the event log');
@@ -533,7 +556,9 @@ SELECT no_drift('a late clearing on an expired group');
 -- the repair, and the drift stayed.
 SELECT record_auth_event('t1','rep_a','g_repair','acme','card_r',
         'authorization', 8000,'USD',false, now());
+ALTER TABLE card_hold_groups DISABLE TRIGGER ck_hold_groups__no_delete;
 DELETE FROM card_hold_groups WHERE tenant_id='t1' AND group_key='g_repair';
+ALTER TABLE card_hold_groups ENABLE ALWAYS TRIGGER ck_hold_groups__no_delete;
 SELECT recompute_hold_group('t1','acme','g_repair');
 SELECT eq('a deleted group row is rebuilt from the log',
           (SELECT total_minor FROM card_hold_groups WHERE group_key='g_repair'), 8000);
@@ -692,7 +717,9 @@ $q$, 'ck_auth_events__sign');
 -- the repair must work in the state the alarm exists to detect: no group row
 SELECT record_auth_event('t1','mr_auth','g_missing','acme','card_mr',
         'authorization', 8000,'USD',false, now());
+ALTER TABLE card_hold_groups DISABLE TRIGGER ck_hold_groups__no_delete;
 DELETE FROM card_hold_groups WHERE tenant_id='t1' AND group_key='g_missing';
+ALTER TABLE card_hold_groups ENABLE ALWAYS TRIGGER ck_hold_groups__no_delete;
 SELECT recompute_hold_group('t1','acme','g_missing');
 SELECT eq('a missing group is materialised and repaired, not just returned',
           (SELECT total_minor FROM card_hold_groups WHERE group_key='g_missing'), 8000);
