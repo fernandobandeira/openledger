@@ -285,6 +285,22 @@ BEGIN
         <> COALESCE(SUM(e.amount_minor) FILTER (WHERE e.direction = 'credit'), 0)
      LIMIT 1;
 
+    -- Deleting EVERY leg leaves a zero-row GROUP BY, so the check above finds
+    -- nothing and passes -- the same "vacuously balanced" reasoning that justified
+    -- ck_txn__has_entries on INSERT, in the delete direction. Verified: a committed
+    -- 2-leg transaction was reduced to zero entries, the posted row survived, and
+    -- with its cached balances also removed the drift view returned nothing, the
+    -- balance sheet balanced, and the accounting equation returned no rows at all.
+    IF TG_OP = 'DELETE'
+       AND EXISTS (SELECT 1 FROM ledger_transactions
+                    WHERE tenant_id = v_tenant AND id = v_txn)
+       AND (SELECT count(*) FROM ledger_entries
+             WHERE tenant_id = v_tenant AND transaction_id = v_txn) < 2 THEN
+        RAISE EXCEPTION
+            'transaction % would be left with fewer than two entries', v_txn
+            USING ERRCODE = '23514';
+    END IF;
+
     IF FOUND THEN
         -- COALESCE because a one-legged transaction reports the missing side as
         -- NULL, which reads as though the value were unknown rather than zero.
@@ -359,10 +375,15 @@ GRANT SELECT, INSERT, UPDATE ON ledger_account_balances TO openledger_app;
 -- silently make the journal mutable. The property is real -- granting UPDATE and
 -- then dropping these lines IS caught by the test suite -- but it comes from the
 -- narrow GRANT, not from these lines.
-REVOKE UPDATE, DELETE ON ledger_entries      FROM openledger_app;
-REVOKE UPDATE, DELETE ON ledger_transactions FROM openledger_app;
-REVOKE        DELETE ON ledger_events        FROM openledger_app;
-REVOKE        DELETE ON ledger_account_balances FROM openledger_app;
+-- TRUNCATE is included deliberately. It is not covered by DELETE, it fires no row
+-- trigger, and it was verified reachable: after a careless `GRANT ALL`, the shipped
+-- REVOKEs left TRUNCATE in place and `SET ROLE openledger_app; TRUNCATE
+-- ledger_entries;` succeeded. That is the whole journal, silently, past every
+-- constraint in this file.
+REVOKE UPDATE, DELETE, TRUNCATE ON ledger_entries      FROM openledger_app;
+REVOKE UPDATE, DELETE, TRUNCATE ON ledger_transactions FROM openledger_app;
+REVOKE        DELETE, TRUNCATE ON ledger_events        FROM openledger_app;
+REVOKE        DELETE, TRUNCATE ON ledger_account_balances FROM openledger_app;
 
 -- ------------------------------------------------------------ the corruption alarm
 -- ADR-0003 leans on balance_after and a recomputation always agreeing, calling it a

@@ -81,7 +81,35 @@ BEGIN
     INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
                                 currency,account_seq,balance_after,effective_at)
     VALUES (p_tenant,p_txn,p_acct,p_dir::ledger_direction,p_amt,p_ccy,v_seq,
-            COALESCE(p_bal, CASE WHEN p_dir='debit' THEN p_amt ELSE -p_amt END), now());
+            COALESCE(p_bal, CASE WHEN p_dir='debit' THEN p_amt ELSE -p_amt END),
+            -- COALESCE: the cross-tenant control deliberately references a
+            -- transaction that does not exist in this tenant, and the FK is what
+            -- should reject it -- not a NOT NULL violation on the way there.
+            COALESCE((SELECT effective_at FROM ledger_transactions
+                       WHERE tenant_id=p_tenant AND id=p_txn), now()));
+
+    -- Maintain the cache. Without this every account with entries already produced
+    -- a `no cached balance row` in ledger_balance_drift, so any control asserting
+    -- `EXISTS (SELECT 1 FROM ledger_balance_drift)` was satisfied BEFORE its tamper
+    -- -- vacuous, and proven so: deleting the tampering statement left the suite
+    -- green. Every drift control below now starts from a clean baseline.
+    INSERT INTO ledger_account_balances AS b (tenant_id,account_id,currency,input,output,last_seq)
+    VALUES (p_tenant,p_acct,p_ccy,
+            CASE WHEN p_dir='debit'  THEN p_amt ELSE 0 END,
+            CASE WHEN p_dir='credit' THEN p_amt ELSE 0 END, v_seq)
+    ON CONFLICT (tenant_id,account_id,currency) DO UPDATE
+       SET input=b.input+EXCLUDED.input, output=b.output+EXCLUDED.output,
+           last_seq=EXCLUDED.last_seq;
+END $$;
+
+-- The baseline must be CLEAN before any drift control runs, or those controls
+-- assert nothing. This is the guard that keeps them honest.
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM ledger_balance_drift) THEN
+        RAISE EXCEPTION 'drift baseline is not clean: %',
+            (SELECT string_agg(problem, '; ') FROM ledger_balance_drift);
+    END IF;
+    RAISE NOTICE 'ok  drift baseline is clean';
 END $$;
 
 -- ---------------------------------------------------------------- the controls
@@ -106,15 +134,69 @@ $q$, 'needs at least two');
 --     only, so this left 900 debits against 0 credits and nothing complained.
 SELECT must_fail('deleting one leg of a balanced transaction', $q$
     DO $d$ DECLARE t uuid := txn('t1','n1c'); BEGIN
+        -- FOUR legs: deleting one of two would leave a single entry and trip
+        -- ck_txn__has_entries first, testing a different rule.
         PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  900);
         PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 900);
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  100);
+        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 100);
     END $d$;
     SET CONSTRAINTS ALL IMMEDIATE;
     DELETE FROM ledger_entries WHERE tenant_id='t1' AND transaction_id IN
         (SELECT id FROM ledger_transactions WHERE tenant_id='t1'
           AND event_id=(SELECT id FROM ledger_events WHERE idempotency_key='n1c'))
-      AND direction='credit';
+      AND direction='credit' AND amount_minor=100;
 $q$, 'does not balance');
+
+-- 1c-bis. Deleting EVERY leg is "vacuously balanced" -- a zero-row GROUP BY finds
+--     nothing, so the balance check passes. Verified before the fix: a committed
+--     2-leg transaction was reduced to zero entries, the posted row survived, and
+--     with its cached balances also removed the drift view returned nothing, the
+--     balance sheet balanced, and the equation returned no rows at all.
+SELECT must_fail('deleting EVERY leg of a committed transaction', $q$
+    DO $d$ DECLARE t uuid := txn('t1','n1cb'); BEGIN
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  700);
+        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 700);
+    END $d$;
+    SET CONSTRAINTS ALL IMMEDIATE;
+    DELETE FROM ledger_entries WHERE tenant_id='t1' AND transaction_id IN
+        (SELECT id FROM ledger_transactions WHERE tenant_id='t1'
+          AND event_id=(SELECT id FROM ledger_events WHERE idempotency_key='n1cb'));
+$q$, 'fewer than two entries');
+
+-- 1c-ter. THE JOURNAL IS SEALED AT COMMIT. The newest and most critical guard had
+--     zero coverage: no test file contained the words `sealed`, `xact_id` or
+--     `already committed`. It closes the hole where legs could be APPENDED to a
+--     transaction committed and reported months earlier -- balanced, correctly
+--     dated, correctly sequenced, and invisible to every alarm.
+--     This whole file is ONE transaction, so every statement shares an xact id and
+--     "already committed" cannot occur naturally here. The transaction row is
+--     written with an EARLIER xact_id instead, which is exactly the state a
+--     genuinely prior commit leaves behind.
+SELECT must_fail('appending a leg to an already-committed transaction', $q$
+    INSERT INTO ledger_events (tenant_id,kind,source,idempotency_key,idempotency_hash,
+                               payload,effective_at)
+    VALUES ('t1','neg','internal','sealed',sha256('sealed'),'{}',now());
+    INSERT INTO ledger_transactions (tenant_id,id,event_id,kind,status,effective_at,xact_id)
+    SELECT 't1','0f0f0f0f-0000-7000-8000-00000000f00d',id,'neg','posted',now(),
+           pg_current_xact_id()::text::bigint - 1
+      FROM ledger_events WHERE tenant_id='t1' AND idempotency_key='sealed';
+    INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
+                                currency,account_seq,balance_after,effective_at)
+    SELECT 't1','0f0f0f0f-0000-7000-8000-00000000f00d',
+           acct('t1','customer_receivable'),'debit',100,'USD',900,100,
+           (SELECT effective_at FROM ledger_transactions
+             WHERE id='0f0f0f0f-0000-7000-8000-00000000f00d');
+$q$, 'sealed');
+
+-- 1c-quater. TRUNCATE is not covered by DELETE and fires no row trigger. After a
+--     careless GRANT ALL the shipped REVOKEs left it in place, and truncating the
+--     whole journal succeeded.
+SELECT must_fail('TRUNCATE as the app role', $q$
+    SET LOCAL ROLE openledger_app;
+    TRUNCATE ledger_entries;
+$q$, 'permission denied');
+RESET ROLE;
 
 -- 1d. session_replication_role='replica' is the logical-replication apply path and
 --     what pg_restore --disable-triggers sets. Under it an unbalanced transaction
@@ -160,7 +242,9 @@ SELECT must_fail('transaction spanning two tenants', $q$
         PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  500);
         PERFORM entry('t2', t, acct('t2','customer_receivable'), 'credit', 500);
     END $d$;
-$q$, 'fk_entries__txn');
+$q$, 'fk_entries__txn"');   -- trailing quote: fk_entries__txn is a PREFIX of
+                           -- fk_entries__txn_effective, so a bare substring match
+                           -- passed even with the cross-tenant FK dropped
 
 -- 4. an entry carrying a currency its account does not hold
 SELECT must_fail('entry currency <> account currency', $q$
@@ -348,8 +432,10 @@ SELECT must_fail('cached balance desynchronised from the journal', $q$
         PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 600);
     END $d$;
     SET CONSTRAINTS ALL IMMEDIATE;
-    INSERT INTO ledger_account_balances (tenant_id,account_id,currency,input,output,last_seq)
-    VALUES ('t1', acct('t1','customer_receivable'), 'USD', 99999999, 0, 7);
+    -- entry() maintains the cache now, so the row exists: desynchronise it rather
+    -- than inserting a phantom (which would test uq/pk, not the alarm).
+    UPDATE ledger_account_balances SET input = input + 99999999
+     WHERE tenant_id='t1' AND account_id = acct('t1','customer_receivable');
     DO $d$ BEGIN
         IF EXISTS (SELECT 1 FROM ledger_balance_drift) THEN
             RAISE EXCEPTION 'DRIFT DETECTED: %',
@@ -394,6 +480,140 @@ SELECT must_fail('one-sided intercompany movement', $q$
         END IF;
     END $d$;
 $q$, 'intercompany does not eliminate');
+
+-- ---------------------------------------------------------------- alarm branches
+--
+-- Mutation testing showed the drift view was tested only as "does it return ANY
+-- row" -- every individual branch could be deleted and the suite stayed green.
+-- Each branch now has a control that makes THAT branch the reason a test fails.
+
+-- An INTERMEDIATE running balance. The alarm once compared only last_value()
+-- against a full-partition sum, so corrupting any row but the last was invisible
+-- -- and those are exactly the rows an as-of read returns.
+SELECT must_fail('an intermediate balance_after', $q$
+    DO $d$ DECLARE t uuid := txn('t1','d1'); BEGIN
+        PERFORM entry('t1', t, acct('t1','fee_revenue'),         'credit', 300);
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  300);
+    END $d$;
+    DO $d$ DECLARE t uuid := txn('t1','d2'); BEGIN
+        PERFORM entry('t1', t, acct('t1','fee_revenue'),         'credit', 400);
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  400);
+    END $d$;
+    SET CONSTRAINTS ALL IMMEDIATE;
+    UPDATE ledger_entries SET balance_after = balance_after + 5
+     WHERE tenant_id='t1' AND account_id = acct('t1','fee_revenue') AND account_seq = 1;
+    DO $d$ BEGIN
+        IF EXISTS (SELECT 1 FROM ledger_balance_drift
+                    WHERE problem LIKE 'running balance diverges%') THEN
+            RAISE EXCEPTION 'DRIFT: %', (SELECT problem FROM ledger_balance_drift LIMIT 1);
+        END IF;
+    END $d$;
+$q$, 'drift: running balance diverges');
+
+-- GROSS TURNOVER. input and output are stored separately precisely so gross
+-- turnover is free -- and it was the one thing nothing validated: adding the same
+-- amount to both left the difference intact and the alarm silent.
+SELECT must_fail('fabricated gross turnover', $q$
+    -- must_fail rolls back each control, so this one posts its own data rather
+    -- than relying on a predecessor's -- otherwise the account has no entries, the
+    -- UPDATE below matches nothing, and the control asserts nothing.
+    DO $d$ DECLARE t uuid := txn('t1','gt1'); BEGIN
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  600);
+        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 600);
+    END $d$;
+    SET CONSTRAINTS ALL IMMEDIATE;
+    UPDATE ledger_account_balances SET input = input + 999999, output = output + 999999
+     WHERE tenant_id='t1' AND account_id = acct('t1','customer_receivable');
+    DO $d$ BEGIN
+        IF EXISTS (SELECT 1 FROM ledger_balance_drift
+                    WHERE problem LIKE '%gross turnover%') THEN
+            RAISE EXCEPTION 'DRIFT: gross turnover';
+        END IF;
+    END $d$;
+$q$, 'drift: gross turnover');
+
+-- last_seq drives the next account_seq. Poisoned downward it is a permanent
+-- per-account denial of service; upward it silently corrupts balance_after.
+SELECT must_fail('a poisoned last_seq', $q$
+    -- must_fail rolls back each control, so this one posts its own data rather
+    -- than relying on a predecessor's -- otherwise the account has no entries, the
+    -- UPDATE below matches nothing, and the control asserts nothing.
+    DO $d$ DECLARE t uuid := txn('t1','ls1'); BEGIN
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  600);
+        PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 600);
+    END $d$;
+    SET CONSTRAINTS ALL IMMEDIATE;
+    UPDATE ledger_account_balances SET last_seq = last_seq + 40
+     WHERE tenant_id='t1' AND account_id = acct('t1','customer_receivable');
+    DO $d$ BEGIN
+        IF EXISTS (SELECT 1 FROM ledger_balance_drift
+                    WHERE problem LIKE '%last_seq%') THEN
+            RAISE EXCEPTION 'DRIFT: last_seq';
+        END IF;
+    END $d$;
+$q$, 'drift: last_seq');
+
+-- ---------------------------------------------------------------- new guards
+--
+-- Each of these landed as a new trigger or a new RAISE and arrived without a
+-- control that makes it the reason a test fails.
+
+-- An account's purpose decides which statement line its whole history reports
+-- under; re-pointing it at a same-shaped type moved that history silently.
+-- Its own tenant: t1 already holds both revenue accounts, so the re-point would
+-- collide on uq_accounts__house before ever reaching the guard under test.
+SELECT must_fail('re-pointing an account that has entries', $q$
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    SELECT 't3','house',NULL,code,category,normal_balance,'USD'
+      FROM account_types WHERE code IN ('interchange_revenue','customer_receivable');
+    DO $d$ DECLARE t uuid := txn('t3','rp1'); BEGIN
+        PERFORM entry('t3', t, acct('t3','customer_receivable'), 'debit',  200);
+        PERFORM entry('t3', t, acct('t3','interchange_revenue'), 'credit', 200);
+    END $d$;
+    SET CONSTRAINTS ALL IMMEDIATE;
+    UPDATE ledger_accounts SET purpose='fee_revenue'
+     WHERE tenant_id='t3' AND purpose='interchange_revenue';
+$q$, 'cannot re-point');
+
+-- fs_lines had no guard at all while account_types.fs_line had one.
+-- 'revenue', not 'equity': the guard counts accounts reporting under the line, and
+-- the fixture has no equity account, so that version asserted nothing.
+SELECT must_fail('moving a statement line to the other statement', $q$
+    UPDATE fs_lines SET statement='balance_sheet' WHERE code='revenue';
+$q$, 'cannot move statement line');
+
+-- An unknown tenant must RAISE. bool_and() over zero rows is NULL, and the
+-- idiomatic `for rows.Next() { if !balanced }` loop passes on an empty result --
+-- the green check that did not execute, reached through the tenant parameter
+-- instead of the axis one.
+SELECT must_fail('an unknown tenant, on the equation', $q$
+    SELECT * FROM accounting_equation('T1');
+$q$, 'unknown tenant');
+SELECT must_fail('an unknown tenant, on the balance sheet', $q$
+    SELECT * FROM balance_sheet_balances('nope');
+$q$, 'unknown tenant');
+
+-- THE BALANCE SHEET MUST BE ABLE TO FAIL. Hardcoding balanced := true passed the
+-- whole suite: every balance-sheet mutation that was caught was caught only
+-- because the function still computed, and the completeness control raises its own
+-- sentinel so it passes on any state.
+SELECT must_fail('a balance sheet that does not balance', $q$
+    ALTER TABLE ledger_entries      DISABLE TRIGGER ck_entries__balances;
+    ALTER TABLE ledger_transactions DISABLE TRIGGER ck_txn__has_entries;
+    DO $d$ DECLARE t uuid := txn('t1','bs1'); BEGIN
+        PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit', 12345);
+    END $d$;
+    ALTER TABLE ledger_entries      ENABLE ALWAYS TRIGGER ck_entries__balances;
+    ALTER TABLE ledger_transactions ENABLE ALWAYS TRIGGER ck_txn__has_entries;
+    DO $d$ DECLARE r record; BEGIN
+        FOR r IN SELECT * FROM balance_sheet_balances('t1') LOOP
+            IF NOT r.balanced THEN
+                RAISE EXCEPTION 'BALANCE SHEET IS OUT by %',
+                    r.assets - r.liabilities_and_equity;
+            END IF;
+        END LOOP;
+    END $d$;
+$q$, 'balance sheet is out');
 
 DO $$ BEGIN RAISE NOTICE 'ok  every breakage above was refused, for the stated reason'; END $$;
 
