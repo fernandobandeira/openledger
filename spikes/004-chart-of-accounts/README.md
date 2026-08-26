@@ -5,8 +5,8 @@ business-specific — a card program funded by a warehouse line has them, a mark
 not. A general ledger cannot ship a fixed chart of accounts. So what *does* it ship, and how does
 it guarantee the math is right when it doesn't know what the accounts are?
 
-**Status:** closed. Feeds [ADR-0002](../../docs/decisions/0002-scaling.md) and
-M0/M1.
+**Status:** closed. Feeds [ADR-0007](../../docs/decisions/0007-schema-conventions-and-chart.md)
+and M0/M1.
 
 ---
 

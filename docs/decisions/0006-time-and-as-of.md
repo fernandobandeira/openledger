@@ -76,7 +76,8 @@ past"*. Only the **mutable** one cost anything: **a running balance on a mutable
 | B | T2 (> T1) | T2.5 | T2 |
 
 A report "as of T2.6" run at T2.7 sees B but not A, uncommitted; re-run at T4 it sees both.
-**Different answer**, and time zones have nothing to do with it: it needs two concurrent writers and
+**Different answer**, and time zones have nothing to do with *this* failure: it needs two concurrent
+writers and
 one slow transaction — a reporting run overlapping a batched posting run, an ordinary Tuesday.
 **Reproduced** on ordinary INSERT grants — one recorded-axis report either side of one commit gave
 revenue **110,000.00 then 160,000.00**, `balanced` both times, drift empty.

@@ -273,12 +273,12 @@ CREATE TABLE ledger_transactions (
     -- guard existed: February revenue went from 500.00 to 1,166.00 with every
     -- constraint in this file satisfied and every report green.
     --
-    -- AND IT IS NOT ENFORCED TODAY. The guard was a trigger, and 0012 deleted it.
+    -- AND IT IS NOT ENFORCED TODAY. The guard was a trigger, and ADR-0004 deleted it.
     -- This column is a bare DEFAULT, which the comment above argues is exactly not
     -- enough -- verified: an ordinary INSERT supplying xact_id = 42 is accepted.
     -- The seal belongs to the writer (ADR-0005), which is not built. Two earlier
     -- versions of this comment pointed at `ck_entries__sealed` and
-    -- `assign_xact_id()` as if they were below; neither has existed since 0012, and
+    -- `assign_xact_id()` as if they were below; neither has existed since ADR-0004, and
     -- a comment naming a guard that is not there is worse than no comment.
     xact_id         bigint NOT NULL DEFAULT pg_current_xact_id()::text::bigint,
 
@@ -465,10 +465,13 @@ CREATE TABLE card_auth_events (
     clearing_deadline  timestamptz,
 
     CONSTRAINT pk_auth_events PRIMARY KEY (tenant_id, id),
-    -- ISO 4217 is uppercase. 0001 enforces this on entries and accounts and 0003
-    -- enforced it nowhere, so 'usd' created a SECOND hold group: the
-    -- hold total for 'USD' reported 1000 while 500 more was live under 'usd'. Same failure the
-    -- 0001 comment describes, in the number the authorization decision is made on.
+    -- ISO 4217 is uppercase. `ck_entries__currency_iso` and `ck_accounts__currency_iso`
+    -- enforce that on the journal; the hold log originally enforced it nowhere, so
+    -- 'usd' created a SECOND hold group -- the hold total for 'USD' reported 1000
+    -- while 500 more was live under 'usd'. The same failure as on the journal, in
+    -- the number the authorization decision is made on. (Two earlier versions of
+    -- this comment cited ADR numbers that never carried the claim; the constraints
+    -- are the durable reference.)
     CONSTRAINT ck_auth_events__currency_iso CHECK (currency ~ '^[A-Z]{3}$'),
     -- sign is a property of the kind. 'advice' is exempt because it is bidirectional
     -- on some processors. 'expiry_reversal' is NOT exempt -- it is pinned to ZERO, for
@@ -497,7 +500,7 @@ CREATE TABLE card_auth_events (
         (kind = 'expiry_reversal' AND amount_delta = 0) OR
         (kind IN ('authorization','incremental') AND amount_delta >= 0) OR
         -- 'expiry' is absent deliberately: expiry is a FLAG. The enum value stays
-        -- (removing one is a rewrite) and no row may carry it. The pre-0012 writer
+        -- (removing one is a rewrite) and no row may carry it. The pre-ADR-0004 writer
         -- function refused it too, but that gated only the function -- an operator backfill
         -- or a second adapter produced the double release the header argues
         -- against, five lines above the constraint that used to permit it.
@@ -562,7 +565,7 @@ CREATE TABLE card_hold_groups (
     group_key   text NOT NULL,
     -- A group holds ONE currency. Without this, total_minor summed minor units
     -- across denominations and reported 100.00 USD + 50.00 EUR as "held 15000" --
-    -- the same vacuity removed from the accounting equation in 0002, but sitting
+    -- the same vacuity removed from the accounting equation in ADR-0007, but sitting
     -- in the authorization decision, where the number IS available credit.
     currency    char(3) NOT NULL CONSTRAINT ck_hold_groups__currency_iso
                     CHECK (currency ~ '^[A-Z]{3}$'),
@@ -626,7 +629,19 @@ CREATE TABLE card_hold_groups (
     low_water_minor bigint NOT NULL DEFAULT 0,
     last_event_seq  bigint NOT NULL DEFAULT 0,
     updated_at  timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT pk_hold_groups PRIMARY KEY (tenant_id, company_id, group_key)
+    CONSTRAINT pk_hold_groups PRIMARY KEY (tenant_id, company_id, group_key),
+    -- Expiry MUST carry its snapshots. The post-expiry alarm compares
+    -- authorized_minor and total_minor against the values frozen when the group
+    -- was released; with a NULL snapshot the COALESCE below degenerates to
+    -- `x > x`, which is never true, and the alarm is silently disarmed rather
+    -- than noisy. Verified: authorize 10000, set expired_at alone, then a genuine
+    -- incremental 10000 -- true exposure 20000, held_minor 0 (GENERATED to 0 the
+    -- moment expired_at is set), drift 0 rows. A missing snapshot fails silent,
+    -- which is the failure this project ranks worst, so the three columns move
+    -- together or not at all.
+    CONSTRAINT ck_hold_groups__expiry_snapshot CHECK (
+        (expired_at IS NULL     AND expired_authorized IS NULL AND expired_total IS NULL)
+     OR (expired_at IS NOT NULL AND expired_authorized IS NOT NULL AND expired_total IS NOT NULL))
 );
 
 
@@ -654,8 +669,23 @@ CREATE INDEX ix_event_group__group
 CREATE INDEX ix_event_group__event ON card_auth_event_group (tenant_id, event_id, id);
 
 
+-- Serves the AUTHORIZATION read -- "sum the live holds for this company" -- which
+-- is the one lookup inside the ~1s deadline (ADR-0008). It does NOT serve the
+-- expiry sweep, and an earlier comment claiming it did was wrong: the partial
+-- predicate `held_minor > 0` matched 100.0% of 20,733 groups in a populated
+-- database, so it has no selectivity to offer a scan that has no tenant or
+-- company to equal against. The planner drove from the event log and applied
+-- held_minor > 0 as a filter, same plan with enable_seqscan = off.
 CREATE INDEX ix_hold_groups__held
     ON card_hold_groups (tenant_id, company_id) WHERE held_minor > 0;
+
+-- What the sweep actually needs. The selective column is the deadline, not the
+-- held amount: 20 of 24,351 events were past due and the plan was a Seq Scan
+-- removing 24,331 rows by filter, because hold_expires_at carried no index at
+-- all. Partial, because a NULL deadline is the overwhelming majority and can
+-- never be due.
+CREATE INDEX ix_auth_events__hold_expiry
+    ON card_auth_events (tenant_id, hold_expires_at) WHERE hold_expires_at IS NOT NULL;
 
 
 -- ----------------------------------------------------------------------
@@ -973,14 +1003,25 @@ WITH live AS (
            SUM(GREATEST(e.amount_delta,0)) FILTER (
                WHERE e.kind IN ('authorization','incremental')
                   OR (e.kind = 'advice' AND e.amount_delta > 0)) AS recomputed_auth,
+           -- NO `amount_delta <> 0` FILTER HERE, and that is the whole point.
+           -- A cumulative-total message mis-grouped into a DELTA group converts to
+           -- delta = raw_amount - total_so_far, which is exactly 0 when the wire
+           -- total equals what the group already holds. Filtering on a non-zero
+           -- delta then removes the only raw_is_total row in the group, the mix
+           -- disappears, and 100.00 of live exposure reports as held 0. Verified:
+           -- two authorizations, wire 10000 each, the second flagged raw_is_total,
+           -- stored deltas 10000 and 0 -- held 10000 against 20000 truly live,
+           -- drift 0 rows WITH the filter and 1 row without it. A $0.00
+           -- authorization is a real message (account verification / AVS), so it
+           -- also has to survive this predicate: without the filter its convention
+           -- is recorded rather than left NULL, which is what stopped the alarm
+           -- firing forever on a legitimate zero-amount auth.
            bool_or(e.raw_is_total) FILTER (
-               WHERE e.amount_delta <> 0
-                 AND (e.kind IN ('authorization','incremental')
-                  OR (e.kind = 'advice' AND e.amount_delta > 0))) AS any_total,
+               WHERE e.kind IN ('authorization','incremental')
+                  OR (e.kind = 'advice' AND e.amount_delta > 0)) AS any_total,
            bool_or(NOT e.raw_is_total) FILTER (
-               WHERE e.amount_delta <> 0
-                 AND (e.kind IN ('authorization','incremental')
-                  OR (e.kind = 'advice' AND e.amount_delta > 0))) AS any_delta,
+               WHERE e.kind IN ('authorization','incremental')
+                  OR (e.kind = 'advice' AND e.amount_delta > 0)) AS any_delta,
            -- Decreases that moved NO MONEY. A clearing posts to the ledger, so a
            -- group whose total went negative from clearings is not under-reserving
            -- -- the cleared amount is a receivable in the journal, and exposure is
@@ -1082,7 +1123,7 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
    -- reversal that arrives before its authorization and a reversal that should
    -- never have been sent are the same three columns. Deciding it needs the
    -- processor's own reversal-to-authorization linkage, which this design
-   -- deliberately does not model -- 0010 argues that grouping is a revisable
+   -- deliberately does not model -- ADR-0008 argues that grouping is a revisable
    -- inference precisely because that linkage is unreliable. So the alarm reports
    -- the precursor state, `low_water_minor` keeps the durable evidence that the
    -- group was ever there, and the ambiguity is recorded in ADR-0008 rather than

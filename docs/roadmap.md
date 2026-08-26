@@ -134,7 +134,7 @@ Two axes, two mechanisms ([ADR-0006](./decisions/0006-time-and-as-of.md)): curre
 recorded-axis balances come from `balance_after`, business-date balances aggregate over
 `effective_at`, and every reporting function names its axis explicitly.
 
-**Blocked on [ADR-0006](./decisions/0006-time-and-as-of.md), still `proposed`.** `recorded_at`
+**Blocked on the as-of cursor in [ADR-0006](./decisions/0006-time-and-as-of.md) — the ADR is accepted; the cursor is not built.** `recorded_at`
 defaults to transaction *start* time and is not monotonic with commit order, so the same as-of
 query can return different answers when re-run; a reproducible cursor must be commit-ordered.
 Decide that before writing code against `recorded_at <= :as_of`. The effective-axis aggregate is

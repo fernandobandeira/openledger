@@ -2,7 +2,7 @@
 
 **Status:** closed
 
-**Question.** [ADR-0004](../../docs/decisions/0004-where-logic-lives.md) removed 25 of 27 triggers on
+**Question.** [ADR-0004](../../docs/decisions/0004-where-logic-lives.md) removed 19 of 27 triggers on
 the grounds that triggers are a maintainability problem. Is that true of real ledgers, or folklore?
 
 **Method.** Nine open-source ledgers — six SQL or ORM-backed, one document-store, and the plain-text family as a contrast, read from source at a pinned commit. Where
