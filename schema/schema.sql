@@ -471,10 +471,18 @@ CREATE TABLE card_auth_events (
     -- 0001 comment describes, in the number the authorization decision is made on.
     CONSTRAINT ck_auth_events__currency_iso CHECK (currency ~ '^[A-Z]{3}$'),
     -- sign is a property of the kind. 'advice' is exempt because it is bidirectional
-    -- on some processors. 'expiry_reversal' is NOT exempt -- it is pinned to ZERO,
+    -- on some processors. 'expiry_reversal' is NOT exempt -- it is pinned to ZERO, for
+    -- the reason given below the constraint.
     -- A $0.00 authorization is a real message -- account verification / AVS /
     -- card-on-file -- and so is a $0.00 capture. Both were refused outright, with
     -- an opaque constraint error.
+    -- A totals event MUST keep its wire amount. The only recovery from a message
+    -- mis-grouped into a totals group is to split it to a new, empty group and
+    -- recompute `delta = raw_amount - 0` (ADR-0010, Known #1). That recovery is
+    -- unavailable if raw_amount is null, and nothing else in the schema would
+    -- notice, so it is a constraint rather than a convention.
+    CONSTRAINT ck_auth_events__totals_keep_wire
+        CHECK (NOT raw_is_total OR raw_amount IS NOT NULL),
     CONSTRAINT ck_auth_events__sign CHECK (
         kind = 'advice' OR
         -- expiry_reversal carries ZERO. Expiry is a flag that never subtracted
@@ -1145,7 +1153,7 @@ GRANT SELECT, INSERT, UPDATE ON ledger_account_balances TO openledger_app;
 -- own remedy. Deciding between
 -- granting UPDATE (and leaning on the append-only trigger to keep it a lock rather
 -- than mutability) and finding a lock that does not need it is open work, recorded
--- in the decision log rather than papered over here.
+-- in ADR-0010's *What it costs*, beside the re-grouping lock order it makes unavailable.
 GRANT SELECT, INSERT ON card_auth_events, card_auth_event_group TO openledger_app;
 GRANT SELECT, INSERT, UPDATE ON card_auth_event_group TO openledger_app;
 GRANT SELECT, INSERT, UPDATE ON card_hold_groups TO openledger_app;
