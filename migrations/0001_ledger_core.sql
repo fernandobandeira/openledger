@@ -608,6 +608,31 @@ BEGIN
             USING ERRCODE = '23514';
     END IF;
 
+    -- ...AND A BALANCED SUBSET IS NOT A LEGAL DELETION EITHER. The two conditions
+    -- above are "every remaining currency balances" and "at least two legs remain",
+    -- and removing a matched PAIR satisfies both. Measured on a four-leg
+    -- transaction -- 500.00 of revenue in cash plus 30.00 of interest accrued --
+    -- deleting the interest pair left the interest expense line at zero with the
+    -- equation balanced, balance_sheet_balances true and both drift views empty,
+    -- while the sibling controls (one leg, all legs) still refused in the same
+    -- database. Balance is preserved by construction when you remove a balanced
+    -- subset, so balance cannot be the test.
+    --
+    -- The rule that does hold is the one the INSERT path already uses: a
+    -- transaction committed in an earlier database transaction is SEALED. Its leg
+    -- set is fixed, and correcting it means a reversing transaction. This is
+    -- deliberately independent of ck_entries__immutable, because the controls that
+    -- reach this branch model corruption arriving with that trigger lifted.
+    IF TG_OP = 'DELETE'
+       AND (SELECT xact_id FROM ledger_transactions
+             WHERE tenant_id = v_tenant AND id = v_txn)
+           IS DISTINCT FROM pg_current_xact_id()::text::bigint THEN
+        RAISE EXCEPTION
+            'transaction % is already committed; its entries are sealed. Correct it '
+            'with a reversing transaction, not by removing legs', v_txn
+            USING ERRCODE = '23514';
+    END IF;
+
     IF FOUND THEN
         -- COALESCE because a one-legged transaction reports the missing side as
         -- NULL, which reads as though the value were unknown rather than zero.

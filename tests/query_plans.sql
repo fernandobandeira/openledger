@@ -201,7 +201,15 @@ BEGIN
         ('ix_entries__asof_recorded',   'recorded_at'),
         ('ix_entries__txn',             'transaction_id'),
         ('uq_entries__account_seq',     'account_seq'),
-        ('ix_hold_groups__held',        'held_minor > 0')
+        ('ix_hold_groups__held',        'held_minor > 0'),
+        -- ...and 0003's own indexes, which the census did not reach. Dropping
+        -- ix_event_group__group turned recompute_hold_group from a per-group index
+        -- scan into a parallel seq scan over the tenant's whole history (measured
+        -- at 200k events: 402 shared hits against 4,679) with the suite green --
+        -- the same failure class this file exists for, on tables it did not police.
+        ('ix_event_group__group',       'group_key'),
+        ('uq_auth_events__msg',         'processor_msg_id'),
+        ('uq_event_group__current',     'event_id')
     ) AS q(idx, needle)
     LOOP
         SELECT indexdef INTO got FROM pg_indexes

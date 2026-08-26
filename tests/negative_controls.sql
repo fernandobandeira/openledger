@@ -2064,6 +2064,123 @@ BEGIN
                  'seal does not confuse them';
 END $$;
 
+-- ============ round 8: the hierarchy, the whitespace, and a balanced subset
+
+-- NO LEDGER TABLE MAY BE INHERITED. A child under ledger_entries carries the
+-- CHECK constraints and nothing else -- no triggers, no unique indexes, no
+-- foreign keys -- while every view reads the hierarchy. Measured through such a
+-- child as the app role, in one session: 500.00 of revenue presented as
+-- 666,500.00, all six reports agreeing, both drift alarms silent, and the seal
+-- still working on the parent at the same moment.
+SELECT must_fail('a child table under ledger_entries', $q$
+    CREATE TABLE ledger_entries_child () INHERITS (ledger_entries);
+$q$, 'may not be inherited');
+SELECT must_fail('...smuggled in with ALTER TABLE INHERIT', $q$
+    CREATE TABLE sneak_child (LIKE ledger_entries INCLUDING CONSTRAINTS);
+    ALTER TABLE sneak_child INHERIT ledger_entries;
+$q$, 'may not be inherited');
+SELECT must_fail('a child under the transactions table', $q$
+    CREATE TABLE ledger_txn_child () INHERITS (ledger_transactions);
+$q$, 'may not be inherited');
+-- ...and the cheap half, which would have turned the mutation red on its own:
+-- nothing in the shipped schema inherits from a ledger table.
+DO $$
+DECLARE v_bad text;
+BEGIN
+    SELECT string_agg(c.relname || ' under ' || p.relname, ', ') INTO v_bad
+      FROM pg_inherits i
+      JOIN pg_class c ON c.oid = i.inhrelid
+      JOIN pg_class p ON p.oid = i.inhparent
+      JOIN pg_namespace n ON n.oid = p.relnamespace
+     WHERE n.nspname='public'
+       AND p.relname IN ('ledger_entries','ledger_transactions','ledger_events',
+                         'ledger_accounts','card_auth_events','card_hold_groups')
+       AND c.relkind = 'r' AND NOT c.relispartition;
+    IF v_bad IS NOT NULL THEN
+        RAISE EXCEPTION 'ledger table(s) are inherited, so their guards are '
+                        'per-table and their views are per-hierarchy: %', v_bad;
+    END IF;
+    RAISE NOTICE 'ok  no ledger table is inherited';
+END $$;
+-- ...and ordinary DDL is unaffected, or the event trigger is a wall
+DO $$ BEGIN
+    CREATE TEMP TABLE probe_ordinary (x int);
+    RAISE NOTICE 'ok  ...while ordinary CREATE TABLE still works';
+END $$;
+
+-- A CAPTION IS COMPARED AS A READER SEES IT, and `btrim(x)` with one argument
+-- strips SPACES ONLY. Every one of these walked through the guard that claims to
+-- cover the class, needing no schema edit -- they are chart data.
+SELECT must_fail('the reserved caption with a trailing TAB', $q$
+    INSERT INTO fs_lines (code,caption,statement,side,sort_order)
+    VALUES ('ws_tab', E'Undistributed earnings (since inception)\t','balance_sheet','liability_equity',9101);
+$q$, 'ck_fs_lines__caption');
+SELECT must_fail('the reserved caption with a ZERO WIDTH SPACE', $q$
+    INSERT INTO fs_lines (code,caption,statement,side,sort_order)
+    VALUES ('ws_zwsp', E'Undistributed earnings (since inception)\u200b','balance_sheet','liability_equity',9102);
+$q$, 'ck_fs_lines__caption');
+SELECT must_fail('a duplicate caption with a NON-BREAKING SPACE', $q$
+    INSERT INTO fs_lines (code,caption,statement,side,sort_order)
+    VALUES ('ws_nbsp', E'Cash and cash equivalents\u00a0','balance_sheet','asset',9103);
+$q$, 'ck_fs_lines__caption');
+SELECT must_fail('a caption carrying a newline', $q$
+    INSERT INTO fs_lines (code,caption,statement,side,sort_order)
+    VALUES ('ws_nl', E'Borrowings\n','balance_sheet','liability_equity',9104);
+$q$, 'ck_fs_lines__caption');
+
+-- owner_type is half of WHO an account belongs to, and was the one member of the
+-- identity tuple with no control behind it: ck_accounts__house_has_no_owner
+-- constrains only the house/NULL pairing, so company -> platform was free.
+SELECT must_fail('reclassifying an account from a company to a platform', $q$
+    UPDATE ledger_accounts SET owner_type='platform'
+     WHERE tenant_id='t1' AND purpose='customer_receivable' AND owner_type='company';
+$q$, 'cannot be re-owned');
+
+-- The DELETE guard refuses one leg and refuses all legs. It did not refuse a
+-- BALANCED SUBSET: remove a matched pair and both its conditions still hold --
+-- every currency balances and two entries remain -- so an entire posting can be
+-- lifted out of a committed transaction with every report agreeing.
+-- ...and the transaction has to be one a PRIOR database transaction committed,
+-- which this whole file cannot produce naturally -- every statement here shares
+-- one xid. Plant an earlier one, exactly as the seal controls above do.
+SET CONSTRAINTS ALL IMMEDIATE;
+SET CONSTRAINTS ALL DEFERRED;
+ALTER TABLE ledger_entries      DISABLE TRIGGER ck_entries__immutable;
+ALTER TABLE ledger_transactions DISABLE TRIGGER ck_txn__immutable;
+DO $$
+DECLARE t uuid := '0a0a0a0a-0000-7000-8000-00000000abcd';
+BEGIN
+    -- post it normally FIRST -- the legs have to land while the transaction is
+    -- still this xact's -- and only then age it into a prior commit
+    INSERT INTO ledger_events (tenant_id,kind,source,idempotency_key,idempotency_hash,payload,effective_at)
+    VALUES ('t1','neg','internal','subset',sha256(convert_to('subset','UTF8')),'{}',now());
+    INSERT INTO ledger_transactions (tenant_id,id,event_id,kind,status,effective_at)
+    SELECT 't1',t,id,'neg','posted',now()
+      FROM ledger_events WHERE tenant_id='t1' AND idempotency_key='subset';
+    PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  500);
+    PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 500);
+    PERFORM entry('t1', t, acct('t1','fbo_cash'),            'debit',  30);
+    PERFORM entry('t1', t, acct('t1','fee_revenue'),         'credit', 30);
+    UPDATE ledger_transactions SET xact_id = pg_current_xact_id()::text::bigint - 1
+     WHERE tenant_id='t1' AND id = t;
+END $$;
+SET CONSTRAINTS ALL IMMEDIATE;
+SET CONSTRAINTS ALL DEFERRED;
+ALTER TABLE ledger_transactions ENABLE ALWAYS TRIGGER ck_txn__immutable;
+
+SELECT must_fail('deleting a balanced PAIR out of a committed four-leg transaction', $q$
+    DELETE FROM ledger_entries
+     WHERE transaction_id = '0a0a0a0a-0000-7000-8000-00000000abcd'
+       AND account_id IN (acct('t1','fbo_cash'), acct('t1','fee_revenue'));
+$q$, 'its entries are sealed');
+-- ...and the sibling guards are still the ones answering for their own cases
+SELECT must_fail('...and one leg of it', $q$
+    DELETE FROM ledger_entries
+     WHERE transaction_id = '0a0a0a0a-0000-7000-8000-00000000abcd'
+       AND account_id = acct('t1','fbo_cash');
+$q$, 'its entries are sealed');
+ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ck_entries__immutable;
+
 SELECT on_origin('the end of the file');
 
 DO $$ BEGIN RAISE NOTICE 'ok  every breakage above was refused, for the stated reason'; END $$;

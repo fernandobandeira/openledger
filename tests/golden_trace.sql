@@ -733,6 +733,66 @@ BEGIN
     RAISE NOTICE 'ok  every account type reports under the line the chart declares';
 END $$;
 
+-- ...and the chart's DECLARED ORDER, not merely that the view is sorted. The
+-- ordering controls check the rows come out non-decreasing in sort_order, which is
+-- a property of the view's ORDER BY -- so any permutation of the seed's numbers
+-- passes, and one put Cash ninth, between Retained earnings and the equity plug.
+-- A statement whose lines come out in an arbitrary order is not a statement.
+DO $$
+DECLARE r record; prev text := ''; bad text := '';
+BEGIN
+    FOR r IN SELECT code FROM fs_lines WHERE statement='balance_sheet' ORDER BY sort_order
+    LOOP
+        prev := prev || r.code || ' ';
+    END LOOP;
+    IF btrim(prev) <> 'cash restricted_cash receivables other_assets payables '
+                      'customer_funds borrowings equity retained_earnings' THEN
+        RAISE EXCEPTION 'the balance sheet''s declared order is now: %', btrim(prev);
+    END IF;
+    prev := '';
+    FOR r IN SELECT code FROM fs_lines WHERE statement='income_statement' ORDER BY sort_order
+    LOOP
+        prev := prev || r.code || ' ';
+    END LOOP;
+    IF btrim(prev) <> 'revenue cost_of_revenue credit_losses interest' THEN
+        RAISE EXCEPTION 'the income statement''s declared order is now: %', btrim(prev);
+    END IF;
+    RAISE NOTICE 'ok  the chart declares assets before liabilities, revenue before costs';
+END $$;
+
+-- THE DERIVED PLUG'S CAPTION IS EMITTED AS A VIEW LITERAL AND GUARDED BY A CHECK
+-- KEYED TO THE SAME STRING, and nothing read either -- so one edit could rename
+-- the view's literal and leave ck_fs_lines__caption_reserved protecting a string
+-- nothing emits. Renaming it back to "Current year earnings" passed the whole
+-- suite, and then a chart line could take the caption the view actually uses:
+-- 44,000.00 of customer suspense folded into the plug, which is verbatim the
+-- defect the CHECK exists for. Tie the two together here.
+DO $$
+DECLARE v_caption text;
+BEGIN
+    SELECT caption INTO v_caption FROM balance_sheet
+     WHERE fs_line = 'current_year_earnings' LIMIT 1;
+    IF v_caption IS NULL THEN
+        RAISE EXCEPTION 'the balance sheet no longer emits a current_year_earnings line';
+    END IF;
+    -- the CHECK must refuse exactly the string the view emits
+    BEGIN
+        INSERT INTO fs_lines (code,caption,statement,side,sort_order)
+        VALUES ('plug_probe', v_caption, 'balance_sheet','liability_equity',9500);
+        RAISE EXCEPTION 'a chart line took the caption the balance sheet emits (%) -- '
+                        'the reserved-caption CHECK and the view literal have drifted '
+                        'apart', v_caption;
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+    IF v_caption ~ '^Current year' THEN
+        RAISE EXCEPTION 'the plug is captioned %, which claims a period this ledger '
+                        'has no close for', v_caption;
+    END IF;
+    RAISE NOTICE 'ok  the reserved caption is the one the balance sheet actually emits (%)',
+        v_caption;
+END $$;
+
 -- ...and the two captions are distinguishable at all. Nothing anywhere read one.
 DO $$
 DECLARE v_dupes int;
