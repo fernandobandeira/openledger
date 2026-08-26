@@ -684,8 +684,19 @@ END $$;
 -- balance_sheet_balances ignoring its tenant argument passed the suite: every
 -- assertion read `balanced`, which is true of the whole book AND of each tenant.
 DO $$
-DECLARE v_t1 bigint; v_t2 bigint; v_all bigint;
+DECLARE v_t1 bigint; v_t2 bigint; v_all bigint; v_scopes int;
 BEGIN
+    -- ASSERT THE FILTER, not a consequence of it. A first version compared the
+    -- per-tenant assets against the whole book's, which survived the mutation:
+    -- with the WHERE deleted the function returns every tenant's row and
+    -- `SELECT ... INTO` silently takes the first, so the numbers still differed.
+    SELECT count(DISTINCT bsb.tenant_id) INTO v_scopes FROM balance_sheet_balances('t1') bsb;
+    IF v_scopes <> 1 THEN
+        RAISE EXCEPTION 'balance_sheet_balances(''t1'') reports on % tenants', v_scopes;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM balance_sheet_balances('t1') bsb WHERE bsb.tenant_id='t1') THEN
+        RAISE EXCEPTION 'balance_sheet_balances(''t1'') does not report on t1 at all';
+    END IF;
     SELECT assets INTO v_t1  FROM balance_sheet_balances('t1') WHERE currency='USD';
     SELECT assets INTO v_t2  FROM balance_sheet_balances('_treasury') WHERE currency='USD';
     SELECT SUM(assets) INTO v_all FROM balance_sheet_balances() WHERE currency='USD';
