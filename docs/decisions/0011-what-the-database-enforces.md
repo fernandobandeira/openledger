@@ -53,7 +53,17 @@ that was 50% wrong**.
 **What this does not fix**, and it matters: `now()` is transaction-*start* time, so `recorded_at`
 is still not monotonic with commit order. [0005](./0005-reproducible-as-of.md) is the outstanding
 work, and until it lands `balance_after` cannot answer a recorded-axis as-of question — the
-aggregate can. Both axes are now asserted in [`tests/bitemporal.sql`](../../tests/bitemporal.sql).
+aggregate can — **which was wrong, and is now corrected in the migration too.** `now()` is
+transaction-*start* time, so a writer that begins before a report and commits after it inserts rows
+that claim to predate the report. Demonstrated with nothing but the app role's INSERT grants: the
+same query, the same as-of, the same axis, run either side of one `COMMIT`, moved revenue from
+110,000.00 to 160,000.00 — balanced both times, zero drift. Assigning `now()` shrank the window
+from "any instant the caller invents" to "the duration of the writer's transaction", which the
+writer still chooses. **A timestamp cannot order commits.** Neither `balance_after` nor the
+aggregate answers a recorded-axis as-of question reproducibly until
+[0005](./0005-reproducible-as-of.md) lands, and `xact_id` is already stored for it. Both axes are
+asserted in [`tests/bitemporal.sql`](../../tests/bitemporal.sql) — as *separation*, which holds; not
+as reproducibility under concurrent writes, which does not.
 
 ### `account_seq` is assigned from the journal
 
@@ -191,6 +201,10 @@ a sheet missing, reporting balanced.
 
 Recorded here because the alternative is implying it can.
 
+- **`REVOKE CREATE ON SCHEMA public FROM PUBLIC` is a no-op here.** Since PostgreSQL 15, PUBLIC has
+  no `CREATE` on `public` to revoke — verified on a database that never ran these migrations. The
+  line is load-bearing only on PG ≤ 14, and this project's floor is 18. Kept as documentation of
+  intent, recorded here so nobody counts it as a defence.
 - **`GRANT ALL` re-grants everything.** A `REVOKE` is a point-in-time change to a privilege, not a
   standing prohibition, so the narrow `GRANT` is a matter of discipline. This entry used to end
   "including `TRUNCATE`", and to say that nothing in SQL could stop that — see the new section

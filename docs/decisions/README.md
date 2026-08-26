@@ -55,10 +55,18 @@ No decision may trade these away. They are what makes the numbers trustworthy:
 
 Undecided, listed plainly rather than buried:
 
-- **[0005](./0005-reproducible-as-of.md) is `proposed`**, not accepted. The as-of cursor blocks
+- **[0005](./0005-reproducible-as-of.md) is `proposed`**, not accepted — and the hole it names is
+  live and reproduced: the same recorded-axis report, re-run either side of one concurrent commit,
+  moved revenue by 45% with every check green. `recorded_at` is transaction-*start* time, and a
+  timestamp cannot order commits. The as-of cursor blocks
   **M5**, not M4 — M4 is the RDS benchmark and is unblocked. Both time axes are now asserted
   ([`tests/bitemporal.sql`](../../tests/bitemporal.sql)); what 0005 still owes is *reproducibility
   under concurrent writes*, which needs a commit-ordered cursor.
+- **Inter-scope obligations reconcile against nothing.** A tenant booking 100,000.00 of
+  `due_from_treasury` against an operator booking 60,000.00 of `due_to_tenants` leaves every scope
+  balanced, both drift views empty, and 40,000.00 of asset owed by nobody. Each sub-book is
+  internally consistent; nothing compares the two sides. This is the same limit as the entry below,
+  stated in the units it costs.
 - **`counterparty_scope` and `is_perimeter` are declarative.** Both are documented at length, both
   carry CHECK constraints, and no view or function reads either. The offsetting rule ADR-0009 §5
   states as a mechanism is not implemented. A consequence worth stating: because nothing reads

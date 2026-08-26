@@ -357,10 +357,16 @@ DECLARE v_fn bigint; v_raw bigint;
 BEGIN
     v_fn := held_for_company('t1','acme','USD');
     -- Sum of held_minor over ALL groups, including those the function's
-    -- `held_minor > 0` predicate skips. Comparing against SUM(total_minor) did not
-    -- kill the mutation it names -- swapping held_minor for total_minor leaves that
-    -- predicate in place, which already excludes the over-captured group, so both
-    -- sums came out identical. This comparison has no such escape.
+    -- `held_minor > 0` predicate skips.
+    --
+    -- BE HONEST ABOUT WHAT THIS CATCHES. An earlier version of this comment said
+    -- the comparison "has no such escape" from the held_minor -> total_minor
+    -- mutation. It has exactly that escape, and for the reason stated one line
+    -- above: under `held_minor > 0` the two columns are the SAME NUMBER --
+    -- held_minor is GREATEST(total_minor,0) on a live group -- so no assertion
+    -- comparing their sums can tell them apart. That mutation is EQUIVALENT, not
+    -- uncaught. What this assertion does have teeth on is the second half: that
+    -- the function is not quietly reducing what the column reports.
     SELECT COALESCE(SUM(held_minor),0) INTO v_raw FROM card_hold_groups
      WHERE tenant_id='t1' AND company_id='acme' AND currency='USD';
     IF v_fn IS DISTINCT FROM v_raw THEN
@@ -1235,6 +1241,86 @@ SELECT eq('re-grouping a clearing in records the low-water mark it creates',
           (SELECT low_water_minor FROM card_hold_groups
             WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_r5w'), -3000);
 SELECT no_drift('re-grouping into an over-capture');
+
+-- ================= round 5: the alarm branches that were assertions of absence
+--
+-- card_hold_drift's convention branch and card_auth_unmatched's superseded filter
+-- were each covered only by `no_drift(...)` or a count that happened to be right.
+-- Both could be deleted with the whole suite green, and both are the layer that
+-- exists to catch what the ingest guards structurally cannot.
+
+-- THE IRRECONCILABLE STATE, as a POSITIVE control. A group holding one
+-- raw_is_total=false and one raw_is_total=true increase is what 0003's header
+-- calls irreconcilable. Ingest refuses to create it and every recompute re-derives
+-- the convention, so it is not reachable through the API -- which is exactly why
+-- the alarm for it went untested and could be deleted. Build it underneath the
+-- guards, the way a bad backfill or a second adapter would.
+SELECT record_auth_event('t1','mx_a','g_mixed','acme','card_mx','authorization',5000,'USD',false,now());
+SELECT must_fail('a group holding both conventions at once', $q$
+    INSERT INTO card_auth_events (tenant_id,processor_msg_id,company_id,card_id,kind,
+                                  amount_delta,raw_amount,raw_is_total,currency,occurred_at)
+    VALUES ('t1','mx_b','acme','card_mx','incremental',3000,3000,true,'USD',now());
+    INSERT INTO card_auth_event_group (tenant_id,event_id,group_key,method,assigned_by)
+    SELECT 't1', id, 'g_mixed', 'manual', 'backfill'
+      FROM card_auth_events WHERE tenant_id='t1' AND processor_msg_id='mx_b';
+    -- RECOMPUTE FIRST, or this control catches on the wrong branch. Attaching a
+    -- membership by hand leaves the stored total disagreeing with the log, so the
+    -- stored-vs-log branch fires and the convention branch could be deleted with
+    -- this test still green -- which is exactly what happened the first time.
+    SELECT recompute_hold_group('t1','acme','g_mixed');
+    DO $d$ BEGIN
+        IF EXISTS (SELECT 1 FROM card_hold_drift WHERE group_key='g_mixed') THEN
+            RAISE EXCEPTION 'MIXED CONVENTION DETECTED';
+        END IF;
+    END $d$;
+$q$, 'mixed convention detected');
+
+-- THE REVIEW QUEUE MUST KEEP WHAT THE OPERATOR PUTS BACK INTO IT. Superseding a
+-- membership is the workflow 0003 itself prescribes for a cumulative-total event
+-- ("supersede it and re-ingest the wire amount against the correct group"). Drop
+-- `superseded_at IS NULL` from card_auth_unmatched and the event silently leaves
+-- the queue that exists so nothing is ever a silent guess.
+SELECT record_auth_event('t1','sq_a','g_squeue','acme','card_sq','authorization',2500,'USD',false,now());
+SELECT eq('an event with a live membership is not in the review queue',
+          (SELECT count(*) FROM card_auth_unmatched
+            WHERE tenant_id='t1' AND processor_msg_id='sq_a'), 0);
+UPDATE card_auth_event_group SET superseded_at = now()
+ WHERE tenant_id='t1' AND group_key='g_squeue' AND superseded_at IS NULL;
+SELECT eq('...and superseding its only membership puts it BACK in the queue',
+          (SELECT count(*) FROM card_auth_unmatched
+            WHERE tenant_id='t1' AND processor_msg_id='sq_a'), 1);
+
+-- ix_hold_groups__held is a PARTIAL index, and the plan assertion pins its NAME.
+-- Dropping its predicate leaves the name intact and the index covering every group
+-- the company ever had, expired ones included -- the read the whole materialised
+-- total exists to make fast.
+DO $$
+DECLARE v_pred text;
+BEGIN
+    SELECT pg_get_expr(i.indpred, i.indrelid) INTO v_pred
+      FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+     WHERE c.relname = 'ix_hold_groups__held';
+    IF v_pred IS NULL OR position('held_minor' in v_pred) = 0 THEN
+        RAISE EXCEPTION 'ix_hold_groups__held is no longer partial on held_minor (%)', v_pred;
+    END IF;
+    RAISE NOTICE 'ok  the hold index is still partial: %', v_pred;
+END $$;
+
+-- raw_is_total defaults to false, and an INSERT that omits it must not silently
+-- become a cumulative total -- that flips the meaning of every amount it carries.
+DO $$
+DECLARE v_is_total boolean;
+BEGIN
+    INSERT INTO card_auth_events (tenant_id,processor_msg_id,company_id,card_id,kind,
+                                  amount_delta,currency,occurred_at)
+    VALUES ('t1','dflt','acme','card_d','authorization',100,'USD',now());
+    SELECT raw_is_total INTO v_is_total FROM card_auth_events
+     WHERE tenant_id='t1' AND processor_msg_id='dflt';
+    IF v_is_total THEN
+        RAISE EXCEPTION 'an event that did not say so was stored as a cumulative total';
+    END IF;
+    RAISE NOTICE 'ok  an amount is a DELTA unless the message says otherwise';
+END $$;
 
 ROLLBACK;
 

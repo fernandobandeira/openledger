@@ -42,6 +42,16 @@ CREATE TABLE fs_lines (
     -- one an account subtotal, one a derived plug.
     CONSTRAINT ck_fs_lines__code_reserved
         CHECK (code <> 'current_year_earnings'),
+    -- ...AND THE CAPTION, which is the half that actually does the harm the
+    -- comment above describes. balance_sheet emits `'current_year_earnings',
+    -- 'Current year earnings'` as LITERALS, so the synthesised row sits outside
+    -- uq_fs_lines__caption entirely: a chart line under a different code could
+    -- take that caption and be accepted. Measured -- 44,000.00 of customer
+    -- suspense liability booked to such a line, and a reader grouping by caption
+    -- saw 268,000.00 of current year earnings against a true 224,000.00, with
+    -- `balanced = t` and both drift views empty.
+    CONSTRAINT ck_fs_lines__caption_reserved
+        CHECK (caption <> 'Current year earnings'),
     CONSTRAINT ck_fs_lines__side_matches_statement CHECK (
         (statement = 'balance_sheet'    AND side IN ('asset','liability_equity')) OR
         (statement = 'income_statement' AND side IN ('credit','debit'))),
@@ -177,8 +187,16 @@ CREATE FUNCTION assert_fs_line_stable() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE n bigint;
 BEGIN
+    -- CAPTION IS IN HERE TOO, and for the same reason the rest of it is: the
+    -- caption is what a reader sees, so renaming a line under which history is
+    -- already reported silently restates issued statements. uq_fs_lines__caption
+    -- stops two lines SHARING a caption; it does not stop them SWAPPING, and a
+    -- three-step rename did exactly that -- 668,000.00 of cash presented as
+    -- receivables, balanced, zero drift. A typo fix on a line nothing reports
+    -- under is still free.
     IF NEW.statement IS DISTINCT FROM OLD.statement
-       OR NEW.side IS DISTINCT FROM OLD.side THEN
+       OR NEW.side IS DISTINCT FROM OLD.side
+       OR NEW.caption IS DISTINCT FROM OLD.caption THEN
         -- account_TYPES, not accounts. The pairing this guards is
         -- (account_types.category <-> fs_lines.statement/side); counting accounts
         -- let a line with types pointing at it but no accounts YET move freely,
@@ -188,8 +206,9 @@ BEGIN
         SELECT count(*) INTO n FROM account_types t WHERE t.fs_line = OLD.code;
         IF n > 0 THEN
             RAISE EXCEPTION
-              'cannot move statement line % (% / %) to (% / %): % account type(s) report under it',
-              OLD.code, OLD.statement, OLD.side, NEW.statement, NEW.side, n
+              'cannot move statement line % (% / % / %) to (% / % / %): % account type(s) report under it',
+              OLD.code, OLD.statement, OLD.side, OLD.caption,
+              NEW.statement, NEW.side, NEW.caption, n
               USING ERRCODE = '23514';
         END IF;
     END IF;
@@ -472,6 +491,18 @@ BEGIN
     IF p_tenant IS NOT NULL
        AND NOT EXISTS (SELECT 1 FROM ledger_accounts a WHERE a.tenant_id = p_tenant) THEN
         RAISE EXCEPTION 'unknown tenant %; it holds no accounts', p_tenant;
+    END IF;
+
+    -- ...and the empty-ledger guard, which accounting_equation has and this -- the
+    -- function 0002 calls "the claim made true" -- did not. On a freshly migrated
+    -- and seeded database it returned ZERO ROWS, so `bool_and(balanced)` over them
+    -- is NULL: a report that printed nothing at all read as a report that found
+    -- nothing wrong. Exactly the failure the sibling's guard names.
+    IF NOT EXISTS (SELECT 1 FROM ledger_accounts) THEN
+        RAISE EXCEPTION
+            'no accounts exist, so there is nothing to balance; an empty report is '
+            'not a balanced one'
+            USING ERRCODE = 'data_exception';
     END IF;
     RETURN QUERY
     SELECT b.tenant_id, b.currency,

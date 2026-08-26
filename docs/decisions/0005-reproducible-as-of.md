@@ -5,6 +5,20 @@
 
 ## Context
 
+**This is no longer hypothetical.** Assigning `recorded_at` from `now()` closed three of the four
+consequences it was written for; the fourth is still live and was reproduced in round 5, needing
+nothing but the app role's ordinary INSERT grants. A writer that BEGINs before a report and COMMITs
+after it inserts rows whose `recorded_at` — transaction-start time — predates the report that could
+not see them. Same query, same as-of, same axis, either side of one commit: revenue 110,000.00 then
+160,000.00, `balanced` both times, both drift views empty.
+
+`xact_id` is already on every transaction, so the cursor this ADR proposes has its input. What is
+missing is the query layer: `accounting_equation` takes one instant and one axis, so a genuinely
+bitemporal question — *the effective-axis February close as it was known on 1 March* — cannot even
+be expressed, and `balance_sheet`, `income_statement` and `balance_sheet_balances` carry no date
+predicate at all. **Storage is bitemporal; the query layer is not.**
+
+
 A report must be **reproducible**: re-running "as of June 30" next year must return the same
 number it returned last year. That is the entire point of recording two time axes
 ([0003](./0003-bitemporal-balances.md)).

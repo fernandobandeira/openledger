@@ -976,7 +976,7 @@ SELECT must_fail('replica: mutating a committed transaction', $q$
         PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 15);
         UPDATE ledger_transactions SET kind='changed' WHERE id = t;
     END $d$;
-$q$, 'is immutable');
+$q$, 'is immutable; only metadata and external_ref may change');
 RESET ROLE;
 
 -- ---------------------------------------------------------------- undefended guards
@@ -1117,15 +1117,16 @@ END $$;
 -- recorded_at the engine had just assigned.
 SELECT must_fail('rewriting an event''s idempotency hash', $q$
     UPDATE ledger_events SET idempotency_hash = sha256(convert_to('other','UTF8'));
-$q$, 'is immutable');
+$q$, 'ledger_events is an event log and is immutable');
 SELECT must_fail('rewriting an event''s recorded_at', $q$
     UPDATE ledger_events SET recorded_at = '2001-01-01';
-$q$, 'is immutable');
-SELECT must_fail('deleting an event', $q$ DELETE FROM ledger_events; $q$, 'is immutable');
+$q$, 'ledger_events is an event log and is immutable');
+SELECT must_fail('deleting an event', $q$ DELETE FROM ledger_events; $q$,
+                 'ledger_events is an event log and is immutable');
 SELECT must_fail('replica: rewriting an event', $q$
     SET LOCAL session_replication_role = 'replica';
     UPDATE ledger_events SET payload = '{"x":1}';
-$q$, 'is immutable');
+$q$, 'ledger_events is an event log and is immutable');
 RESET ROLE;
 
 -- An account's OWNER was mutable while its purpose and currency were frozen.
@@ -1457,6 +1458,294 @@ DO $$ BEGIN
         RAISE EXCEPTION 'the fixture was not restored -- drift remains on fbo_cash';
     END IF;
     RAISE NOTICE 'ok  ...and the books are whole again once it is put back';
+END $$;
+
+-- ======================= round 5: guards that were their own sole defence
+--
+-- Each of these could be deleted with the whole suite green, and each is the only
+-- thing standing between a report and a comfortable lie.
+
+-- An unknown SCOPE must raise rather than return an empty balanced report, and
+-- both report functions must do it -- only one of them did. The other half of
+-- this claim, a database with no accounts AT ALL, cannot be checked from inside a
+-- file that creates accounts in order to have something to break; tests/run.sh
+-- asserts it against the freshly migrated database, before any suite runs.
+SELECT must_fail('a report for a tenant that holds no accounts', $q$
+    DO $d$ BEGIN PERFORM * FROM accounting_equation('no_such_tenant'); END $d$;
+$q$, 'unknown tenant');
+SELECT must_fail('a balance sheet for a tenant that holds no accounts', $q$
+    DO $d$ BEGIN PERFORM * FROM balance_sheet_balances('no_such_tenant'); END $d$;
+$q$, 'unknown tenant');
+
+-- The derived `current_year_earnings` plug is emitted by balance_sheet as literal
+-- code AND literal caption, so it sits outside uq_fs_lines__caption. Reserving the
+-- code without the caption left the half that does the harm open: a chart line
+-- under any other code could take that caption and be accepted, and a reader
+-- grouping by caption then sees a real liability folded into a derived plug.
+SELECT must_fail('a chart line wearing the derived plug''s caption', $q$
+    INSERT INTO fs_lines (code,caption,statement,side,sort_order)
+    VALUES ('suspense_plug','Current year earnings','balance_sheet','liability_equity',9000);
+$q$, 'ck_fs_lines__caption_reserved');
+
+-- uq_fs_lines__caption itself had no control either -- its own comment says
+-- "nothing in the suite reads a caption, so this is the constraint rather than a
+-- test", and the constraint had no test, so it could be dropped with the build
+-- green.
+SELECT must_fail('two statement lines sharing one caption', $q$
+    INSERT INTO fs_lines (code,caption,statement,side,sort_order)
+    VALUES ('second_cash','Cash and cash equivalents','balance_sheet','asset',9100);
+$q$, 'uq_fs_lines__caption');
+
+-- ...and a caption may not be RENAMED under history that already reports beneath
+-- it. UNIQUE stops two lines sharing a caption; it does not stop them SWAPPING,
+-- and a three-step rename presented 668,000.00 of cash as receivables with every
+-- check green.
+SELECT must_fail('renaming a line that has account types under it', $q$
+    UPDATE fs_lines SET caption='Something else entirely' WHERE code='receivables';
+$q$, 'cannot move statement line');
+-- ...while a line nothing reports under is still free to be corrected
+DO $$ BEGIN
+    INSERT INTO fs_lines (code,caption,statement,side,sort_order)
+    VALUES ('probe_free','Typo captoin','balance_sheet','asset',9200);
+    UPDATE fs_lines SET caption='Typo caption' WHERE code='probe_free';
+    RAISE NOTICE 'ok  a caption on a line with no types under it is still correctable';
+END $$;
+
+-- The app role must be able to READ the alarms. ledger_transaction_drift is called
+-- "the standing cross-check that would have SEEN it" in the migration that defines
+-- it, and the operating role got `permission denied for view` on it, on
+-- card_hold_drift, and on the unmatched queue. A check the role cannot execute is
+-- a check that cannot fire.
+DO $$
+DECLARE r record; bad text := '';
+BEGIN
+    FOR r IN SELECT v FROM unnest(ARRAY['ledger_balance_drift','ledger_transaction_drift',
+                                        'card_hold_drift','card_auth_unmatched']) v
+    LOOP
+        IF NOT has_table_privilege('openledger_app', r.v, 'SELECT') THEN
+            bad := bad || r.v || ' ';
+        END IF;
+    END LOOP;
+    IF bad <> '' THEN
+        RAISE EXCEPTION 'the app role cannot read the alarms it must act on: %', bad;
+    END IF;
+    RAISE NOTICE 'ok  the app role can read every drift alarm and the unmatched queue';
+END $$;
+
+-- ledger_transaction_drift's `< 2` boundary. A one-entry transaction is reachable
+-- and the view must flag it; at `< 1` it goes silent.
+DO $$
+DECLARE t uuid; v_n int;
+BEGIN
+    SET CONSTRAINTS ALL IMMEDIATE; SET CONSTRAINTS ALL DEFERRED;
+    ALTER TABLE ledger_transactions DISABLE TRIGGER ck_txn__has_entries;
+    ALTER TABLE ledger_entries      DISABLE TRIGGER ck_entries__balances;
+    INSERT INTO ledger_transactions (tenant_id,kind,status,effective_at)
+    VALUES ('t1','neg','posted',now()) RETURNING id INTO t;
+    PERFORM entry('t1', t, acct('t1','fee_revenue'), 'credit', 5);
+    SET CONSTRAINTS ALL IMMEDIATE; SET CONSTRAINTS ALL DEFERRED;
+    SELECT entries INTO v_n FROM ledger_transaction_drift WHERE id = t;
+    IF v_n IS DISTINCT FROM 1 THEN
+        RAISE EXCEPTION 'a one-entry transaction is invisible to the cross-check '
+                        '(got %) -- the boundary is off by one', v_n;
+    END IF;
+    RAISE NOTICE 'ok  a ONE-entry transaction is flagged, not just a zero-entry one';
+    ALTER TABLE ledger_transactions ENABLE ALWAYS TRIGGER ck_txn__has_entries;
+    ALTER TABLE ledger_entries      ENABLE ALWAYS TRIGGER ck_entries__balances;
+END $$;
+
+-- ================ round 5: immutability attested for ONE column out of ten
+--
+-- `assert_transaction_immutable` compares a ROW of ten columns. Exactly one
+-- control reached it, and it UPDATEs `kind` -- so every other column in that
+-- tuple was unattested, and two of them could be dropped from the comparison with
+-- the whole suite green:
+--
+--   * `status`, the column 0001 marks `-- NEVER MUTATES` and on which
+--     assert_correction_target's "decidable at INSERT time" argument rests. One
+--     UPDATE un-recognised 500.00 of revenue: no journal row changed, both drift
+--     views empty, the equation balanced.
+--   * `xact_id`, which IS the seal. Dropping it re-opened a committed,
+--     already-reported transaction and appended two more legs to it -- verbatim
+--     the defect 0001's comment says was closed.
+--
+-- So walk the whole tuple. A guard tested through one column is a guard tested
+-- through one column.
+DO $$
+DECLARE t uuid; c text; v text; msg text; missed text := '';
+BEGIN
+    SET CONSTRAINTS ALL IMMEDIATE; SET CONSTRAINTS ALL DEFERRED;
+    t := txn('t1','immut_all');
+    PERFORM entry('t1', t, acct('t1','customer_receivable'), 'debit',  500);
+    PERFORM entry('t1', t, acct('t1','interchange_revenue'), 'credit', 500);
+    SET CONSTRAINTS ALL IMMEDIATE; SET CONSTRAINTS ALL DEFERRED;
+
+    FOR c, v IN SELECT * FROM (VALUES
+        ('tenant_id',    't2'),
+        ('id',           '00000000-0000-7000-8000-0000000000aa'),
+        ('event_id',     NULL),
+        ('kind',         'changed'),
+        ('status',       'pending'),
+        ('effective_at', '2020-01-01'),
+        ('recorded_at',  '1999-01-01'),
+        -- non-NULL: these are NULL on the fixture, and IS DISTINCT FROM
+        -- correctly ignores a no-op UPDATE, which would make the probe vacuous
+        ('resolves_id',  '00000000-0000-7000-8000-0000000000bb'),
+        ('reverses_id',  '00000000-0000-7000-8000-0000000000cc'),
+        ('xact_id',      '1')
+    ) AS q(col, val)
+    LOOP
+        BEGIN
+            EXECUTE format('UPDATE ledger_transactions SET %I = %L WHERE id = %L', c, v, t);
+            missed := missed || c || ' ';
+        EXCEPTION WHEN OTHERS THEN
+            GET STACKED DIAGNOSTICS msg = MESSAGE_TEXT;
+            IF position('is immutable; only metadata and external_ref may change'
+                       in msg) = 0 THEN
+                missed := missed || c || '(wrong reason: ' || left(msg,40) || ') ';
+            END IF;
+        END;
+    END LOOP;
+
+    IF missed <> '' THEN
+        RAISE EXCEPTION 'a committed transaction accepted an UPDATE to: %', missed;
+    END IF;
+    RAISE NOTICE 'ok  a committed transaction refuses an UPDATE to every identity column';
+END $$;
+
+-- ...and the two that are DELIBERATELY mutable still are, or the guard above is
+-- just a wall and the exception in 0001's message is a lie.
+DO $$
+DECLARE t uuid;
+BEGIN
+    SELECT id INTO t FROM ledger_transactions WHERE tenant_id='t1' AND kind='neg' LIMIT 1;
+    UPDATE ledger_transactions SET metadata = '{"note":"annotation"}'::jsonb,
+                                  external_ref = '{"ref":"ref-1"}'::jsonb
+     WHERE id = t;
+    RAISE NOTICE 'ok  ...while metadata and external_ref stay writable, as its message says';
+END $$;
+
+-- A transaction may not resolve ITSELF. Doing so permanently consumes its own
+-- uq_txn__one_resolution slot, so the genuine resolution can never be recorded.
+-- Self-REVERSAL was controlled; self-resolution was not.
+SELECT must_fail('a transaction that resolves itself', $q$
+    DO $d$ DECLARE t uuid; BEGIN
+        INSERT INTO ledger_transactions (tenant_id,kind,status,effective_at)
+        VALUES ('t1','neg','pending',now()) RETURNING id INTO t;
+        UPDATE ledger_transactions SET resolves_id = t WHERE id = t;
+    END $d$;
+$q$, 'is immutable; only metadata and external_ref may change');
+SELECT must_fail('a transaction inserted resolving itself', $q$
+    DO $d$ DECLARE t uuid := gen_random_uuid(); BEGIN
+        INSERT INTO ledger_transactions (tenant_id,id,kind,status,effective_at,resolves_id)
+        VALUES ('t1',t,'neg','posted',now(),t);
+    END $d$;
+$q$, 'ck_txn__no_self_reference');
+
+-- ------------------------------------------- the chart guard's OTHER half
+-- assert_account_matches_type checks category AND normal_balance. Both existing
+-- controls supply a row where BOTH differ, so the surviving half always answers
+-- and either disjunct could be deleted. Vary exactly one.
+SELECT must_fail('an account whose CATEGORY alone contradicts its type', $q$
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    VALUES ('t1','house',NULL,'interchange_revenue','liability','credit','USD');
+$q$, 'but type');
+SELECT must_fail('an account whose NORMAL BALANCE alone contradicts its type', $q$
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    VALUES ('t1','house',NULL,'fee_revenue','revenue','debit','USD');
+$q$, 'but type');
+
+-- ck_accounts__house_has_no_owner was controlled in one direction only. The other
+-- direction is 0001's own phrase for why identity is frozen: a receivable owed by
+-- nobody is not a receivable.
+SELECT must_fail('an OWNED account with no owner', $q$
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    VALUES ('t1','company',NULL,'customer_receivable','asset','debit','USD');
+$q$, 'ck_accounts__house_has_no_owner');
+
+-- ------------------------------------------- the app role's LEGITIMATE path
+-- Every privilege control asserts what the role must NOT do. None exercised what
+-- it must: dropping `GRANT SELECT ON account_types` left openledger_app unable to
+-- open an account at all -- `permission denied for table account_types`, raised
+-- from inside assert_account_matches_type -- and the suite passed. 0002 shipped
+-- that grant because the omission was found the expensive way.
+DO $$
+DECLARE t uuid; a uuid; e uuid;
+BEGIN
+    SET CONSTRAINTS ALL IMMEDIATE; SET CONSTRAINTS ALL DEFERRED;
+    SET LOCAL ROLE openledger_app;
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    VALUES ('t5','company','appco','customer_receivable','asset','debit','USD') RETURNING id INTO a;
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    VALUES ('t5','house',NULL,'interchange_revenue','revenue','credit','USD');
+    INSERT INTO ledger_events (tenant_id,kind,source,idempotency_key,idempotency_hash,payload,effective_at)
+    VALUES ('t5','app','internal','appkey',sha256(convert_to('appkey','UTF8')),'{}',now())
+    RETURNING id INTO e;
+    INSERT INTO ledger_transactions (tenant_id,event_id,kind,status,effective_at)
+    VALUES ('t5',e,'app','posted',now()) RETURNING id INTO t;
+    INSERT INTO ledger_account_balances (tenant_id,account_id,currency,input,output)
+    VALUES ('t5', a, 'USD', 900, 0);
+    INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,amount_minor,
+                                currency,balance_after,effective_at)
+    VALUES ('t5',t,a,'debit',900,'USD',900,now()),
+           ('t5',t,(SELECT id FROM ledger_accounts WHERE tenant_id='t5' AND purpose='interchange_revenue'),
+            'credit',900,'USD',-900,now());
+    SET CONSTRAINTS ALL IMMEDIATE; SET CONSTRAINTS ALL DEFERRED;
+    PERFORM 1 FROM trial_balance WHERE tenant_id='t5';
+    PERFORM 1 FROM ledger_balance_drift;
+    RESET ROLE;
+    RAISE NOTICE 'ok  the app role can open accounts, post a transaction and read its reports';
+END $$;
+RESET ROLE;
+
+-- ------------------------------------------- what the reports PRESENT
+-- balance_sheet filters its lines to `statement = 'balance_sheet'`. Without that
+-- it presents revenue on the balance sheet -- and balance_sheet_balances still
+-- says balanced = t, because it counts only side IN ('asset','liability_equity')
+-- and an income-statement line carries neither. That is the identical mechanism
+-- 0002 documents in the other direction ("counted on NEITHER side and vanished").
+DO $$
+DECLARE v_bad text;
+BEGIN
+    SELECT string_agg(DISTINCT bs.fs_line, ', ') INTO v_bad
+      FROM balance_sheet bs
+      JOIN fs_lines f ON f.code = bs.fs_line
+     WHERE f.statement <> 'balance_sheet';
+    IF v_bad IS NOT NULL THEN
+        RAISE EXCEPTION 'the balance sheet is presenting income-statement lines: %', v_bad;
+    END IF;
+    RAISE NOTICE 'ok  the balance sheet presents balance-sheet lines only';
+END $$;
+DO $$
+DECLARE v_bad text;
+BEGIN
+    SELECT string_agg(DISTINCT i.fs_line, ', ') INTO v_bad
+      FROM income_statement i
+      JOIN fs_lines f ON f.code = i.fs_line
+     WHERE f.statement <> 'income_statement';
+    IF v_bad IS NOT NULL THEN
+        RAISE EXCEPTION 'the income statement is presenting balance-sheet lines: %', v_bad;
+    END IF;
+    RAISE NOTICE 'ok  the income statement presents income-statement lines only';
+END $$;
+
+-- ...and both are presented in the order the chart declares. `sort_order` is
+-- written by the seed and was read by nothing, so every value in it could be
+-- changed with the suite green -- a statement whose lines come out in an
+-- arbitrary order is not a statement.
+DO $$
+DECLARE v_prev int := -1; r record;
+BEGIN
+    FOR r IN SELECT bs.fs_line, f.sort_order FROM balance_sheet bs
+             JOIN fs_lines f ON f.code = bs.fs_line
+             WHERE bs.tenant_id='t1' AND bs.currency='USD' AND bs.fs_line <> 'current_year_earnings'
+    LOOP
+        IF r.sort_order < v_prev THEN
+            RAISE EXCEPTION 'balance-sheet line % breaks the chart''s declared order', r.fs_line;
+        END IF;
+        v_prev := r.sort_order;
+    END LOOP;
+    RAISE NOTICE 'ok  the balance sheet comes out in the chart''s declared order';
 END $$;
 
 SELECT on_origin('the end of the file');

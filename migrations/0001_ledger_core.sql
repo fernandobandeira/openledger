@@ -265,10 +265,31 @@ CREATE TABLE ledger_account_balances (
 --     GREEN recorded-axis report that was 50% wrong
 --
 -- now() is transaction-start time, so all legs of a transaction now share one
--- value by construction, and no caller can choose it. What this does NOT fix is
--- monotonicity with COMMIT order -- see ADR-0005, still proposed. Until that
--- lands, balance_after cannot answer a recorded-axis as-of question either; the
--- aggregate can.
+-- value by construction, and no caller can choose it.
+--
+-- WHAT THIS DOES NOT FIX is monotonicity with COMMIT order, and the previous
+-- version of this comment got that badly wrong. It said "balance_after cannot
+-- answer a recorded-axis as-of question either; THE AGGREGATE CAN." The aggregate
+-- cannot. Demonstrated, needing nothing but the app role's INSERT grants:
+--
+--   Session A: BEGIN; insert a posted transaction and its legs   (txn start T0)
+--   Session B: T1 := now();  accounting_equation('acme', T1, 'recorded')
+--                -> revenue 110,000.00, balanced
+--   Session A: COMMIT                                            (commit at T2 > T1)
+--   Session B: the SAME query, the SAME as-of, the SAME axis
+--                -> revenue 160,000.00, balanced.  +45%, zero drift.
+--
+-- Because recorded_at is T0 and T0 < T1, rows that were invisible when the report
+-- was issued satisfy `recorded_at <= T1` afterwards. Assigning now() shrank the
+-- window from "any instant the caller invents" to "the duration of the writer's
+-- transaction" -- which the writer still chooses. That is a smaller hole, not a
+-- closed one, and it is consequence #1 of the list above, still live.
+--
+-- A timestamp cannot order commits. ADR-0005 (proposed) is the fix: a
+-- commit-ordered cursor, for which `xact_id` is already stored on every
+-- transaction. Until it lands, NEITHER balance_after NOR the aggregate answers a
+-- recorded-axis as-of question reproducibly, and no report in this schema should
+-- be described as though one does.
 CREATE FUNCTION assign_recorded_at() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -603,6 +624,7 @@ BEGIN
     END LOOP;
 END $$;
 
+
 CALL enforce_triggers_on_replicas();
 
 -- A transaction with NO entries is vacuously balanced, so the row trigger above
@@ -796,5 +818,11 @@ WHERE fb.account_seq IS NOT NULL
    -- per-account denial of service (every later posting hits uq_entries__account_seq);
    -- poisoned upward it silently corrupts balance_after. It was outside the alarm.
    OR b.last_seq IS DISTINCT FROM l.journal_last_seq;
+
+-- ...and the alarms. ledger_transaction_drift is called "the standing cross-check
+-- that would have SEEN it" a hundred lines above, and the app role could not read
+-- it: `permission denied for view ledger_transaction_drift`. A check the operating
+-- role cannot execute is a check that cannot fire.
+GRANT SELECT ON ledger_balance_drift, ledger_transaction_drift TO openledger_app;
 
 COMMIT;

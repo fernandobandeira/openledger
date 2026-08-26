@@ -958,6 +958,11 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
 -- that adds an FK must repeat this, or that FK is skipped on the replication apply
 -- path -- which is how a whole balanced sub-book was deleted with every report
 -- still green (ADR-0011).
+-- The hold alarms, for the same reason 0001 grants its own: an operator role that
+-- cannot read card_hold_drift or the unmatched queue cannot act on either.
+GRANT SELECT ON card_hold_drift, card_auth_unmatched TO openledger_app;
+GRANT SELECT ON card_auth_events, card_auth_event_group, card_hold_groups TO openledger_app;
+
 CALL enforce_triggers_on_replicas();
 
 COMMIT;

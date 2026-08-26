@@ -40,6 +40,20 @@ both the manifest and the floor, so replacing its body with `exit 0` printed PAS
 two hundred lines of controls ran on the replication apply path *only*. Each is now closed by
 something that fails loudly.
 
+**And the harness had to be fixed twice.** After the first round of fixes, an audit replaced
+`card_holds.sql` — 1,146 lines, the only evidence for the entire hold flow — with **five lines**
+that raise 160 notices in a loop and print the completion sentinel. The build said PASS. So did
+replacing `concurrency.sh` with four lines of `echo`. Every guard was reading output the file
+printed *about itself*: the manifest checks existence, the floor counts notices, the sentinel is a
+string the file emits. The fix is to count assertion **call sites in the source** — a stub that
+prints 160 `ok`s has two — and to keep the floors exact rather than slack, because seven
+assertions of headroom turned out to be exactly enough to delete the three most recently added
+controls and walk a live mutant back in.
+
+The general lesson, which is the reason this is in the roadmap and not only in a test comment:
+**a test suite that grades itself grades nothing.** Every check on a suite has to read something
+the suite cannot produce.
+
 Still open: putting it in CI, and the
 [ADR-0006 schema snapshot test](./decisions/0006-schema-conventions.md).
 
