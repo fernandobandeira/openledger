@@ -1,0 +1,23 @@
+[package]
+name = "cunc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+uuid = { version = "1.25.0", features = ["v4"] }
+
+[[bin]]
+name = "ok"
+path = "src/ok.rs"
+
+[[bin]]
+name = "fab1"
+path = "src/fab1.rs"
+
+[[bin]]
+name = "fab2"
+path = "src/fab2.rs"
+
+[[bin]]
+name = "fab3"
+path = "src/fab3.rs"

@@ -1,0 +1,32 @@
+[package]
+name = "bugbrs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+serde_json = "1.0.151"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "macros"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
+uuid = { version = "1.25.0", features = ["v4", "serde"] }
+
+[[bin]]
+name = "bugbrs"
+path = "src/main.rs"
+
+[[bin]]
+name = "f1"
+path = "fails/f1_dropped_column.rs"
+
+[[bin]]
+name = "f2"
+path = "fails/f2_dropped_error.rs"
+
+[[bin]]
+name = "f3"
+path = "fails/f3_null_deref.rs"
+
+[[bin]]
+name = "f4"
+path = "fails/f4_type_mismatch.rs"
