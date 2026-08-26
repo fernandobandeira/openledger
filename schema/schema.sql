@@ -5,7 +5,10 @@
 -- ADRs describe is expressible in PostgreSQL using nothing but tables, types,
 -- CHECK constraints, foreign keys and unique indexes.
 --
--- NO TRIGGERS. NO PL/pgSQL. NO LOGIC IN VIEWS BEYOND REPORTING.
+-- A TRIGGER NEEDS A WRITTEN JUSTIFICATION. The default is none. Two invariants clear
+-- that bar and are implemented at the bottom of this file; everything else is a
+-- CHECK, a key, a GRANT, or one code path in Go. No PL/pgSQL business logic, no
+-- orchestration, no derivation-with-backfill, and no logic in views beyond reporting.
 --
 -- An earlier version of this schema carried 27 triggers and 26 PL/pgSQL functions,
 -- and had quietly become the ledger -- the balance invariant, sequence assignment,
@@ -23,8 +26,12 @@
 --     "account_seq is the next one for this account", "this hold group's total is
 --     the sum of its live events" -- belongs in Go, in one code path, where an
 --     unbalanced transaction is UNREPRESENTABLE rather than refused.
---   * Append-only is a GRANT, not a trigger: the application role gets no UPDATE,
---     DELETE or TRUNCATE on the journal, so there is nothing to police.
+--   * Append-only is a GRANT *and* a trigger, because a grant binds the application
+--     role and nothing else. Migrations, backfills and psql sessions run as the
+--     OWNER, `pg_restore --disable-triggers` and the logical-replication apply path
+--     set `session_replication_role = 'replica'`, and PostgreSQL's own manual says
+--     that in that configuration triggers do not fire at all. See the bottom of
+--     this file for what is guarded and what is honestly not.
 --
 -- Two invariants that used to be triggers are now foreign keys, which is strictly
 -- better -- they are declarative, they are visible in \d, and they cannot be
@@ -35,6 +42,13 @@
 --     balance -- a revenue type cannot report under an expense caption
 --
 -- PostgreSQL 18 is a floor: uuidv7() is the default on six tables.
+--
+-- HOW THIS GETS APPLIED IS NOT DECIDED YET. `make schema` runs it through psql, which is
+-- appropriate for a design artefact and is not a migration story -- there is no ordering, no
+-- record of what has been applied, and no way to take a change to a database that already has
+-- data. Spike 007 is comparing goose, golang-migrate, tern, Atlas and sqldef; see the "Still open"
+-- list in docs/decisions/README.md. Until that lands, treat this file as the SHAPE, not as
+-- something you migrate to.
 
 BEGIN;
 
@@ -829,5 +843,132 @@ GROUP BY s.tenant_id, s.currency
 -- statement whose lines come out in an arbitrary order is not a statement.
 ORDER BY tenant_id, currency, sort_order;
 
+
+
+-- ----------------------------------------------------------------------
+-- THE ONLY TRIGGERS IN THIS SCHEMA, AND WHY EACH ONE IS HERE
+--
+-- The rule: a trigger states (1) the invariant it holds, (2) why nothing
+-- declarative can hold it, and (3) what it does NOT protect against. Two clear
+-- that bar. An earlier version of this schema had twenty-seven; ADR-0012 records
+-- what happened to the other twenty-five.
+--
+-- The evidence for drawing the line here rather than elsewhere is spike 007.
+-- Formance -- Go, PostgreSQL, in production, the closest analogue there is -- built
+-- a full PL/pgSQL write engine and then demolished it: migration 11
+-- `make-stateless` dropped five triggers that dispatched business flow, and
+-- migration 37 dropped twenty-seven stored functions. But they still run seven
+-- triggers per ledger today, on by default. What they removed was ORCHESTRATION and
+-- DERIVATION-WITH-BACKFILL. What they kept is assignment and integrity on insert.
+-- Airbnb's demolition is the same shape: their triggers were change-data-capture
+-- feeding an ETL pipeline, and their verdict was that "SQL is good for lightweight
+-- data transformation. It is not designed to handle complicated business data flow."
+-- Neither project removed a constraint.
+
+-- (1) THE JOURNAL IS APPEND-ONLY.
+--
+-- INVARIANT: no row in ledger_entries, ledger_transactions, ledger_events or
+-- card_auth_events may ever be updated or deleted. A correction is a new row. This
+-- is the claim the whole project rests on -- every other guarantee is downstream of
+-- "the history you are reading is the history that happened".
+--
+-- WHY NOTHING DECLARATIVE HOLDS IT: there is no CHECK for "this row may not change"
+-- and no key that expresses it. The only non-trigger option is to withhold the
+-- privilege, and `REVOKE` binds the APPLICATION role only. Migrations, repair
+-- scripts and a human at a psql prompt all run as the owner, which is precisely the
+-- population that has historically done the damage: Airbnb's core payment objects
+-- were "mutable by default", and the audit-trail machinery they bolted on to cope
+-- is what they later tore out.
+--
+-- WHAT IT DOES NOT PROTECT AGAINST: an owner who runs `ALTER TABLE ... DISABLE
+-- TRIGGER` or drops it, which is one statement. This binds ACCIDENTS, not intent.
+-- Nobody in this field holds append-only with a database mechanism -- Monzo does it
+-- with a reviewed six-caller network allowlist, Uber with cryptographic signatures
+-- over each record. Those are the two published answers and both live outside the
+-- database. This is the cheap 80%.
+CREATE FUNCTION refuse_mutation() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION '% is append-only: % on % refused. Correct it with a new row.',
+        TG_TABLE_NAME, TG_OP, OLD.id
+        USING ERRCODE = '23514';
+END $$;
+
+-- (2) ...AND TRUNCATE IS NOT A DELETE.
+--
+-- INVARIANT: the same one. TRUNCATE is separated because PostgreSQL separates it:
+-- "TRUNCATE will not fire any ON DELETE triggers that might exist for the tables"
+-- (sql-truncate). The guard above sees nothing.
+--
+-- WHY NOTHING DECLARATIVE HOLDS IT: `REVOKE TRUNCATE` has the same owner-shaped
+-- hole as above, and there is no other mechanism -- an event trigger would be the
+-- natural one object for the job, and PostgreSQL refuses it outright:
+-- `ERROR: event triggers are not supported for TRUNCATE TABLE`. Verified. So it is
+-- one statement-level trigger per table or nothing.
+--
+-- WHAT IT DOES NOT PROTECT AGAINST: the same owner. Also note each table must carry
+-- its own -- `TRUNCATE a CASCADE` reaching b is refused by B's guard, naming B, so a
+-- test that only checks "something was refused" passes with A's guard deleted.
+CREATE FUNCTION refuse_truncate() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION '% is history and cannot be truncated', TG_TABLE_NAME
+        USING ERRCODE = '23514';
+END $$;
+
+-- ENABLE ALWAYS on every one, or they are decoration on exactly the paths that need
+-- them most. `session_replication_role = 'replica'` is the logical-replication apply
+-- path and what `pg_restore --disable-triggers` sets; the PostgreSQL manual states
+-- that "in the default configuration, triggers do not fire on replicas", and that
+-- "triggers configured as ENABLE ALWAYS will fire regardless of the current
+-- replication role". A subscriber that does not enforce its publisher's invariants
+-- is a laundering channel for corrupt rows.
+CREATE TRIGGER ck_entries__append_only BEFORE UPDATE OR DELETE ON ledger_entries
+    FOR EACH ROW EXECUTE FUNCTION refuse_mutation();
+ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ck_entries__append_only;
+CREATE TRIGGER ck_entries__no_truncate BEFORE TRUNCATE ON ledger_entries
+    FOR EACH STATEMENT EXECUTE FUNCTION refuse_truncate();
+ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ck_entries__no_truncate;
+
+CREATE TRIGGER ck_txn__append_only BEFORE UPDATE OR DELETE ON ledger_transactions
+    FOR EACH ROW EXECUTE FUNCTION refuse_mutation();
+ALTER TABLE ledger_transactions ENABLE ALWAYS TRIGGER ck_txn__append_only;
+CREATE TRIGGER ck_txn__no_truncate BEFORE TRUNCATE ON ledger_transactions
+    FOR EACH STATEMENT EXECUTE FUNCTION refuse_truncate();
+ALTER TABLE ledger_transactions ENABLE ALWAYS TRIGGER ck_txn__no_truncate;
+
+CREATE TRIGGER ck_events__append_only BEFORE UPDATE OR DELETE ON ledger_events
+    FOR EACH ROW EXECUTE FUNCTION refuse_mutation();
+ALTER TABLE ledger_events ENABLE ALWAYS TRIGGER ck_events__append_only;
+CREATE TRIGGER ck_events__no_truncate BEFORE TRUNCATE ON ledger_events
+    FOR EACH STATEMENT EXECUTE FUNCTION refuse_truncate();
+ALTER TABLE ledger_events ENABLE ALWAYS TRIGGER ck_events__no_truncate;
+
+CREATE TRIGGER ck_auth_events__append_only BEFORE UPDATE OR DELETE ON card_auth_events
+    FOR EACH ROW EXECUTE FUNCTION refuse_mutation();
+ALTER TABLE card_auth_events ENABLE ALWAYS TRIGGER ck_auth_events__append_only;
+CREATE TRIGGER ck_auth_events__no_truncate BEFORE TRUNCATE ON card_auth_events
+    FOR EACH STATEMENT EXECUTE FUNCTION refuse_truncate();
+ALTER TABLE card_auth_events ENABLE ALWAYS TRIGGER ck_auth_events__no_truncate;
+
+-- WHAT DELIBERATELY HAS NO GUARD, so the absence reads as a decision:
+--
+--   * ledger_account_balances, card_hold_groups -- MATERIALISED state, rebuildable
+--     from the journal. They are supposed to be updated; that is what they are for.
+--   * card_auth_event_group -- a membership is SUPERSEDED, not deleted, which is an
+--     UPDATE by design.
+--   * "debits equal credits", "a transaction has at least two entries" -- enforced
+--     by CONSTRUCTION. The Go writer builds both legs in one code path, so an
+--     unbalanced transaction is unrepresentable rather than refused. This is what
+--     TigerBeetle gets from a single Transfer row carrying both account ids, and
+--     what Formance gets from Posting{Source,Destination} -- their Validate() has
+--     no balance check at all, because there is nothing to check.
+--   * recorded_at, account_seq, balance_after, xact_id -- ASSIGNED by the writer.
+--     There is no parameter for a caller to supply, which is stronger than a
+--     DEFAULT (a DEFAULT is overridable, and that was a measured defect here: a
+--     client-settable insertion axis let an already-issued report be rewritten by a
+--     transaction claiming to predate it). Formance kept its assignment triggers and
+--     we did not; the difference is that they accept multiple writers and we are
+--     betting on one. If that bet ever breaks, this is the first thing to revisit.
+--   * chart integrity -- two foreign keys, above. Strictly better than the triggers
+--     they replaced: declarative, visible in \d, and impossible to forget.
 
 COMMIT;

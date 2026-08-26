@@ -63,5 +63,8 @@ Everything else was close to a wash — go-jet handled every hard query we have.
 - **Dynamic queries** use `sqlc.narg` + `IS NULL OR`, escalating to hand-written SQL scanned by
   `pgx.RowToStructByNameLax` into the same generated structs.
 
-**Not blocked by this:** M1 is schema and migrations — pure SQL. The spike schema applies cleanly
-with its invariants enforced by Postgres and graduates to `schema/schema.sql`.
+**Not blocked by this:** M1 is schema — pure SQL. The spike schema applies cleanly with its
+invariants enforced by Postgres. **It did not graduate**, and an earlier version of this sentence
+said it did: `spikes/002-sqlc-vs-jet/schema.sql` puts `idempotency_key` on `ledger_transactions`,
+which [0004](./0004-event-log.md) moved to `ledger_events`. `schema/schema.sql` was written by
+hand. `spikes/README.md` has said so all along; this line disagreed with it.

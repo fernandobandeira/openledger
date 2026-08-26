@@ -42,8 +42,16 @@ of June 30" — is a business-date question.
 | Question | Mechanism |
 | --- | --- |
 | Current balance (the hot path) | `balance_after`, `ORDER BY account_seq DESC LIMIT 1` — O(1) |
-| Balance as *recorded* at instant T | same lookup, plus `recorded_at <= T` |
+| Balance as *recorded* at instant T | `ORDER BY recorded_at DESC, account_seq DESC LIMIT 1` |
 | **Balance as of business date T** | **aggregate over `effective_at <= T`** |
+
+**The recorded-axis row used to read "same lookup, plus `recorded_at <= T`", and that shape is
+wrong.** It plans on the current-balance index — which is ordered by `account_seq` — and then
+filters, discarding tens of thousands of rows to find one. The read has to be ordered by the axis
+it is asking about, which is what `ix_entries__asof_recorded` exists for. Measured before the SQL
+harness was deleted: the naive shape removed ~36,000 rows by filter; the corrected one removed
+none. Two different questions, two different indexes — which is the whole point of this ADR, and
+the table stated it wrongly for the axis it was about.
 
 `effective_at` is denormalized onto `ledger_entries` so the aggregate is a single-table index scan
 rather than a join.

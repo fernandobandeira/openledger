@@ -6,8 +6,11 @@
 ## Context
 
 **Idempotency** — making a retried request produce the stored result rather than a second effect
-— currently lives on `ledger_transactions`. So we can only deduplicate events that *produce a
-ledger transaction*. But most of a ledger's accepted operations deliberately produce none:
+— lived on `ledger_transactions` when this was written, so only events that *produced a ledger
+transaction* could be deduplicated. (Past tense: this ADR shipped. `ledger_transactions` has no
+idempotency column; `ledger_events` carries `idempotency_key` and `idempotency_hash` under
+`uq_events__idempotency`.) Most of a ledger's accepted operations deliberately produce no
+transaction:
 
 | Event | Writes a ledger transaction? |
 | --- | --- |
@@ -33,7 +36,12 @@ general engine this table is the difference between having a retry contract and 
 Add **`ledger_events`**: an append-only record of every accepted external event, written in the
 same transaction as whatever it causes.
 
-- `idempotency_key` + `idempotency_hash`, tenant-scoped with `NULLS NOT DISTINCT`.
+- `idempotency_key` + `idempotency_hash`, tenant-scoped. The index carries `NULLS NOT DISTINCT`
+  and **that clause is inert**: both `tenant_id` and `idempotency_key` are `NOT NULL`, so no NULL
+  can reach it. It was carried over from the spike schema, where `tenant_id` *was* nullable and the
+  clause was load-bearing — without it a unique index does not constrain house-scoped rows at all.
+  Kept as documentation of that hazard for anyone who later makes either column nullable; it costs
+  nothing and it is the kind of thing that is silently wrong when reintroduced.
 - `kind`, `source`, `payload jsonb`, `effective_at`, `recorded_at`.
 - Every `ledger_transactions` row *should* reference the event that caused it — but `event_id` is
 **nullable and unenforced**, and an event-less transaction inserts without complaint. Making it

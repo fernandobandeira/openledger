@@ -48,7 +48,8 @@ while the schema makes them impossible.
 
 ```sql
 card_auth_events (
-    event_id     -- idempotency: one row per processor message
+    processor_msg_id  -- idempotency: one row per processor message
+                      -- (this sketch said `event_id`; there is no such column -- see the banner)
     group_key    -- ties an auth to its increments, reversals and clearings
     kind         -- authorization | incremental | reversal | clearing | expiry
     amount_delta -- SIGNED: auth/incremental add, reversal/clearing/expiry subtract
@@ -165,7 +166,8 @@ across an original and its increments. Either way it is a display field.
 
 ### Event-id stability across redeliveries is not universal
 
-Our `UNIQUE (tenant_id, event_id)` assumes a processor reuses the id when it redelivers. **Stripe
+Our `UNIQUE (tenant_id, processor_msg_id)` assumes a processor reuses the id when it redelivers.
+(Written as `event_id` here originally; the column has never been called that.) **Stripe
 and Lithic document this. Marqeta and Highnote do not** — they document unique event ids and tell
 integrators to be idempotent, without stating that a *resend* carries the same id. Must be verified
 in each sandbox before the constraint is relied on.
