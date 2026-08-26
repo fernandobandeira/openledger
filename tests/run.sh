@@ -49,7 +49,7 @@ fi
 floor_for() {
     case "$1" in
         *bitemporal.sql)        echo 20 ;;
-        *card_holds.sql)        echo 125 ;;
+        *card_holds.sql)        echo 140 ;;
         *golden_trace.sql)      echo 30 ;;
         *negative_controls.sql) echo 110 ;;
         *query_plans.sql)       echo  7 ;;
@@ -87,8 +87,8 @@ echo "── tests/concurrency.sh"
 cout=$(./tests/concurrency.sh "$URL" 2>&1) || fail=1
 echo "$cout"
 cn=$(echo "$cout" | grep -cE '^ +ok  ') || true
-if [ "$cn" -lt 34 ]; then
-    echo "   FAIL tests/concurrency.sh made $cn assertions, below its floor of 34"
+if [ "$cn" -lt 44 ]; then
+    echo "   FAIL tests/concurrency.sh made $cn assertions, below its floor of 44"
     fail=1
 fi
 if ! echo "$cout" | grep -q "SUITE-COMPLETE concurrency"; then

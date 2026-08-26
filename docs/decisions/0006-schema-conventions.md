@@ -16,7 +16,7 @@ would have caught:
   `accounts_metadata`. The real gap — a sequential scan on every metadata write, forever — was
   hidden by the name.
 - Two composite primary keys are named in a way that reads like single-column indexes.
-- All four of their `CHECK` constraints are `NOT VALID` and none was ever validated, so they
+- **Five** of their nine `CHECK` constraints are `NOT VALID` and were never validated, so they
   constrain new rows only — not what a reader would assume.
 
 Cheap to prevent, expensive to discover.

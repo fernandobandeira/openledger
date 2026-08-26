@@ -27,7 +27,7 @@ here, so the ADRs don't each stop to re-explain them.
 | [0003](./0003-bitemporal-balances.md) | Running balance for "now", aggregate-on-read for "as of a business date" | A backdated entry lands with a *later* sequence number, so a running balance answers business-date questions wrongly | accepted |
 | [0004](./0004-event-log.md) | Add an append-only `ledger_events` table | Most accepted operations write no ledger transaction, so idempotency can't live on the transactions table | accepted |
 | [0005](./0005-reproducible-as-of.md) | Pin reports to a commit-ordered cursor, not a timestamp | `recorded_at` is transaction-*start* time, so the same "as of" query re-runs to a different answer | **proposed** |
-| [0006](./0006-schema-conventions.md) | Naming rules, a CI schema-snapshot test, keep FKs and enums | Dropping a column silently drops its indexes — Formance lost a hot-path index that way for thirty migrations | accepted |
+| [0006](./0006-schema-conventions.md) | Naming rules, a CI schema-snapshot test, keep FKs and enums | Dropping a column silently drops its indexes — Formance lost two that way, unnoticed for sixteen migrations | accepted |
 | [0007](./0007-open-source-positioning.md) | Reframe as a general open-source ledger; keep Postgres | The bottleneck is one contended row, not the hardware — and striping fixes it | accepted |
 | [0008](./0008-durable-timers.md) | Durable timers in Postgres, not Temporal | The need is durable *scheduling*, not workflow orchestration — and a job row commits in the same transaction as the ledger write, which Temporal cannot do | accepted |
 | [0009](./0009-chart-and-completeness.md) | Chart of accounts as data; completeness is a separate invariant | A report missing one account still satisfies the accounting equation — the missing account drops out of both sides | accepted |
@@ -105,10 +105,29 @@ Undecided, listed plainly rather than buried:
   nothing bounds how far back a backdated entry can restate a reported period.
 - **No number has been measured on RDS.** Everything so far is localhost, where a round trip is
   ten times cheaper. Nothing gets published until that is fixed.
-- **Two hold-flow findings are recorded rather than closed**, in
-  [0010](./0010-authorization-holds.md): a same-total race whose outcome depends on arrival order
-  (50.00 or 100.00 held), and a regroup that can deadlock against an unsorted multi-group caller.
-  Both fail closed — availability, not correctness — and neither has a fix in the schema.
+- **Three hold-flow findings are recorded rather than closed**, in
+  [0010](./0010-authorization-holds.md), and **one of them under-reserves credit** — the failure
+  this project calls the cardinal sin. This entry previously said "two", and said both "fail
+  closed — availability, not correctness". Both halves were wrong, and the omitted one was the
+  serious one:
+  - **A cumulative restatement that DECREASES is refused, and the refusal is sticky.**
+    `authorized_minor` only rises, so a processor restating a *lower* subtotal after a partial
+    reversal is read as out-of-order, and the group can never accept a total below its high-water
+    mark again. Measured at 60.00 held against 90.00 real, with `card_hold_drift` silent — the
+    materialised total and the log agree, on the wrong number. Representing a *decreasing*
+    authorized subtotal is the missing design piece, which is why this is recorded and not
+    guarded.
+  - **A refused convention mix leaves an order-dependent number in service** — the same two
+    messages leave 50.00 or 100.00 held depending on arrival order, because only the second is
+    refused and the first is already applied. Quarantining the *group* rather than the message is
+    the likely answer.
+  - **A regroup can deadlock against an unsorted multi-group caller.** This one, and only this
+    one, costs availability rather than correctness: it aborts cleanly and leaves no drift.
+- **Completeness is guaranteed WITHIN a scope, not across them**, and that limit is recorded only
+  in `migrations/0002`. A scope with no accounts at all is invisible to every report, and
+  `balance_sheet`'s `p_tenant` is exactly the "parameter in which to pass an incomplete list" that
+  [0009](./0009-chart-and-completeness.md) says should not exist. `vision.md` states the
+  completeness guarantee without that qualification.
 - **Shipped surface nothing reads.** `webhook_deliveries`, `hold_expires_at` and `clearing_deadline`
   exist in `migrations/0003`, carry rationale in comments, and are referenced by no view, no
   function and no test. They are either the next milestone's work or dead weight; recorded here
@@ -131,8 +150,13 @@ These are real decisions with real reasoning; none has an ADR, which makes the h
 - **`webhook_deliveries` is a separate table** from `ledger_events`: HTTP-layer redelivery is a
   different concern from ledger identity, and collapsing them makes a retried webhook look like a
   business event.
-- **PostgreSQL 18 is a floor, not a preference.** `uuidv7()` is the default on four tables and does
-  not exist before 18. The roadmap targets RDS for M4/M6, which must therefore run 18.
+- **PostgreSQL 18 is a floor, not a preference.** `uuidv7()` is the default on **six** tables and
+  does not exist before 18. The roadmap targets RDS for M4/M6, which must therefore run 18.
+- **Two chart constraints have no ADR**: `uq_fs_lines__caption` (two lines sharing a caption are
+  indistinguishable on the face of the statement, which is the restricted-cash harm arrived at from
+  the other side — and nothing in the suite reads a caption, so it had to be a constraint rather
+  than a test) and `ck_fs_lines__code_reserved` (a real chart line may not shadow the
+  `current_year_earnings` plug the balance sheet synthesises).
 
 ## On sourcing
 

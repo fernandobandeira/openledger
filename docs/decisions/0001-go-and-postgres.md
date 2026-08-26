@@ -12,7 +12,10 @@ Almost all the load-bearing logic in a ledger lives in SQL, not in application c
 - A balance is an index lookup on `(account_id, account_seq DESC)`.
 - Immutability is a trigger that refuses `UPDATE` and `DELETE` on entries for every role, backed
   by a narrow `GRANT` — not application discipline. See [0011](./0011-what-the-database-enforces.md).
-- Tenant isolation is row-level security.
+- Tenant isolation is **meant to be** row-level security. `tenant_id` leading every key is the
+  prerequisite and it is built; the policies are **not** -- `migrations/` contains no
+  `CREATE POLICY` and no `ENABLE ROW LEVEL SECURITY`. This line read as present tense for three
+  rounds while the decision log's front page recorded the gap and named this file.
 
 That narrows the host language's job: run that SQL, drive durable timers, parse webhooks, serve
 an API.

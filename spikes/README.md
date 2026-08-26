@@ -12,7 +12,7 @@ code is its own Go module so its dependencies never leak into the root `go.mod`.
 | [001](./001-formance/) | What can we take from Formance's production ledger? | Their running-balance problem was the **mutable business-date** one, not running balances in general. Ours is the immutable kind, so it stands. | **closed** |
 | [002](./002-sqlc-vs-jet/) | sqlc or go-jet? | **sqlc**, reversing the ADR's own proposal. Arrays were fine under both, so the pre-registered rule never fired; go-jet's silent-zero scan trap decided it. | **closed** |
 | [003](./003-throughput-ceiling/) | Where does the Postgres design top out, and what moves it? | **~800/s → 8,200/s** by removing contention on one shared row. Striping is the mechanism; dropping the running balance is not worth it. | **closed** |
-| [006](./006-append-only-holds/) | Should holds be a mutable row or an append-only event log? | Append-only. One formula — `SUM(GREATEST(group_total,0))` — covers every edge case in the spec, and `SUM` being commutative makes it order-tolerant for free. | **open** — `group_key` under research |
+| [006](./006-append-only-holds/) | Should holds be a mutable row or an append-only event log? | Append-only, and `SUM` being commutative makes it order-tolerant for free. The spike's "one formula covers every edge case" did **not** survive contact: the shipped design in `migrations/0003` has no `group_key` column on the event at all (grouping is its own bitemporal table) and needs a materialised total, a delta/total convention, and expiry snapshots besides. | **closed** — superseded by [ADR-0010](../docs/decisions/0010-authorization-holds.md) |
 | [005](./005-durable-timers/) | Can Postgres replace Temporal for durable timers? | Yes — verified with River; the need is durable *scheduling*, not workflow orchestration, and idempotency already comes from the event log. | **closed** |
 | [004](./004-chart-of-accounts/) | What does a general ledger ship when the chart of accounts is business-specific? | Ship the chart as **data** plus constraints that make the accounting identity a theorem. But the identity does **not** prove completeness — that needs its own guard. | **closed** |
 
@@ -21,8 +21,11 @@ Outcomes fed the decision log from [ADR-0002](../docs/decisions/0002-data-access
 
 ## Artifacts worth knowing about
 
-Spike 002 and 004 left behind files the project will actually use, because they were built against
-a real database rather than sketched:
+Spike 002 and 004 left behind files worth reading, because they were built against a real database
+rather than sketched. **None of them ships**: `migrations/0002` says in its own header that it
+supersedes `004/chart.sql` and `004/completeness.sql`, and running either against the shipped
+schema now fails with `relation "account_types" already exists`. Nothing in `spikes/` is executed
+by CI.
 
 | File | What it is |
 | --- | --- |
@@ -32,4 +35,4 @@ a real database rather than sketched:
 | [`002-sqlc-vs-jet/sqlc.yaml`](./002-sqlc-vs-jet/sqlc.yaml) | The verified codegen config. |
 | [`004-chart-of-accounts/chart.sql`](./004-chart-of-accounts/chart.sql) | Account types as data, with the constraints that keep them honest. |
 | [`004-chart-of-accounts/completeness.sql`](./004-chart-of-accounts/completeness.sql) | The guard against a report silently omitting an account. |
-| [`004-chart-of-accounts/golden_trace.sql`](./004-chart-of-accounts/golden_trace.sql) | **Superseded** by [`tests/golden_trace.sql`](../tests/golden_trace.sql). Still runs against spike 002's schema; against the shipped one it fails on `uq_accounts__owned`, and it writes `idempotency_key` to a table that no longer has it. |
+| [`004-chart-of-accounts/golden_trace.sql`](./004-chart-of-accounts/golden_trace.sql) | **Superseded** by [`tests/golden_trace.sql`](../tests/golden_trace.sql). Still runs against spike 002's schema; against the shipped one it fails on the very first statement, with `null value in column "tenant_id" of relation "ledger_accounts"` — it never reaches a unique index. It also writes `idempotency_key` to a table that no longer has it. |

@@ -103,8 +103,23 @@ observations, not as reproducible benchmarks — the harness that produced them 
 **What held under the same attack**, and is worth recording as attested rather than assumed:
 `record_auth_event` has no window — `INSERT … ON CONFLICT DO NOTHING` waits on a concurrent
 inserter (measured: a second session blocked 2.96 s, then saw the row and locked it). 3,600
-concurrent calls on one group produced a materialised total exactly equal to the log, and
-**concurrent ingest on a single group cannot deadlock** — it takes exactly one row lock. The
+concurrent calls on one group produced a materialised total exactly equal to the log.
+
+This paragraph used to end: *"and concurrent ingest on a single group **cannot deadlock** — it
+takes exactly one row lock."* **That was false, and it was false because of a lock nobody wrote.**
+The re-delivery attach takes the `card_hold_groups` row `FOR UPDATE` and then, through
+`fk_event_group__event`, an implicit `FOR KEY SHARE` on the event row when it inserts the
+membership — and `regroup_auth_event` takes those two in the *opposite* order, event first, on
+purpose. A matcher attaching a queued event against an operator moving the same event deadlocked in
+**18 of 20 trials**, each one aborting the adapter's whole webhook transaction. Correctness held
+throughout; availability did not. The attach path now takes the event lock first, explicitly, which
+also closed a second defect in the same three lines: eight concurrent re-deliveries all read the
+membership with no lock held, all saw none, and **seven of the eight** got a raw duplicate-key
+error instead of the exposure they asked for.
+
+The lesson is narrower than "take more locks". It is that **a foreign key acquires a lock on your
+behalf, in an order you did not choose**, and a lock-ordering argument that counts only the locks
+written in the function is not an argument. The
 cumulative-total conversion also fails closed: 1,304 of 1,800 racing attempts were refused as
 out-of-order, and the derived total was never wrong.
 
@@ -143,6 +158,28 @@ that, and `card_hold_drift` reported nothing for any of them.
 - The ledger takes no dependency on any of this: holds are a product-layer concern built on the
   core, and the core does not know they exist.
 
+### One finding declined, with the argument
+
+A reviewer reported that an over-capture nets against later exposure: a $1.00 fuel authorization
+clearing at $95.00 leaves `total_minor` at −94.00, and a subsequent $100.00 incremental then holds
+**6.00, not 100.00** — 94.00 apparently under-reserved, with the alarm silent.
+
+**The netting is correct, and the reasoning that says otherwise stops one step too early.** The
+$95.00 clearing has already *posted to the ledger* — a clearing is the event that writes entries,
+which is the whole point of the authorization/clearing split. The customer's exposure is therefore
+95.00 of posted receivable **plus** 6.00 of un-cleared hold = 101.00, which is exactly the 1.00 +
+100.00 that was authorized. A hold is the un-cleared remainder by construction; asking it to also
+carry the cleared part would double-count it against available credit.
+
+What the report does correctly identify is the wording. *"An over-capture must contribute 0, never
+raise available credit"* is loose: `held_minor` is clamped at 0, so an over-captured group never
+*adds* credit — but the negative residue does reduce that group's future hold. Precisely: **an
+over-capture never makes `held_for_company` smaller than the un-cleared exposure of that group.**
+
+Where it *would* be a real defect is if the later increase belonged to a **different**
+authorization that merely shares an inferred `group_key`. That is a grouping error, and it is what
+the unmatched queue and `regroup_auth_event` exist to correct — it is not the sum being wrong.
+
 ## Known, and not fixed
 
 Three findings from adversarial review are recorded rather than closed, because
@@ -159,6 +196,12 @@ each needs a design decision rather than a guard:
   messages therefore leave 50.00 or 100.00 held depending on arrival order. If
   refusing the mix is the answer, the *group* should be quarantined, not just the
   message.
+- **An emptied group pins its currency forever.** Group rows cannot be deleted (they carry
+  `expired_at` and `low_water_minor`, which are not in the log), so once every event has been moved
+  out of a group its `currency` is permanent, and a later message for that key in another currency
+  is refused and never stored. Reusing one inferred `group_key` across currencies is not a
+  realistic domain event, so this is recorded rather than guarded — but it is the residue of the
+  phantom-group defect above, and worth knowing before someone reuses keys deliberately.
 - **`regroup_auth_event` can deadlock against a multi-group adapter transaction.**
   It sorts its two locks by `group_key`; `record_auth_event` takes its single lock
   in call order, so a batch touching `ZZZ` then `AAA` takes them backwards.

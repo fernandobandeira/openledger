@@ -222,10 +222,12 @@ Row-level security scopes what a database role can see. Per-tenant accounts make
 today `tenant_id` is NULL on house accounts, so a tenant policy makes every house account
 invisible to everyone. But three things follow.
 
-### 1. `ledger_entries` needs a denormalized `tenant_id`
+### 1. `ledger_entries` needs a denormalized `tenant_id` — **and now has one**
 
-It has none; tenant is reachable only by joining `ledger_accounts`, and an RLS policy containing a
-subquery runs **per row** — a well-known planner trap. Denormalize it, as
+*Written when it had none.* `migrations/0001` gives `ledger_entries.tenant_id text NOT NULL` and it
+leads every key; house accounts carry a real tenant too. The reasoning below is why, and it stands:
+tenant would otherwise be reachable only by joining `ledger_accounts`, and an RLS policy containing
+a subquery runs **per row** — a well-known planner trap. Denormalize it, as
 [ADR-0003](../../docs/decisions/0003-bitemporal-balances.md) did for `effective_at`. It is also the
 column a future `PARTITION BY HASH (tenant_id)` would need.
 

@@ -180,10 +180,28 @@ SELECT 'p1', 'co'||(g % 200), 'k'||g, 'USD', 100 FROM generate_series(1,20000) g
 UPDATE card_hold_groups SET expired_at = now()
  WHERE tenant_id='p1' AND group_key <> 'k1' AND (substring(group_key from 2))::int % 3 <> 0;
 ANALYZE card_hold_groups;
-SELECT plan_uses('held_for_company', $q$
-    SELECT SUM(held_minor) FROM card_hold_groups
-     WHERE tenant_id='p1' AND company_id='co1' AND currency='USD' AND held_minor > 0
-$q$, 'ix_hold_groups__held');
+--    AND THE QUERY UNDER TEST IS THE FUNCTION'S OWN BODY, read from pg_proc.
+--    A hand-retyped copy is not a plan guard for the function it names: dropping
+--    `AND held_minor > 0` from `held_for_company` moves it off the partial index
+--    onto the primary key -- scanning every group the company has ever had,
+--    expired ones included -- and a retyped copy carrying the predicate still
+--    planned correctly, so the guard could not see the change. The predicate is
+--    value-equivalent (`held_minor` is never negative) and plan-critical, which is
+--    exactly the combination a hand-written copy cannot catch.
+DO $$
+DECLARE v_src text; v_sql text;
+BEGIN
+    SELECT prosrc INTO v_src FROM pg_proc WHERE proname = 'held_for_company';
+    IF v_src IS NULL THEN
+        RAISE EXCEPTION 'held_for_company does not exist';
+    END IF;
+    v_sql := replace(replace(replace(v_src,
+                 'p_tenant',   quote_literal('p1')),
+                 'p_company',  quote_literal('co1')),
+                 'p_currency', quote_literal('USD'));
+    PERFORM plan_uses('held_for_company (its own shipped body)', v_sql,
+                      'ix_hold_groups__held');
+END $$;
 
 ROLLBACK;
 

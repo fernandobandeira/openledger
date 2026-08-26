@@ -114,7 +114,7 @@ pump authorization clearing at $95. **Forced post** — a clearing with no autho
 
 **Hot account** — an account touched by nearly every transaction, so every writer queues on the
 same row. `network_settlement_payable` is ours. Measured: one shared row caps the whole system at
-~800 clearings/s regardless of hardware. This is a named, forty-year-old problem — it's the branch
+~800 clearings/s regardless of hardware — though spike 003 never varied hardware, and its own banner shows the same configuration measuring 833 and then 482 purely from machine load, so read this as a shape. This is a named, forty-year-old problem — it's the branch
 record in the 1985 DebitCredit benchmark.
 
 **Contention** — writers waiting on the same row. The ceiling above is contention, not CPU or
