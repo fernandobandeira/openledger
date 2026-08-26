@@ -48,11 +48,11 @@ fi
 # did not. Same class of failure, one keystroke apart.
 floor_for() {
     case "$1" in
-        *bitemporal.sql)        echo 18 ;;
-        *card_holds.sql)        echo 100 ;;
-        *golden_trace.sql)      echo 18 ;;
-        *negative_controls.sql) echo 90 ;;
-        *query_plans.sql)       echo  4 ;;
+        *bitemporal.sql)        echo 20 ;;
+        *card_holds.sql)        echo 125 ;;
+        *golden_trace.sql)      echo 30 ;;
+        *negative_controls.sql) echo 110 ;;
+        *query_plans.sql)       echo  7 ;;
         *)                      echo  1 ;;
     esac
 }
@@ -87,8 +87,8 @@ echo "── tests/concurrency.sh"
 cout=$(./tests/concurrency.sh "$URL" 2>&1) || fail=1
 echo "$cout"
 cn=$(echo "$cout" | grep -cE '^ +ok  ') || true
-if [ "$cn" -lt 20 ]; then
-    echo "   FAIL tests/concurrency.sh made $cn assertions, below its floor of 20"
+if [ "$cn" -lt 34 ]; then
+    echo "   FAIL tests/concurrency.sh made $cn assertions, below its floor of 34"
     fail=1
 fi
 if ! echo "$cout" | grep -q "SUITE-COMPLETE concurrency"; then

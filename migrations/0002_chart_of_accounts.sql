@@ -15,7 +15,14 @@ BEGIN;
 -- outward, so there is no parameter in which to pass an incomplete account list.
 CREATE TABLE fs_lines (
     code       text CONSTRAINT pk_fs_lines PRIMARY KEY,
-    caption    text NOT NULL,
+    -- The caption is what a reader sees, so two lines carrying the SAME caption
+    -- are indistinguishable on the face of the statement -- which is exactly the
+    -- harm the restricted-cash split exists to prevent, arrived at from the other
+    -- direction. Giving `restricted_cash` the caption 'Cash and cash equivalents'
+    -- passed every trigger and every test: the split was real in the chart and
+    -- invisible in the report. Nothing in the suite reads a caption, so this is
+    -- the constraint rather than a test.
+    caption    text NOT NULL CONSTRAINT uq_fs_lines__caption UNIQUE,
     statement  text NOT NULL CONSTRAINT ck_fs_lines__statement
                    CHECK (statement IN ('balance_sheet','income_statement')),
     -- Which side of the statement this line sits on, declared rather than

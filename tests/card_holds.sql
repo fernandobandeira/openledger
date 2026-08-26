@@ -959,6 +959,188 @@ $q$, 'reports increases as');
 
 DO $$ BEGIN RAISE NOTICE 'ok  card hold flow attested'; END $$;
 
+-- ================================ round 4: constraints nothing was defending
+--
+-- A mutation audit could delete each of these with the whole suite green. Most
+-- are CHECKs -- the cheapest guards in the schema, and the easiest to leave
+-- untested precisely because writing the bad value feels absurd. The currency one
+-- is not absurd at all: `'usd'` and `'USD'` are two different hold groups, and the
+-- held amount is the number an authorization decision is made on.
+
+SELECT must_fail('a lowercase currency on an auth event', $q$
+    INSERT INTO card_auth_events (tenant_id,processor_msg_id,company_id,card_id,kind,
+                                  amount_delta,currency,occurred_at)
+    VALUES ('t1','iso_lc','acme','card_i','authorization',100,'usd',now());
+$q$, 'ck_auth_events__currency_iso');
+
+SELECT must_fail('a NEGATIVE authorization stored directly', $q$
+    INSERT INTO card_auth_events (tenant_id,processor_msg_id,company_id,card_id,kind,
+                                  amount_delta,currency,occurred_at)
+    VALUES ('t1','sign_neg','acme','card_i','authorization',-100,'USD',now());
+$q$, 'ck_auth_events__sign');
+
+SELECT must_fail('an auth event with no occurrence time', $q$
+    INSERT INTO card_auth_events (tenant_id,processor_msg_id,company_id,card_id,kind,
+                                  amount_delta,currency,occurred_at)
+    VALUES ('t1','no_when','acme','card_i','authorization',100,'USD',NULL);
+$q$, 'occurred_at');
+
+SELECT must_fail('a lowercase currency on a hold group', $q$
+    INSERT INTO card_hold_groups (tenant_id,company_id,group_key,currency)
+    VALUES ('t1','acme','g_iso','eur');
+$q$, 'ck_hold_groups__currency_iso');
+
+SELECT must_fail('a third convention', $q$
+    INSERT INTO card_hold_groups (tenant_id,company_id,group_key,currency,total_convention)
+    VALUES ('t1','acme','g_conv','USD','absolute');
+$q$, 'ck_hold_groups__total_convention');
+
+SELECT must_fail('a grouping method nobody defined', $q$
+    INSERT INTO card_auth_event_group (tenant_id,event_id,group_key,method,assigned_by)
+    SELECT 't1', id, 'g_m', 'guess', 'x' FROM card_auth_events LIMIT 1;
+$q$, 'ck_event_group__method');
+
+SELECT must_fail('re-grouping an event that does not exist', $q$
+    SELECT regroup_auth_event('t1','00000000-0000-0000-0000-0000000000aa'::uuid,
+                              'g_any','operator');
+$q$, 'no such auth event');
+
+-- ------------------------------------------------------- what ingest RETURNS
+-- An unmatched event has no group, so there is no exposure to report. Returning
+-- the event's own delta instead passed every test: nothing asserted the value on
+-- that path, and it is the number the adapter decides on.
+SELECT eq('an unmatched event reports NO held amount',
+          record_auth_event('t1','r4_unmatched', NULL,'acme','card_u',
+                            'authorization', 30000,'USD',false, now()), 0);
+-- ...and so does the RE-DELIVERY of one that is still unmatched. That is a
+-- separate branch of the function -- the dedup returns before the group block --
+-- and nothing exercised it, so it could report the event's own delta while the
+-- adapter was deciding on it.
+SELECT eq('...and so does re-delivering it while it is still unmatched',
+          record_auth_event('t1','r4_unmatched', NULL,'acme','card_u',
+                            'authorization', 30000,'USD',false, now()), 0);
+SELECT eq('...and it is still exactly one event',
+          (SELECT count(*) FROM card_auth_events
+            WHERE tenant_id='t1' AND processor_msg_id='r4_unmatched'), 1);
+SELECT eq('...and still in the unmatched queue',
+          (SELECT count(*) FROM card_auth_unmatched
+            WHERE tenant_id='t1' AND processor_msg_id='r4_unmatched'), 1);
+
+-- `abs()` on the increase side silently normalises a negative wire amount into a
+-- positive hold. That over-reserves rather than under-reserves, so it is not the
+-- cardinal sin -- but it must be visible in the audit trail rather than inferred,
+-- and dropping the abs() changes a 500.00 hold into a -500.00 one with no alarm.
+DO $$
+DECLARE v_held bigint; v_raw bigint; v_delta bigint;
+BEGIN
+    v_held := record_auth_event('t1','r4_negauth','g_neg','acme','card_n',
+                                'authorization', -50000,'USD',false, now());
+    SELECT raw_amount, amount_delta INTO v_raw, v_delta
+      FROM card_auth_events WHERE processor_msg_id='r4_negauth';
+    IF v_held <> 50000 OR v_delta <> 50000 THEN
+        RAISE EXCEPTION 'a negative authorization was not normalised: held %, delta %',
+            v_held, v_delta;
+    END IF;
+    IF v_raw <> -50000 THEN
+        RAISE EXCEPTION 'the wire amount was not preserved: raw_amount = %', v_raw;
+    END IF;
+    RAISE NOTICE 'ok  a negative authorization holds % and records the wire % verbatim',
+        v_held, v_raw;
+END $$;
+
+-- ------------------------------------------- the counters on the group row
+-- Both could stop being maintained with the suite green. `last_event_seq` is
+-- described as "the monotonic counter the alarm keys on" and nothing read it.
+SELECT record_auth_event('t1','cnt_a','g_count','acme','card_c','authorization',1000,'USD',false,now());
+SELECT record_auth_event('t1','cnt_b','g_count','acme','card_c','incremental',  500,'USD',false,now());
+SELECT record_auth_event('t1','cnt_c','g_count','acme','card_c','clearing',     200,'USD',false,now());
+SELECT eq('open_events counts the live memberships',
+          (SELECT open_events FROM card_hold_groups WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_count'), 3);
+SELECT eq('last_event_seq advances once per applied event',
+          (SELECT last_event_seq FROM card_hold_groups WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_count'), 3);
+SELECT recompute_hold_group('t1','acme','g_count');
+SELECT eq('...and open_events survives a repair',
+          (SELECT open_events FROM card_hold_groups WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_count'), 3);
+
+-- advice is increase-SIDE, and the repair must agree with ingest about that or
+-- the two disagree about authorized_minor -- the base every cumulative
+-- conversion is computed against and the sole input to the out-of-order refusal.
+SELECT record_auth_event('t1','adv_a','g_adv','acme','card_a','authorization',4000,'USD',false,now());
+SELECT record_auth_event('t1','adv_b','g_adv','acme','card_a','advice',       1000,'USD',false,now());
+SELECT recompute_hold_group('t1','acme','g_adv');
+SELECT eq('the repair counts a positive advice toward the authorized subtotal',
+          (SELECT authorized_minor FROM card_hold_groups WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_adv'), 5000);
+
+-- overcaptured_at is the durable evidence that a clearing exceeded its
+-- authorization. The repair could stop maintaining it entirely.
+SELECT record_auth_event('t1','r4oc_a','g_r4oc','acme','card_o','authorization',1000,'USD',false,now());
+SELECT record_auth_event('t1','r4oc_b','g_r4oc','acme','card_o','clearing',     3000,'USD',false,now());
+-- Clear it first. Ingest already set the flag on the way in, so a repair that
+-- merely LEAVES IT ALONE passed -- the assertion was reading ingest's work.
+UPDATE card_hold_groups SET overcaptured_at = NULL
+ WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_r4oc';
+SELECT recompute_hold_group('t1','acme','g_r4oc');
+DO $$ BEGIN
+    IF (SELECT overcaptured_at FROM card_hold_groups
+         WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_r4oc') IS NULL THEN
+        RAISE EXCEPTION 'an over-capture left no durable evidence after a repair';
+    END IF;
+    RAISE NOTICE 'ok  the repair records over-capture evidence';
+END $$;
+
+-- ------------------------------------------------------- the alarm's own joins
+-- The drift view's currency clause is qualified by company_id, and the repair's
+-- materialising INSERT is too. Without those, two companies sharing an inferred
+-- group_key -- which is a real state, because group_key comes from network values
+-- that are not per-company -- read each other's events.
+SELECT record_auth_event('t1','sh_a','g_shared_ccy','acme',  'card_s1','authorization',1000,'USD',false,now());
+SELECT record_auth_event('t1','sh_b','g_shared_ccy','globex','card_s2','authorization',2000,'EUR',false,now());
+SELECT no_drift('two companies on one inferred group key, in different currencies');
+SELECT eq('...and the USD company holds only the USD number',
+          (SELECT held_minor FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_shared_ccy'), 1000);
+SELECT eq('...and the EUR company only the EUR one',
+          (SELECT held_minor FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='globex' AND group_key='g_shared_ccy'), 2000);
+
+-- The repair's MATERIALISING insert is company-scoped too, and losing that filter
+-- is invisible to every other control: it picks a currency from whichever event
+-- the LIMIT 1 happens to reach, which may belong to the other company sharing the
+-- key. Currency is not repairable afterwards -- it is fixed on the group row -- so
+-- every subsequent genuine message for that company is refused forever.
+-- globex FIRST, deliberately: an unfiltered `LIMIT 1` takes whichever row it
+-- reaches first, so with acme's own event inserted first the mutant picks the
+-- right currency by luck and the control proves nothing.
+SELECT record_auth_event('t1','z08_b','g_z08','globex','card_z2','authorization',2200,'EUR',false,now());
+SELECT record_auth_event('t1','z08_a','g_z08','acme',  'card_z1','authorization',1100,'USD',false,now());
+SET CONSTRAINTS ALL IMMEDIATE; SET CONSTRAINTS ALL DEFERRED;
+ALTER TABLE card_hold_groups DISABLE TRIGGER ck_hold_groups__no_delete;
+DELETE FROM card_hold_groups WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_z08';
+ALTER TABLE card_hold_groups ENABLE ALWAYS TRIGGER ck_hold_groups__no_delete;
+SELECT recompute_hold_group('t1','acme','g_z08');
+SELECT eq('the repair rebuilds the group in ITS OWN company''s currency',
+          (SELECT CASE currency WHEN 'USD' THEN 1 ELSE 0 END FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_z08'), 1);
+SELECT eq('...and with its own company''s total',
+          (SELECT total_minor FROM card_hold_groups
+            WHERE tenant_id='t1' AND company_id='acme' AND group_key='g_z08'), 1100);
+SELECT no_drift('repairing one company''s half of a shared group key');
+
+-- FULL OUTER, both halves. The membership-without-a-group half is controlled
+-- above; the OTHER half -- a materialised group whose members have ALL been moved
+-- away, still holding a stale total -- would vanish under a RIGHT JOIN.
+SELECT record_auth_event('t1','stale_a','g_stale','acme','card_st','authorization',7000,'USD',false,now());
+SELECT must_fail('a group whose members have all moved away', $q$
+    UPDATE card_auth_event_group SET superseded_at = now()
+     WHERE tenant_id='t1' AND group_key='g_stale' AND superseded_at IS NULL;
+    DO $d$ BEGIN
+        IF EXISTS (SELECT 1 FROM card_hold_drift WHERE group_key='g_stale') THEN
+            RAISE EXCEPTION 'STALE GROUP DETECTED';
+        END IF;
+    END $d$;
+$q$, 'stale group detected');
+
+
 ROLLBACK;
 
 DO $$ BEGIN RAISE NOTICE 'ok  SUITE-COMPLETE card_holds'; END $$;

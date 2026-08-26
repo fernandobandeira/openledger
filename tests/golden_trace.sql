@@ -614,6 +614,309 @@ BEGIN
     RAISE NOTICE 'ok  expect_state catches an account it was not told about';
 END $$;
 
+-- ============================================ round 4: what the reports present
+--
+-- Every assertion above reads a BALANCE or a `balanced` flag. None read a
+-- caption, a statement line, or which of two output columns a number came out
+-- of -- so a report could present the right numbers in the wrong places and stay
+-- green. These are the presentation properties the chart's comments say were
+-- found the expensive way.
+
+-- Reg S-X 5-02.1 and ASC 230-10-45-4: customer funds held FBO are RESTRICTED and
+-- must not share a caption with the operator's own liquidity. Mapped to `cash`,
+-- unrestricted liquidity is overstated by the entire float -- the number a lender
+-- and a covenant both read. Re-pointing fbo_cash from restricted_cash to cash is
+-- asset-to-asset, so every trigger is happy and every balance is unchanged.
+-- The trace does not otherwise hold customer float, so open the two accounts and
+-- move 700.00 into them: this control needs a NON-ZERO restricted balance or it
+-- passes vacuously.
+DO $$ BEGIN
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    SELECT 't1','house',NULL,code,category,normal_balance,'USD'
+      FROM account_types WHERE code IN ('fbo_cash','customer_wallet')
+    ON CONFLICT DO NOTHING;
+END $$;
+SELECT post('t1','fbo_float', ARRAY['fbo_cash','debit','70000',
+                                    'customer_wallet','credit','70000']);
+
+DO $$
+DECLARE v_cash bigint; v_restricted bigint; v_fbo bigint;
+BEGIN
+    SELECT COALESCE(amount_minor,0) INTO v_cash FROM balance_sheet
+     WHERE tenant_id='t1' AND currency='USD' AND fs_line='cash';
+    SELECT COALESCE(amount_minor,0) INTO v_restricted FROM balance_sheet
+     WHERE tenant_id='t1' AND currency='USD' AND fs_line='restricted_cash';
+    SELECT COALESCE(SUM(balance_minor),0) INTO v_fbo FROM trial_balance
+     WHERE tenant_id='t1' AND currency='USD' AND purpose='fbo_cash';
+    IF v_fbo = 0 THEN
+        RAISE EXCEPTION 'the trace holds no FBO cash, so this control proves nothing';
+    END IF;
+    IF v_restricted <> v_fbo THEN
+        RAISE EXCEPTION 'restricted cash presents % against % of FBO balance',
+            v_restricted, v_fbo;
+    END IF;
+    IF v_cash <> 0 AND v_cash >= v_fbo THEN
+        -- the operator does hold its own cash; what matters is that the float is
+        -- not inside that number
+        IF EXISTS (SELECT 1 FROM balance_sheet bs
+                    WHERE bs.tenant_id='t1' AND bs.currency='USD' AND bs.fs_line='cash'
+                      AND bs.amount_minor = v_cash + v_fbo) THEN
+            RAISE EXCEPTION 'the FBO float is inside the unrestricted cash caption';
+        END IF;
+    END IF;
+    RAISE NOTICE 'ok  customer float presents as restricted cash (%), not as cash (%)',
+        v_restricted, v_cash;
+END $$;
+
+-- ...and the two captions are distinguishable at all. Nothing anywhere read one.
+DO $$
+DECLARE v_dupes int;
+BEGIN
+    SELECT count(*) INTO v_dupes FROM (
+        SELECT caption FROM fs_lines GROUP BY caption HAVING count(*) > 1) q;
+    IF v_dupes > 0 THEN
+        RAISE EXCEPTION '% caption(s) appear on more than one statement line -- the '
+                        'split is real in the chart and invisible in the report', v_dupes;
+    END IF;
+    RAISE NOTICE 'ok  every statement line has its own caption';
+END $$;
+
+-- balance_sheet_balances ignoring its tenant argument passed the suite: every
+-- assertion read `balanced`, which is true of the whole book AND of each tenant.
+DO $$
+DECLARE v_t1 bigint; v_t2 bigint; v_all bigint;
+BEGIN
+    SELECT assets INTO v_t1  FROM balance_sheet_balances('t1') WHERE currency='USD';
+    SELECT assets INTO v_t2  FROM balance_sheet_balances('_treasury') WHERE currency='USD';
+    SELECT SUM(assets) INTO v_all FROM balance_sheet_balances() WHERE currency='USD';
+    IF v_t1 = v_all OR v_t2 = v_all THEN
+        RAISE EXCEPTION 'balance_sheet_balances ignores its tenant argument: '
+                        't1=%, _treasury=%, all=%', v_t1, v_t2, v_all;
+    END IF;
+    IF v_t1 + v_t2 > v_all THEN
+        RAISE EXCEPTION 'the per-tenant reports exceed the whole book';
+    END IF;
+    RAISE NOTICE 'ok  balance_sheet_balances is per tenant (t1=%, _treasury=%, book=%)',
+        v_t1, v_t2, v_all;
+END $$;
+
+-- The income statement must enumerate its scopes from the CHART, like the balance
+-- sheet -- from ledger_accounts, not from ledger_entries. Scoped from entries, a
+-- tenant that has opened accounts but posted nothing to an income-statement line
+-- VANISHES from the report rather than reporting zeros. The balance sheet's
+-- version of this is asserted; its sibling's was not.
+DO $$
+DECLARE v_n int;
+BEGIN
+    INSERT INTO ledger_accounts (tenant_id,owner_type,owner_id,purpose,category,normal_balance,currency)
+    SELECT 't_quiet','house',NULL,code,category,normal_balance,'USD'
+      FROM account_types WHERE code='interchange_revenue';
+    SELECT count(*) INTO v_n FROM income_statement
+     WHERE tenant_id='t_quiet' AND currency='USD';
+    IF v_n = 0 THEN
+        RAISE EXCEPTION 'a tenant with accounts and no postings vanished from the '
+                        'income statement instead of reporting zeros';
+    END IF;
+    IF EXISTS (SELECT 1 FROM income_statement
+                WHERE tenant_id='t_quiet' AND amount_minor IS NULL) THEN
+        RAISE EXCEPTION 'a quiet income-statement line reports NULL rather than 0';
+    END IF;
+    RAISE NOTICE 'ok  a tenant with no postings still reports % income-statement lines', v_n;
+END $$;
+
+-- trial_balance's COALESCE on debits and credits: an account with only debits
+-- reports NULL credits without it, and NULL propagates through every arithmetic
+-- a consumer does with it.
+DO $$
+DECLARE v_bad int;
+BEGIN
+    SELECT count(*) INTO v_bad FROM trial_balance
+     WHERE debits IS NULL OR credits IS NULL OR balance_minor IS NULL
+        OR balance_debit_positive IS NULL;
+    IF v_bad > 0 THEN
+        RAISE EXCEPTION '% trial-balance row(s) report NULL where they must report 0', v_bad;
+    END IF;
+    RAISE NOTICE 'ok  no trial-balance row reports NULL for a zero';
+END $$;
+
+-- ================================================ the pending -> posted lifecycle
+--
+-- THE ONE PLACE THE LEDGER DESIGN WAS NOT ATTESTED. A mutation audit deleted
+-- `status = 'posted'` from ALL FOUR reporting paths -- trial_balance,
+-- accounting_equation, balance_sheet, income_statement -- and widened it to
+-- `IN ('posted','pending')`, and the whole suite stayed green. So could making
+-- uq_txn__one_resolution non-unique, and dropping fk_txn__resolves and
+-- fk_txn__reverses. No file anywhere created a pending transaction.
+--
+-- 0002 records that this exact defect was MEASURED: "a pending authorization was
+-- recognised as revenue, and its posted resolution then counted it AGAIN --
+-- 500.00 of interchange twice, every check green." A fix with a story and no
+-- witness is free to regress, and the reversal half of the model was tested while
+-- the resolution half was not tested at all.
+CREATE FUNCTION post_status(p_tenant text, p_key text, p_status ledger_txn_status,
+                            p_resolves uuid, p_legs text[]) RETURNS uuid
+LANGUAGE plpgsql AS $$
+DECLARE v_event uuid; v_txn uuid; r record; v_seq bigint; v_bal bigint;
+BEGIN
+    INSERT INTO ledger_events (tenant_id, kind, source, idempotency_key, idempotency_hash,
+                               payload, effective_at)
+    VALUES (p_tenant,'trace','internal',p_key,sha256(convert_to(p_key,'UTF8')),
+            to_jsonb(p_legs), now())
+    RETURNING id INTO v_event;
+    INSERT INTO ledger_transactions (tenant_id,event_id,kind,status,effective_at,resolves_id)
+    VALUES (p_tenant,v_event,'trace',p_status,now(),p_resolves) RETURNING id INTO v_txn;
+    FOR r IN
+        WITH legs AS MATERIALIZED (
+            SELECT i AS ord, p_legs[(i-1)*3+1] AS purpose,
+                   p_legs[(i-1)*3+2]::ledger_direction AS dir,
+                   p_legs[(i-1)*3+3]::bigint AS amt
+            FROM generate_series(1, array_length(p_legs,1)/3) AS i)
+        SELECT a.id AS account_id, l.dir, l.amt FROM legs l
+        JOIN ledger_accounts a ON a.tenant_id=p_tenant AND a.purpose=l.purpose
+                              AND a.currency='USD'
+        ORDER BY a.id
+    LOOP
+        INSERT INTO ledger_account_balances AS b (tenant_id,account_id,currency,input,output,last_seq)
+        VALUES (p_tenant, r.account_id, 'USD',
+                CASE WHEN r.dir='debit'  THEN r.amt ELSE 0 END,
+                CASE WHEN r.dir='credit' THEN r.amt ELSE 0 END, 1)
+        ON CONFLICT (tenant_id,account_id,currency) DO UPDATE
+           SET input=b.input+EXCLUDED.input, output=b.output+EXCLUDED.output,
+               last_seq=b.last_seq+1, updated_at=now()
+        RETURNING b.last_seq, b.input - b.output INTO v_seq, v_bal;
+        INSERT INTO ledger_entries (tenant_id,transaction_id,account_id,direction,
+                                    amount_minor,currency,account_seq,balance_after,effective_at)
+        VALUES (p_tenant, v_txn, r.account_id, r.dir, r.amt, 'USD', v_seq, v_bal,
+                (SELECT effective_at FROM ledger_transactions
+                  WHERE tenant_id=p_tenant AND id=v_txn));
+    END LOOP;
+    RETURN v_txn;
+END $$;
+
+CREATE FUNCTION rev_t1() RETURNS bigint LANGUAGE sql STABLE AS $$
+    SELECT revenue FROM accounting_equation('t1', now(), 'effective') WHERE currency='USD';
+$$;
+CREATE FUNCTION tb_t1(p_purpose text) RETURNS bigint LANGUAGE sql STABLE AS $$
+    SELECT COALESCE(SUM(balance_minor),0) FROM trial_balance
+     WHERE tenant_id='t1' AND purpose=p_purpose AND currency='USD';
+$$;
+
+DO $$
+DECLARE v_rev0 bigint; v_recv0 bigint; v_pending uuid; v_n_entries int;
+        v_is0 bigint; v_bs0 bigint;
+BEGIN
+    SET CONSTRAINTS ALL IMMEDIATE; SET CONSTRAINTS ALL DEFERRED;
+    v_rev0  := rev_t1();
+    v_recv0 := tb_t1('customer_receivable');
+    SELECT COALESCE(SUM(amount_minor),0) INTO v_is0 FROM income_statement
+     WHERE tenant_id='t1' AND currency='USD' AND fs_line='revenue';
+    SELECT COALESCE(SUM(amount_minor),0) INTO v_bs0 FROM balance_sheet
+     WHERE tenant_id='t1' AND currency='USD' AND fs_line='receivables';
+
+    v_pending := post_status('t1','life_pending','pending',NULL,
+        ARRAY['customer_receivable','debit','50000',
+              'interchange_revenue','credit','50000']);
+    SET CONSTRAINTS ALL IMMEDIATE; SET CONSTRAINTS ALL DEFERRED;
+
+    -- the entries EXIST. What must not happen is their being reported.
+    SELECT count(*) INTO v_n_entries FROM ledger_entries
+     WHERE tenant_id='t1' AND transaction_id=v_pending;
+    IF v_n_entries <> 2 THEN
+        RAISE EXCEPTION 'the pending transaction has % entries, not 2 -- this test '
+                        'would then prove nothing about the status filter', v_n_entries;
+    END IF;
+    RAISE NOTICE 'ok  a pending transaction writes its entries (%)', v_n_entries;
+
+    IF rev_t1() <> v_rev0 THEN
+        RAISE EXCEPTION 'a PENDING transaction was recognised as revenue: % -> %',
+            v_rev0, rev_t1();
+    END IF;
+    RAISE NOTICE 'ok  accounting_equation does not recognise pending revenue = %', v_rev0;
+
+    IF tb_t1('customer_receivable') <> v_recv0 THEN
+        RAISE EXCEPTION 'trial_balance counted a PENDING transaction: % -> %',
+            v_recv0, tb_t1('customer_receivable');
+    END IF;
+    RAISE NOTICE 'ok  trial_balance does not count a pending transaction = %', v_recv0;
+
+    IF (SELECT COALESCE(SUM(amount_minor),0) FROM income_statement
+         WHERE tenant_id='t1' AND currency='USD' AND fs_line='revenue') <> v_is0 THEN
+        RAISE EXCEPTION 'the income statement recognised pending revenue';
+    END IF;
+    RAISE NOTICE 'ok  the income statement does not recognise pending revenue = %', v_is0;
+
+    IF (SELECT COALESCE(SUM(amount_minor),0) FROM balance_sheet
+         WHERE tenant_id='t1' AND currency='USD' AND fs_line='receivables') <> v_bs0 THEN
+        RAISE EXCEPTION 'the balance sheet counted a pending receivable';
+    END IF;
+    RAISE NOTICE 'ok  the balance sheet does not count a pending receivable = %', v_bs0;
+
+    -- ...and the resolution counts it EXACTLY ONCE. The measured defect was a
+    -- DOUBLE count: pending recognised, then its resolution recognised again.
+    PERFORM post_status('t1','life_resolved','posted',v_pending,
+        ARRAY['customer_receivable','debit','50000',
+              'interchange_revenue','credit','50000']);
+    SET CONSTRAINTS ALL IMMEDIATE; SET CONSTRAINTS ALL DEFERRED;
+
+    IF rev_t1() <> v_rev0 + 50000 THEN
+        RAISE EXCEPTION 'resolution recognised % of revenue, expected exactly 50000 '
+                        '(% -> %)', rev_t1() - v_rev0, v_rev0, rev_t1();
+    END IF;
+    RAISE NOTICE 'ok  resolution recognises the revenue exactly once = %', rev_t1();
+    IF tb_t1('customer_receivable') <> v_recv0 + 50000 THEN
+        RAISE EXCEPTION 'trial_balance counted the resolution % times',
+            (tb_t1('customer_receivable') - v_recv0) / 50000;
+    END IF;
+    RAISE NOTICE 'ok  trial_balance counts the resolution exactly once';
+END $$;
+
+-- one pending transaction, one resolution
+DO $$
+DECLARE v_p uuid; v_caught text;
+BEGIN
+    SELECT resolves_id INTO v_p FROM ledger_transactions
+     WHERE tenant_id='t1' AND resolves_id IS NOT NULL LIMIT 1;
+    BEGIN
+        PERFORM post_status('t1','life_double','posted',v_p,
+            ARRAY['customer_receivable','debit','1','interchange_revenue','credit','1']);
+        SET CONSTRAINTS ALL IMMEDIATE;
+        RAISE EXCEPTION 'NOT_REFUSED';
+    EXCEPTION WHEN OTHERS THEN
+        GET STACKED DIAGNOSTICS v_caught = MESSAGE_TEXT;
+        IF v_caught = 'NOT_REFUSED' THEN
+            RAISE EXCEPTION 'one pending transaction was resolved TWICE';
+        END IF;
+        IF position('uq_txn__one_resolution' in v_caught) = 0 THEN
+            RAISE EXCEPTION 'refused, but not by uq_txn__one_resolution: %', v_caught;
+        END IF;
+    END;
+    RAISE NOTICE 'ok  refused  a second resolution of one pending transaction';
+END $$;
+SET CONSTRAINTS ALL DEFERRED;
+
+-- ...and the target has to exist at all
+DO $$
+DECLARE v_caught text;
+BEGIN
+    BEGIN
+        PERFORM post_status('t1','life_ghost','posted',
+            '00000000-0000-0000-0000-0000000000ff'::uuid,
+            ARRAY['customer_receivable','debit','1','interchange_revenue','credit','1']);
+        SET CONSTRAINTS ALL IMMEDIATE;
+        RAISE EXCEPTION 'NOT_REFUSED';
+    EXCEPTION WHEN OTHERS THEN
+        GET STACKED DIAGNOSTICS v_caught = MESSAGE_TEXT;
+        IF v_caught = 'NOT_REFUSED' THEN
+            RAISE EXCEPTION 'a transaction resolved one that does not exist';
+        END IF;
+        IF position('fk_txn__resolves' in v_caught) = 0 THEN
+            RAISE EXCEPTION 'refused, but not by fk_txn__resolves: %', v_caught;
+        END IF;
+    END;
+    RAISE NOTICE 'ok  refused  resolving a transaction that does not exist';
+END $$;
+SET CONSTRAINTS ALL DEFERRED;
+
 ROLLBACK;
 
 DO $$ BEGIN RAISE NOTICE 'ok  SUITE-COMPLETE golden_trace'; END $$;

@@ -313,5 +313,83 @@ chk "...with no drift" "$(q "select count(*) from card_hold_drift where tenant_i
 # ...and once more, now that every workload has written its .err files.
 chk "failed statements (all workloads)" "$(count_errs)" 0
 
+# ---------------------------------------------------------------- workload F
+# THE NOT-YET-EXISTING DESTINATION. regroup_auth_event materialises the
+# destination INSIDE its sorted lock loop, at that group's place in the order.
+# Hoisting the INSERT above the loop -- which reads as a harmless tidy-up, and is
+# how the function was originally written -- passed the entire suite, because
+# workload C shuttles between two groups that ALREADY EXIST and never races the
+# creation of one.
+#
+# That is verbatim the defect the function's own comment describes as measured:
+# "an adapter processing a webhook batch deadlocked against an operator splitting
+# an event into a not-yet-existing group, and the whole batch rolled back."
+#
+# `INSERT ... ON CONFLICT DO NOTHING` IS a lock acquisition, so putting it before
+# the sort puts one lock outside the ordering the sort exists to impose. Named so
+# that gFa < gFb: the adapter takes gFa then gFb; a correct regroup takes them in
+# the same order and QUEUES, a hoisted one takes gFb first and closes the cycle.
+psql "$URL" -q -v ON_ERROR_STOP=1 -c \
+  "DO \$d\$ BEGIN PERFORM record_auth_event('fx','f_seed','gFa','co1','c1','authorization',1000,'USD',false,now()); END \$d\$;"
+f_dl_before=$(q "select deadlocks from pg_stat_database where datname=current_database()")
+ffifo="$TMPD/f_fx"; rm -f "$ffifo"; mkfifo "$ffifo"
+( psql "$URL" -qAt -f "$ffifo" >"$TMPD/fx_adapter.out" 2>&1 ) &
+exec 8>"$ffifo"
+echo "BEGIN;" >&8
+# the adapter takes gFa first...
+echo "SELECT record_auth_event('fx','f_a2','gFa','co1','c1','incremental',10,'USD',false,now());" >&8
+sleep 0.7
+# ...the operator starts moving the seeded event gFa -> gFb, which does not exist
+( psql "$URL" -qAt -c "SELECT regroup_auth_event('fx',(SELECT id FROM card_auth_events WHERE tenant_id='fx' AND processor_msg_id='f_seed'),'gFb','operator')" \
+    >"$TMPD/fx_op.out" 2>&1 ) &
+fx_op=$!
+sleep 0.7
+# ...and only then does the adapter reach gFb, closing the cycle if the operator
+# grabbed it out of order
+echo "SELECT record_auth_event('fx','f_b1','gFb','co1','c1','authorization',20,'USD',false,now());" >&8
+echo "COMMIT;" >&8; exec 8>&-
+wait "$fx_op" 2>/dev/null
+sleep 0.3
+f_dl_after=$(q "select deadlocks from pg_stat_database where datname=current_database()")
+chk "adapter vs operator on a not-yet-existing destination: deadlocks" \
+    "$(( f_dl_after - f_dl_before ))" 0
+chk "...and nothing was lost" "$(q "select count(*) from card_hold_drift where tenant_id='fx'")" 0
+chk "...and the event did move" \
+    "$(q "select m.group_key from card_auth_event_group m join card_auth_events e on e.tenant_id=m.tenant_id and e.id=m.event_id where e.processor_msg_id='f_seed' and m.superseded_at is null")" \
+    gFb
+
+# ---------------------------------------------------------------- workload G
+# THE SAME MESSAGE, TWICE, AT ONCE. `record_auth_event` inserts the event with
+# `ON CONFLICT DO NOTHING ... RETURNING`, so the loser of that race gets NO ROW
+# back and must re-run to attach against the row the winner committed. Replacing
+# that branch with `RETURN 0` passed the whole suite: every concurrent workload
+# here gives each worker its own message ids, so the branch was never taken.
+#
+# The code comment names the outcome: "800.00 sat in the unmatched queue and
+# held_for_company said 0" -- and 0 is what the adapter authorises against.
+psql "$URL" -q -v ON_ERROR_STOP=1 -c "SELECT 1" -o /dev/null
+for w in $(seq 1 8); do
+    ( psql "$URL" -qAt -c "SELECT record_auth_event('rd','same_msg','gRD','co1','c1','authorization',80000,'USD',false,now())" \
+        >"$TMPD/rd$w.out" 2>"$TMPD/rd$w.err" ) &
+done
+wait
+rd_true=$(q "select total_minor from card_hold_groups where tenant_id='rd' and group_key='gRD'")
+chk "one message delivered eight times at once is stored once" \
+    "$(q "select count(*) from card_auth_events where tenant_id='rd' and processor_msg_id='same_msg'")" 1
+chk "...and is attached exactly once" \
+    "$(q "select count(*) from card_auth_event_group m join card_auth_events e on e.tenant_id=m.tenant_id and e.id=m.event_id where e.processor_msg_id='same_msg' and m.superseded_at is null")" 1
+chk "...and the group holds it" "$rd_true" 80000
+rd_bad=0
+for w in $(seq 1 8); do
+    got=$(tr -d ' \n' < "$TMPD/rd$w.out")
+    if [ "$got" != "$rd_true" ]; then
+        echo "   .. worker $w was told '$got' against a true exposure of $rd_true"
+        rd_bad=$((rd_bad+1))
+    fi
+done
+chk "...and every racing caller was told the true exposure" "$rd_bad" 0
+chk "...with nothing left unmatched" \
+    "$(q "select count(*) from card_auth_unmatched where tenant_id='rd'")" 0
+
 echo "   ok  SUITE-COMPLETE concurrency"
 exit "$fail"
