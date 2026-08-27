@@ -1,0 +1,247 @@
+/* openledger — a thin layer over the Nextra docs theme.
+ *
+ * The theme supplies the sidebar, the table of contents and the reading measure;
+ * this file supplies the things that are specific to a ledger: a wider measure
+ * than the default so the prose does not cut short, a typeface pairing, and the
+ * two callout treatments the documents rely on. Everything is a token override
+ * so light and dark stay in step. */
+
+:root {
+  --ol-serif: 'IBM Plex Serif', Georgia, 'Times New Roman', serif;
+  --ol-sans: 'IBM Plex Sans', var(--font-sans, ui-sans-serif), system-ui, sans-serif;
+  --ol-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --ol-credit: #9e3a24;
+  --ol-credit-bg: #f7e7e2;
+  --ol-ok: #2c6a4d;
+  --ol-ok-bg: #e0efe7;
+  --ol-rule: #d6dee6;
+  --ol-code-bg: rgba(28, 79, 134, 0.07);
+}
+
+.dark {
+  --ol-credit: #e08b6e;
+  --ol-credit-bg: #33211a;
+  --ol-ok: #74c096;
+  --ol-ok-bg: #172b21;
+  --ol-rule: #2a343f;
+  --ol-code-bg: rgba(130, 178, 232, 0.11);
+}
+
+body {
+  font-family: var(--ol-sans);
+}
+
+/* The complaint this site exists to fix: the default measure left the text
+   cutting short against a dead gutter. Documents here are dense and argumentative
+   and want a longer line. */
+article {
+  max-width: 62rem !important;
+}
+article :is(p, li, blockquote) {
+  max-width: 46rem;
+}
+article :is(h1, h2, h3, h4) {
+  font-family: var(--ol-serif);
+  letter-spacing: -0.015em;
+  text-wrap: balance;
+}
+article h1 {
+  font-size: 2.4rem;
+  line-height: 1.1;
+}
+
+article code {
+  font-family: var(--ol-mono);
+}
+
+/* Wide, argumentative tables are the house style. Nextra already gives every
+   table `display:block; overflow-x:auto`, so a twelve-column table scrolls
+   inside itself and the page never scrolls sideways -- verified, not assumed.
+   What was missing was everything around that:
+
+   1. The tables were paying 16px of side padding per cell. At six columns that
+      is 192px of the 822 available, which was the whole reason the reference
+      product's chart of accounts clipped `per_shard` mid-word. Tighter cells
+      and a slightly smaller face fit it with room to spare.
+   2. The scroll was invisible. A thin, themed scrollbar is always drawn when
+      the table does overflow, so a clipped column reads as scrollable rather
+      than as broken. */
+article table {
+  max-width: none;
+  font-size: 0.92rem;
+  scrollbar-width: thin;
+  scrollbar-color: var(--ol-rule) transparent;
+  overscroll-behavior-x: contain;
+}
+article :is(td, th) {
+  vertical-align: top;
+  padding: 0.45rem 0.7rem;
+}
+article :is(td, th) > code:only-child {
+  white-space: nowrap;
+}
+/* Identifiers are names: `allowance_for_credit_losses` broken across two lines
+   is a different-looking name. Everything else in a cell may wrap anywhere, so
+   prose columns give way before the identifier column does. */
+article :is(td, th) {
+  overflow-wrap: break-word;
+}
+article :is(td, th) code {
+  overflow-wrap: normal;
+  word-break: keep-all;
+}
+/* Some of the repository's tables carry an empty header row -- `| | |` -- which
+   GitHub swallows and a styled table renders as a blank band. */
+article thead:not(:has(th:not(:empty))) {
+  display: none;
+}
+
+/* A diagram is not prose. Images inherit the 46rem reading measure otherwise,
+   which rendered the 1180-unit ERD at roughly 7px type -- unreadable, and the
+   whole point of the page. A standalone image gets the full article width;
+   Nextra's click-to-zoom covers the detail beyond that. Images inside a table
+   cell are excluded, because docs/README.md lists the diagrams in an
+   image-beside-caption table that is sized separately. */
+article p:has(> img:only-child) {
+  max-width: none;
+}
+article p > img:only-child {
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--ol-rule);
+  border-radius: 6px;
+}
+
+/* The navbar wordmark carries the one-line description, so the home page does
+   not have to repeat it. */
+.ol-logo {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.2;
+}
+.ol-logo-sub {
+  font-size: 0.7rem;
+  opacity: 0.6;
+  font-weight: 400;
+}
+@media (max-width: 50rem) {
+  .ol-logo-sub {
+    display: none;
+  }
+}
+
+/* Two callout treatments, and keeping them apart is the point. A defect the
+   design CAUGHT is evidence the design works; a STILL OPEN one is something
+   that does not. Painting both in the same alarm colour made a hardened schema
+   read as a fragile one. The class comes from `mdx-components.js`, which reads
+   the blockquote's first word -- the markdown itself stays plain. */
+article blockquote.ol-note {
+  margin: 1.4rem 0;
+  padding: 0.7rem 0 0.7rem 1.1rem;
+  border-left: 2px solid var(--ol-rule);
+  border-inline-start-width: 2px;
+  font-size: 0.95rem;
+  font-style: normal;
+  color: inherit;
+  max-width: 46rem;
+}
+article blockquote.ol-note > :first-child {
+  margin-top: 0;
+}
+article blockquote.ol-note > :last-child {
+  margin-bottom: 0;
+}
+article blockquote.ol-caught {
+  border-left-color: var(--ol-ok);
+  background: color-mix(in srgb, var(--ol-ok-bg) 55%, transparent);
+}
+article blockquote.ol-caught strong:first-child {
+  color: var(--ol-ok);
+}
+article blockquote.ol-gap {
+  border-left-color: var(--ol-credit);
+  background: color-mix(in srgb, var(--ol-credit-bg) 55%, transparent);
+}
+article blockquote.ol-gap strong:first-child {
+  color: var(--ol-credit);
+}
+article blockquote.ol-note strong:first-child {
+  letter-spacing: 0.01em;
+}
+
+/* The diagrams. `docs/README.md` lists them in a two-column table, image beside
+   caption, which on GitHub gives the drawing half the page. Here the caption
+   prose won the width fight and the architecture diagram came out 180px wide --
+   a thumbnail of a thing that has to be read. Claim the column back; the theme's
+   click-to-zoom is the fallback for the detail that still will not fit.
+
+   The SVGs carry their own `prefers-color-scheme` rules. Loaded through `<img>`
+   they answer to the operating system rather than to this site's toggle, which
+   is a limitation of the element, not of the drawing. */
+article td:has(img) {
+  width: 46%;
+  min-width: 13rem;
+}
+article :is(td, p) img {
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--ol-rule);
+  border-radius: 4px;
+  cursor: zoom-in;
+}
+
+
+/* ---- quieting the inline code ----------------------------------------------
+   Nextra draws inline `code` as a chip: a border, a filled background, and --
+   inside a link -- the accent colour as well. These documents name an identifier
+   every other sentence (`ledger_entries`, `fk_entries__account`, `DR`), so the
+   default turned running prose into a row of buttons and broke the reading line.
+   No border, a faint tint of the accent, and a code-link that reads as a link
+   rather than a link inside a box. */
+article :not(pre) > code.nextra-code:not([class*="twoslash-"]) {
+  border: 0;
+  background: var(--ol-code-bg);
+  padding: 0.08em 0.32em;
+  border-radius: 3px;
+  font-size: 0.88em;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+article a > code.nextra-code:not([class*="twoslash-"]),
+article code.nextra-code:not([class*="twoslash-"]) a {
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* A horizontal rule immediately before a heading doubles the rule the heading
+   already draws. The documents use `---` as a section break because they were
+   written to be read as plain files, where headings carry no rule. */
+article hr {
+  border-color: var(--ol-rule);
+  margin: 2.5rem 0;
+}
+article hr + :is(h1, h2) {
+  border-top: 0;
+  padding-top: 0;
+  margin-top: 0;
+}
+
+/* ---- the footer ------------------------------------------------------------
+   It was 48px of empty band above and below one grey sentence, with nothing
+   separating it from the last paragraph, so it read as an orphan rather than as
+   the end of the page. A rule to close the column, and half the air. */
+body footer {
+  border-top: 1px solid var(--ol-rule);
+  margin-top: 3rem;
+  padding-top: 1.5rem !important;
+  padding-bottom: 3rem !important;
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+body footer > span {
+  max-width: 46rem;
+}
