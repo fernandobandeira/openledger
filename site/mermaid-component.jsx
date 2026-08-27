@@ -13,6 +13,7 @@
 // (remark-mermaid does `value.replaceAll('\n', '\\n')`), so it is decoded back
 // to real newlines first -- the same thing @theguild's own component does.
 import { renderMermaidSVG } from 'beautiful-mermaid'
+import { MermaidZoom } from './mermaid-zoom.jsx'
 
 // Colours are passed as CSS-variable references. beautiful-mermaid writes them
 // onto the SVG's own `style` attribute, so the one SVG inherits whatever
@@ -46,13 +47,9 @@ export function Mermaid({ chart }) {
   const source = String(chart).replaceAll('\\n', '\n')
   try {
     const svg = localiseFonts(renderMermaidSVG(source, OPTS))
-    return (
-      <div
-        className="ol-mermaid"
-        role="img"
-        dangerouslySetInnerHTML={{ __html: svg }}
-      />
-    )
+    // The SVG is rendered here (server, build time). MermaidZoom is a thin
+    // client wrapper that adds click-to-fullscreen and nothing else.
+    return <MermaidZoom html={svg} />
   } catch (error) {
     // A diagram beautiful-mermaid cannot render must never break the build:
     // fall back to the diagram source as a plain code block.
