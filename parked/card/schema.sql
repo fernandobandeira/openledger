@@ -10,7 +10,10 @@
 -- fail early when the core objects are absent, and one REVOKE was dropped in the
 -- lift and later restored with the comment that records how. Checked
 -- statement-by-statement against `git show 525ada2:schema/schema.sql`; every one of
--- the original file's 79 statements appears in the baseline or in this file.
+-- the original file's 79 statements appears in the baseline or in this file. The
+-- CATALOG DOCUMENTATION section at the foot (COMMENT ON, ADR-0007) is a later
+-- addition and is NOT part of that count: it distils the comments above into the
+-- catalog and defines no object, so it is pure documentation of the originals.
 --
 -- IT DOES NOT LOAD ON ITS OWN. Four things it does not own: the `refuse_mutation()`
 -- and `refuse_truncate()` trigger functions and the `openledger_app` role, all three
@@ -533,3 +536,58 @@ GRANT SELECT, INSERT ON webhook_deliveries TO openledger_app;
 -- point -- ADR-0004 specifies the mechanism as `REVOKE` AND a trigger, and for one
 -- commit this log had one of the two.
 REVOKE UPDATE, DELETE, TRUNCATE ON card_auth_events        FROM openledger_app;
+
+
+-- ----------------------------------------------------------------------
+-- CATALOG DOCUMENTATION (ADR-0007)
+--
+-- COMMENT ON, so the live card schema documents itself in `\d+` /
+-- obj_description() / col_description(), distilled from the inline comments above.
+-- Navigational only; the rationale stays in the ADRs. A lighter pass than the core
+-- (tables, the load-bearing columns, the two alarm views), matching the module''s
+-- parked status.
+
+COMMENT ON TABLE card_auth_events IS
+  'The append-only authorization event log (one row per processor MESSAGE). Signed, normalised deltas -- never wire values. Grouping into an authorization is a revisable INFERENCE, so there is deliberately no group_key here (see card_auth_event_group). Append-only by trigger (ADR-0001).';
+COMMENT ON TABLE card_auth_event_group IS
+  'The revisable membership inference: which authorization an event belongs to, as its own bitemporal table so the immutable event never needs an UPDATE. Re-grouping is a routine corrective (attach an unmatched clearing, split a mis-merged trace). superseded_at IS NULL is the live assignment (ADR-0001).';
+COMMENT ON TABLE card_hold_groups IS
+  'The materialised per-group hold total, kept because summing an unbounded event log inside a ~1s decisioning budget is unbounded work. held_minor is the number the authorization decision reads; card_hold_drift keeps it honest against a re-aggregation of the live log (ADR-0001).';
+COMMENT ON TABLE webhook_deliveries IS
+  'HTTP-layer delivery dedup -- a separate concern from ledger identity, with no ledger effect.';
+
+COMMENT ON COLUMN card_auth_events.processor_msg_id IS
+  'The processor''s per-MESSAGE object id (Marqeta transaction token, Increase element id, Lithic events[].token), NOT the webhook delivery id -- one occurrence can emit two delivery ids (ADR-0001).';
+COMMENT ON COLUMN card_auth_events.kind IS
+  'The event kind (auth_event_kind). Sign is a property of the kind (ck_auth_events__sign, a whitelist), and ''expiry'' is deliberately absent -- expiry is a FLAG, not an event carrying a delta.';
+COMMENT ON COLUMN card_auth_events.amount_delta IS
+  'NORMALISED: signed, always a DELTA, never a wire value. The adapter converts a cumulative total into a delta; the wire amount is kept in raw_amount.';
+COMMENT ON COLUMN card_auth_events.currency IS
+  'ISO 4217, uppercase (ck_auth_events__currency_iso). Part of the value, not metadata -- the minor-unit exponent is currency-dependent, and ''usd'' vs ''USD'' created a second hold group live under the decision number.';
+COMMENT ON COLUMN card_auth_events.raw_is_total IS
+  'Whether raw_amount is a cumulative TOTAL rather than a delta. A totals event must keep its wire amount (ck_auth_events__totals_keep_wire); mixing totals and deltas in one group is irreconcilable (ADR-0001).';
+COMMENT ON COLUMN card_auth_events.hold_expires_at IS
+  'OUR hold-release policy clock. NOT the network clearing_deadline, which is a different clock driving dispute eligibility. Indexed for the expiry sweep where non-NULL.';
+
+COMMENT ON COLUMN card_auth_event_group.group_key IS
+  'The inferred authorization this event is grouped into. Method-tagged (lifecycle_id/rrn/fuzzy/manual); revisable, so it lives here rather than on the immutable event.';
+COMMENT ON COLUMN card_auth_event_group.superseded_at IS
+  'NULL = the current assignment (one live per event, uq_event_group__current). Set when a later assignment supersedes this one; equal to assigned_at for a correction made inside the same transaction (ADR-0001).';
+
+COMMENT ON COLUMN card_hold_groups.total_minor IS
+  'The net running total of all deltas in the group. Can go negative from clearings/reversals; held_minor clamps it to >= 0 for the decision.';
+COMMENT ON COLUMN card_hold_groups.authorized_minor IS
+  'The cumulative AUTHORIZED subtotal: increase-side deltas only. The base every cumulative-total conversion and out-of-order refusal is computed against -- distinct from total_minor, which also carries clearings and reversals (ADR-0001).';
+COMMENT ON COLUMN card_hold_groups.held_minor IS
+  'GENERATED: 0 once expired_at is set, else GREATEST(total_minor, 0). The clamped number the authorization decision reads; an over-capture contributes 0, never raises available credit (ADR-0001).';
+COMMENT ON COLUMN card_hold_groups.total_convention IS
+  'delta or total -- which convention the group''s increase-side messages use, fixed by the first one. Mixing them is IRRECONCILABLE and refused; card_hold_drift flags a group whose log disagrees with this (ADR-0001).';
+COMMENT ON COLUMN card_hold_groups.expired_at IS
+  'When the hold was released. Carries snapshots (expired_authorized/expired_total) so the post-expiry alarm can tell exposure ADDED after release from an event merely arriving after it (ck_hold_groups__expiry_snapshot) (ADR-0001).';
+COMMENT ON COLUMN card_hold_groups.low_water_minor IS
+  'The monotone non-increasing low-water mark of total_minor -- durable evidence that the group ever over-captured, because overcaptured_at is non-latching and gets erased by the next event (ADR-0001).';
+
+COMMENT ON VIEW card_auth_unmatched IS
+  'The review queue: an auth event with no live group assignment. Grouping is never a silent guess, so an unmatched event surfaces here rather than being force-fit (ADR-0001).';
+COMMENT ON VIEW card_hold_drift IS
+  'The hold alarm ADR-0001 names as catching every failure it records: compares each materialised card_hold_groups row against a re-aggregation of its live event log and lists every way they can disagree (total, authorized, currency, convention, post-expiry exposure, bloodless decreases). Empty is passing (ADR-0001).';

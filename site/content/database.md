@@ -753,6 +753,15 @@ One convention that used to live only in a spike is now stated by the schema its
 reading every credit-normal account would report drift on its first entry, which is what makes the
 stated mapping falsifiable ([0010](/decisions/0010-reconciliation)).
 
+**The schema documents itself.** Every table and every load-bearing column carries a `COMMENT ON` in
+the catalog — distilled from the migration's inline comments, each citing the ADR that holds the
+rationale — and so do the report functions and the reconciliation views. So `\d+ ledger_entries`,
+`obj_description('ledger_entries'::regclass)` or a read of `information_schema` explains the schema to
+a human or an AI *without the repo*: that `ledger_entries` is the append-only journal, that `stripe`
+is a physical partition a reader sums, that `xact_id < :cursor` is the as-of filter. The
+schema-snapshot test dumps `pg_description`, so a comment that drifts from the schema shows in the
+diff like any other change ([0007](/decisions/0007-schema-conventions-and-chart)).
+
 **Enforced by the database:**
 
 - Single-row `CHECK`s — `amount_minor > 0`, ISO currency, house accounts having no owner, caption
