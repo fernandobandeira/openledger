@@ -56,6 +56,27 @@
   --ol-ok-bg: #0e1a17;
   --ol-rule: #262626;
   --ol-code-bg: rgba(255, 255, 255, 0.06);
+
+  /* ---- the mermaid diagrams -------------------------------------------------
+     beautiful-mermaid (in `mermaid.mjs`) renders every ```mermaid fence to an
+     inline SVG at build time and passes these as CSS-variable references, so
+     one SVG inherits the site palette here rather than baking colours in. The
+     values are Vesper's, the same source the rest of this file reads from: the
+     near-black ground, the peach accent (`focusBorder`), a soft white for
+     labels, and the site's own hairline greys for edges and node outlines.
+
+     Defined once on `:root`, dark-only, exactly like everything else here: the
+     site forces its theme (`app/layout.jsx`), Vesper has no light variant, and
+     the SVGs deliberately carry no `prefers-color-scheme` rules -- there is one
+     rendering everywhere, which is the same decision the `<img>` diagrams above
+     record. */
+  --ol-mm-bg: #101010;       /* page ground; also the subgraph fill */
+  --ol-mm-fg: #e6e6e6;       /* node + edge labels */
+  --ol-mm-accent: #ffc799;   /* arrowheads / highlights -- the site accent */
+  --ol-mm-muted: #8b8b8b;    /* secondary text, edge labels (Vesper comment) */
+  --ol-mm-line: #5c5c5c;     /* connectors */
+  --ol-mm-surface: #181818;  /* node fill, a step off the ground */
+  --ol-mm-border: #333333;   /* node + subgraph outlines */
 }
 
 body {
@@ -192,6 +213,23 @@ article p > img:only-child {
   height: auto;
   border: 1px solid var(--ol-rule);
   border-radius: 6px;
+}
+
+/* The build-time mermaid SVG. Like the standalone images above, a diagram is
+   not prose: it claims the full article width rather than the 46rem reading
+   measure, and centres inside it. The SVG carries its own intrinsic size, so it
+   renders at natural size on a wide screen and scales down to fit a narrow one
+   -- never blown up past what it was laid out for. No frame: the diagram is
+   transparent and sits on the page's own ground, the way Vesper's code does. */
+article .ol-mermaid {
+  max-width: none;
+  margin: 1.8rem 0;
+  text-align: center;
+  overflow-x: auto;
+}
+article .ol-mermaid svg {
+  max-width: 100%;
+  height: auto;
 }
 
 /* The wordmark is the name and nothing else. */
