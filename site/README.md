@@ -60,5 +60,5 @@ app/theme.css         the only styling this site adds on top of the theme
 app/[[...mdxPath]]/   the catch-all that renders a content page
 mdx-components.js     blockquote classification (CAUGHT vs STILL OPEN callouts)
 content/              THE DOCUMENTATION. Committed, and the source of truth.
-public/diagrams/      the SVGs the documents embed.
+public/diagrams/      leftover SVGs; most diagrams are now inline Mermaid in the markdown itself.
 ```
