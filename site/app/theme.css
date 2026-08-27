@@ -6,26 +6,60 @@
  * two callout treatments the documents rely on. Everything is a token override
  * so light and dark stay in step. */
 
-:root {
-  --ol-serif: 'IBM Plex Serif', Georgia, 'Times New Roman', serif;
-  --ol-sans: 'IBM Plex Sans', var(--font-sans, ui-sans-serif), system-ui, sans-serif;
-  --ol-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+/* ---- neutralising the theme's greys ----------------------------------------
+   The dark mode read blue, and `--nextra-bg` was only half the reason. The docs
+   theme ships Tailwind v4's `gray` scale, and not one step of it is neutral:
+   every one carries chroma .02-.034 at hue ~260. Those nine variables paint the
+   borders, the sidebar hovers, the cards and the table rules, so the chrome
+   stayed cool no matter what the page background was set to.
 
-  --ol-credit: #9e3a24;
-  --ol-credit-bg: #f7e7e2;
-  --ol-ok: #2c6a4d;
-  --ol-ok-bg: #e0efe7;
-  --ol-rule: #d6dee6;
-  --ol-code-bg: rgba(28, 79, 134, 0.07);
+   Same lightness ladder, chroma zeroed, so every contrast relationship the theme
+   was designed around survives untouched. `gray-900` is the exception: pulled
+   21% -> 17% so raised surfaces sit nearer Vesper's near-black rather than
+   floating above it. These are unlayered, which is what makes them win -- the
+   theme declares its own inside `@layer theme`, and an unlayered rule beats a
+   layered one regardless of import order. */
+:root {
+  --x-color-gray-50: oklch(98.5% 0 0);
+  --x-color-gray-100: oklch(96.7% 0 0);
+  --x-color-gray-200: oklch(92.8% 0 0);
+  --x-color-gray-300: oklch(87% 0 0);
+  --x-color-gray-400: oklch(70.7% 0 0);
+  --x-color-gray-600: oklch(44.6% 0 0);
+  --x-color-gray-700: oklch(37.3% 0 0);
+  --x-color-gray-800: oklch(27.8% 0 0);
+  --x-color-gray-900: oklch(17% 0 0);
 }
 
+:root {
+  /* Geist, self-hosted by the `geist` package and bound to these variables in
+     `app/layout.jsx`. It has no serif, and the headings do not want one: the
+     display face is the sans cut tight, which is how Vesper's own UI reads. */
+  --ol-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --ol-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --ol-display: var(--ol-sans);
+
+  --ol-credit: #a8392a;
+  --ol-credit-bg: #f8e9e4;
+  --ol-ok: #1f6f57;
+  --ol-ok-bg: #e2f0ea;
+  --ol-rule: #e6e0d8;
+  --ol-code-bg: rgba(0, 0, 0, 0.055);
+}
+
+/* The two callout colours are Vesper's, not inventions: `#99FFE4` is what it
+   paints strings and `#FF8080` what it paints invalid. Taking them from the code
+   theme means a caught defect and a still-open one are the same two colours in
+   the prose as in the SQL beside it. It also resolves a collision the previous
+   palette had no way to avoid -- the old `--ol-credit` was a peach, and the
+   accent is now Vesper's peach, so the two would have been indistinguishable. */
 .dark {
-  --ol-credit: #e08b6e;
-  --ol-credit-bg: #33211a;
-  --ol-ok: #74c096;
-  --ol-ok-bg: #172b21;
-  --ol-rule: #2a343f;
-  --ol-code-bg: rgba(130, 178, 232, 0.11);
+  --ol-credit: #ff8080;
+  --ol-credit-bg: #1c1210;
+  --ol-ok: #99ffe4;
+  --ol-ok-bg: #0e1a17;
+  --ol-rule: #262626;
+  --ol-code-bg: rgba(255, 255, 255, 0.06);
 }
 
 body {
@@ -41,24 +75,41 @@ article {
 article :is(p, li, blockquote) {
   max-width: 46rem;
 }
+/* Geist is a tight-fitting grotesque; at display sizes it wants the tracking
+   pulled in further than a text face would, or the headings read loose against
+   the body. */
 article :is(h1, h2, h3, h4) {
-  font-family: var(--ol-serif);
-  letter-spacing: -0.015em;
+  font-family: var(--ol-display);
+  letter-spacing: -0.022em;
   text-wrap: balance;
 }
 article h1 {
   font-size: 2.4rem;
   line-height: 1.1;
+  letter-spacing: -0.032em;
 }
 
-article code {
+article code,
+article kbd {
   font-family: var(--ol-mono);
 }
 
-/* Wide, argumentative tables are the house style. Nextra already gives every
-   table `display:block; overflow-x:auto`, so a twelve-column table scrolls
-   inside itself and the page never scrolls sideways -- verified, not assumed.
-   What was missing was everything around that:
+/* ---- the tables ------------------------------------------------------------
+   Wide, argumentative tables are the house style, and the docs theme renders
+   them as spreadsheets: `mdx-components/table.js` puts a full `border` on every
+   `th` and `td` and zebra-stripes alternate rows. On a page of eight decisions
+   that is nine vertical rules and eight horizontal ones drawn around prose that
+   already has structure -- the grid competes with the argument instead of
+   carrying it. The dark border was `gray-600` (oklch 44.6%), loud against a
+   near-black ground.
+
+   Reference-book treatment instead: no vertical rules at all, one hairline under
+   each row, a heavier one under the header, and no fill anywhere. The header
+   becomes a label rather than a band.
+
+   Nextra already gives every table `display:block; overflow-x:auto`, so a
+   twelve-column table scrolls inside itself and the page never scrolls sideways
+   -- verified, not assumed. What was missing was everything around that:
 
    1. The tables were paying 16px of side padding per cell. At six columns that
       is 192px of the 822 available, which was the whole reason the reference
@@ -70,13 +121,47 @@ article code {
 article table {
   max-width: none;
   font-size: 0.92rem;
+  border-collapse: collapse;
   scrollbar-width: thin;
   scrollbar-color: var(--ol-rule) transparent;
   overscroll-behavior-x: contain;
 }
 article :is(td, th) {
   vertical-align: top;
-  padding: 0.45rem 0.7rem;
+  padding: 0.5rem 0.9rem 0.5rem 0;
+  border: 0;
+  border-bottom: 1px solid var(--ol-rule);
+}
+article :is(td, th):last-child {
+  padding-right: 0;
+}
+article th {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.65;
+  padding-bottom: 0.4rem;
+  border-bottom-width: 1.5px;
+  text-align: left;
+}
+/* The zebra fill came from the theme; it does not survive the loss of the grid,
+   and it is what made the rows read as cells. Unlayered, so it beats the
+   theme's `@layer utilities` declaration without needing `!important`. */
+article tbody tr {
+  background: none;
+}
+article tbody tr:last-child :is(td, th) {
+  border-bottom: 0;
+}
+
+/* A cell holding nothing but a link or an identifier is a key, not prose: it
+   should claim the width it needs and no more, so the argument columns get the
+   rest. This is what stops a four-character `0001` column from being sized like
+   a paragraph. */
+article :is(td, th):has(> a:only-child) {
+  width: 1%;
+  white-space: nowrap;
 }
 article :is(td, th) > code:only-child {
   white-space: nowrap;
@@ -113,22 +198,10 @@ article p > img:only-child {
   border-radius: 6px;
 }
 
-/* The navbar wordmark carries the one-line description, so the home page does
-   not have to repeat it. */
+/* The wordmark is the name and nothing else. */
 .ol-logo {
-  display: flex;
-  flex-direction: column;
-  line-height: 1.2;
-}
-.ol-logo-sub {
-  font-size: 0.7rem;
-  opacity: 0.6;
-  font-weight: 400;
-}
-@media (max-width: 50rem) {
-  .ol-logo-sub {
-    display: none;
-  }
+  font-family: var(--ol-display);
+  letter-spacing: -0.02em;
 }
 
 /* Two callout treatments, and keeping them apart is the point. A defect the
@@ -217,6 +290,21 @@ article code.nextra-code:not([class*="twoslash-"]) a {
   text-underline-offset: 2px;
 }
 
+/* ---- the code blocks -------------------------------------------------------
+   Vesper draws no chrome: editor, sidebar and tab bar are all `#101010`, and the
+   code is the only thing on screen with colour in it. The theme's default is the
+   opposite -- a black fill inside a `neutral-700` ring (oklch 37%), which on a
+   near-black page is a panel with a bright edge around it.
+
+   The block takes the page's own background and a single hairline instead, so it
+   reads as a region of the page rather than a window onto something else. The
+   syntax colours are Vesper's, set in `next.config.mjs`; Nextra passes
+   `keepBackground: false`, so the theme never fights this rule for the fill. */
+article .nextra-code > pre {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--ol-rule);
+}
+
 /* A horizontal rule immediately before a heading doubles the rule the heading
    already draws. The documents use `---` as a section break because they were
    written to be read as plain files, where headings carry no rule. */
@@ -228,20 +316,4 @@ article hr + :is(h1, h2) {
   border-top: 0;
   padding-top: 0;
   margin-top: 0;
-}
-
-/* ---- the footer ------------------------------------------------------------
-   It was 48px of empty band above and below one grey sentence, with nothing
-   separating it from the last paragraph, so it read as an orphan rather than as
-   the end of the page. A rule to close the column, and half the air. */
-body footer {
-  border-top: 1px solid var(--ol-rule);
-  margin-top: 3rem;
-  padding-top: 1.5rem !important;
-  padding-bottom: 3rem !important;
-  font-size: 0.85rem;
-  line-height: 1.6;
-}
-body footer > span {
-  max-width: 46rem;
 }

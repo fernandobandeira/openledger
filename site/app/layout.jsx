@@ -1,4 +1,6 @@
-import { Footer, Layout, Navbar } from 'nextra-theme-docs'
+import { GeistSans } from 'geist/font/sans'
+import { GeistMono } from 'geist/font/mono'
+import { Layout, Navbar } from 'nextra-theme-docs'
 import { Head } from 'nextra/components'
 import { getPageMap } from 'nextra/page-map'
 import 'nextra-theme-docs/style.css'
@@ -6,45 +8,45 @@ import './theme.css'
 
 export const metadata = {
   title: {
-    default: 'openledger',
-    template: '%s — openledger'
+    default: 'OpenLedger',
+    template: '%s — OpenLedger'
   },
   description:
     'An open-source double-entry ledger. Postgres for storage, Rust for the service. ' +
     'Every decision, its evidence, and what it costs.'
 }
 
-const navbar = (
-  <Navbar
-    logo={
-      <span className="ol-logo">
-        <b>openledger</b>
-        <span className="ol-logo-sub">a double-entry ledger, decided in the open</span>
-      </span>
-    }
-  />
-)
+const navbar = <Navbar logo={<b className="ol-logo">OpenLedger</b>} />
 
-const footer = (
-  <Footer>
-    <span>
-      MIT. Every page here is a file in the repository — the markdown is the deliverable,
-      this site is a viewer over it.
-    </span>
-  </Footer>
-)
 
 export default async function RootLayout({ children }) {
   return (
-    <html lang="en" dir="ltr" suppressHydrationWarning>
+    /* The three families `theme.css` asked for -- IBM Plex Serif, Sans and Mono
+       -- were named and never loaded: no `next/font`, no `<link>`, no
+       `@font-face`. Every reader without them installed locally has been seeing
+       Georgia and system-ui. Geist is self-hosted by the package, so the static
+       export stays a directory of plain files with no network fetch at runtime. */
+    <html
+      lang="en"
+      dir="ltr"
+      className={`${GeistSans.variable} ${GeistMono.variable}`}
+      suppressHydrationWarning
+    >
+      {/* The palette is Vesper's, read off the theme itself rather than guessed:
+          `#FFC799` is its link/focus colour and `#101010` its editor background,
+          which is a true neutral black -- zero chroma -- and the reason the site
+          no longer reads blue. Light mode is invented; Vesper is dark-only. */}
       <Head
-        color={{ hue: 210, saturation: 65 }}
-        backgroundColor={{ light: '#f4f6f8', dark: '#0f141a' }}
+        color={{
+          hue: { light: 24, dark: 27 },
+          saturation: { light: 85, dark: 100 },
+          lightness: { light: 40, dark: 80 }
+        }}
+        backgroundColor={{ light: '#fffdfa', dark: '#101010' }}
       />
       <body>
         <Layout
           navbar={navbar}
-          footer={footer}
           pageMap={await getPageMap()}
           // There is no public repository to edit against or file issues in, so
           // the theme's two default GitHub links -- which point at Nextra's own
