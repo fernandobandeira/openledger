@@ -485,7 +485,7 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
    -- above never fires, not in the precursor state and not after. Measured:
    -- authorization 100.00, clearing 100.00 (which POSTS), spurious reversal
    -- 100.00, then a genuine incremental 100.00. True exposure 200.00 (100 posted +
-   -- 100 un-cleared), reported 100.00, drift 0 rows at every step. Scaled three
+   -- 100 un-cleared), reported 100.00, and drift silent from the incremental onward -- the second disjunct below catches the precursor state and then self-heals. Scaled three
    -- times over: 300.00 under-reserved, and the hidden residue is bounded only by
    -- the group's cleared amount.
    --
