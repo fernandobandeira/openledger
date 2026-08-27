@@ -3,65 +3,47 @@
 An open-source **double-entry ledger** — Postgres for storage, Rust for the service. A single
 binary and a database you already know how to operate.
 
-Double-entry means every money movement is recorded as debits and credits that sum to the same
-amount, so the books cannot silently drift. A $500 card purchase looks like this:
+**The documentation is the deliverable, and it lives in [`site/content/`](./site/content/).** It is
+ordinary markdown, readable straight from that directory, and it is also a site:
 
+```sh
+make docs         # read it at localhost:3000 — sidebar, search, the ERD
+make docs-build   # or build it to site/out/ and host that anywhere
 ```
-DR  customer_receivable         500.00    the customer owes us $500
-CR  network_settlement_payable  491.00    we owe the card network $491
-CR  interchange_revenue           9.00    we keep $9 as our fee
+
+Start with [`site/content/index.md`](./site/content/index.md) for what this is,
+[`database.md`](./site/content/database.md) for the schema drawn and explained, and
+[`decisions/`](./site/content/decisions/) for why every piece has the shape it has.
+
+## Running the database
+
+```sh
+make up        # PostgreSQL 18 in Docker
+make migrate   # openledger migrate — applies the baseline, then exits
+make chart     # seed an EXAMPLE chart of accounts; yours will differ
 ```
-
-The bet: most teams that need a real ledger do not need a fast one, but every one of them needs a
-correct one. Every cent accounted for, no manual fixes, and any number reproducible as of any
-date, forever — cheap to build in, painful to retrofit.
-
-Its **reference implementation** is an embedded B2B charge card funded by a credit line. That
-product exists to prove the core carries something real without forking, and to give the core a
-demanding acceptance test. It is not the project.
-
-**Status: design stage.** The deliverable is [`docs/decisions/`](./docs/decisions/).
-`schema/schema.sql` holds the ledger core, the chart of accounts and the card hold model — it exists
-to show that shape is expressible, and it loads. **There is no test suite and no service yet**: a
-SQL implementation and its harness were deleted, and why is [ADR-0004](./docs/decisions/0004-where-logic-lives.md).
-
-## Start here
-
-**Never built a ledger? Start with [docs/glossary.md](./docs/glossary.md).** It defines every term
-the rest of this uses, so nothing else has to stop and re-explain.
-
-| | |
-| --- | --- |
-| [docs/glossary.md](./docs/glossary.md) | Every term, for someone who has never built a ledger |
-| [docs/vision.md](./docs/vision.md) | Why this exists when Formance already does |
-| [docs/roadmap.md](./docs/roadmap.md) | What gets built next, and why in that order |
-| [docs/decisions/](./docs/decisions/) | One file per decision, and what is still open |
-| [schema/schema.sql](./schema/schema.sql) | The schema the decisions describe — it loads |
-| [spikes/](./spikes/) | Timeboxed investigations: brief, findings, sources |
 
 ## Layout
 
 ```
-docs/             THE DELIVERABLE — decisions, vision, glossary, diagrams,
-                  roadmap, reference product.
-schema/           the design schema: 11 tables, CHECKs, foreign keys, 5 views and
-                  8 triggers over 2 functions -- each justified in place, per
-                  decisions/0004. chart.sql seeds an example chart of accounts.
-spikes/           timeboxed investigations, one directory each. Self-contained;
-                  there is no CI.
-src/               entrypoint. Prints "nothing to run yet". Where the
-                  service will go.
+site/content/     THE DELIVERABLE — vision, glossary, the database page,
+                  the decision log, the roadmap, the spike write-ups.
+site/             the viewer over it: `make docs`. Generated pages for the
+                  files below land in content/source/ and are not committed.
+migrations/       the schema, as one numbered migration, with the reasoning
+                  in comments beside each object.
+schema/           chart.sql: an EXAMPLE chart of accounts, seeded separately
+                  by `make chart`. No migration owns it.
+parked/card/      the card product's schema, written and not deployed.
+src/              the binary. `openledger migrate` is its only command.
+spikes/           timeboxed investigations, one directory each: the code
+                  stays here, the write-up is in site/content/spikes/.
 ```
 
-## Performance
-
-**No number here is a benchmark, and several in-repo documents quote figures that are only
-shapes.** Spike 003's own banner says so: re-auditing the same configurations moved its baseline
-from 833 to 482 clearings/s. Treat every throughput figure in `docs/` accordingly. [Spike 003](./spikes/003-throughput-ceiling/README.md)
-measured the design with durability on, but everything so far ran on localhost — where a network
-round trip costs 0.05 ms against roughly 0.5 ms on RDS. That reorders the tuning levers rather
-than merely scaling the result, so nothing goes in a README until it is measured over a real
-network. See [the vision doc](./docs/vision.md#performance).
+**Status: design stage, with the first thing built.** The schema and the command that applies it are
+real. There is still no service and no test suite beyond the two that guard ADR-0003's rules — a SQL
+implementation and its harness were deleted, and why is
+[ADR-0004](./site/content/decisions/0004-where-logic-lives.md).
 
 ## Licence
 

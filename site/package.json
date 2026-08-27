@@ -1,0 +1,27 @@
+{
+  "name": "openledger-docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sync": "node scripts/sync.mjs",
+    "dev": "npm run sync && next dev",
+    "build": "npm run sync && next build && npm run search-index",
+    "start": "npx serve out",
+    "search-index": "pagefind --site out --output-subdir _pagefind"
+  },
+  "dependencies": {
+    "next": "^16.3.3",
+    "nextra": "^4.6.1",
+    "nextra-theme-docs": "^4.6.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "description": "A viewer over the repository\u2019s own markdown. The docs live in ../docs; this renders them.",
+  "devDependencies": {
+    "pagefind": "1.5.2"
+  },
+  "//zod": "nextra-theme-docs' Layout strips `children` from its props and then validates the remainder against a schema that still requires it. zod <4.4 lets a missing key through z.custom(); 4.4 made it 'expected nonoptional', which throws on every page. Held below 4.4 until nextra fixes the schema.",
+  "overrides": {
+    "zod": "<4.4"
+  }
+}

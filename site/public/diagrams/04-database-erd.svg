@@ -1,0 +1,168 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 780" role="img" aria-label="Entity relationship diagram of the seven core tables. The journal — ledger_entries, ledger_transactions, ledger_events — sits on top; ledger_entries points down to ledger_accounts, which points down to account_types and then to fs_lines; ledger_account_balances points back at ledger_accounts."><title>The core ledger: seven tables in three layers</title><style>
+  text { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .box      { fill: #ffffff; stroke: #8695a3; stroke-width: 1; }
+  .box-head { fill: #e9eef3; }
+  .rule     { stroke: #d6dee6; stroke-width: 1; }
+  .t-name   { font-size: 13px; font-weight: 600; fill: #11171e; }
+  .t-field  { font-size: 11.5px; fill: #55636f; }
+  .t-key    { font-size: 10px; fill: #1c4f86; letter-spacing: .04em; }
+  .t-band   { font-size: 10px; letter-spacing: .14em; fill: #8695a3; }
+  .t-edge   { font-size: 10.5px; fill: #1c4f86; }
+  .t-warn   { font-size: 10.5px; fill: #9e3a24; }
+  .t-legend { font-size: 10.5px; fill: #55636f; }
+  .edge     { stroke: #1c4f86; stroke-width: 1.7; fill: none; }
+  .edge-warn{ stroke: #9e3a24; stroke-width: 1.7; fill: none; stroke-dasharray: 5 4; }
+  @media (prefers-color-scheme: dark) {
+    .box      { fill: #161d25; stroke: #6c7b8a; }
+    .box-head { fill: #1f2831; }
+    .rule     { stroke: #2a343f; }
+    .t-name   { fill: #e3e9ef; }
+    .t-field  { fill: #97a4b1; }
+    .t-key    { fill: #82b2e8; }
+    .t-band   { fill: #6c7b8a; }
+    .t-edge   { fill: #82b2e8; }
+    .t-warn   { fill: #e08b6e; }
+    .t-legend { fill: #97a4b1; }
+    .edge     { stroke: #82b2e8; }
+    .edge-warn{ stroke: #e08b6e; }
+  }
+</style>
+<defs>
+  <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+    <path d="M0 1L10 5L0 9z" fill="#1c4f86"/>
+  </marker>
+  <marker id="aw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+    <path d="M0 1L10 5L0 9z" fill="#9e3a24"/>
+  </marker>
+</defs>
+
+<text class="t-band" x="1140" y="46" text-anchor="end">1 · THE JOURNAL — WHAT HAPPENED, IN ORDER</text>
+
+<!-- ledger_entries -->
+<rect class="box" x="40" y="62" width="286" height="158" rx="4"/>
+<path class="box-head" d="M40 66a4 4 0 0 1 4-4h278a4 4 0 0 1 4 4v26H40z"/>
+<line class="rule" x1="40" y1="92" x2="326" y2="92"/>
+<text class="t-name" x="54" y="83">ledger_entries</text>
+<text class="t-field" x="54" y="114">tenant_id, id</text><text class="t-key" x="312" y="114" text-anchor="end">PK</text>
+<text class="t-field" x="54" y="132">transaction_id</text>
+<text class="t-field" x="54" y="150">account_id, currency</text>
+<text class="t-field" x="54" y="168">direction, amount_minor</text>
+<text class="t-field" x="54" y="186">account_seq, balance_after</text>
+<text class="t-field" x="54" y="204">effective_at, recorded_at</text>
+
+<!-- ledger_transactions -->
+<rect class="box" x="446" y="62" width="286" height="140" rx="4"/>
+<path class="box-head" d="M446 66a4 4 0 0 1 4-4h278a4 4 0 0 1 4 4v26H446z"/>
+<line class="rule" x1="446" y1="92" x2="732" y2="92"/>
+<text class="t-name" x="460" y="83">ledger_transactions</text>
+<text class="t-field" x="460" y="114">tenant_id, id</text><text class="t-key" x="718" y="114" text-anchor="end">PK</text>
+<text class="t-field" x="460" y="132">event_id</text>
+<text class="t-field" x="460" y="150">status, kind</text>
+<text class="t-field" x="460" y="168">effective_at, recorded_at</text>
+<text class="t-field" x="460" y="186">resolves_id, reverses_id</text>
+
+<!-- ledger_events -->
+<rect class="box" x="852" y="62" width="286" height="140" rx="4"/>
+<path class="box-head" d="M852 66a4 4 0 0 1 4-4h278a4 4 0 0 1 4 4v26H852z"/>
+<line class="rule" x1="852" y1="92" x2="1138" y2="92"/>
+<text class="t-name" x="866" y="83">ledger_events</text>
+<text class="t-field" x="866" y="114">tenant_id, id</text><text class="t-key" x="1124" y="114" text-anchor="end">PK</text>
+<text class="t-field" x="866" y="132">idempotency_key + hash</text>
+<text class="t-field" x="866" y="150">kind, source</text>
+<text class="t-field" x="866" y="168">payload</text><text class="t-key" x="1124" y="168" text-anchor="end">JSON</text>
+<text class="t-field" x="866" y="186">effective_at, recorded_at</text>
+
+<!-- journal edges -->
+<line class="edge" x1="326" y1="132" x2="438" y2="132" marker-end="url(#a)"/>
+<text class="t-edge" x="382" y="112" text-anchor="middle">transaction_id,</text>
+<text class="t-edge" x="382" y="124" text-anchor="middle">effective_at</text>
+
+<line class="edge-warn" x1="732" y1="132" x2="844" y2="132" marker-end="url(#aw)"/>
+<text class="t-warn" x="788" y="112" text-anchor="middle">event_id</text>
+<text class="t-warn" x="788" y="124" text-anchor="middle">nullable</text>
+
+<path class="edge" d="M666 202L666 246L512 246L512 210" marker-end="url(#a)"/>
+<text class="t-edge" x="589" y="264" text-anchor="middle">resolves_id / reverses_id — a correction is a new row</text>
+
+<!-- entries -> accounts -->
+<line class="edge" x1="104" y1="220" x2="104" y2="348" marker-end="url(#a)"/>
+<text class="t-edge" x="118" y="278">account_id,</text>
+<text class="t-edge" x="118" y="292">currency</text>
+
+<text class="t-band" x="732" y="338" text-anchor="end">2 · THE REGISTER — WHOSE MONEY, AND THE ONE CACHED NUMBER</text>
+
+<!-- ledger_accounts -->
+<rect class="box" x="40" y="356" width="286" height="158" rx="4"/>
+<path class="box-head" d="M40 360a4 4 0 0 1 4-4h278a4 4 0 0 1 4 4v26H40z"/>
+<line class="rule" x1="40" y1="386" x2="326" y2="386"/>
+<text class="t-name" x="54" y="377">ledger_accounts</text>
+<text class="t-field" x="54" y="408">tenant_id, id</text><text class="t-key" x="312" y="408" text-anchor="end">PK</text>
+<text class="t-field" x="54" y="426">owner_type, owner_id</text>
+<text class="t-field" x="54" y="444">purpose</text>
+<text class="t-field" x="54" y="462">category, normal_balance</text>
+<text class="t-field" x="54" y="480">currency</text>
+<text class="t-field" x="54" y="498">metadata, created_at</text>
+
+<!-- ledger_account_balances -->
+<rect class="box" x="446" y="356" width="286" height="122" rx="4"/>
+<path class="box-head" d="M446 360a4 4 0 0 1 4-4h278a4 4 0 0 1 4 4v26H446z"/>
+<line class="rule" x1="446" y1="386" x2="732" y2="386"/>
+<text class="t-name" x="460" y="377">ledger_account_balances</text>
+<text class="t-field" x="460" y="408">tenant, account, currency</text><text class="t-key" x="718" y="408" text-anchor="end">PK</text>
+<text class="t-field" x="460" y="426">input, output</text>
+<text class="t-field" x="460" y="444">last_seq</text>
+<text class="t-field" x="460" y="462">updated_at</text>
+
+<line class="edge" x1="438" y1="418" x2="334" y2="418" marker-end="url(#a)"/>
+<text class="t-edge" x="386" y="398" text-anchor="middle">account_id,</text>
+<text class="t-edge" x="386" y="410" text-anchor="middle">currency</text>
+
+<!-- accounts -> types -->
+<line class="edge" x1="104" y1="514" x2="104" y2="566" marker-end="url(#a)"/>
+<text class="t-edge" x="118" y="534">purpose, category,</text>
+<text class="t-edge" x="118" y="548">normal_balance</text>
+
+<text class="t-band" x="732" y="556" text-anchor="end">3 · THE CHART — WHAT THE NUMBERS MEAN</text>
+
+<!-- account_types -->
+<rect class="box" x="40" y="574" width="286" height="140" rx="4"/>
+<path class="box-head" d="M40 578a4 4 0 0 1 4-4h278a4 4 0 0 1 4 4v26H40z"/>
+<line class="rule" x1="40" y1="604" x2="326" y2="604"/>
+<text class="t-name" x="54" y="595">account_types</text>
+<text class="t-field" x="54" y="626">code</text><text class="t-key" x="312" y="626" text-anchor="end">PK</text>
+<text class="t-field" x="54" y="644">category</text>
+<text class="t-field" x="54" y="662">normal_balance</text>
+<text class="t-field" x="54" y="680">fs_line</text>
+<text class="t-field" x="54" y="698">fs_statement, fs_side</text><text class="t-key" x="312" y="698" text-anchor="end">DERIVED</text>
+
+<!-- fs_lines -->
+<rect class="box" x="446" y="574" width="286" height="122" rx="4"/>
+<path class="box-head" d="M446 578a4 4 0 0 1 4-4h278a4 4 0 0 1 4 4v26H446z"/>
+<line class="rule" x1="446" y1="604" x2="732" y2="604"/>
+<text class="t-name" x="460" y="595">fs_lines</text>
+<text class="t-field" x="460" y="626">code</text><text class="t-key" x="718" y="626" text-anchor="end">PK</text>
+<text class="t-field" x="460" y="644">caption</text>
+<text class="t-field" x="460" y="662">statement, side</text>
+<text class="t-field" x="460" y="680">sort_order</text>
+
+<line class="edge" x1="326" y1="638" x2="438" y2="638" marker-end="url(#a)"/>
+<text class="t-edge" x="382" y="618" text-anchor="middle">fs_line,</text>
+<text class="t-edge" x="382" y="630" text-anchor="middle">statement, side</text>
+
+<!-- legend -->
+<line class="rule" x1="852" y1="592" x2="1138" y2="592"/>
+<text class="t-band" x="852" y="584">READING IT</text>
+<line class="edge" x1="856" y1="614" x2="892" y2="614" marker-end="url(#a)"/>
+<text class="t-legend" x="902" y="618">a foreign key: the database refuses</text>
+<text class="t-legend" x="902" y="632">a row that breaks it</text>
+<line class="edge-warn" x1="856" y1="652" x2="892" y2="652" marker-end="url(#aw)"/>
+<text class="t-legend" x="902" y="656">real, but still allowed to be empty</text>
+<text class="t-key" x="874" y="682" text-anchor="end">PK</text>
+<text class="t-legend" x="902" y="682">the columns that identify a row</text>
+<text class="t-key" x="874" y="700" text-anchor="end">DERIVED</text>
+<text class="t-legend" x="902" y="700">computed by the database, never supplied</text>
+<text class="t-legend" x="852" y="726">Every arrow carries more than an id — the</text>
+<text class="t-legend" x="852" y="740">currency, the date, the category. A value</text>
+<text class="t-legend" x="852" y="754">copied for speed is put inside a key, so</text>
+<text class="t-legend" x="852" y="768">the copy cannot disagree with the original.</text>
+</svg>
