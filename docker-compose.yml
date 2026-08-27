@@ -1,6 +1,10 @@
 services:
   db:
     image: postgres:18-alpine
+    # 1gb, not Docker's 64 MB default: the reconciliation sweep at 1M entries
+    # fails 3/3 with `could not resize shared memory segment ... No space left on
+    # device` under the default /dev/shm (ADR-0010).
+    shm_size: 1gb
     environment:
       POSTGRES_USER: openledger
       POSTGRES_PASSWORD: openledger

@@ -1,0 +1,193 @@
+# CI. Two jobs: the Rust one, and the one that puts DDL into a real PostgreSQL 18.
+#
+# This file was deleted once already, with the SQL conformance suite it ran
+# (ADR-0004). What it must not become is the thing this project keeps citing as
+# the failure it is organised against: "a green check that didn't actually
+# execute." So every step here either compares something or loads something into
+# a server, and where a check is designed but not built it is a comment, not a
+# step that exits 0.
+#
+# ADR-0014 is the reasoning for the `parked-ddl` job; ADR-0003 for `migrate`
+# being a subcommand rather than a shell script; ADR-0007 §2 for the schema
+# snapshot that is still missing.
+
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A migration run takes an advisory lock. Two of these racing on the same
+# service container cannot happen -- each job gets its own -- but cancelling a
+# superseded run is right anyway.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deny warnings in the build as well as in clippy: `unsafe_code = "forbid"`
+  # and the panic lints in Cargo.toml are the point of choosing Rust (ADR-0001).
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Record what actually ran
+        run: cargo --version && rustc --version && cargo clippy --version
+
+      # `make tidy`, split so a failure names which half failed.
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Today this is two tests and neither touches a database: that a migration
+      # set carries no down migration, and that a `-- no-transaction` migration
+      # holds exactly one statement (spike 008 found why the second matters).
+      # M0's conformance suite comes back here, in Rust, after M3.
+      - name: cargo test
+        run: cargo test --all-targets
+
+  schema:
+    name: migrations against PostgreSQL 18
+    runs-on: ubuntu-latest
+
+    services:
+      db:
+        # Pinned to the same image `docker-compose.yml` runs locally. 18 is a
+        # floor, not a preference: `uuidv7()` is a PostgreSQL 18 built-in and
+        # both the baseline and the parked card DDL default primary keys to it.
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: openledger
+          POSTGRES_PASSWORD: openledger
+          POSTGRES_DB: openledger
+        ports:
+          # 5433 on purpose: it is what `docker-compose.yml` publishes and what
+          # the Makefile's DB_URL defaults to, so CI runs the same commands the
+          # README tells an adopter to run rather than a private variant of them.
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U openledger"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+
+    env:
+      PGPASSWORD: openledger
+      PGHOST: localhost
+      PGPORT: 5433
+      PGUSER: openledger
+      DATABASE_URL: postgres://openledger:openledger@localhost:5433/openledger?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Record what actually ran
+        run: psql --version && psql -tAc 'select version()'
+
+      # ---------------------------------------------------------------
+      # The parked file's own guard, checked FIRST and for one reason.
+      #
+      # `parked/card/schema.sql` opens with a DO block that refuses to load
+      # unless refuse_mutation(), refuse_truncate() and the openledger_app role
+      # are present. Two of those three are per-database; the role is
+      # CLUSTER-wide. So on any cluster where the baseline has run even once,
+      # in any database, the role half of that guard passes vacuously. A fresh
+      # service container is the only place the guard can be tested honestly,
+      # and only before the first migrate. That is why this step is here and
+      # not further down.
+      - name: The parked card DDL refuses to load without the core
+        run: |
+          set -euo pipefail
+          psql -d postgres -v ON_ERROR_STOP=1 -q -c 'CREATE DATABASE coreless_check'
+          if psql -d coreless_check -v ON_ERROR_STOP=1 --single-transaction -q \
+               -f parked/card/schema.sql 2>err.txt; then
+            echo "::error::parked/card/schema.sql loaded into a database with no core -- its DO block did not fire"
+            exit 1
+          fi
+          grep -q 'apply migrations/00001_baseline.sql first' err.txt
+          # ...and it left nothing behind. The file has no BEGIN/COMMIT of its
+          # own (it inherits the core's design), so --single-transaction is what
+          # makes a failed load clean rather than half-applied.
+          left=$(psql -d coreless_check -tAc "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'r'")
+          test "$left" = "0" || { echo "::error::a refused load stranded $left tables"; exit 1; }
+
+      # ---------------------------------------------------------------
+      # The documented path, run as documented (ADR-0003).
+      - name: openledger migrate
+        run: cargo run --locked -- migrate
+
+      # Re-running the pre-deploy command is what a redeploy does, and the
+      # roadmap records "idempotent on re-run" as UNVERIFIED because nothing in
+      # the tree ran it twice. This step is that verification.
+      - name: openledger migrate, again
+        run: cargo run --locked -- migrate
+
+      # Seed data, owned by no migration (ADR-0007 §9). It is an EXAMPLE chart;
+      # loading it here proves the chart guard accepts the one we publish.
+      - name: Seed the reference chart
+        run: psql -d openledger -v ON_ERROR_STOP=1 --single-transaction -q -f schema/chart.sql
+
+      - name: What the applied schema is
+        run: |
+          psql -d openledger -c "select
+              (select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'r') as tables,
+              (select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'v') as views,
+              (select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'i') as indexes"
+
+      # ---------------------------------------------------------------
+      # ADR-0007 §2, the schema snapshot test, IS NOT HERE.
+      #
+      # It belongs immediately after the step above: dump every index,
+      # constraint and trigger, dump every NOT VALID constraint separately, and
+      # diff both against a committed snapshot. It is the highest-leverage
+      # untaken item in this repository, and what exists today is twenty-one
+      # lines containing one SELECT that emits a string -- no committed
+      # snapshot, no comparison, no failure path.
+      #
+      # There is deliberately NO placeholder step. A step that runs and passes
+      # without comparing anything is a green check that did not execute, and
+      # this project has a name for that. When the snapshot and its comparison
+      # land, they go here, and they go into the `openledger` database above --
+      # which is why the card DDL below is loaded into a database of its own.
+
+      # ---------------------------------------------------------------
+      # The parked-DDL guard (ADR-0014). `parked/card/schema.sql` is applied by
+      # no migration and owned by no test; its only attestation before this job
+      # existed was that somebody pasted it into a database once by hand. It
+      # depends on three objects the baseline creates. Nothing declares that
+      # dependency to a machine, so the core could rename any of them and every
+      # check in this repository would stay green.
+      #
+      # Its own database, for two reasons: the snapshot test above must see the
+      # applied schema and nothing else, and this file is NOT idempotent -- a
+      # second load fails on `type "auth_event_kind" already exists`.
+      - name: The parked card DDL still loads on top of the core
+        run: |
+          set -euo pipefail
+          psql -d postgres -v ON_ERROR_STOP=1 -q -c 'CREATE DATABASE parked_check'
+          DATABASE_URL='postgres://openledger:openledger@localhost:5433/parked_check?sslmode=disable' \
+            cargo run --locked -- migrate
+          before=$(psql -d parked_check -tAc "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'r'")
+          psql -d parked_check -v ON_ERROR_STOP=1 --single-transaction -q -f parked/card/schema.sql
+          after=$(psql -d parked_check -tAc "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'r'")
+          echo "core $before tables -> core+card $after"
+          # The file is 4 tables. Asserting the delta rather than just the exit
+          # status is what makes a silently-shrinking parked file fail here.
+          test "$after" = "$((before + 4))" || { echo "::error::expected 4 card tables, got $((after - before))"; exit 1; }
