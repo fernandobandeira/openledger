@@ -1,4 +1,4 @@
-# openledger
+# OpenLedger
 
 An open-source **double-entry ledger** — Postgres for storage, Rust for the service. A single
 binary and a database you already know how to operate.

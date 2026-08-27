@@ -1,7 +1,7 @@
 # The reference product — an embedded card ledger
 
-**This is the product openledger's reference implementation targets, not the project's
-requirements.** openledger is a general double-entry ledger; see [`vision.md`](/vision) for why,
+**This is the product OpenLedger's reference implementation targets, not the project's
+requirements.** OpenLedger is a general double-entry ledger; see [`vision.md`](/vision) for why,
 and [ADR-0002](/decisions/0002-scaling) for the decision that made this document
 a product spec rather than a system spec.
 

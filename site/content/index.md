@@ -1,4 +1,4 @@
-# openledger
+# OpenLedger
 
 An open-source **double-entry ledger** — Postgres for the schema, Rust for the service that will
 sit on it.
