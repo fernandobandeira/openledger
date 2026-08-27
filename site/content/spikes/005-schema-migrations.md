@@ -1,4 +1,4 @@
-# Spike 007 — how do schema changes get applied?
+# Spike 005 — how do schema changes get applied?
 
 **Status:** closed → [ADR-0003](/decisions/0003-migrations)
 
@@ -122,14 +122,14 @@ error is the silent variant: `atlas schema inspect --format '{{ sql . }}' > insp
 259 clean-looking lines and **zero `CREATE VIEW`** in them; the "Skipping… Upgrade to Pro" notice
 only appears on a TTY. psqldef v3.11.20 **SIGSEGVs** on `trial_balance`. Adopting either means paying
 for Pro or deleting from `schema.sql` the objects it exists to prove are expressible — the same shape
-as River's periodic jobs in [ADR-0008](/decisions/0008-authorization-holds).
+as River's periodic jobs in [ADR-0001](/card/decisions/0001-authorization-holds).
 
 **The declarative half was never about applying anything, and we keep it.** What one flat file buys
 is readability and diffability. The synthesis is **versioned application, declarative verification**:
 ordered migrations replayed with the transitions we chose, plus ADR-0007's still-unbuilt
 snapshot test — apply to an empty database, dump every index, constraint and `NOT VALID` row, diff
 against a committed snapshot. That yields "the database matches the file" with no diff engine, no dev
-database and no login, and it catches the failure ADR-0007 is actually afraid of. **Spike 007 does
+database and no login, and it catches the failure ADR-0007 is actually afraid of. **Spike 005 does
 not build it; it removes the excuse that a declarative tool would have covered it.**
 
 The honest case for declarative, on the record: after N migrations nobody can read the current shape

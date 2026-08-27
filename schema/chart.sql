@@ -2,7 +2,7 @@
 --
 -- This is the chart for the PARKED reference product -- the embedded B2B charge card
 -- whose DDL lives in parked/card/ and is applied by no migration. See
--- site/content/parked-card.md. The product is parked; its chart is not, because it is the
+-- site/content/card/parked.md. The product is parked; its chart is not, because it is the
 -- only chart in the tree, so `make reset` hands a wallet or marketplace deployment a
 -- card-issuer-and-lender chart it did not ask for: customer_receivable,
 -- facility_borrowings, credit_loss_expense, allowance_for_credit_losses. That is not

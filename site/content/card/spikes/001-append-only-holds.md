@@ -1,9 +1,9 @@
-# Spike 006 — Holds as an append-only event log
+# Spike 001 — Holds as an append-only event log
 
 
 > ⚠️ **The verification in this spike does not run, and its headline survey was
 > invented.** Both are recorded here rather than quietly repaired, because this
-> spike is the evidence base for [ADR-0008](/decisions/0008-authorization-holds).
+> spike is the evidence base for [ADR-0001](/card/decisions/0001-authorization-holds).
 >
 >   *(This bullet has itself been corrected. It previously listed three schema
 >   mismatches, two of which describe `schema/schema.sql` and not the file in this
@@ -39,7 +39,7 @@ arrive, `state` UPDATEd on expiry — with `auth_id text NOT NULL UNIQUE`.
 Two problems. It contradicts the append-only discipline used everywhere else in this ledger, and
 **`auth_id UNIQUE` rejects an incremental authorization outright** — the hotel or fuel-pump case
 where a merchant tops up an existing authorization. The
-[reference spec](/reference-product) lists "incremental auths" in its edge-case table
+[reference spec](/card) lists "incremental auths" in its edge-case table
 while the schema makes them impossible.
 
 ## The answer
@@ -100,9 +100,11 @@ group's events. Groups are small — an authorization plus a handful of incremen
 so the scan is bounded by *events per authorization*, not by history. But it is on the
 authorization hot path, which has a ~1s deadline, and it has **not been benchmarked here**. If it
 proves too slow the standard answer applies: a materialised per-group total maintained on write,
-with the event log staying the source of truth — the same relationship
-[ADR-0006](/decisions/0006-time-and-as-of) sets up between `balance_after` and
-recomputation.
+with the event log staying the source of truth — the same relationship the ledger core has between
+`ledger_account_balances` and recomputing from the entries
+([ADR-0006](/decisions/0006-time-and-as-of)). Note what
+[spike 009](/spikes/009-where-the-balance-lives) found about that relationship: a cache written from
+the same locked row in the same transaction is not an independent check on itself.
 
 **More rows.** Five to ten per authorization instead of one. At this volume, irrelevant.
 

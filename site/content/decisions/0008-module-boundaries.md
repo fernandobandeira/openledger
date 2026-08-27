@@ -1,12 +1,12 @@
-# 0009 — The card module gets its own Postgres schema, not its own migration set
+# 0008 — The card module gets its own Postgres schema, not its own migration set
 
 **Status:** proposed — **and overtaken in part; read the next paragraph before the decision.**
-**Evidence:** [spike 011](/spikes/011-optional-modules).
+**Evidence:** [spike 008](/spikes/008-optional-modules).
 
 ## What happened instead, and what that leaves open
 
 **The card DDL is not in `public` any more, and it is not in a `card` schema either.** It was lifted
-out of the baseline entirely and parked in [`parked/card/`](/parked-card), applied by
+out of the baseline entirely and parked in [`parked/card/`](/card/parked), applied by
 no migration. Everything below describing what a wallet-only user "still gets" is therefore stale:
 they get seven core tables.
 
@@ -15,13 +15,13 @@ Two things follow, and the second is the reason this ADR cannot simply be marked
 **Parking beats this ADR on the axis that matters most, and nobody wrote that down.** 0009 puts the
 card objects *inside migration 00001*. When it was written nothing had been applied anywhere, so that
 was free. It is not free now: 00001 has been applied, [0003](/decisions/0003-migrations) forbids editing an
-applied migration, and ADR-0008 records open findings in this model that **under-reserve credit**.
+applied migration, and ADR-0001 records open findings in this model that **under-reserve credit**.
 Shipping that DDL in 00001 would have frozen it. Parking does not.
 
 **And so this ADR is not implementable as written.** Its `core`/`card` split has to be re-specified
 as migration 00002 — which also means the seven core tables cannot move into a `core` schema the way
 it describes, since they are already in `public` under an applied migration. Until that rewrite
-happens, [the parked-card page](/parked-card)'s prerequisite list asks for two things that contradict each other.
+happens, [the parked-card page](/card/parked)'s prerequisite list asks for two things that contradict each other.
 
 **What parking does NOT buy** is the thing 0009 exists for: **removability**. A parked file is not a
 `DROP SCHEMA card CASCADE`; it is a file nothing installs, nothing loads, and nothing tests. That is
@@ -35,9 +35,9 @@ schema.** [0003](/decisions/0003-migrations) is otherwise unchanged: `migrations
 
 - `core` and `card` are two schemas in one database, created by that one migration: against
   PostgreSQL 18.6 it lands **7 tables / 3 views / 23 indexes** in `core`, **4 / 2 / 10** in `card`.
-  *Those six numbers are quoted from [spike 011](/spikes/011-optional-modules)'s own
+  *Those six numbers are quoted from [spike 008](/spikes/008-optional-modules)'s own
   measurement of the split it built, which is why they appear here rather than only in
-  [the decision log](/decisions#what-the-schema-enforces-today) — that section is the single
+  [the database page](/database#what-the-schema-enforces-today) — that section is the single
   canonical census of the shipped schema, and if the two ever disagree, it is right and this is a
   stale quotation.*
 - **The card module becomes removable, not optional.** *(As proposed: a wallet-only user still gets
@@ -138,4 +138,4 @@ then `workspace_root/.sqlx` (`sqlx-macros-core-0.9.0/src/query/mod.rs:97-101`); 
   simple query in an **implicit** transaction block — proved with a control where the second statement
   divides by zero and the first one's table is absent afterwards. Either statement **alone** applies
   fine. So every `CONCURRENTLY` migration is **one statement** and the idempotent pair is two
-  migrations. Verified against goose in spike 007, carried into a `sqlx` decision without being re-run.
+  migrations. Verified against goose in spike 005, carried into a `sqlx` decision without being re-run.

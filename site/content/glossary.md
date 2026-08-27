@@ -1,28 +1,20 @@
 # Glossary
 
-Every term this project uses that you'd only know if you'd built a ledger before. Examples are real
-— they come from the [reference product](/reference-product), the
-[decisions](/decisions), or something we measured.
+Every term this project uses that you'd only know if you'd built a ledger before. Examples come
+from the [reference product](/card), the [decisions](/decisions), or something we measured.
 
 ## Accounting
 
 **Double-entry** — every transaction moves money *between* accounts, so it always has at least
-two sides that cancel out. A $500 card purchase is:
-
-```
-DR customer_receivable       500.00   ← the customer now owes us 500
-CR network_settlement_payable 491.00  ← we owe Visa 491
-CR interchange_revenue          9.00  ← we keep 9
-```
-
-500 out, 500 in. A transaction that doesn't balance is meant to be *unrepresentable* rather than
-rejected — the writer never builds one. That writer does not exist yet, so today nothing refuses an
-unbalanced transaction; [ADR-0005](/decisions/0005-event-log-and-write-path) is the plan.
+two sides that cancel out. A $500 sale is 500 out and 500 in: the customer owes us 500, we owe the
+seller 491, we keep 9 as fee ([worked through](/database)). A transaction that doesn't balance is
+meant to be *unrepresentable* rather than rejected — the writer never builds one
+([ADR-0005](/decisions/0005-event-log-and-write-path)).
 
 **Debit / credit** — the two sides. Not "money in / money out": which one *increases* an account
 depends on the account. Debits increase assets and expenses; credits increase liabilities, equity
 and revenue. Above, a debit increases what the customer owes us (an asset) and a credit increases
-what we owe Visa (a liability). Both are "more".
+what we owe the seller (a liability). Both are "more".
 
 **Normal balance** — which side an account normally sits on. `customer_receivable` is
 debit-normal; `interchange_revenue` is credit-normal.
@@ -35,9 +27,9 @@ you have to store both.
 **Category** — one of exactly five: asset, liability, equity, revenue, expense. This is what rolls
 up into financial statements.
 
-**Chart of accounts** — the list of account *types* a business uses. Ours has 20
-(`customer_receivable`, `interchange_revenue`, …). Not the same as the accounts themselves: one
-type can have thousands of instances, one per customer.
+**Chart of accounts** — the list of account *types* a business uses (`customer_receivable`,
+`interchange_revenue`, …). Not the same as the accounts themselves: one type can have thousands of
+instances, one per customer.
 
 **Trial balance** — every account and its balance, listed. Should always balance.
 
@@ -63,18 +55,23 @@ to us because it's what bounds an otherwise unbounded scan when computing histor
 **Entry** — one line: this account, this direction, this amount. **Transaction** — a balanced set
 of entries. **Account** — the thing entries attach to.
 
-**Running balance** (`balance_after`) — each entry stores the account's balance *after* that entry,
-so reading the current balance is one index lookup instead of summing history. What summing history
-would cost at a million entries is **unmeasured** — no harness in this repository times a balance
-read.
+**Balance cache** (`ledger_account_balances`) — one row per account holding what it is worth *now*,
+so reading a current balance is a primary-key lookup instead of summing history. It is also the row
+a writer locks, which is what serializes two people spending the same money.
+
+**Running balance** — a balance stored on *each entry*, giving the account's total immediately after
+that entry. This ledger has **no such column**: it had one and
+[spike 009](/spikes/009-where-the-balance-lives) dropped it, because a running balance is only
+correct on the order rows were *inserted*, and every question anyone asks is about the date the money
+*moved*.
 
 **Recorded date vs effective date** — *when we learned about it* vs *when it happened*. A card
 clearing arrives Tuesday for a purchase Visa dates to Monday. Recorded = Tuesday, effective =
 Monday. Keeping both is called **bitemporal**.
 
 **Backdating** — an entry arriving with an effective date earlier than entries already recorded.
-Normal in payments: late clearings and chargebacks are inherently backdated. It's why
-`balance_after` answers "balance as recorded at T" but *not* "balance as of business date T" — see
+Normal in payments: late clearings and chargebacks are inherently backdated. It is why a running
+balance cannot answer "balance as of business date T", and why this ledger stores none — see
 [ADR-0006](/decisions/0006-time-and-as-of).
 
 **Idempotency key** — a key on an incoming event so a retry doesn't post it twice. The network
@@ -119,9 +116,9 @@ pump authorization clearing at $95. **Forced post** — a clearing with no autho
 
 An authorization is not one message. A purchase can produce an authorization, several increments, a
 reversal and several clearings, arriving in any order and sometimes twice. The designed model
-([ADR-0008](/decisions/0008-authorization-holds)) keeps every message as an immutable row in
+([ADR-0001](/card/decisions/0001-authorization-holds)) keeps every message as an immutable row in
 `card_auth_events` and derives the hold from them. That DDL is written and **parked** in
-[`parked/card/`](/parked-card); no migration applies it.
+[`parked/card/`](/card/parked); no migration applies it.
 
 **`group_key`** — the identifier that ties those messages together as *one* authorization. It is not
 something the processor reliably tells you: network IDs (ARN, RRN) don't agree across messages, so
@@ -152,19 +149,18 @@ tolerance holds — deltas commute, and totals resolve to the highest total seen
 ## Performance
 
 **Hot account** — an account touched by nearly every transaction, so every writer queues on the same
-row. `network_settlement_payable` is ours. [Spike 003](/spikes/003-throughput-ceiling)
-put a single shared row in the high hundreds of clearings per second on one machine, where the same
-configuration re-measured at 833 and then 482 purely from machine load — a shape, not a number. This
-is a named, forty-year-old problem: it is the branch record in the 1985 DebitCredit benchmark.
+row. `network_settlement_payable` is ours. [Spike 003](/spikes/003-throughput-ceiling) put a single
+shared row in the high hundreds of clearings per second on one machine — a shape, not a number, and
+[the vision](/vision#performance) says how far it moved on a re-audit. This is a named,
+forty-year-old problem: it is the branch record in the 1985 DebitCredit benchmark.
 
 **Contention** — writers waiting on the same row. The ceiling above is contention, not CPU or
 disk, which is why a bigger instance doesn't help.
 
 **Striping** — storing one logical account as N physical rows so writers spread across them;
-balance = sum of the stripes. **Not built here**: there is no stripe column in `migrations/`, and
-`uq_accounts__house` would currently prevent one on the accounts that need it. Measured in [spike
-003](/spikes/003-throughput-ceiling) only, on the same single machine as the figure
-above: 872 → 6,970 clearings/s at 64 stripes.
+balance = sum of the stripes. **Not built** ([roadmap](/roadmap)). Measured in [spike
+003](/spikes/003-throughput-ceiling) only, on the same single machine as the figure above:
+872 → 6,970 clearings/s at 64 stripes.
 
 **Skew** — how unevenly traffic is spread across customers. Uniform = everyone equal; skewed = one
 customer is most of your volume, which is what real platforms look like. It matters because giving
@@ -174,5 +170,5 @@ tenant's own account just becomes the new hot row. Striping is immune to this.
 **Coalescing / batching** — combining many postings to one account into a single write. Worth
 ~4.4× on its own.
 
-**Round trip** — one request to the database and back. Cheap on localhost (0.05 ms), ~10× more on
-managed Postgres — which is why our local numbers are not publishable figures.
+**Round trip** — one request to the database and back. Cheap on localhost, ~10× more on managed
+Postgres — which is why our local numbers are not publishable figures.

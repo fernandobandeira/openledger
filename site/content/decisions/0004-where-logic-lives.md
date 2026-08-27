@@ -1,7 +1,7 @@
 # 0004 — The ledger goes in Rust; PostgreSQL holds the shape
 
 **Status:** accepted
-**Evidence:** [spike 009](/spikes/009-how-other-ledgers-enforce)
+**Evidence:** [spike 006](/spikes/006-how-other-ledgers-enforce)
 for the survey, [spike 001](/spikes/001-formance) for Formance.
 
 ## The decision
@@ -35,7 +35,7 @@ impossible, reached with the application role's ordinary `INSERT` grant and ever
 | **A correction pointing at something it can correct.** `resolves_id` and `reverses_id` have foreign keys, so the target must *exist*. | Nothing requires the target to be in a state the correction means anything against. A posted transaction "resolved" by another posted one, and a pending one "reversed", took revenue to **−49,223** with drift at 0 and the equation balanced. The referential integrity was real; the semantic linkage was assumed. |
 | **`ENABLE ALWAYS` on triggers — including the foreign keys' own.** | `session_replication_role = 'replica'` (the logical-replication apply path, and what `pg_restore --disable-triggers` sets) skips triggers left in the default `ENABLE ORIGIN` state, **and foreign keys are implemented as triggers**. With the FK triggers left in that state, a transaction spanning two tenants, both legs in a currency their account does not hold, dated 27 years before its own transaction, committed cleanly on that path. *(Open: all **36** internal FK triggers in the shipped schema are `ENABLE ORIGIN` — nine foreign keys, four triggers each, re-counted after the card split took the tenth.)* |
 | **A chart that cannot contradict itself.** | Pointing a `revenue` type at a cost-of-revenue line put 6,000 of revenue on the expense side of the income statement — the harm [0007](/decisions/0007-schema-conventions-and-chart) is about — with every check green. A balance-sheet line carrying side `debit` was counted on *neither* side and vanished: 90% of a sheet missing, reporting balanced. Now a composite foreign key rather than a trigger, which is strictly better. |
-| **One convention per hold group; expiry measured against a snapshot.** | Mixing deltas with cumulative totals is *irreconcilable*, not merely awkward. And `assigned_at > expired_at` compares two `now()` values, so any writer whose transaction opened before the release timer fired was invisible. Both are [0008](/decisions/0008-authorization-holds)'s, and both survive in the card DDL — now parked in [`parked/card/`](/parked-card) and applied by no migration. |
+| **One convention per hold group; expiry measured against a snapshot.** | Mixing deltas with cumulative totals is *irreconcilable*, not merely awkward. And `assigned_at > expired_at` compares two `now()` values, so any writer whose transaction opened before the release timer fired was invisible. Both are [0001](/card/decisions/0001-authorization-holds)'s, and both survive in the card DDL — now parked in [`parked/card/`](/card/parked) and applied by no migration. |
 
 **A finding is a claim, too.** One escape once recorded here — plant a transaction carrying a *future*
 `xact_id`, wait for the counter to reach it, then append legs — reached an ADR and a migration on a
@@ -58,7 +58,7 @@ police a table arbitrary callers write to directly, which happens only where no 
 | --- | --- | --- |
 | `TRUNCATE` refusal | 7 → **3 kept** (4 while the card log shipped) | Kept, on the immutable logs. There is no declarative alternative and no way to collapse them: PostgreSQL refuses event triggers for `TRUNCATE TABLE` outright (verified: `ERROR: event triggers are not supported for TRUNCATE TABLE`), and `TRUNCATE` fires no `ON DELETE` trigger. |
 | Immutability (no `UPDATE`/`DELETE` on the journal) | 5 → **3 kept** (4 while the card log shipped) | `REVOKE` **and** a trigger. The grant binds the application role; the trigger is the only thing that also binds a backfill script or a human at a psql prompt. One `refuse_mutation()` over them all. |
-| Assignment (`recorded_at`, `xact_id`, `account_seq`, `balance_after`) | 5 | The writer assigns them, with no parameter for a caller to supply — stronger than a `DEFAULT`, which is overridable, and that was a measured defect: a client-settable insertion axis let an already-issued report be rewritten by a transaction claiming to predate it. |
+| Assignment (`recorded_at`, `xact_id`, `account_seq`) | 5 | The writer assigns them, with no parameter for a caller to supply — stronger than a `DEFAULT`, which is overridable, and that was a measured defect: a client-settable insertion axis let an already-issued report be rewritten by a transaction claiming to predate it. |
 | Cross-row validation | ~10 | Two became **foreign keys** (below). The rest — "debits equal credits", "at least two entries", correction targets — are enforced by *construction*: the writer builds both legs in one code path, so an unbalanced transaction is **unrepresentable** rather than refused ([0005](/decisions/0005-event-log-and-write-path)). |
 
 **Two triggers became keys, which is strictly better** — visible in `\d`, needing no test.
@@ -92,8 +92,9 @@ a transfer, nothing for a guard to police.
 
 | | Why not |
 | --- | --- |
-| **Zero triggers** | Reasoned from maintainability alone, and [spike 009](/spikes/009-how-other-ledgers-enforce) corrects it: three of the nine ledgers surveyed ship triggers in production, the anti-trigger doctrine has no canonical citation, and two invariants have no declarative form and no application-side reach. |
+| **Zero triggers** | Reasoned from maintainability alone, and [spike 006](/spikes/006-how-other-ledgers-enforce) corrects it: three of the nine ledgers surveyed ship triggers in production, the anti-trigger doctrine has no canonical citation, and two invariants have no declarative form and no application-side reach. |
 | **Validate rather than assign** | Tried for `account_seq` against the balance cache: the application role can write the thing being validated against, and a brand-new account has no cache row at all, so bigint-max was accepted and the account was permanently bricked. |
+| **A Postgres sequence for `account_seq`** | Three reasons, and the first two are fatal. A sequence is **per table, not per account** — `account_seq` has to run 1, 2, 3 *within each account*, so a shared counter gives account A 1, 5, 9 and account B 2, 3, 4; getting per-account numbering out of sequences means one sequence object per account, created by DDL at account-open time. And **`nextval()` is non-transactional and deliberately leaks gaps**: a transaction that takes 5 and aborts leaves a permanent hole, which is exactly what [0006](/decisions/0006-time-and-as-of) rejects `bigserial` for on the as-of cursor, and what Formance documents against its own per-ledger sequence — *"we can still have holes on ids since a sql transaction can be reverted after a usage of the sequence"*. Gaplessness is the property `account_seq` exists to provide: it is the key a drift check walks and every as-of reconstruction depends on, so a hole makes *"did we lose an entry, or did a transaction abort?"* unanswerable. Third and cheapest: the writer already holds the balance row's lock, so `last_seq = b.last_seq + 1` in that same statement is free and advances the balance and the counter **atomically together**, where a separate sequence is a second source of truth that can disagree with the balance it orders. |
 | **"One service owns the writes"** | A hope about deployment — it fails the day someone writes a second adapter or a backfill. Formance ships **zero `GRANT` and zero `REVOKE` in its entire repository** and does not bet on it either; their guarantee is a *type* ([0005](/decisions/0005-event-log-and-write-path)). |
 
 ## What it costs
@@ -126,9 +127,9 @@ refused it is gone. Every system in the survey that made this move shipped the e
 first; we did not. The fix is a posting-shaped write primitive, not a grant and not a trigger
 ([0005](/decisions/0005-event-log-and-write-path)).
 
-**What survives:** [`migrations/00001_baseline.sql`](/source/baseline), applied by
+**What survives:** `migrations/00001_baseline.sql`, applied by
 `openledger migrate` — the counted inventory of what is in it lives in one place,
-[the decision log](/decisions#what-the-schema-enforces-today), and is deliberately not repeated
+[the database page](/database#what-the-schema-enforces-today), and is deliberately not repeated
 here. It proves the shape is expressible
 declaratively, and `schema/chart.sql` seeds a chart satisfying it. The suites that exercised it are
 deleted; what they *learned* is in these ADRs, and returns as tests beside the code.

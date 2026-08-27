@@ -11,12 +11,12 @@ the two things an ADR cannot: **the chart of accounts in detail**, and **the car
 text**, where each step can be diffed, grepped and argued with.
 
 Two things to hold while reading. Durable timers run **in-process on Postgres**
-([ADR-0008](/decisions/0008-authorization-holds)), not on an external workflow engine. And the hold
+([ADR-0001](/card/decisions/0001-authorization-holds)), not on an external workflow engine. And the hold
 tables named in the trace below are the *shape* of the design, not what shipped: `card_holds`,
 `credit_lines`, `spend_controls` and `card_transactions` do not exist. The hold model is **written and parked** as an
 append-only trio — `card_auth_events`, `card_auth_event_group`, `card_hold_groups`
-([ADR-0008](/decisions/0008-authorization-holds)) — in
-[`parked/card/schema.sql`](/source/card-schema), which **no migration applies**. The
+([ADR-0001](/card/decisions/0001-authorization-holds)) — in
+`parked/card/schema.sql`, which **no migration applies**. The
 credit-line and spend-control tables were never written at all (roadmap M7).
 
 ## The thesis
@@ -32,13 +32,13 @@ warehouse-funded receivables, we own the authorization decision, delegated KYB/K
 an expiry timer; the ledger first hears about the purchase at **clearing**, which is also when
 interchange is recognized. That is **our choice, not the field's** — about half the systems surveyed
 write a durable, balance-affecting row at authorization time and about half keep it outside the
-ledger as we do. [Spike 008](/spikes/008-processor-hold-semantics) has the split per
+ledger as we do. [Spike 002](/card/spikes/002-processor-hold-semantics) has the split per
 vendor; it is not repeated here, because a list in two places drifts out of step with itself.
-See also [ADR-0008](/decisions/0008-authorization-holds).
+See also [ADR-0001](/card/decisions/0001-authorization-holds).
 
 ## The chart of accounts
 
-Twenty account types, seeded by [`schema/chart.sql`](/source/chart) — **seed data, not
+Twenty account types, seeded by `schema/chart.sql` — **seed data, not
 engine**: a marketplace or wallet deployment ships a different chart against the same core. Each
 type declares its `category` (which rolls up the financial statements), its `normal_balance` (which
 side it sits on), and the `fs_line` it maps to (the caption it appears under). Completeness comes
@@ -96,28 +96,34 @@ earnings appear as the derived `current_year_earnings` line in the `balance_shee
 
 ## Reading a balance, and the trap in the as-of query
 
-`posted` — what the customer owes — is read straight off the ledger, with no cache and no second
-copy to drift. Every entry carries the running balance of its account at that moment.
+`posted` — what the customer owes — is the ledger's own current balance, so it is a primary-key read
+of one row. There is no running balance on the entries to read instead:
+[spike 009](/spikes/009-where-the-balance-lives) dropped it, because a running balance is only
+correct on the order rows were inserted in.
 
 ```sql
--- current balance: one index lookup, no scan. tenant_id is not optional: it leads
--- every index, so without it this plans as a Seq Scan plus a Sort.
-SELECT balance_after FROM ledger_entries
-WHERE tenant_id = :tenant AND account_id = :acct
-ORDER BY account_seq DESC LIMIT 1;
+-- current balance: one row, by primary key.
+SELECT input - output FROM ledger_account_balances
+WHERE tenant_id = :tenant AND account_id = :acct AND currency = :ccy;
 
--- balance as of a past RECORDING instant. The ORDER BY must match
--- ix_entries__asof_recorded, NOT the balance index above.
-SELECT balance_after FROM ledger_entries
-WHERE tenant_id = :tenant AND account_id = :acct AND recorded_at <= :as_of
-ORDER BY recorded_at DESC, account_seq DESC LIMIT 1;
+-- balance as of a past RECORDING instant: an aggregate, not a lookup. The ORDER BY
+-- and the predicate must both match ix_entries__asof_recorded. tenant_id is not
+-- optional -- it leads every index, and without it this plans as a Seq Scan.
+SELECT sum(CASE WHEN direction = 'debit' THEN amount_minor ELSE -amount_minor END)
+FROM ledger_entries
+WHERE tenant_id = :tenant AND account_id = :acct AND recorded_at <= :as_of;
 ```
 
-**The as-of query is not "the same lookup with one more predicate".** Once `recorded_at` is a range
-predicate, ordering by `account_seq` alone cannot be served by
-`(tenant_id, account_id, recorded_at DESC, account_seq DESC)`, so the planner walks the balance
-index backwards discarding rows. `ix_entries__asof_recorded` exists for exactly this query; the
-ordering above is what reaches it.
+> **The current-balance read is the one the ~1s authorization deadline depends on**, and dropping
+> the running balance made it slightly worse, not better: `ledger_account_balances` is rewritten on
+> every posting to that account, so a hot account's row never gets its visibility-map bit set and
+> the read always visits the heap. It is one heap fetch on one row. Spike 009 took that trade
+> deliberately, and the card rail is where it is felt first.
+
+**The as-of query is not "the current balance with one more predicate".** It cannot be, now: the
+current balance is a different table. `ix_entries__asof_recorded` exists for exactly the second
+query, and the predicate above is what reaches it — written any other way the planner scans and
+discards.
 
 Two limits on what that second query answers. It is a *recording*-axis question only: a business-date
 balance must aggregate over `effective_at`, because a backdated entry lands with a later sequence

@@ -1,8 +1,8 @@
 # 0003 — Migrations are `sqlx`, plus a polling try-lock of our own, run as their own command
 
 **Status:** accepted
-**Evidence:** [spike 007](/spikes/007-schema-migrations) for the deployment shape,
-[spike 010](/spikes/010-go-or-rust) for the locking.
+**Evidence:** [spike 005](/spikes/005-schema-migrations) for the deployment shape,
+[spike 007](/spikes/007-go-or-rust) for the locking.
 
 ## The decision
 
@@ -25,11 +25,11 @@
 - **No down migrations.**
 - **There are two SQL schema files, and a migration owns exactly one of them.**
   `migrations/00001_baseline.sql` is the ledger core, applied by `openledger migrate`.
-  [`parked/card/schema.sql`](/parked-card) is the card product's DDL, and **no
+  [`parked/card/schema.sql`](/card/parked) is the card product's DDL, and **no
   migration applies it, no runner loads it and no CI checks it** — its only attestation is a manual
   paste. "The database matches the file" is a claim about the baseline and says nothing about the
   parked one.
-- **This one is built** — [`src/migrate.rs`](/source/migrate-rs), 255 lines, of which the try-lock
+- **This one is built** — `src/migrate.rs`, 255 lines, of which the try-lock
   poll is 32. Two of the rules above are tests in that file rather than sentences in this one: no
   `.down.sql` in the set, and a `-- no-transaction` migration holding exactly one statement.
 
@@ -117,7 +117,7 @@ file's. (`make chart` is a `psql -f` of a file no migration owns, and gets the s
 
 ## What it costs
 
-- **We own the locker.** A `pg_try_advisory_lock` poll in [`src/migrate.rs`](/source/migrate-rs) —
+- **We own the locker.** A `pg_try_advisory_lock` poll in `src/migrate.rs` —
   32 lines of that file's 255 — and the bug reports about them come to us. This is the sharpest cost
   of [0001](/decisions/0001-rust-and-postgres) that is not about types. **The poll ceiling had to be set
   deliberately** — a migration slower than the retry budget makes a *second* migrator give up rather
@@ -150,7 +150,7 @@ file's. (`make chart` is a `psql -f` of a file no migration owns, and gets the s
   ```
 
   **They cannot share a file, and an earlier version of this ADR said they could.** That pair was
-  verified against goose in [spike 007](/spikes/007-schema-migrations) and carried
+  verified against goose in [spike 005](/spikes/005-schema-migrations) and carried
   into an `sqlx` decision without being re-run. Under `sqlx` 0.9.0 it fails:
 
   ```

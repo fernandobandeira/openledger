@@ -67,16 +67,28 @@ payments, because a clearing carries the network's business date. On the **effec
 backdated entry invalidates every later running balance, so their trigger runs an unbounded
 `UPDATE … WHERE effective_date > new.effective_date`. Migration 10 sets `fillfactor = 80` on the journal. The fill factor is verified at the pinned
 commit; the REASON is OUR INFERENCE -- `notes.yaml` reads only "Define fill factor of moves table"
--- and we infer it is because the table became UPDATE-heavy. Six migrations touch volume/pcv
-aggregation
-afterwards — **three of them repairing data** (19, 20, 28), two replacing functions, and one
-(`27-fix-invalid-pcv`) a no-op stub. An earlier version of this line said all six "exist solely to
-repair volume data"; fetched at the pinned commit, that is not what they do.
+-- and we infer it is because the table became UPDATE-heavy. **Seven** migrations touch volume aggregation —
+2, 3, 9, 19, 20, 27 and 28 — **four of them mutating data**. Migration 20 is the instructive one: it
+rebuilds the *aggregate* from the per-entry running balance
+(`first_value(post_commit_volumes) over (… order by seq desc)`), which is prior art for a repair
+path this project does not have.
 
-**Our `balance_after` is their immutable one.** It is ordered by `account_seq`, assigned on
-insertion, so a backdated entry gets the *next* sequence number and its own balance; nothing
-already written changes. The lesson is not "running balances are bad" — it is **"a running
-balance on a mutable axis is bad"**, and we keep only the immutable one.
+`27-fix-invalid-pcv` reads as a no-op stub today and was not one: it shipped as a 63-line backfill,
+was superseded the same day by 28, and was **retroactively replaced with a `raise notice` fourteen
+months later**. Formance edits migration files after release, so read them with
+`git show <first-commit>:<path>` rather than at HEAD.
+
+**Our `balance_after` was their immutable one.** It was ordered by `account_seq`, assigned on
+insertion, so a backdated entry got the *next* sequence number and its own balance; nothing already
+written changed. The lesson drawn here was not "running balances are bad" but **"a running balance
+on a mutable axis is bad"**, and this spike kept the immutable one.
+
+> **SUPERSEDED by [spike 009](/spikes/009-where-the-balance-lives) — the column is gone.** That
+> conclusion is true and it is not sufficient. The immutable axis is safe precisely because it is
+> inert, and it is inert because nothing anyone asks about is ordered by it: every as-of balance a
+> business wants is a *business-date* question, which is the axis this very spike showed a running
+> balance cannot serve. The table below is the demonstration — on the recorded axis both queries
+> agree, and agreeing about the wrong axis is not a use.
 
 ## What it cost us
 
@@ -95,8 +107,10 @@ silently includes the Jan 30 entry, because the backdated row has a *higher* `ac
 **On the recorded axis both queries agree.** So the vision doc's as-of query is correct as
 written — the gap is that its stated *purpose* (reproducible lender reporting, "as of June 30")
 is a business-date question, and on that axis `balance_after` is unusable the moment anything is
-backdated. Resolved in [ADR-0006](/decisions/0006-time-and-as-of): keep the
-running balance for the recorded axis, aggregate on read for the effective axis.
+backdated. Resolved at the time in [ADR-0006](/decisions/0006-time-and-as-of) — keep the running
+balance for the recorded axis, aggregate on read for the effective axis — and reopened by
+[spike 009](/spikes/009-where-the-balance-lives), which dropped the recorded-axis half too. "Now"
+comes from `ledger_account_balances` and both as-of reads are aggregates.
 
 ---
 
@@ -239,6 +253,14 @@ The third row is the one that matters. Index-only scans need the visibility-map 
 — so on a **freshly inserted row, which is exactly what the auth hot path reads**, the heap fetch
 happens anyway. `INCLUDE` is justified by as-of reporting over settled history, not by the hot
 path. Adopted with that rationale recorded in the schema.
+
+> **Both halves of that justification are now gone, and this table is half the reason.** This spike
+> established that the covering index does *not* help the hot path.
+> [Spike 009](/spikes/009-where-the-balance-lives) established that the as-of read it *was* justified
+> by is a business-date question a running balance cannot answer at all. Nothing was left, so the
+> column went and the index went with it — stripped of its payload it was a straight duplicate of
+> `uq_entries__account_seq`. The 3 MB gap above (16 MB → 19 MB) is what that payload cost, per this
+> table's own measurement.
 
 The mirror image is why their covering index on `accounts_volumes` is a mistake: it duplicates the
 PK's key columns on an **UPDATE-heavy** table, paying two index writes per posting to save a heap

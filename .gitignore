@@ -16,14 +16,11 @@
 
 # The docs site.
 #
-# `site/content/` IS the documentation -- it is committed and it is the source of
-# truth. The one exception is `content/source/`, which site/scripts/sync.mjs
-# regenerates from files that have to live elsewhere (the migration, the chart,
-# the parked DDL, the Rust). Those are copies, so they are not committed.
+# `site/content/` IS the documentation -- every file under it is committed and is
+# the source of truth. Nothing there is generated.
 /site/node_modules/
 /site/.next/
 /site/out/
-/site/content/source/
 # Next.js writes these; they are not this repository's to own.
 /site/AGENTS.md
 /site/CLAUDE.md

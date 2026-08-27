@@ -1,4 +1,4 @@
-# 0008 — A hold is a SUM over an append-only event log, and its timers live in the same Postgres
+# 0001 — A hold is a SUM over an append-only event log, and its timers live in the same Postgres
 
 **Status:** accepted, and **scoped as future work.** The core ledger ships first; the card rail is
 built on top of it afterwards. This ADR records the model and the evidence behind it so the work is
@@ -6,10 +6,10 @@ not re-derived — it is *not* a specification of something being built now, and
 are recorded rather than closed deliberately. Where a sentence here is in the present tense about an
 adapter, a writer or a sweep, **that code does not exist**, and neither do the tables: `src/` is the
 migration runner and nothing else, and this module's DDL is parked in
-[`parked/card/`](/parked-card), applied by no migration.
-**Evidence:** spikes [006](/spikes/006-append-only-holds),
-[008](/spikes/008-processor-hold-semantics),
-[005](/spikes/005-durable-timers) and [010](/spikes/010-go-or-rust).
+[`parked/card/`](/card/parked), applied by no migration.
+**Evidence:** spikes [001](/card/spikes/001-append-only-holds),
+[002](/card/spikes/002-processor-hold-semantics),
+[003](/card/spikes/003-durable-timers) and [007](/spikes/007-go-or-rust).
 
 ## The decision
 
@@ -18,12 +18,14 @@ and the purchase may never clear. But the amount is not spendable either, and th
 has about a second to decide if it fits. So a hold is **derived from an immutable log of processor
 messages**, never a running amount anyone updates.
 
+![The authorization hot path: a roughly one-second network deadline, inside which our own synchronous work targets p99 under 300 ms](/diagrams/02-auth-hot-path.svg)
+
 **The budget, because it is the only latency-bound path in the system.** The network gives roughly
 **one second** end to end; the target for our own synchronous work is **p99 under 300 ms**. What runs
 inside it is one short transaction: lock the credit line, read the posted balance, sum the live holds,
 decide, write the hold row. **The ledger write is not in it** — a clearing is recorded as an event and
 posted by a job outside the deadline ([0002](/decisions/0002-scaling)). Every design choice below that looks
-like premature optimization is paying for this number, and **it has never been measured**: spike 010
+like premature optimization is paying for this number, and **it has never been measured**: spike 007
 recorded single-shot wall times of 9.1 ms including connection setup on a laptop-class container,
 which is not a p99 and must not be quoted as one. The authorization path needs its own spike.
 
@@ -46,7 +48,7 @@ The vocabulary, since every sentence uses it:
 | **2. Group membership is a separate system-versioned table** | There is deliberately no `group_key` column on the event. Re-grouping is routine — a clearing arrives unmatched and is attached later, a mis-grouped increment is split out — and storing the inference on the event would force that correction to `UPDATE` a row we call immutable. |
 | **3. Expiry is a flag, not an event** | An event carrying `−remaining` would have to read the aggregate to compute its own amount: a read-modify-write smuggled into an append-only log, and a read does not commute. The mirror image is the same mistake and shipped once — an `expiry_reversal` carrying `+remaining` made one 100.00 authorization hold 200.00, still 100.00 after full capture, drift silent because the log genuinely contained the `+10000`; it now carries **zero**, clearing a flag that never subtracted. An expired group re-opens on any increase-side message, including a restatement whose delta is zero, since the restatement itself is the liveness signal; a late clearing does not resurrect it. `expired_authorized` and `expired_total` snapshot the group at release so the alarm can tell *exposure added after a release* from *an event merely arriving after one*. |
 | **4. Over-capture clamps to zero and is recorded** | A $1 fuel authorization clearing at $95 must contribute 0 to available credit, never *raise* it. The clamp maps three conditions onto one 0 — legitimate over-capture, an adapter feeding a total into a delta column, a mis-grouped clearing — so `overcaptured_at` and `low_water_minor` make it an alarmable state rather than a value swallowed at `SELECT` time. |
-| **5. The per-group total is materialised** | Because the authorization deadline is about a second end to end and summing an unbounded log is unbounded work. *That is an argument, not a measurement*: spike 006 says the derivation "has not been benchmarked here", and the cost of the alternative is unmeasured. **Two views watch it.** `card_auth_unmatched` is the review queue: an event with no live assignment is unmatched *by definition*, so the queue cannot drift from the data it describes. `card_hold_drift` is the alarm — a materialised total disagreeing with its log, a log with no materialised total, a group mixing conventions, exposure added after expiry, a group under water with un-posted decreases. [`parked/card/schema.sql`](/source/card-schema) is the implementation — **parked, and applied by no migration**; see [`parked/card/README.md`](/parked-card). |
+| **5. The per-group total is materialised** | Because the authorization deadline is about a second end to end and summing an unbounded log is unbounded work. *That is an argument, not a measurement*: spike 001 says the derivation "has not been benchmarked here", and the cost of the alternative is unmeasured. **Two views watch it.** `card_auth_unmatched` is the review queue: an event with no live assignment is unmatched *by definition*, so the queue cannot drift from the data it describes. `card_hold_drift` is the alarm — a materialised total disagreeing with its log, a log with no materialised total, a group mixing conventions, exposure added after expiry, a group under water with un-posted decreases. `parked/card/schema.sql` is the implementation — **parked, and applied by no migration**; see [`parked/card/README.md`](/card/parked). |
 | **6. The expiry timer is a job row in our own Postgres. No Temporal.** | Durable timers run inside the application binary, backed by the same database the ledger writes to, and the product layer gets a narrow interface whose **transaction parameter is the point**: `at(tx, kind, key, when, payload)` and `cancel(tx, kind, key)`. The job row commits in the same transaction as the ledger write, so *"the hold row and its expiry timer both exist, or neither"* is a database guarantee rather than a convention. Exactly one driver ships: **`graphile_worker` 0.13.5** (MIT, on `sqlx` 0.9.0). **The ledger core takes no scheduler dependency at all** ([0002](/decisions/0002-scaling) — every timer belongs to a rail). |
 
 The four properties that matter for the timer, run against a real `ledger_write` table:
@@ -58,6 +60,11 @@ C. 7-day absolute run_at     run_at=2026-09-02 …
 D. idempotent by job key     1 row after 3 enqueues
 ```
 
+![State machines: the hold, clearing and settlement lifecycles, and which transitions emit a ledger transaction](/diagrams/03-state-machines.svg)
+
+*The lifecycles this decision governs.* Only some transitions emit a ledger transaction — an
+authorization emits none.
+
 ## Why a SUM over a log
 
 **A clearing has no reliable key back to its authorization.** Network identifiers (ARN, RRN) do not
@@ -65,7 +72,7 @@ agree across messages, so grouping is an *inference*, and inferences get correct
 rely solely on network reference IDs to correlate authorization and clearing events. Network
 identifiers are not guaranteed to be consistent across the lifecycle of a transaction"* — and they
 ship an unmatched queue rather than guessing, out-of-order clearing being a routine sequence in their
-message table. *(Spike 008 has the URL; re-fetched and matched verbatim.)*
+message table. *(Spike 002 has the URL; re-fetched and matched verbatim.)*
 
 **Processors disagree on delta versus cumulative total, with no norm to fall back on.** Adyen and
 Pismo send deltas; **Marqeta** says so unambiguously — *"`authorization.incremental` — Increases the
@@ -74,10 +81,18 @@ send restated totals. Treasury Prime releases the old hold and re-holds at the n
 **Stripe, Increase, Galileo and Treasury Prime each send both in one message** — Galileo puts the
 cumulative amount in the primary fields and, in its own words, *"the incremental amount will be
 present in the local amount fields"*. Keeping `raw_amount` and `raw_is_total` verbatim beside the
-normalised delta is the only defensible response to six conventions with no norm. *(Spike 008 read
+normalised delta is the only defensible response to six conventions with no norm. *(Spike 002 read
 thirteen processors' references; six of fifty-one pages carry a link — treat the rest as unverified.)*
 And **messages arrive out of order, are re-delivered, and sometimes never arrive** — merchants should
 reverse what they do not capture and many do not. Order tolerance is what lets a SUM answer.
+
+**Redelivery is deduplicated at the HTTP layer, in a table of its own.** `webhook_deliveries` keys
+`(tenant_id, delivery_id)` on the *processor's* delivery id and has no ledger effect. It is
+deliberately not folded into [`ledger_events`](/decisions/0005-event-log-and-write-path): that log's
+identity is the operation a caller asked us to accept, and a delivery id identifies one HTTP attempt
+at telling us about it. Collapse the two and a retried webhook looks like a business event —
+the same message delivered twice becomes two accepted operations, which is the failure the idempotency
+contract exists to prevent. It is parked with the rest of this module and read by nothing today.
 
 **Two divergences from the field, both deliberate.** About half the systems surveyed write a durable,
 balance-affecting row at authorization time, so *"an authorization writes no ledger entry" is a
@@ -207,7 +222,7 @@ zero-delta restatement can. The sweep then expires against live exposure and `he
 **How often this happens is unknown, and the earlier claim that it is "the expected case" was
 unsupported.** It reasoned from Visa's Table 5-12 window being shorter than our hold — but that table
 is the *acquirer's clearing-submission* deadline, which this same ADR insists is a different clock.
-Worse, every expiry-time message [spike 008](/spikes/008-processor-hold-semantics)
+Worse, every expiry-time message [spike 002](/card/spikes/002-processor-hold-semantics)
 documents is a **release**, not an un-expiry, so nothing here establishes that an `expiry_reversal` is
 even a message a processor sends: **the wire event this kind maps to is unidentified.** This
 **qualifies property 1**: the `SUM` is commutative, but `held_minor` is that `SUM` gated by a flag set

@@ -1,10 +1,10 @@
-# Spike 010 — Go or Rust for the ledger service
+# Spike 007 — Go or Rust for the ledger service
 
 **Status:** closed. Produced [ADR-0001](/decisions/0001-rust-and-postgres), and three
 corrections to ADRs that were already accepted.
 
 **Question.** [0001](/decisions/0001-rust-and-postgres) chose Go, partly on Temporal SDK
-quality — a premise [0008](/decisions/0008-authorization-holds) removed when it chose River.
+quality — a premise [0001](/card/decisions/0001-authorization-holds) removed when it chose River.
 Meanwhile [0005](/decisions/0005-event-log-and-write-path) moved the balance invariant *into the
 type system*. Both changes put weight on the type system that Go was never chosen for. So: is Go
 still right?
@@ -128,7 +128,7 @@ configuration, while in Go the idiomatic form is `switch` and it is checked only
 third-party binary that has not shipped in nearly three years.
 
 **When the enum grows, Go wins a round.** `ALTER TYPE auth_event_kind ADD VALUE
-'financial_authorization'` (a real gap — [0008](/decisions/0008-authorization-holds)
+'financial_authorization'` (a real gap — [0001](/card/decisions/0001-authorization-holds)
 names Lithic's `FINANCIAL_AUTHORIZATION`): `sqlc
 generate` propagates it into the type and `exhaustive` then forces you to visit the switch. Rust has
 no codegen, so the hand-written enum does not grow and `cargo build` stays clean.

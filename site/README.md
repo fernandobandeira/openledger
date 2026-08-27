@@ -5,24 +5,10 @@ navigation, search and a reading layout; it does not add content.
 
 ## Where the words live
 
-`docs/`, the root `README.md`, and each `spikes/*/README.md` are **the source of truth**. Edit
-those. `site/content/` is **generated and gitignored** — `scripts/sync.mjs` rebuilds it from
-scratch on every run, so anything written there is lost.
+`site/content/` **is** the documentation and every file under it is committed. Edit it directly;
+nothing here is generated.
 
-What the sync does:
-
-- copies each markdown file to a site route, adding only a `title` frontmatter;
-- rewrites relative links (`../../migrations/00001_baseline.sql`) to site routes;
-- **de-links** repository files the site does not publish — a spike's `schema.sql`, the
-  `LICENSE` — keeping the link text and dropping the dead href, because a relative path served
-  from a static host is a 404 the reader cannot see coming. Each run prints the list, which is
-  how you notice a file has become worth publishing;
-- renders four source files (`migrations/00001_baseline.sql`, `schema/chart.sql`,
-  `parked/card/schema.sql`, `src/*.rs`) as their own fenced-code pages;
-- copies `docs/diagrams/` into `public/diagrams/`;
-- writes the `_meta.js` files that order the sidebar.
-
-Content is emitted as `.md`, never `.mdx`, **on purpose**: the repository's prose contains
+Pages are `.md`, never `.mdx`, **on purpose**: the prose contains
 `Option<i64>` and `<table>_<column>_not_null`, which MDX would try to parse as JSX. Keep it that
 way.
 
@@ -30,8 +16,8 @@ way.
 
 ```
 npm install
-npm run dev      # sync + next dev
-npm run build    # sync + static export to out/ + pagefind index
+npm run dev      # next dev
+npm run build    # static export to out/ + pagefind index
 npm start        # serve out/
 ```
 
@@ -46,8 +32,7 @@ Nextra 4's search box is a [Pagefind](https://pagefind.app) client that fetches 
 `/_pagefind/`. Without that index the box renders and finds nothing, so `npm run build` runs
 `pagefind --site out --output-subdir _pagefind` after the export — that is the only reason
 `pagefind` is a dependency. `next.config.mjs` sets `search: { codeblocks: true }`; Nextra
-excludes code from the index by default, which here meant the migration was unsearchable on its
-own identifiers.
+excludes code from the index by default.
 
 The index is built from `out/`, so **search does not work under `npm run dev`** — the box is
 there and returns nothing. Use `npm run build && npm start` to try it.
@@ -74,8 +59,6 @@ app/layout.jsx        navbar, footer, theme tokens, Layout options
 app/theme.css         the only styling this site adds on top of the theme
 app/[[...mdxPath]]/   the catch-all that renders a content page
 mdx-components.js     blockquote classification (CAUGHT vs STILL OPEN callouts)
-scripts/sync.mjs      renders the 5 source-code pages into content/source/
 content/              THE DOCUMENTATION. Committed, and the source of truth.
-                      Only content/source/ is generated.
 public/diagrams/      the SVGs the documents embed.
 ```

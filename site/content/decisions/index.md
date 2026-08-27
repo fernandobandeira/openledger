@@ -9,7 +9,7 @@ the ADRs don't each stop to re-explain them.
 ## The stack
 
 - **Rust** — the ledger is written in Rust; Postgres holds the shape. Chosen over Go after
-  [spike 010](/spikes/010-go-or-rust) built both against the real schema and seeded
+  [spike 007](/spikes/007-go-or-rust) built both against the real schema and seeded
   this project's own bugs into each: Rust's compiler caught **5 of 5**, Go's caught **0 of 5**, and
   two of the five were guarantees an accepted ADR had already claimed in writing and did not have.
 - **Postgres**, one instance — measured at ~800 **clearings**/s untuned (a clearing is one card
@@ -26,13 +26,8 @@ the ADRs don't each stop to re-explain them.
 
 ## The decisions
 
-Nine. Eight came from consolidating fourteen by subject once the language changed; the ninth
-answers how an optional module that owns tables gets shipped. Two files were
-archaeology: one recorded what a deleted PL/pgSQL implementation could not guarantee, one compared
-two Go code generators. Their evidence moved into the file that owns the subject; their narrative did
-not. **One decision nearly went with them** — *"a general ledger with a card product as its reference
-implementation, not a card ledger"* — and is now the opening line of
-[0002](/decisions/0002-scaling), because it is what decides the build order.
+Eight, each one file, each stating the decision first and then its evidence, its alternatives and
+what it costs.
 
 | # | We decided | Because | Status |
 | --- | --- | --- | --- |
@@ -43,8 +38,7 @@ implementation, not a card ledger"* — and is now the opening line of
 | [0005](/decisions/0005-event-log-and-write-path) | An append-only `ledger_events` table, and **a posting — not an entry — as the write primitive** | Most accepted operations write no ledger transaction, so idempotency cannot live on the transactions table. And "one service owns the writes" is a hope about deployment; a type that cannot express an unbalanced transaction holds for every caller | accepted |
 | [0006](/decisions/0006-time-and-as-of) | Running balance for "now", aggregate-on-read for "as of a business date" — and reports pinned to a commit-ordered cursor | A backdated entry lands with a *later* sequence number. And `recorded_at` is transaction-*start* time, so the same "as of" query re-runs to a different answer | accepted; **the as-of cursor is unbuilt and blocks M5** |
 | [0007](/decisions/0007-schema-conventions-and-chart) | Naming rules, a CI schema-snapshot test, and the chart of accounts as data with completeness as a separate invariant | Dropping a column silently drops its indexes — Formance lost two that way, unnoticed for sixteen migrations. And a dropped *balanced sub-book* satisfies the accounting equation while the report is incomplete | accepted |
-| [0008](/decisions/0008-authorization-holds) | A hold is a SUM over an append-only event log, and its timers are job rows in Postgres, not a workflow engine | Grouping a clearing to its authorization is a revisable inference, and processors disagree on whether an increment carries a delta or a cumulative total. The need is durable *scheduling*, and a job row commits in the same transaction as the ledger write, which Temporal cannot do | accepted |
-| [0009](/decisions/0009-module-boundaries) | **The card module gets its own Postgres schema, not its own migration set** | Not one foreign key crosses the card/core boundary, so the seam is real — but `sqlx` has no ordering between migration sets, and of eight systems read from source, the only two that separate cleanly give each component its own *database* | **proposed** |
+| [0008](/decisions/0008-module-boundaries) | **The card module gets its own Postgres schema, not its own migration set** | Not one foreign key crosses the card/core boundary, so the seam is real — but `sqlx` has no ordering between migration sets, and of eight systems read from source, the only two that separate cleanly give each component its own *database* | **proposed** |
 
 ## Non-negotiable
 
@@ -67,64 +61,6 @@ No decision may trade these away. They are what makes the numbers trustworthy:
   had to notice. [0004](/decisions/0004-where-logic-lives) turned it into a foreign key, which is the same
   property, declaratively.
 
-## What the schema enforces today
-
-Measured against a fresh load of [`migrations/00001_baseline.sql`](/source/baseline), not asserted.
-
-**7 tables · 3 views · 23 indexes · 9 foreign keys · 15 CHECKs · 6 triggers over 2 functions · 0 event triggers · 0 policies**
-
-Those are the objects **the migration defines**. A database that has actually been migrated carries
-one more of each: `sqlx` creates its own `_sqlx_migrations` bookkeeping table, with a primary key —
-so `psql -f` gives 7 tables and 23 indexes, and `openledger migrate` gives 8 and 24. That extra
-table is also the single object in a migrated database whose name does not match convention 1
-(`_sqlx_migrations_pkey`), and it is not ours to rename. Stated because the difference between
-"loaded the file" and "ran the migrator" is now a real fork, and a census that does not say which
-one it counted is the kind of number this section exists to stop.
-
-**This section is the only place in the repository that carries those counts**, and every other
-document that used to — the root `README.md`, [`roadmap.md`](/roadmap) M1 and
-[0004](/decisions/0004-where-logic-lives) — now links here and states no number. A count maintained in five
-files is a count that drifts, which is this log's own rule and was being broken by this log.
-[0009](/decisions/0009-module-boundaries) still prints six of them because it is quoting spike 011's
-measurement of a split it built; it says so in place. *(`database.md` carries its own inventory and
-is not covered by this consolidation.)*
-
-Every index and every named constraint matches `^(pk|uq|ix|ck|fk)_`; **0** carry a PostgreSQL default
-name. The card module's 4 tables, 2 views and 10 indexes are **parked** and applied by nothing —
-[`parked/card/`](/parked-card).
-
-**Enforced by the database:**
-
-- Single-row `CHECK`s — `amount_minor > 0`, ISO currency, house accounts having no owner, caption
-  cleanliness, statement/side agreement. *(The sign rule per authorization kind is real, and lives in
-  the parked card DDL, so nothing enforces it today.)*
-- **Chart integrity, by two composite foreign keys.** An account cannot claim a category or normal
-  balance its type does not have; a type cannot report under a statement line that contradicts its
-  category. A wrong chart is refused at seed time — verified, three of four mutant charts died on
-  load.
-- **Append-only on the three immutable logs** — `ledger_entries`, `ledger_transactions`,
-  `ledger_events` — by trigger, `ENABLE ALWAYS`, so it holds on the replication apply path too.
-  `TRUNCATE` refused on the same three.
-- Uniqueness — `uq_events__idempotency`, `uq_txn__one_per_event` (one transaction per event),
-  `uq_accounts__house` (one house account per tenant, purpose and currency), and **`uq_entries__account_seq`**, the
-  journal's per-account sequence, which is arguably its most important key.
-- Three more single-row rules worth naming because they are easy to miss: `ck_balances__non_negative`
-  on the cache, `ck_txn__no_self_reference`, and `ck_txn__not_both` (a transaction may resolve or
-  reverse, not both).
-
-**NOT enforced by the database, deliberately or otherwise:**
-
-| | why |
-| --- | --- |
-| **Debits equal credits** | **Deliberate.** [0005](/decisions/0005-event-log-and-write-path) makes it unconstructible in the Rust writer rather than refused in SQL. Until that writer exists, **nothing enforces it at all**, and it says so. |
-| `recorded_at`, `xact_id`, `account_seq`, `balance_after` | **Deliberate.** Assigned by the writer, which has no parameter for them. Today `recorded_at` and `xact_id` are bare `DEFAULT`s; `account_seq` and `balance_after` have no default at all and are wholly caller-supplied and are forgeable by an `INSERT` — verified, `recorded_at` accepted as `1999-01-01`. |
-| **Foreign keys on the replication apply path** | **Not deliberate.** All **36** internal FK triggers are `ENABLE ORIGIN`. Under `session_replication_role = 'replica'` every foreign key is skipped — verified: a two-tenant entry in a currency its account does not hold, dated 1999, committed. |
-| **Table inheritance** | **Not deliberate.** The event trigger went with the PL/pgSQL. A child of `ledger_entries` plus one `INSERT … SELECT * FROM ONLY` doubles every number in every report — verified. |
-| **Reclassifying a statement line** | **Not deliberate.** `fk_types__fs_line` blocks a move that contradicts the category; it does **not** block a move to another line of the same statement and side. Verified: 440.00 of customer float moved from restricted cash to unrestricted on an already-issued balance sheet. |
-
-The last three are the honest cost of [0004](/decisions/0004-where-logic-lives), and they are in *Still
-open* below.
-
 ## Still open
 
 Undecided, listed plainly rather than buried.
@@ -146,96 +82,20 @@ Undecided, listed plainly rather than buried.
 | **There is no idempotency replay path** | `idempotency_hash` is written and never read, so "same key + same body replays the stored result; a different body is refused" is designed and unbuilt. The unique index only makes the second attempt fail. |
 | **Striping is not built** | The stack summary above quotes striped figures. There is no stripe column in `migrations/`, and `uq_accounts__house` would currently prevent one on the accounts that need it. |
 | **There is no CI** | `.github/workflows/test.yml` was present in three commits' trees and was deleted with the suite it ran ([0004](/decisions/0004-where-logic-lives)). It comes back when the Rust tests do, and should run `cargo test` and load `migrations/00001_baseline.sql` against a PostgreSQL 18 service. |
-| **Hash chaining for tamper evidence is deferred, not decided** | [0005](/decisions/0005-event-log-and-write-path) leaves it open: it needs a total order, so it is entangled with [0006](/decisions/0006-time-and-as-of). The cost figures quoted there are extrapolated from spike 003's contended-row numbers, not measured. |
 | **The chart of accounts is not versioned** | Changing which statement line an account reports under silently restates issued statements, and `fk_types__fs_line` blocks that **only across a statement or a side** — a move to another line of the *same* statement and side is accepted, which is the reclassification hole three rows above. An earlier version of this row said it was "blocked outright"; it is not. A stopgap either way, since IAS 1.41 *requires* reclassifying comparatives. See [0007](/decisions/0007-schema-conventions-and-chart). |
-| **No number has been measured on RDS** | Everything so far is localhost, where a round trip is ten times cheaper. Nothing gets published until that is fixed. |
-| **Hold-flow findings recorded rather than closed** | The list lives in [0008 §Known, and not fixed](/decisions/0008-authorization-holds#known-and-not-fixed), and **at least four of them under-reserve credit**, the failure this project calls the cardinal sin. *There is deliberately no copy of that list here* — a count maintained in two files is a count that drifts, and this one miscounted four rounds running. |
-| **Completeness is guaranteed WITHIN a scope, not across them** | Recorded only in `migrations/00001_baseline.sql` and [`database.md`](/database). A scope with no accounts at all is invisible to every report, and a tenant parameter on the balance-sheet report is exactly the "parameter in which to pass an incomplete list" that [0007](/decisions/0007-schema-conventions-and-chart) says should not exist. `vision.md` states the completeness guarantee without that qualification. |
-| **Intercompany balances are presented GROSS** | Nothing nets `due_from_treasury` against `due_to_tenants`, so a consolidated balance sheet shows both sides at full size. The golden trace asserts they eliminate to zero; no *report* does. |
-| **Statement periods have a timezone and nothing models it** | `reference-product.md` closes statements "in the customer's timezone" and [0008](/decisions/0008-authorization-holds) says per-customer timezones make the statement run a per-customer job. `grep -rn "AT TIME ZONE"` over the whole tree returns **zero hits**, and [0006](/decisions/0006-time-and-as-of), which owns time, scopes itself away from the question. A period boundary is a business-date boundary in *someone's* zone; nothing says whose. |
-| **The card schema is parked, not separated** | [0009](/decisions/0009-module-boundaries) decided the card objects move to their own `card` schema inside the one baseline, making the module **removable**. That move is **not done**. What *is* done is cruder and buys the same thing for now: the card DDL was lifted out of the baseline into [`parked/card/`](/parked-card) and is applied by nothing, so the migrated database is 7 core tables and no card tables. It still loads on top of the core when pasted in by hand — verified — because not one foreign key crosses the boundary. 0009 stays `proposed`, and the collision test it requires still does not exist. |
+| **Hold-flow findings recorded rather than closed** | The list lives in [the card rail's 0001 §Known, and not fixed](/card/decisions/0001-authorization-holds#known-and-not-fixed), and **at least four of them under-reserve credit**, the failure this project calls the cardinal sin. *There is deliberately no copy of that list here* — a count maintained in two files is a count that drifts, and this one miscounted four rounds running. |
+| **Statement periods have a timezone and nothing models it** | `reference-product.md` closes statements "in the customer's timezone" and [the card rail's 0001](/card/decisions/0001-authorization-holds) says per-customer timezones make the statement run a per-customer job. `grep -rn "AT TIME ZONE"` over the whole tree returns **zero hits**, and [0006](/decisions/0006-time-and-as-of), which owns time, scopes itself away from the question. A period boundary is a business-date boundary in *someone's* zone; nothing says whose. |
+| **The card schema is parked, not separated** | [0008](/decisions/0008-module-boundaries) decided the card objects move to their own `card` schema inside the one baseline, making the module **removable**. That move is **not done**. What *is* done is cruder and buys the same thing for now: the card DDL was lifted out of the baseline into [`parked/card/`](/card/parked) and is applied by nothing, so the migrated database is 7 core tables and no card tables. It still loads on top of the core when pasted in by hand — verified — because not one foreign key crosses the boundary. 0009 stays `proposed`, and the collision test it requires still does not exist. |
 | **DDL outside the migration set has no owner and no guard** | `parked/card/schema.sql` needs three objects the core migration creates — `refuse_mutation()`, `refuse_truncate()` and the `openledger_app` role — plus `uuidv7()` from PostgreSQL 18. **Nothing applies that file, no CI loads it, and no test asserts the dependency**, so its only attestation is that somebody pasted it into a database once by hand. The core migration could rename or drop any of the three tomorrow and every check in this repository would stay green. The file's own `DO` block raises if they are missing, which helps the person pasting it and helps nobody else: it only runs if the file runs. A parked file is not a tested file, and this row is the difference between the two. |
-| **The parking decision has no ADR** | Lifting the card DDL out of the baseline was a real decision with real reasoning, and it is recorded in the [parked-card page](/parked-card) — a page of its own rather than an entry in this log. [0009](/decisions/0009-module-boundaries) has been annotated to say it was overtaken, which is not the same as the decision being written up: nothing in this log states the trade, and the three rows around this one are the whole of it in `docs/`. The header of this file says "everything we've decided, on one page"; this is one of the things it means by that overstatement. |
-| **[0008](/decisions/0008-authorization-holds) is `accepted` and has no artifact in any applied schema** | It was accepted against a schema that carried its tables. That schema no longer exists: after `openledger migrate` the database is seven core tables and not one card object. So an `accepted` ADR now describes four tables, two views and ten indexes that exist only in a file nothing installs. The decision is not withdrawn and should not be — the model is still what we intend to build — but "accepted" and "deployed" have come apart here, and the status field does not say which one it means. |
+| **The parking decision has no ADR** | Lifting the card DDL out of the baseline was a real decision with real reasoning, and it is recorded in the [parked-card page](/card/parked) — a page of its own rather than an entry in this log. [0008](/decisions/0008-module-boundaries) has been annotated to say it was overtaken, which is not the same as the decision being written up: nothing in this log states the trade, and the three rows around this one are the whole of it in `docs/`. The header of this file says "everything we've decided, on one page"; this is one of the things it means by that overstatement. |
+| **[the card rail's 0001](/card/decisions/0001-authorization-holds) is `accepted` and has no artifact in any applied schema** | It was accepted against a schema that carried its tables. That schema no longer exists: after `openledger migrate` the database is seven core tables and not one card object. So an `accepted` ADR now describes four tables, two views and ten indexes that exist only in a file nothing installs. The decision is not withdrawn and should not be — the model is still what we intend to build — but "accepted" and "deployed" have come apart here, and the status field does not say which one it means. |
 | **The balance-sheet half of `fk_types__fs_line` is two-valued** | The income-statement half distinguishes revenue from expense; the balance-sheet half distinguishes only `asset` from `liability_equity`, so **`liability`, `equity` and any contra of either are freely interchangeable across all five liability-and-equity captions.** Verified: 1,000.00 of paid-in capital presented under "Accounts payable and accrued", assets − liabilities-and-equity = 0.00, every check green. The key is called this file's best guard; on the balance sheet it is a two-way check. Splitting the side into `liability` and `equity` is the obvious fix and would need every balance-sheet line re-declared. |
 | **Nothing reconciles the journal against the reports** | A `SUM` over `ledger_entries` and a `SUM` over `trial_balance`, per tenant and currency, should agree and are compared by nothing. Measured on a book carrying one orphan pair: raw journal 55,280.96 against a trial balance of 5,280.96 — a 50,000.00 gap reported by no view, no constraint and no function. Three lines of SQL would surface it. This is the residual cost of joining the reports on currency: the orphan is now consistently absent rather than inconsistently present, which is better, but it is also unfalsifiable from inside the artefact. |
-| **Reclassification has a second path, through the account** | The register above records the chart route (`account_types.fs_line`), which a schema snapshot test could see. `fk_accounts__type` is on `(purpose, category, normal_balance)`, so **any account may become any other type sharing its category and normal balance, with the chart byte-identical.** Verified: 1,400.00 of restricted cash became Other assets and 1,000.00 of customer funds became trade payables, every check green, `chart.sql` untouched. The interchangeable sets are **4** asset/debit types and **8** liability/credit types. `ledger_accounts`, `account_types` and `fs_lines` — the three tables that decide what every posted number *means* — carry no append-only guard and appear on neither the guarded list nor the "what deliberately has no guard" list, so the absence does not read as a decision. |
-| **DDL walks straight through append-only** | The trigger guard covers DML only. `ALTER TABLE ledger_entries ALTER COLUMN balance_after TYPE bigint USING (balance_after / 10)` **rewrote posted history with both triggers still `ENABLE ALWAYS` and neither firing.** The same rewrite of `amount_minor` — the column that would change a *reported* number — is refused while the views exist (`cannot alter type of a column used by a view or rule`) and succeeds after `DROP VIEW trial_balance, balance_sheet, income_statement`, which an owner doing a migration would do anyway. An earlier version of this row pasted the `amount_minor` form as if it ran unaided; it does not. This is *not* the hole the schema admits to (an owner disabling or dropping the trigger). A `ddl_command_start` event trigger could cover `ALTER TABLE`/`DROP TABLE`; the schema argues event triggers are useless because they cannot cover `TRUNCATE`, which is true and does not cover this. **Related:** `pg_dump -a` warns that the circular foreign keys on `ledger_transactions` require `--disable-triggers` to restore, and that flag issues `ALTER TABLE … DISABLE TRIGGER ALL` — so the ordinary data-only restore path routes through the one hole the file does name. |
+| **DDL walks straight through append-only** | The trigger guard covers DML only. `ALTER TABLE ledger_entries ALTER COLUMN account_seq TYPE bigint USING (account_seq * 10)` **rewrote posted history with both triggers still `ENABLE ALWAYS` and neither firing** — re-verified 2026-08-27 against the current baseline, and it destroys gaplessness, which is what makes "no entry is missing" a checkable claim. The same rewrite of `amount_minor` — the column that would change a *reported* number — is refused while the views exist (`cannot alter type of a column used by a view or rule`) and succeeds after `DROP VIEW trial_balance, balance_sheet, income_statement`, which an owner doing a migration would do anyway. An earlier version of this row pasted the `amount_minor` form as if it ran unaided; it does not. This is *not* the hole the schema admits to (an owner disabling or dropping the trigger). A `ddl_command_start` event trigger could cover `ALTER TABLE`/`DROP TABLE`; the schema argues event triggers are useless because they cannot cover `TRUNCATE`, which is true and does not cover this. **Related:** `pg_dump -a` warns that the circular foreign keys on `ledger_transactions` require `--disable-triggers` to restore, and that flag issues `ALTER TABLE … DISABLE TRIGGER ALL` — so the ordinary data-only restore path routes through the one hole the file does name. |
 | **Inheritance is a DELETE channel, not only a doubling one** | The register records that a child of `ledger_entries` doubles every report. It is also a way to **remove** rows: `DELETE FROM shadow_entries` took the parent-visible count from 8 to 4. The child carries 3 CHECKs and no foreign key, no unique index and no trigger. |
 | **The chart is global; the ledger is multi-tenant** | `fs_lines` and `account_types` carry no `tenant_id` and are keyed on `code` alone, so **per-tenant charts are unrepresentable** and one tenant's reclassification restates every tenant's issued statements. Recorded nowhere before this line. |
-| **One transaction can span two currencies at an implicit rate of 1.0** | Each leg satisfies `fk_entries__account` in its own account's own currency, so 100.00 USD became 100.00 EUR — accepted, at an implicit rate of 1.0. **The balance sheet then does *not* balance**, by +100.00 in USD and −100.00 in EUR; only debits-equal-credits *within the transaction* survives, and an earlier version of this row claimed both books balanced, which is more than the database does. The harm is the acceptance, not a silent report: there is **no FX gain/loss line in `fs_lines` and no FX type in `account_types`**, so even a correct writer has nowhere to book the difference. |
 | **Nothing in the shipped artefact would notice debits ≠ credits** | The register already says nothing *enforces* it. The sharper point: nothing *reports* it either. No view mentions balance; the only multi-row constraints on `ledger_entries` are three single-row CHECKs. A posted transaction with one entry, or zero entries, is accepted and appears in no exception list. |
+| **The balance cache is the write lock, the counter *and* the balance** | It is the row a writer locks, the source of `account_seq`, and the cached balance. [Spike 009](/spikes/009-where-the-balance-lives) settled which of those is authoritative — the balance, because the per-entry running balance that used to compete with it is gone — but it did not *separate* them. Three jobs on one row means the drift check, the sequence and the lock all fail together, and a hot account's read never gets an index-only scan because that row is rewritten on every write. |
 | **The balance cache and the journal have no relationship** | Using only the app role's granted `UPDATE`, the cache was moved from 1,000.00 to 100.00 with `last_seq` forged; the balance sheet was unchanged and every check stayed green. **Zero shipped views compare the cache to the journal, and zero constraints reference `ledger_entries` from it.** The ledger-side drift views went with [0004](/decisions/0004-where-logic-lives) and nothing replaced them. |
-| **`balance_after` is forgeable and two writers collide on it silently** | [0006](/decisions/0006-time-and-as-of)'s headline O(1) read returned 9,999.99 where the cache and a journal aggregate both said 220.00. Worse, two concurrent sessions that do not route through the cache row both committed `balance_after = 1000` at sequences 4 and 5 where the truth was 200.00 and 210.00 — **nothing serializes them.** Separately: a whole book written with `balance_after = 0` on every entry produced three correct reports, because no report reads the column. |
 | **An account's owner can be nulled** | `UPDATE ledger_accounts SET owner_type='house', owner_id=NULL` leaves the liability on the balance sheet owed to nobody, every check green. Credit where due: `uq_accounts__owned` and `uq_accounts__house` *do* bind updates — reassigning a wallet to another owner and collapsing two house accounts were both refused. |
 | **`ach_pull_returnable` presents customer cash as a trade payable** | Same class as the `outbound_transfer_in_transit` line fixed in the chart: customer cash inside an ACH return window reports under `payables`, so the `payables` line hosts six types mixing `per_shard` and `shared` counterparty scopes and the netting problem recorded for `due_to_tenants` silently covers customer float too. |
-| **A wrong-but-valid `status` is unfixable in place** | `status` is an enum, so only `pending` and `posted` are possible — but a complete balanced transaction written `pending` by mistake vanishes from all three reports, is counted by the balance cache, and `ledger_transactions` is append-only. The resolution path (`resolves_id`) is the intended recovery and no document says so. **No shipped view surfaces the pending population at all.** |
-| **The auth hot path reads tables no schema defines** | The authorization decision reads `credit_lines`; neither `migrations/00001_baseline.sql` nor `parked/card/schema.sql` defines `credit_lines`, `spend_controls` or `card_holds`. [Spike 010](/spikes/010-go-or-rust) had to add a minimal `credit_lines` before either implementation could run the hot path at all. **The card flow's decision step is not implementable against the committed schema** — the hold *log* is built, the credit line it is decided against is not. |
-| **Surface nothing reads** | *Reduced rather than fixed:* every object on this list was card-side, and parking the card schema means none of it is deployed. `webhook_deliveries` carries rationale in comments and is referenced by no view and no function. `hold_expires_at` and `clearing_deadline` are *exposed* by `card_auth_unmatched` (it selects `e.*`) but nothing reads them for a decision, and nothing writes them — see [0008](/decisions/0008-authorization-holds), whose reconciliation sweep filters on one of them and therefore matches nothing. Either the next milestone's work or dead weight — and [0008](/decisions/0008-authorization-holds)'s reconciliation sweep *reads* one of them, which is why that sweep can never fire. |
-| **Posting rules** | A deployment declares its own accounts; it must also declare how a business event becomes entries. Adyen proves those templates balance at design time. We have not designed ours. |
-
-## Decided, but recorded only in the schema
-
-Real decisions with real reasoning; none has an ADR, which makes the header above ("everything we've
-decided, on one page") an overstatement. Listed here until they get one:
-
-- **All three reports filter `status = 'posted'`.** Without it a pending authorization was recognised
-  as revenue and its posted resolution counted it again — 500.00 of interchange twice.
-- **Balances are stored debit-positive**, and `trial_balance` splits `balance_minor` (presentation,
-  normal-balance-signed) from `balance_debit_positive` (arithmetic). Every report does its addition in
-  the second and its display in the first.
-- **`webhook_deliveries` is a separate table** from `ledger_events`: HTTP-layer redelivery is a
-  different concern from ledger identity, and collapsing them makes a retried webhook look like a
-  business event.
-- **`uq_txn__one_per_event`** is a correctness constraint with a reproduced counterexample: without it
-  "two transactions were produced from one event row", so the idempotency spine does not by itself
-  prevent double-posting. It belongs in [0005](/decisions/0005-event-log-and-write-path).
-- **Four named correctness constraints are reasoned about in no document**: `uq_txn__one_resolution`,
-  `uq_accounts__id_currency`, `uq_txn__id_effective` and `fk_entries__txn_effective`. A fifth,
-  `uq_txn__one_reversal` — the double-reversal guard spike 001 identifies as a real Formance bug class
-  — appears in [0007](/decisions/0007-schema-conventions-and-chart), but only as a naming example, which is not the
-  same as being justified anywhere. Of the four, **`uq_accounts__id_currency` and `uq_txn__id_effective`
-  are the referenced-side unique indexes the composite foreign keys point at** — drop either and the
-  schema does not load (`there is no unique constraint matching given keys`), verified. A constraint
-  whose absence makes the schema unbuildable needs no test. `fk_entries__txn_effective` is the foreign
-  key itself, not an index, and dropping it loads cleanly — it does need one.
-- **PostgreSQL 18 is a floor, not a preference.** `uuidv7()` is the default on **four** tables in the
-  baseline (two more in the parked card DDL) and does not exist before 18. The roadmap targets RDS for M4/M6, which must therefore run 18.
-- **Three chart constraints have no ADR**: `uq_fs_lines__caption` (two lines sharing a caption are
-  indistinguishable on the face of the statement — the restricted-cash harm arrived at from the other
-  side); `ck_fs_lines__code_reserved` (a real chart line may not shadow the `current_year_earnings`
-  plug the balance sheet synthesises); and `ck_fs_lines__caption_reserved`, **the half that does the
-  harm** — `balance_sheet` emits that plug's caption as a literal, so it sits outside the UNIQUE and a
-  line under any other code could take it.
-
-## On sourcing
-
-Claims about third-party systems are the weakest evidence in this repository, and twice a number
-attributed to a named project turned out never to have existed. Three rules follow, and they are cheap:
-
-> **Every accounting-standard citation in this tree is unverified, everywhere it appears.** IAS 32.42,
-> IAS 1.41, ASC 210-20-45-1, Reg S-X 5-02.1 and ASC 230-10-45-4 are behind paywalls, so no URL can sit
-> next to them. Stated once here rather than marked at each of the eight sites, because a marker
-> maintained in eight places is a marker that drifts — which is the failure this section exists to
-> stop. **Treat every one of them as a paraphrase from memory until an accountant confirms it.**
-
-- **A third-party figure needs a fetchable source next to it, or it is marked unverified.** Not
-  softened — marked. "I could not check this" is a finding, not an embarrassment. *This rule is not met
-  today:* an audit counted thirteen unique external URLs in the whole tree against dozens of third-party
-  figures, and three attempts to cover the gap with a section banner each turned out to cover less than
-  claimed. **So: treat every third-party figure in this repository as unverified unless a URL sits next
-  to it.**
-- **Corrections get applied to the document that carries the claim**, not only to the ADR that
-  discovered it. `grep` the struck phrase across the whole tree, not just `docs/`.
-- **A spike's own verification can be dead.** Nothing in `spikes/` is executed by CI, and nothing in
-  `spikes/` runs against the shipped schema, so "measured" there means "was measured once, against
-  something".
-
-## How this log works
-
-One file per decision, numbered, never deleted. A decision that turns out wrong gets a new ADR
-superseding it; the old one stays, with its status changed, so the reasoning trail survives.
-
-Each ADR states its decision as a claim, then **Why**, **Alternatives** and **What it costs**. Where
-measurement later corrected a decision, the ADR states the current position **first** and summarises
-what it superseded — you should never have to read a change history to learn what we think now.

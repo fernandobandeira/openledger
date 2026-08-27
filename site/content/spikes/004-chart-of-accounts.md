@@ -28,7 +28,7 @@ It follows because *every individual transaction balances*, so **any union of wh
 balances** — every prefix, every as-of cut, every per-tenant slice. So we don't *check* the math;
 we make the two premises structurally impossible to violate.
 
-**Proven:** the [the reference product spec §06](/reference-product) golden trace — one $500 purchase, 13
+**Proven:** the [the reference product spec §06](/card) golden trace — one $500 purchase, 13
 transactions — reproduces the vision doc's hand-computed figures to the cent, with the equation
 verified after **every** transaction. That is M0's acceptance test, passing.
 
@@ -314,9 +314,7 @@ against `DatabaseConnectionsCurrentlySessionPinned`.
 ## Prior art
 
 > **SOURCING: every third-party figure and quotation below is UNVERIFIED.** None
-> carries a fetchable URL, and the rule at
-> [`docs/decisions/README.md`](/decisions#on-sourcing) says
-> that makes it unverified, not merely unsourced. They are recorded because the
+> carries a fetchable URL, and that makes them unverified, not merely unsourced. They are recorded because the
 > *shapes* they describe shaped our design, and marking them is cheaper than
 > pretending. Do not quote any number here as evidence without finding the source
 > first. Twice already, a figure attributed to a named project turned out never to

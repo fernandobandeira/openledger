@@ -2,7 +2,7 @@
 
 **Status:** accepted
 **Evidence:** [spike 001](/spikes/001-formance),
-[spike 009](/spikes/009-how-other-ledgers-enforce).
+[spike 006](/spikes/006-how-other-ledgers-enforce).
 
 ## The decision
 
@@ -13,6 +13,10 @@ transaction as whatever it causes.
 - `kind`, `source`, `payload jsonb`, `effective_at`, `recorded_at`.
 - Every `ledger_transactions` row references the event that caused it — and so do the rails that
   write no transaction at all: holds, transfers, disputes.
+- **One event, at most one transaction** — `uq_txn__one_per_event`, partial on
+  `event_id IS NOT NULL` because most events cause none. **The idempotency spine does not by itself
+  prevent double-posting**: `uq_events__idempotency` deduplicates the *event*, and without this
+  second index two transactions were produced from one event row. Reproduced.
 
 **The retry contract, stated once:** same key + same hash → replay the stored outcome. Same key +
 *different* hash → reject. A caller bug that silently returns the wrong stored result is worse than
@@ -33,8 +37,8 @@ is no code path that writes an entry on its own.
 no zero value and no implicit `Default` to fabricate one from
 ([0001](/decisions/0001-rust-and-postgres)).
 
-`ledger_entries` keeps its present shape — independent rows carrying a `direction`, with
-`account_seq` and `balance_after`. That is deliberate, and it is what Formance does too: `Posting` in
+`ledger_entries` keeps its present shape — independent rows carrying a `direction` and an
+`account_seq`. That is deliberate, and it is what Formance does too: `Posting` in
 the type, two `moves` rows in storage. **The row is a leg; the primitive you can call is a pair.**
 
 ## Why an event log rather than a key on the transaction
@@ -119,7 +123,7 @@ favour of a partial unique index.**
   FX rate is implicit in the difference between two amounts and is not stored. We should store it.
 - **None of this binds direct DML.** A posting type is a guarantee about our code, and says nothing
   about a psql session, a backfill, `pg_restore --disable-triggers`, or the replication apply path.
-  That is what the two triggers in [`migrations/00001_baseline.sql`](/source/baseline) are for, and why
+  That is what the two triggers in `migrations/00001_baseline.sql` are for, and why
   [0004](/decisions/0004-where-logic-lives) keeps them: they are the outer layer, and they bind accidents,
   not intent.
 - **And nothing enforces balance today.** `ck_entries__balances` is gone and the write path does not
