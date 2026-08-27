@@ -1,5 +1,16 @@
--- Reference chart of accounts for the card product. SEED DATA, not engine:
--- a marketplace or wallet deployment ships a different one against the same core.
+-- AN EXAMPLE CHART OF ACCOUNTS. SEED DATA, not engine.
+--
+-- This is the chart for the PARKED reference product -- the embedded B2B charge card
+-- whose DDL lives in parked/card/ and is applied by no migration. See
+-- site/content/parked-card.md. The product is parked; its chart is not, because it is the
+-- only chart in the tree, so `make reset` hands a wallet or marketplace deployment a
+-- card-issuer-and-lender chart it did not ask for: customer_receivable,
+-- facility_borrowings, credit_loss_expense, allowance_for_credit_losses. That is not
+-- a recommendation. Delete the lines you do not have and add the ones you do --
+-- ADR-0007 ships the chart AS DATA precisely so that this file is yours to replace.
+--
+-- migrations/00001_baseline.sql creates fs_lines and account_types EMPTY and requires
+-- no row in either. Nothing in this file is part of the schema.
 INSERT INTO fs_lines (code, caption, statement, side, sort_order) VALUES
   ('cash','Cash and cash equivalents','balance_sheet','asset',100),
   -- Customer funds held FBO are RESTRICTED and must not share a caption with the
@@ -25,7 +36,19 @@ INSERT INTO fs_lines (code, caption, statement, side, sort_order) VALUES
   -- performance is invisible.
   ('credit_losses','Provision for credit losses','income_statement','debit',250),
   ('interest','Interest expense','income_statement','debit',300)
-ON CONFLICT DO NOTHING;
+-- DO UPDATE, not DO NOTHING. Re-running this file must leave the database matching it.
+-- Under DO NOTHING it does not: editing a caption or an fs_line mapping and re-seeding
+-- exits 0 and changes nothing. Verified -- 'Restricted cash' rewritten to 'Restricted
+-- cash (segregated)', re-applied with --single-transaction, exit 0, old caption still
+-- in the table. In a file whose longest comment exists because a wrong fs_line
+-- overstated unrestricted liquidity by the entire customer float, a fix that looks
+-- applied and is not is the wrong default. `code` is the primary key on both tables,
+-- so the conflict target is exact and the SET list is every non-key column.
+ON CONFLICT (code) DO UPDATE SET
+  caption    = excluded.caption,
+  statement  = excluded.statement,
+  side       = excluded.side,
+  sort_order = excluded.sort_order;
 
 INSERT INTO account_types (code,category,normal_balance,description,fs_line,is_perimeter,counterparty_scope) VALUES
   ('customer_receivable','asset','debit','what a customer owes us','receivables',false,'per_shard'),
@@ -44,7 +67,7 @@ INSERT INTO account_types (code,category,normal_balance,description,fs_line,is_p
   -- THE CLEARING ACCOUNT. glossary.md defines one as "a designed staging account
   -- money passes THROUGH on its way somewhere, expected to return to zero", and
   -- until now the chart had none -- nineteen types and nowhere to stage a movement. The
-  -- cost of that gap was visible: docs/diagrams/03-state-machines.svg drew an
+  -- cost of that gap was visible: site/public/diagrams/03-state-machines.svg drew an
   -- outbound transfer as DR fbo_cash / CR fbo_cash, a posting that moves no money,
   -- because there was no account to pass it through. A wallet withdrawal is
   -- DR customer_wallet / CR here on submit, DR here / CR fbo_cash on settle, and
@@ -82,4 +105,17 @@ INSERT INTO account_types (code,category,normal_balance,description,fs_line,is_p
   ('interest_expense','expense','debit','interest on the facility','interest',false,'none'),
   ('platform_rev_share_expense','expense','debit','interchange shared with the platform','cost_of_revenue',false,'none'),
   ('credit_loss_expense','expense','debit','realised and provisioned losses','credit_losses',false,'none')
-ON CONFLICT DO NOTHING;
+-- DO UPDATE, for the reason above: a re-seed that silently ignores an edit is worse
+-- than one that fails. Note what this does NOT make easy -- changing a type's category
+-- or normal_balance while accounts already reference it is REFUSED, because
+-- fk_accounts__type points at (code, category, normal_balance). That refusal is the
+-- point: it is loud, and it happens at seed time rather than in a report. Verified,
+-- with live accounts on the type: `update or delete on table "account_types" violates
+-- foreign key constraint "fk_accounts__type" on table "ledger_accounts"`.
+ON CONFLICT (code) DO UPDATE SET
+  category         = excluded.category,
+  normal_balance   = excluded.normal_balance,
+  description      = excluded.description,
+  fs_line          = excluded.fs_line,
+  is_perimeter     = excluded.is_perimeter,
+  counterparty_scope = excluded.counterparty_scope;
