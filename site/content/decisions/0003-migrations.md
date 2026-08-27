@@ -56,6 +56,16 @@ deadlocks against CONCURRENTLY.
   and **CI loads it on top of the core on
   every push** ([0008](/decisions/0008-module-boundaries)), so the dependency is asserted rather than pasted. "The database matches the file"
   is a claim about the baseline; the parked file's claim is one CI job narrower.
+- **The command line is `clap`'s derive, and the exit codes are not.** The interface is declared on
+  the fields in `src/main.rs` — flag forms, the `DATABASE_URL` and
+  `OPENLEDGER_MIGRATE_LOCK_SECS` fallbacks, the 1–86400 range, the help text — rather than parsed by
+  a hand-written loop, which is where the argument handling in this repository started. `clap` is
+  five crates against [0001](/decisions/0001-rust-and-postgres)'s dependency-count cost, taken
+  without `color`, `wrap_help` or `suggestions`, and it is the one place a small hand-rolled thing
+  was replaced by a dependency rather than the other way round. **What stayed ours is the exit
+  code**, because for this binary it is an operator-facing contract and not a detail: `clap`'s own
+  convention already puts a usage error at 2, and `main` maps its errors explicitly anyway so that
+  the agreement is pinned rather than inherited.
 - **This one is built** — `src/migrate.rs`, 255 lines, of which the try-lock
   poll is 32. Two of the rules above are tests in that file rather than sentences in this one: no
   `.down.sql` in the set, and a `-- no-transaction` migration holding exactly one statement.
@@ -148,11 +158,12 @@ file's. (`make chart` is a `psql -f` of a file no migration owns, and gets the s
   deliberately** — a migration slower than the retry budget makes a *second* migrator give up rather
   than wait. With a pre-deploy job that is the right failure, because a job that gives up is visible
   and re-runnable. **The number has now been chosen: 900 s, re-asking once a second.**
-  `OPENLEDGER_MIGRATE_LOCK_SECS` overrides it, clamped to 1–86400 — a day, because `Instant +
-  Duration` panics on overflow and a `u64` of seconds reaches it. A malformed or out-of-range value
-  is a usage error, never a silent fall back to the default: the point of the setting is that someone
-  chose the number. Giving up on the lock exits **3** and a failed migration exits **1**, so "re-run
-  this" and "do not retry blindly" are distinguishable by an operator who reads neither.
+  `OPENLEDGER_MIGRATE_LOCK_SECS`, or `--lock-secs`, overrides it, clamped to 1–86400 — a day, because
+  `Instant + Duration` panics on overflow and a `u64` of seconds reaches it. A malformed or
+  out-of-range value is a usage error, never a silent fall back to the default: the point of the
+  setting is that someone chose the number. Giving up on the lock exits **3** and a failed migration
+  exits **1**, so "re-run this" and "do not retry blindly" are distinguishable by an operator who
+  reads neither.
 - **A killed migrator leaves an INVALID index behind, and the retry does not heal it.** This is the
   failure a pre-deploy job makes *more* likely, because pods get evicted, `activeDeadlineSeconds`
   fires and nodes drain. Reproduced against PostgreSQL 18: kill the backend mid-build and

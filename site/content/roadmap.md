@@ -61,7 +61,8 @@ belongs to the writer ([0005](/decisions/0005-event-log-and-write-path)).
 **`openledger migrate` is built** ([ADR-0003](/decisions/0003-migrations)) — `sqlx` with its
 blocking lock replaced by a `pg_try_advisory_lock` poll, migrations compiled into the binary, no
 down migrations, and a wait budget an operator chooses (900 s by default,
-`OPENLEDGER_MIGRATE_LOCK_SECS` to change it). It applies the baseline to an empty database.
+`OPENLEDGER_MIGRATE_LOCK_SECS` or `--lock-secs` to change it). It applies the baseline to an empty
+database.
 ***Idempotent on re-run* is verified, and now checked on every push.** Run twice against a fresh
 database on 2026-08-27 it exited 0 both times, 51 ms then 1 ms, and `.github/workflows/test.yml`
 runs it twice. The tests in `src/migrate.rs`
