@@ -60,61 +60,103 @@ The three period and one perimeter tables, plus the two new chart tables, arrive
 [0009](/decisions/0009-append-only-perimeter)–[0013](/decisions/0013-write-path-contract). Arrows
 point from a table to the table it depends on.
 
-The diagram below draws all thirteen, grouped by layer — the versioned chart is `chart_presentation`
-sitting between `chart_versions` and the two tables it maps together, `account_types` (what an
-account means) and `fs_lines` (where it shows):
+The diagram below is all thirteen tables and the foreign keys between them — the versioned chart is
+`chart_presentation` sitting between `chart_versions` and the two tables it maps, `account_types`
+(what an account means) and `fs_lines` (where it shows):
 
 ```mermaid
-flowchart TD
-    subgraph journal["JOURNAL — what happened, in order"]
-        ledger_events["ledger_events"]
-        ledger_transactions["ledger_transactions"]
-        ledger_entries["ledger_entries"]
-    end
+erDiagram
+    ledger_events {
+        uuid id PK
+        text idempotency_key
+        jsonb payload
+    }
+    ledger_transactions {
+        uuid id PK
+        uuid event_id FK
+        xid8 xact_id
+        text status
+    }
+    ledger_entries {
+        uuid id PK
+        uuid transaction_id FK
+        uuid account_id FK
+        smallint stripe FK
+        text direction
+        bigint amount_minor
+    }
+    ledger_accounts {
+        uuid id PK
+        text purpose FK
+        text currency
+        text owner_type
+    }
+    ledger_account_balances {
+        uuid account_id PK
+        smallint stripe PK
+        bigint input
+        bigint output
+    }
+    account_types {
+        text code PK
+        text category
+        text normal_balance
+    }
+    chart_versions {
+        int version PK
+        text note
+    }
+    chart_presentation {
+        int chart_version FK
+        text type_code FK
+        text fs_line FK
+    }
+    fs_lines {
+        int chart_version PK
+        text code PK
+        text fs_statement
+        text fs_side
+    }
+    ledger_periods {
+        text period_code PK
+        timestamptz starts_at
+        timestamptz ends_at
+    }
+    ledger_period_closes {
+        text period_code FK
+        uuid transaction_id FK
+        xid8 computed_at_xid
+    }
+    ledger_period_balances {
+        text period_code FK
+        uuid account_id FK
+        bigint input
+        bigint output
+    }
+    perimeter_attestations {
+        uuid account_id FK
+        date as_of
+        bigint external_minor
+    }
 
-    subgraph register["REGISTER — whose money it is"]
-        ledger_accounts["ledger_accounts"]
-        ledger_account_balances["ledger_account_balances"]
-    end
-
-    subgraph chart["CHART — what it means, per version"]
-        chart_versions["chart_versions"]
-        chart_presentation["chart_presentation"]
-        account_types["account_types"]
-        fs_lines["fs_lines"]
-    end
-
-    subgraph close["PERIOD CLOSE — the business-date checkpoint"]
-        ledger_periods["ledger_periods"]
-        ledger_period_closes["ledger_period_closes"]
-        ledger_period_balances["ledger_period_balances"]
-    end
-
-    subgraph perimeter["PERIMETER — what a third party said"]
-        perimeter_attestations["perimeter_attestations"]
-    end
-
-    ledger_transactions -->|event_id| ledger_events
-    ledger_entries -->|transaction_id| ledger_transactions
-    ledger_entries -->|account_id, currency| ledger_accounts
-    ledger_entries -->|stripe| ledger_account_balances
-    ledger_account_balances -->|account_id| ledger_accounts
-    ledger_accounts -->|purpose → code| account_types
-
-    fs_lines -->|chart_version| chart_versions
-    chart_presentation -->|chart_version| chart_versions
-    chart_presentation -->|type_code| account_types
-    chart_presentation -->|fs_line| fs_lines
-
-    ledger_period_closes -->|period_code| ledger_periods
-    ledger_period_closes -->|transaction_id| ledger_transactions
-    ledger_period_balances -->|period_code| ledger_period_closes
-    ledger_period_balances -->|account_id| ledger_accounts
-
-    perimeter_attestations -->|account_id| ledger_accounts
+    ledger_events           ||--o{ ledger_transactions     : "event_id"
+    ledger_transactions     ||--o{ ledger_entries          : "transaction_id"
+    ledger_accounts         ||--o{ ledger_entries          : "account_id"
+    ledger_account_balances ||--o{ ledger_entries          : "stripe"
+    ledger_accounts         ||--o{ ledger_account_balances : "account_id"
+    account_types           ||--o{ ledger_accounts         : "purpose"
+    chart_versions          ||--o{ fs_lines                : "chart_version"
+    chart_versions          ||--o{ chart_presentation      : "chart_version"
+    account_types           ||--o{ chart_presentation      : "type_code"
+    fs_lines                ||--o{ chart_presentation      : "fs_line"
+    ledger_periods          ||--o{ ledger_period_closes    : "period_code"
+    ledger_transactions     ||--o{ ledger_period_closes    : "transaction_id"
+    ledger_period_closes    ||--o{ ledger_period_balances  : "period_code"
+    ledger_accounts         ||--o{ ledger_period_balances  : "account_id"
+    ledger_accounts         ||--o{ perimeter_attestations  : "account_id"
 ```
 
-Every arrow is a *composite* key — it carries more than an id. **When a value is copied into a
+Every relationship is a *composite* key — it carries more than an id. **When a value is copied into a
 second table for speed, the copy is made part of a key, so it cannot disagree with the original.**
 Three report readers (not drawn) — `trial_balance`, still a view, and `balance_sheet_at` and
 `income_statement_for`, now set-returning functions — read the chart at the bottom and the journal
@@ -283,10 +325,11 @@ corrupt rows.
 A **transaction** is the event. An **entry** is one leg of it. The $500 sale above is *one*
 transaction and *three* entries:
 
-```
-transaction  ──┬── entry   DR customer_receivable   500.00
-   the sale    ├── entry   CR due_to_tenants        491.00
-               └── entry   CR fee_revenue             9.00
+```mermaid
+flowchart LR
+    t["transaction<br/>the sale"] --> e1["entry — DR customer_receivable 500.00"]
+    t --> e2["entry — CR due_to_tenants 491.00"]
+    t --> e3["entry — CR fee_revenue 9.00"]
 ```
 
 They hold different kinds of fact. The transaction knows *when* — both dates — what it resolves or
@@ -473,17 +516,16 @@ cash", "Accounts receivable" and "Other assets" are all assets. So `chart_presen
 chart version, the line each account type appears on, and the mapping is many-to-one in both
 directions:
 
+```mermaid
+flowchart LR
+    oc["operating_cash<br/>asset"] --> cash["cash<br/>Cash and cash equivalents"]
+    fbo["fbo_cash<br/>asset"] --> rc["restricted_cash<br/>Restricted cash"]
+    cr["customer_receivable<br/>asset"] --> rec["receivables<br/>Accounts receivable"]
+    acl["allowance_for_credit_losses<br/>asset"] --> rec
 ```
-account_types  (what it MEANS)                    fs_lines  (where it SHOWS)
 
-operating_cash               asset  ───────────►  cash             Cash and cash equivalents
-fbo_cash                     asset  ───────────►  restricted_cash  Restricted cash
-      same category, deliberately different lines
-
-customer_receivable          asset  ──┐
-allowance_for_credit_losses  asset  ──┴────────►  receivables      Accounts receivable
-      different types, one line: the allowance nets against the receivable
-```
+*Two assets, two lines — same category, deliberately different lines. Two types, one line — the
+allowance nets against the receivable.*
 
 Splitting the first pair is a money question, not a taxonomy one. `fbo_cash` is customer money held
 *for benefit of* the customer; `operating_cash` is the operator's own bank balance. Put them on one
