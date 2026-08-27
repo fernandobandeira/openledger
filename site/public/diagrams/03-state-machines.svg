@@ -1,32 +1,27 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 300" role="img" aria-label="Diagram showing an ACH transfer state machine on top with four states, and below it the immutable ledger transactions emitted by only some of those transitions; the submitted-to-Fed transition emits nothing."><title>Domain state machines vs. the ledger</title><style>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 318" role="img" aria-label="Diagram showing an ACH transfer state machine on top with four states, and below it the immutable ledger transactions emitted by only some of those transitions; the submitted-to-Fed transition emits nothing."><title>Domain state machines vs. the ledger</title><style>
+  /* Vesper, dark-only, same as the site: #101010 ground, #FFC799 for the path
+     that carries the emphasis, #99FFE4 for the ledger, neutral greys for
+     everything else. One palette, no media query: through `img` the old
+     `prefers-color-scheme` block answered to the OS, not the site. The `.t-lbl`
+     fills are load-bearing -- without one, SVG text falls back to black. */
   text { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
-  .s-cool { stroke: #1f5f66; color: #1f5f66; }
-  .s-faint { stroke: #d3dade; }
-  .s-fill-card { fill: #fbfcfc; }
-  .s-fill-cool { fill: #dfeced; }
-  .s-fill-hot { fill: #f5e4e0; }
-  .s-hot { stroke: #ab2f1c; color: #ab2f1c; }
-  .s-stroke { stroke: #12171c; }
-  .t-edge { font-size: 10.5px; fill: #46545f; }
-  .t-hdr { font-size: 10px; letter-spacing: .12em; fill: #7b8994; }
-  .t-hot { font-size: 10.5px; fill: #ab2f1c; font-weight: 600; }
-  .t-lbl { font-size: 12px; font-weight: 600; }
-  .t-sub { font-size: 10.5px; fill: #7b8994; }
-  @media (prefers-color-scheme: dark) {
-    .s-cool { stroke: #6fb3ba; color: #6fb3ba; }
-    .s-faint { stroke: #2a343a; }
-    .s-fill-card { fill: #141a1e; }
-    .s-fill-cool { fill: #142428; }
-    .s-fill-hot { fill: #2c1a16; }
-    .s-hot { stroke: #e2705a; color: #e2705a; }
-    .s-stroke { stroke: #e4eaed; }
-    .t-edge { font-size: 10.5px; fill: #9dabb4; }
-    .t-hdr { font-size: 10px; letter-spacing: .12em; fill: #6d7c86; }
-    .t-hot { font-size: 10.5px; fill: #e2705a; font-weight: 600; }
-    .t-lbl { font-size: 12px; font-weight: 600; }
-    .t-sub { font-size: 10.5px; fill: #6d7c86; }
-  }
+  .bg { fill: #101010; }
+  .s-cool { stroke: #99ffe4; color: #99ffe4; }
+  .s-faint { stroke: #383838; color: #383838; }
+  .s-fill-card { fill: #161616; }
+  .s-fill-cool { fill: #0e1a17; }
+  .s-fill-hot { fill: #201811; }
+  .s-hot { stroke: #ffc799; color: #ffc799; }
+  .s-stroke { stroke: #e5e5e5; }
+  .t-edge { font-size: 10.5px; fill: #ababab; }
+  .t-hdr { font-size: 10px; letter-spacing: .12em; fill: #7a7a7a; }
+  .t-hot { font-size: 10.5px; fill: #ffc799; font-weight: 600; }
+  .t-lbl { font-size: 12px; font-weight: 600; fill: #ffffff; }
+  .t-lbl.s-cool { fill: #99ffe4; }
+  .t-lbl.s-hot { fill: #ffc799; }
+  .t-sub { font-size: 10.5px; fill: #7a7a7a; }
   </style>
+      <rect class="bg" x="0" y="0" width="100%" height="100%"/>
       <defs>
         <marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
           <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
@@ -86,5 +81,6 @@
 
       <text class="t-lbl" x="20" y="252">State transitions emit ledger transactions. The ledger never mutates.</text>
       <text class="t-sub" x="20" y="272">The domain object's status column changes four times. The ledger only ever gets appended to — three times.</text>
-      <text class="t-sub" x="20" y="288">Durable-job boundary (ADR-0008: a job queue in Postgres, not Temporal): the job is the state machine; "write the ledger transaction" is an idempotent step.</text>
+      <text class="t-sub" x="20" y="288">Durable-job boundary (ADR-0008: a job queue in Postgres, not Temporal): the job is the state machine;</text>
+      <text class="t-sub" x="20" y="304">"write the ledger transaction" is an idempotent step.</text>
     </svg>
