@@ -20,13 +20,18 @@ down: ## Stop local postgres
 
 .PHONY: reset
 reset: ## Drop and recreate the local database
-	docker compose down -v && $(MAKE) up && $(MAKE) schema
+	docker compose down -v && $(MAKE) up && $(MAKE) migrate chart
 
-.PHONY: schema
-schema: ## Load the design schema and the seed chart
-	@psql "$(DB_URL)" -v ON_ERROR_STOP=1 --single-transaction -q -f schema/schema.sql
+.PHONY: migrate
+migrate: ## Apply the migrations (debug build; a deploy runs the release binary)
+	@# DATABASE_URL, not --database-url: the flag is visible in `ps` to anyone
+	@# on the host, and this target is the example operators copy.
+	DATABASE_URL="$(DB_URL)" cargo run --quiet -- migrate
+
+.PHONY: chart
+chart: ## Seed the reference chart of accounts (an EXAMPLE; yours will differ)
 	@psql "$(DB_URL)" -v ON_ERROR_STOP=1 --single-transaction -q -f schema/chart.sql
-	@echo "  loaded schema/schema.sql + schema/chart.sql"
+	@echo "  seeded schema/chart.sql"
 
 .PHONY: psql
 psql: ## Open a psql shell
@@ -40,6 +45,15 @@ test: ## Run the tests
 build: ## Build the binary
 	cargo build --release
 
+.PHONY: docs
+docs: ## Serve the docs site at localhost:3000 (needs Node)
+	cd site && npm install --silent && npm run dev
+
+.PHONY: docs-build
+docs-build: ## Build the docs site to site/out/ -- plain files, host them anywhere
+	cd site && npm install --silent && npm run build
+	@echo "  built site/out/"
+
 .PHONY: tidy
 tidy: ## Check formatting and lints
-	cargo fmt --check && cargo clippy -- -D warnings
+	cargo fmt --check && cargo clippy --all-targets -- -D warnings

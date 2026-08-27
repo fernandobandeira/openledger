@@ -6,6 +6,8 @@ license = "MIT"
 publish = false
 
 [dependencies]
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "migrate", "macros"] }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
 
 [lints.rust]
 unsafe_code = "forbid"
