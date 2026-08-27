@@ -1,0 +1,6 @@
+INSERT INTO ledger_events (tenant_id,id,kind,source,idempotency_key,idempotency_hash,payload,effective_at) VALUES ('t1','a1111111-0000-0000-0000-0000000000b1','fee','internal','k-b1','\x00','{}','2026-02-15');
+INSERT INTO ledger_transactions (tenant_id,id,event_id,kind,status,effective_at) VALUES ('t1','b1111111-0000-0000-0000-0000000000b1','a1111111-0000-0000-0000-0000000000b1','fee','posted','2026-02-15');
+INSERT INTO ledger_entries (tenant_id,id,transaction_id,account_id,direction,amount_minor,currency,stripe,account_seq,effective_at) VALUES
+ ('t1','c0000000-0000-0000-0000-0000000000b1','b1111111-0000-0000-0000-0000000000b1','11111111-1111-1111-1111-111111111111','debit',3000,'USD',0,3,'2026-02-15'),
+ ('t1','c0000000-0000-0000-0000-0000000000b2','b1111111-0000-0000-0000-0000000000b1','22222222-2222-2222-2222-222222222222','credit',3000,'USD',0,3,'2026-02-15');
+UPDATE ledger_account_balances b SET input=j.di,output=j.cr,last_seq=j.ms FROM (SELECT account_id,currency,stripe,COALESCE(SUM(amount_minor)FILTER(WHERE direction='debit'),0) di,COALESCE(SUM(amount_minor)FILTER(WHERE direction='credit'),0) cr,MAX(account_seq) ms FROM ledger_entries WHERE tenant_id='t1' GROUP BY account_id,currency,stripe) j WHERE b.tenant_id='t1' AND b.account_id=j.account_id AND b.currency=j.currency AND b.stripe=j.stripe;

@@ -1,0 +1,79 @@
+############################################################
+# GOLDEN PASS on the fixed schema
+############################################################
+reconciliation (all breaks must be 0):
+       check_name        | breaks 
+-------------------------+--------
+ accounting_equation     |      0
+ balance_cache           |      0
+ chart_lint              |      0
+ checkpoint_drift        |      0
+ close_typing            |      0
+ cross_scope_mirror      |      0
+ cursor_forgery          |      0
+ journal_to_reports      |      0
+ orphan_entries          |      0
+ unbalanced_transactions |      0
+(10 rows)
+
+
+balance sheet:
+      fs_line      | amount_minor |  side  
+-------------------+--------------+--------
+ cash              |       105000 | asset
+ equity            |       100000 | equity
+ retained_earnings |         5000 | equity
+(3 rows)
+
+
+############ A1: column-level INSERT grant refuses a forged xact_id ############
+PRE-FIX (table-wide grant restored) forged xact_id inserts:
+INSERT 0 1
+FIXED forged xact_id refused:
+ERROR:  permission denied for table ledger_entries
+
+############ A2: identity freeze (fk_balances__account_purpose) ############
+PRE-FIX (freeze FK dropped) reclassification succeeds:
+UPDATE 1
+FIXED reclassification refused:
+ERROR:  update or delete on table "ledger_accounts" violates foreign key constraint "fk_balances__account_purpose" on table "ledger_account_balances"
+
+############ A3/A6: plug + accounting-equation catch a backdated-into-closed-period entry ############
+PRE-FIX plug: backdated fee drops from equity; recon_equation_breaks gap =
+3000
+FIXED plug: backdated fee held as un-closed earnings; recon_equation_breaks rows =
+0
+
+############ A4: close typing (fk_closes__txn_kind) + recon_close_breaks ############
+FIXED: a close naming a non-close txn is refused:
+ERROR:  insert or update on table "ledger_period_closes" violates foreign key constraint "fk_closes__txn_kind"
+
+############ A5: a resolved hold leaves the pending population ############
+pending on cash BEFORE resolution = 900
+pending on cash AFTER resolution  = 0 (superseded bucket = 900)
+
+############ A8: forged xact_id caught by recon_cursor_breaks ############
+clean recon_cursor_breaks = 0
+after owner forges xact_id='1': recon_cursor_breaks = 1 predates_txn
+
+############ A13/A14: statement functions RAISE on unknown / unpresented version ############
+A13 unknown version: ERROR:  chart version 999 does not exist
+
+############ A15: back-filling a superseded chart version is refused ############
+ERROR:  fs_lines names chart version 1, below the current maximum 2 -- a superseded chart version is frozen history; append a new version instead
+
+############ A16/A17/A19: attestation tz, finite effective_at, non-empty tenant ############
+A16 unknown zone: ERROR:  time zone "Mars/Phobos" not recognized
+A17 infinity:     ERROR:  new row for relation "ledger_transactions" violates check constraint "ck_txn__effective_finite"
+A19 blank tenant: ERROR:  new row for relation "ledger_accounts" violates check constraint "ck_accounts__tenant_non_empty"
+
+############ SURVIVALS (attacks the design defeated must still hold) ############
+cross-tenant entry:  fk_entries__txn
+currency mismatch:   fk_entries__account
+app UPDATE journal:  permission denied
+owner UPDATE journal:append-only
+TRUNCATE journal:    cannot be truncated
+per_shard in house:  per_shard_is_owned
+RLS unscoped rows:   0
+
+DONE.
