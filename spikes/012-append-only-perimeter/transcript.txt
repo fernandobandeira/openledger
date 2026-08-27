@@ -1,0 +1,793 @@
+
+################ 01 -- census of the shipped schema
+
+--- internal (foreign-key) triggers, by enablement ---
+ tgisinternal | tgenabled | count 
+--------------+-----------+-------
+ f            | A         |     6
+ t            | O         |    36
+(2 rows)
+
+--- the nine foreign keys and their four internal triggers each ---
+          conname          | internal_triggers | enabled 
+---------------------------+-------------------+---------
+ fk_accounts__type         |                 4 | O
+ fk_balances__account      |                 4 | O
+ fk_entries__account       |                 4 | O
+ fk_entries__txn           |                 4 | O
+ fk_entries__txn_effective |                 4 | O
+ fk_txn__event             |                 4 | O
+ fk_txn__resolves          |                 4 | O
+ fk_txn__reverses          |                 4 | O
+ fk_types__fs_line         |                 4 | O
+(9 rows)
+
+--- the six declared triggers ---
+       relname       |         tgname          | tgenabled 
+---------------------+-------------------------+-----------
+ ledger_entries      | ck_entries__append_only | A
+ ledger_entries      | ck_entries__no_truncate | A
+ ledger_events       | ck_events__append_only  | A
+ ledger_events       | ck_events__no_truncate  | A
+ ledger_transactions | ck_txn__append_only     | A
+ ledger_transactions | ck_txn__no_truncate     | A
+(6 rows)
+
+--- event triggers ---
+ event_triggers 
+----------------
+              0
+(1 row)
+
+--- do the views read ONLY? ---
+     relname      | reads_only 
+------------------+------------
+ balance_sheet    | f
+ income_statement | f
+ trial_balance    | f
+(3 rows)
+
+
+################ 02 -- CHANNEL A: foreign keys skipped on the replication apply path
+
+=== before ===
+ entries 
+---------
+       8
+(1 row)
+
+BEGIN
+SET
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+COMMIT
+=== after: every one of the three committed ===
+ entries 
+---------
+       9
+(1 row)
+
+ orphan_entries 
+----------------
+              1
+(1 row)
+
+ accounts_contradicting_their_type 
+-----------------------------------
+                                 1
+(1 row)
+
+=== and the ledger is still ENABLE ALWAYS-protected against DML: ===
+=== the SAME replica session cannot delete the row it just laundered in ===
+BEGIN
+SET
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/02_replica_fk_hole.sql:59: ERROR:  ledger_entries is append-only: DELETE on dead0000-0000-0000-0000-000000000001 refused. Correct it with a new row.
+CONTEXT:  PL/pgSQL function refuse_mutation() line 3 at RAISE
+ROLLBACK
+
+################ 03 -- CHANNEL A closed, and why the proposed spelling does not exist
+
+=== (i) the four internal triggers of a foreign key are NOT named after it ===
+     conname     |      on_table       |            tgname            | tgenabled 
+-----------------+---------------------+------------------------------+-----------
+ fk_entries__txn | ledger_transactions | RI_ConstraintTrigger_a_59886 | O
+ fk_entries__txn | ledger_transactions | RI_ConstraintTrigger_a_59887 | O
+ fk_entries__txn | ledger_entries      | RI_ConstraintTrigger_c_59888 | O
+ fk_entries__txn | ledger_entries      | RI_ConstraintTrigger_c_59889 | O
+(4 rows)
+
+=== (ii) so naming the constraint is a syntax-level miss ===
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/03_enable_always_fk.sql:13: ERROR:  trigger "fk_entries__txn" for table "ledger_entries" does not exist
+=== (iii) ...and ALL / USER are not accepted after ALWAYS. The grammar is
+===       ENABLE ALWAYS TRIGGER <name> only. ===
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/03_enable_always_fk.sql:17: ERROR:  syntax error at or near "ALL"
+LINE 1: ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER ALL;
+                                                         ^
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/03_enable_always_fk.sql:18: ERROR:  syntax error at or near "USER"
+LINE 1: ALTER TABLE ledger_entries ENABLE ALWAYS TRIGGER USER;
+                                                         ^
+=== so the only spelling that works names the generated, OID-derived name ===
+=== -- which is different in every database, so it cannot be written into a
+=== migration file. It has to be generated from the catalog at apply time. ===
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/03_enable_always_fk.sql:37: NOTICE:  promoted 36 internal FK triggers to ENABLE ALWAYS
+DO
+ tgisinternal | tgenabled | count 
+--------------+-----------+-------
+ f            | A         |     6
+ t            | A         |    36
+(2 rows)
+
+=== the three replica-role writes from 02, re-run against the fixed schema ===
+BEGIN
+SET
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/03_enable_always_fk.sql:50: ERROR:  insert or update on table "ledger_entries" violates foreign key constraint "fk_entries__txn"
+DETAIL:  Key (tenant_id, transaction_id)=(t1, 00000000-0000-0000-0000-0000deadbeef) is not present in table "ledger_transactions".
+ROLLBACK
+BEGIN
+SET
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/03_enable_always_fk.sql:57: ERROR:  insert or update on table "ledger_transactions" violates foreign key constraint "fk_txn__event"
+DETAIL:  Key (tenant_id, event_id)=(t1, 00000000-0000-0000-0000-00000000beef) is not present in table "ledger_events".
+ROLLBACK
+BEGIN
+SET
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/03_enable_always_fk.sql:64: ERROR:  insert or update on table "ledger_accounts" violates foreign key constraint "fk_accounts__type"
+DETAIL:  Key (purpose, category, normal_balance)=(interchange_revenue, asset, debit) is not present in table "account_types".
+ROLLBACK
+=== an ordinary write is unaffected ===
+INSERT 0 1
+INSERT 0 2
+ entries 
+---------
+      10
+(1 row)
+
+=== WHAT ENABLE ALWAYS DOES NOT DO: pg_restore --disable-triggers still wins ===
+BEGIN
+ALTER TABLE
+SET
+INSERT 0 1
+ accepted_anyway 
+-----------------
+               1
+(1 row)
+
+ROLLBACK
+
+################ 04 -- CHANNEL B: the pg_dump -a --disable-triggers restore path
+
+=== before: the six declared triggers are ENABLE ALWAYS ===
+         tgname          | tgenabled 
+-------------------------+-----------
+ ck_entries__append_only | A
+ ck_entries__no_truncate | A
+ ck_events__append_only  | A
+ ck_events__no_truncate  | A
+ ck_txn__append_only     | A
+ ck_txn__no_truncate     | A
+(6 rows)
+
+=== exactly what pg_dump -a --disable-triggers emits for one table ===
+ALTER TABLE
+         tgname          | tgenabled 
+-------------------------+-----------
+ ck_entries__append_only | D
+ ck_entries__no_truncate | D
+(2 rows)
+
+=== ...and inside that window, posted history is fully mutable ===
+ before 
+--------
+      8
+(1 row)
+
+DELETE 4
+UPDATE 4
+ after_delete 
+--------------
+            4
+(1 row)
+
+=== now the ENABLE half of the pair ===
+ALTER TABLE
+=== THE TRIGGERS CAME BACK AS ENABLE ORIGIN, NOT ENABLE ALWAYS ===
+         tgname          | tgenabled 
+-------------------------+-----------
+ ck_entries__append_only | O
+ ck_entries__no_truncate | O
+(2 rows)
+
+
+################ 05 -- CHANNEL C: inheritance, both directions
+
+=== 1. who can open this channel ===
+-- the app role, with the shipped grants: no CREATE on the schema --
+SET
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/05_inheritance.sql:12: ERROR:  permission denied for schema public
+LINE 1: CREATE TABLE shadow_entries () INHERITS (ledger_entries);
+                     ^
+RESET
+-- ...and with CREATE granted by mistake: ownership of the PARENT is the gate --
+GRANT
+SET
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/05_inheritance.sql:17: ERROR:  must be owner of table ledger_entries
+RESET
+REVOKE
+=== 2. as the OWNER, which is who runs a migration ===
+ entries_via_parent 
+--------------------
+                  8
+(1 row)
+
+ tenant_id | currency | fs_line | amount_minor 
+-----------+----------+---------+--------------
+ t1        | USD      | revenue |        30000
+ t2        | USD      | revenue |        70000
+(2 rows)
+
+CREATE TABLE
+-- what the child carries: 3 CHECKs, no key, no FK, no unique index, no trigger --
+ checks | pkeys | fkeys | indexes | triggers 
+--------+-------+-------+---------+----------
+      3 |     0 |     0 |       0 |        0
+(1 row)
+
+=== 3. THE DOUBLING CHANNEL ===
+INSERT 0 8
+ entries_via_parent 
+--------------------
+                 16
+(1 row)
+
+ tenant_id | currency | fs_line | amount_minor 
+-----------+----------+---------+--------------
+ t1        | USD      | revenue |        60000
+ t2        | USD      | revenue |       140000
+(2 rows)
+
+=== 4. THE DELETE CHANNEL -- the same child, the other direction ===
+-- a DELETE naming the PARENT reaches the child, and the parent has an
+-- ENABLE ALWAYS append-only trigger. The child has none, so the trigger
+-- refuses the parent rows and the child rows go. --
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/05_inheritance.sql:46: ERROR:  ledger_entries is append-only: DELETE on e1000000-0000-0000-0000-000000000001 refused. Correct it with a new row.
+CONTEXT:  PL/pgSQL function refuse_mutation() line 3 at RAISE
+ entries_via_parent 
+--------------------
+                 16
+(1 row)
+
+-- ...and naming the CHILD deletes without even an error --
+DELETE 8
+ entries_via_parent 
+--------------------
+                  8
+(1 row)
+
+=== 5. and this is genuinely a REMOVAL of posted history, not only of copies ===
+-- put the child back, this time with rows that exist ONLY in the child --
+INSERT 0 8
+DELETE 4
+ entries_via_parent 
+--------------------
+                 12
+(1 row)
+
+ tenant_id | currency | fs_line | amount_minor 
+-----------+----------+---------+--------------
+ t1        | USD      | revenue |        30000
+ t2        | USD      | revenue |       140000
+(2 rows)
+
+=== 6. the child also accepts rows NO KEY constrains, and every report counts them ===
+INSERT 0 1
+ parent_visible 
+----------------
+             13
+(1 row)
+
+=== 7. ...and DROP TABLE removes reported history with no trigger and no error ===
+DROP TABLE
+ parent_visible 
+----------------
+              8
+(1 row)
+
+
+################ 06 -- CHANNEL E: an account's owner can be nulled
+
+=== a customer wallet with money in it ===
+INSERT 0 1
+INSERT 0 1
+INSERT 0 2
+ owner_type | owner_id |     purpose     
+------------+----------+-----------------
+ company    | acme     | customer_wallet
+(1 row)
+
+ tenant_id | currency |                 caption                  | amount_minor 
+-----------+----------+------------------------------------------+--------------
+ t1        | USD      | Cash and cash equivalents                |        80000
+ t1        | USD      | Customer funds payable                   |        50000
+ t1        | USD      | Undistributed earnings (since inception) |        30000
+(3 rows)
+
+=== 1. THE APP ROLE CANNOT REACH IT. It holds INSERT and SELECT, nothing else. ===
+    grantee     |     privs     
+----------------+---------------
+ openledger_app | INSERT,SELECT
+(1 row)
+
+SET
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/06_owner_nulled.sql:25: ERROR:  permission denied for table ledger_accounts
+RESET
+=== 2. what the unique indexes DO bind, checked rather than assumed ===
+INSERT 0 1
+-- reassigning a wallet onto an owner who already has one: refused --
+BEGIN
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/06_owner_nulled.sql:35: ERROR:  duplicate key value violates unique constraint "uq_accounts__owned"
+DETAIL:  Key (tenant_id, owner_type, owner_id, purpose, currency)=(t1, company, globex, customer_wallet, USD) already exists.
+ROLLBACK
+-- collapsing one house account onto another: refused by uq_accounts__house --
+BEGIN
+UPDATE 1
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/06_owner_nulled.sql:42: ERROR:  duplicate key value violates unique constraint "uq_accounts__house"
+DETAIL:  Key (tenant_id, purpose, currency)=(t1, interchange_revenue, USD) already exists.
+ROLLBACK
+-- ...but reassigning to an owner nobody else has: ACCEPTED --
+BEGIN
+UPDATE 1
+ owner_type | owner_id 
+------------+----------
+ company    | initech
+(1 row)
+
+ROLLBACK
+=== 3. THE OWNER-NULLING CHANNEL, as the database owner ===
+UPDATE 1
+ owner_type | owner_id |     purpose     
+------------+----------+-----------------
+ house      |          | customer_wallet
+(1 row)
+
+=== the balance sheet is byte-identical: 500.00 of customer funds, owed to nobody ===
+ tenant_id | currency |                 caption                  | amount_minor 
+-----------+----------+------------------------------------------+--------------
+ t1        | USD      | Cash and cash equivalents                |        80000
+ t1        | USD      | Customer funds payable                   |        50000
+ t1        | USD      | Undistributed earnings (since inception) |        30000
+(3 rows)
+
+=== and no view in the schema reads owner_type or owner_id except trial_balance, ===
+=== which prints owner_id and nothing that depends on it ===
+     relname      | mentions_owner 
+------------------+----------------
+ balance_sheet    | f
+ income_statement | f
+ trial_balance    | t
+(3 rows)
+
+ owner_id |       purpose       | balance_minor 
+----------+---------------------+---------------
+          | customer_wallet     |         50000
+          | interchange_revenue |         30000
+          | operating_cash      |         80000
+(3 rows)
+
+
+################ 07 -- CHANNEL D: DDL walks straight through append-only
+
+=== before ===
+         tgname          | tgenabled 
+-------------------------+-----------
+ ck_entries__append_only | A
+ ck_entries__no_truncate | A
+(2 rows)
+
+ tenant_id |              account_id              | account_seq 
+-----------+--------------------------------------+-------------
+ t1        | 11111111-1111-1111-1111-111111111111 |           1
+ t1        | 11111111-1111-1111-1111-111111111111 |           2
+ t1        | 22222222-2222-2222-2222-222222222222 |           1
+ t1        | 22222222-2222-2222-2222-222222222222 |           2
+ t2        | 33333333-3333-3333-3333-333333333333 |           1
+ t2        | 33333333-3333-3333-3333-333333333333 |           2
+ t2        | 44444444-4444-4444-4444-444444444444 |           1
+ t2        | 44444444-4444-4444-4444-444444444444 |           2
+(8 rows)
+
+=== the rewrite ===
+ALTER TABLE
+=== after: every account_seq multiplied by ten, no error, no trigger fired ===
+ tenant_id |              account_id              | account_seq 
+-----------+--------------------------------------+-------------
+ t1        | 11111111-1111-1111-1111-111111111111 |          10
+ t1        | 11111111-1111-1111-1111-111111111111 |          20
+ t1        | 22222222-2222-2222-2222-222222222222 |          10
+ t1        | 22222222-2222-2222-2222-222222222222 |          20
+ t2        | 33333333-3333-3333-3333-333333333333 |          10
+ t2        | 33333333-3333-3333-3333-333333333333 |          20
+ t2        | 44444444-4444-4444-4444-444444444444 |          10
+ t2        | 44444444-4444-4444-4444-444444444444 |          20
+(8 rows)
+
+=== gaplessness -- the property account_seq exists to provide -- is gone ===
+ tenant_id |              account_id              | max_seq | rows | gapless 
+-----------+--------------------------------------+---------+------+---------
+ t1        | 11111111-1111-1111-1111-111111111111 |      20 |    2 | f
+ t1        | 22222222-2222-2222-2222-222222222222 |      20 |    2 | f
+ t2        | 33333333-3333-3333-3333-333333333333 |      20 |    2 | f
+ t2        | 44444444-4444-4444-4444-444444444444 |      20 |    2 | f
+(4 rows)
+
+=== ...and the balance cache still says last_seq = 2 ===
+ tenant_id |              account_id              | last_seq 
+-----------+--------------------------------------+----------
+ t1        | 11111111-1111-1111-1111-111111111111 |        2
+ t1        | 22222222-2222-2222-2222-222222222222 |        2
+ t2        | 33333333-3333-3333-3333-333333333333 |        2
+ t2        | 44444444-4444-4444-4444-444444444444 |        2
+(4 rows)
+
+=== the amount_minor form: refused while the views exist ===
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/07_ddl_rewrite.sql:24: ERROR:  cannot alter type of a column used by a view or rule
+DETAIL:  rule _RETURN on view trial_balance depends on column "amount_minor"
+=== ...and accepted after the DROP VIEW a migrator would do anyway ===
+ tenant_id | currency | fs_line | amount_minor 
+-----------+----------+---------+--------------
+ t1        | USD      | revenue |        30000
+ t2        | USD      | revenue |        70000
+(2 rows)
+
+DROP VIEW
+ALTER TABLE
+ journal_total 
+---------------
+       2000000
+(1 row)
+
+=== and DROP TABLE is not a DELETE either ===
+DROP TABLE
+ ledger_entries_still_exists 
+-----------------------------
+                           0
+(1 row)
+
+
+################ 08+09 -- the event-trigger guard, and everything it does not cover
+
+CREATE FUNCTION
+CREATE EVENT TRIGGER
+ALTER EVENT TRIGGER
+CREATE EVENT TRIGGER
+ALTER EVENT TRIGGER
+CREATE EVENT TRIGGER
+ALTER EVENT TRIGGER
+=== A. the account_seq rewrite -- refused ===
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/09_guard_proof.sql:5: ERROR:  public.ledger_entries is posted history and may not be rewritten by DDL (rewrite reason 4)
+HINT:  Add a new column or a new table; posted rows are not editable, by DDL either.
+CONTEXT:  PL/pgSQL function refuse_journal_ddl() line 13 at RAISE
+ tenant_id | account_seq 
+-----------+-------------
+ t1        |           1
+ t1        |           1
+(2 rows)
+
+=== B. the amount_minor rewrite after DROP VIEW -- refused ===
+BEGIN
+DROP VIEW
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/09_guard_proof.sql:11: ERROR:  public.ledger_entries is posted history and may not be rewritten by DDL (rewrite reason 4)
+HINT:  Add a new column or a new table; posted rows are not editable, by DDL either.
+CONTEXT:  PL/pgSQL function refuse_journal_ddl() line 13 at RAISE
+ROLLBACK
+=== C. DROP TABLE ledger_entries -- refused ===
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/09_guard_proof.sql:15: NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to view trial_balance
+drop cascades to view income_statement
+drop cascades to view balance_sheet
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/09_guard_proof.sql:15: ERROR:  public.ledger_entries is posted history and may not be dropped
+CONTEXT:  PL/pgSQL function refuse_journal_ddl() line 27 at RAISE
+=== D. CREATE TABLE ... INHERITS -- refused ===
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/09_guard_proof.sql:18: ERROR:  public.shadow_entries inherits from posted history: a child carries none of the parent's keys or triggers and is visible through it to every report
+CONTEXT:  PL/pgSQL function refuse_journal_ddl() line 41 at RAISE
+ shadow_exists 
+---------------
+             0
+(1 row)
+
+=== E. ALTER TABLE ... INHERIT (the same state by another grammar) -- refused ===
+BEGIN
+CREATE TABLE
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/09_guard_proof.sql:24: ERROR:  public.shadow2 inherits from posted history: a child carries none of the parent's keys or triggers and is visible through it to every report
+CONTEXT:  PL/pgSQL function refuse_journal_ddl() line 41 at RAISE
+ROLLBACK
+=== F. under session_replication_role = replica -- still refused, because ENABLE ALWAYS ===
+BEGIN
+SET
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/09_guard_proof.sql:30: ERROR:  public.ledger_entries is posted history and may not be rewritten by DDL (rewrite reason 4)
+HINT:  Add a new column or a new table; posted rows are not editable, by DDL either.
+CONTEXT:  PL/pgSQL function refuse_journal_ddl() line 13 at RAISE
+ROLLBACK
+-- ...and the counterfactual: the same event trigger left ENABLE ORIGIN --
+ALTER EVENT TRIGGER
+BEGIN
+SET
+ALTER TABLE
+ tenant_id | account_seq 
+-----------+-------------
+ t1        |          10
+ t1        |          10
+(2 rows)
+
+ROLLBACK
+ALTER EVENT TRIGGER
+=== WHAT IT DOES NOT COVER ===
+-- 1. TRUNCATE: PostgreSQL refuses an event trigger for it outright --
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/09_guard_proof.sql:44: ERROR:  event triggers are not supported for TRUNCATE TABLE
+--    (covered instead by the six statement-level triggers ADR-0004 kept) --
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/09_guard_proof.sql:46: ERROR:  ledger_entries is history and cannot be truncated
+CONTEXT:  PL/pgSQL function refuse_truncate() line 3 at RAISE
+-- 2. an ALTER TABLE that does not rewrite: DROP COLUMN is accepted --
+BEGIN
+ALTER TABLE
+ rows_still_there 
+------------------
+                8
+(1 row)
+
+ROLLBACK
+-- 3. ALTER TABLE ... DISABLE TRIGGER USER: accepted, needs no superuser --
+BEGIN
+ALTER TABLE
+DELETE 4
+ after_delete 
+--------------
+            4
+(1 row)
+
+ROLLBACK
+-- 4. DROP EVENT TRIGGER: one statement, and event triggers cannot guard themselves --
+BEGIN
+DROP EVENT TRIGGER
+ALTER TABLE
+ tenant_id | account_seq 
+-----------+-------------
+ t1        |          10
+ t1        |          10
+(2 rows)
+
+ROLLBACK
+-- 5. legitimate DDL is untouched --
+BEGIN
+CREATE INDEX
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ROLLBACK
+VACUUM
+-- ...but a volatile DEFAULT does rewrite, and is refused. A true positive: --
+-- adding that column to posted history writes a new value into every row. --
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/09_guard_proof.sql:79: ERROR:  public.ledger_entries is posted history and may not be rewritten by DDL (rewrite reason 2)
+HINT:  Add a new column or a new table; posted rows are not editable, by DDL either.
+CONTEXT:  PL/pgSQL function refuse_journal_ddl() line 13 at RAISE
+=== final state: untouched ===
+ entries | total  | max_seq 
+---------+--------+---------
+       8 | 200000 |       2
+(1 row)
+
+ event_triggers 
+----------------
+              3
+(1 row)
+
+
+################ 10 -- CHANNEL E closed declaratively, with no seventh trigger
+
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+UPDATE 4
+ALTER TABLE
+REVOKE
+GRANT
+=== a customer wallet with 500.00 in it ===
+INSERT 0 1
+INSERT 0 1
+INSERT 0 2
+INSERT 0 1
+=== 1. owned -> house (the nulling itself) -- REFUSED, as the database owner ===
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/10_owner_frozen.sql:65: ERROR:  update or delete on table "ledger_accounts" violates foreign key constraint "fk_balances__account_owner" on table "ledger_account_balances"
+DETAIL:  Key (tenant_id, id, owner_type, owner_id_key)=(t1, 55555555-5555-5555-5555-555555555555, company, acme) is still referenced from table "ledger_account_balances".
+=== 2. owned -> a different owner -- REFUSED (uq_accounts__owned only caught collisions) ===
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/10_owner_frozen.sql:69: ERROR:  update or delete on table "ledger_accounts" violates foreign key constraint "fk_balances__account_owner" on table "ledger_account_balances"
+DETAIL:  Key (tenant_id, id, owner_type, owner_id_key)=(t1, 55555555-5555-5555-5555-555555555555, company, acme) is still referenced from table "ledger_account_balances".
+=== 3. company -> platform, same owner_id -- REFUSED ===
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/10_owner_frozen.sql:73: ERROR:  update or delete on table "ledger_accounts" violates foreign key constraint "fk_balances__account_owner" on table "ledger_account_balances"
+DETAIL:  Key (tenant_id, id, owner_type, owner_id_key)=(t1, 55555555-5555-5555-5555-555555555555, company, acme) is still referenced from table "ledger_account_balances".
+=== 4. house -> owned, the other direction -- REFUSED ===
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/10_owner_frozen.sql:77: ERROR:  update or delete on table "ledger_accounts" violates foreign key constraint "fk_balances__account_owner" on table "ledger_account_balances"
+DETAIL:  Key (tenant_id, id, owner_type, owner_id_key)=(t1, 11111111-1111-1111-1111-111111111111, house, ) is still referenced from table "ledger_account_balances".
+=== 5. the app role cannot launder the copy first ===
+SET
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/10_owner_frozen.sql:82: ERROR:  permission denied for table ledger_account_balances
+-- ...and the writer's own upsert is unaffected --
+UPDATE 1
+RESET
+              account_id              | input | last_seq | owner_type | owner_id_key 
+--------------------------------------+-------+----------+------------+--------------
+ 55555555-5555-5555-5555-555555555555 | 50100 |        2 | company    | acme
+(1 row)
+
+=== 6. what is still allowed: metadata, and everything that is not identity ===
+UPDATE 1
+=== WHAT IT DOES NOT COVER ===
+-- (a) an account with no balance row yet is not frozen. Nothing has been
+--     posted to it, so there is no posted history to restate. --
+INSERT 0 1
+UPDATE 1
+ owner_id 
+----------
+ newco2
+(1 row)
+
+-- (b) it says nothing about whether the owner was RIGHT at open.
+-- (c) DELETE of the balance row would unfreeze it -- but the app role has no
+--     DELETE on that table (REVOKE, shipped), and the owner is the owner. --
+-- (d) the owner can still drop the constraint. Same boundary as everything else here. --
+
+################ 11 -- the privilege boundary: who can reach any of this
+
+=== the APPLICATION role reaches none of the five channels ===
+SET
+-- A. session_replication_role --
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/11_privileges.sql:6: ERROR:  permission denied to set parameter "session_replication_role"
+-- B. DISABLE TRIGGER --
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/11_privileges.sql:8: ERROR:  must be owner of table ledger_entries
+-- C. inheritance --
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/11_privileges.sql:10: ERROR:  permission denied for schema public
+LINE 1: CREATE TABLE shadow_entries () INHERITS (ledger_entries);
+                     ^
+-- D. the rewrite --
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/11_privileges.sql:12: ERROR:  must be owner of table ledger_entries
+-- E. the register --
+psql:/home/fernando/git/openledger/spikes/012-append-only-perimeter/11_privileges.sql:14: ERROR:  permission denied for table ledger_accounts
+RESET
+=== ...and what the shipped grants actually are ===
+       table_name        |        privs         
+-------------------------+----------------------
+ account_types           | SELECT
+ balance_sheet           | SELECT
+ fs_lines                | SELECT
+ income_statement        | SELECT
+ ledger_account_balances | INSERT,SELECT,UPDATE
+ ledger_accounts         | INSERT,SELECT
+ ledger_entries          | INSERT,SELECT
+ ledger_events           | INSERT,SELECT
+ ledger_transactions     | INSERT,SELECT
+ trial_balance           | SELECT
+(10 rows)
+
+=== the OWNER reaches all five. Both proposed guards need MORE than owner. ===
+-- (run 11_privileges_nosuper.sh for the non-superuser-owner half) --
+
+################ 12 -- the role split
+
+################ A. migrator IS the database owner (today's shape)
+ nspname |   public_owner    
+---------+-------------------
+ public  | pg_database_owner
+(1 row)
+
+-- the database owner is a member of pg_database_owner, which OWNS public, --
+-- so it can drop a superuser's function in it, and CASCADE takes the guard. --
+-- can the migrator remove the guard, or use any of the four channels? --
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to event trigger ck_journal__no_rewrite
+drop cascades to event trigger ck_journal__no_drop
+drop cascades to event trigger ck_journal__no_inherit
+DROP FUNCTION
+ERROR:  event trigger "ck_journal__no_rewrite" does not exist
+ALTER TABLE
+CREATE TABLE
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to view trial_balance
+drop cascades to view income_statement
+drop cascades to view balance_sheet
+drop cascades to table shadow_entries
+DROP TABLE
+ERROR:  relation "ledger_entries" does not exist
+
+################ B. migrator owns the TABLES; the database is owned elsewhere
+psql:/home/fernando/git/openledger/migrations/00001_baseline.sql:826: WARNING:  no privileges were granted for "public"
+psql:/home/fernando/git/openledger/migrations/00001_baseline.sql:847: WARNING:  no privileges could be revoked for "public"
+-- can the migrator remove the guard, or use any of the four channels? --
+ERROR:  must be owner of function refuse_journal_ddl
+ERROR:  must be owner of event trigger ck_journal__no_rewrite
+ERROR:  public.ledger_entries is posted history and may not be rewritten by DDL (rewrite reason 4)
+HINT:  Add a new column or a new table; posted rows are not editable, by DDL either.
+CONTEXT:  PL/pgSQL function refuse_journal_ddl() line 13 at RAISE
+ERROR:  public.shadow_entries inherits from posted history: a child carries none of the parent's keys or triggers and is visible through it to every report
+CONTEXT:  PL/pgSQL function refuse_journal_ddl() line 41 at RAISE
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to view trial_balance
+drop cascades to view income_statement
+drop cascades to view balance_sheet
+ERROR:  public.ledger_entries is posted history and may not be dropped
+CONTEXT:  PL/pgSQL function refuse_journal_ddl() line 27 at RAISE
+ALTER TABLE
+-- ...and what the split BREAKS in the shipped baseline: --
+ grantee | privilege_type 
+---------+----------------
+(0 rows)
+
+ app_can_see_the_schema 
+------------------------
+ t
+(1 row)
+
+
+################ 13 -- the proposed baseline edits, applied and attacked
+
+proposed edits applied clean
+--- the four channels, as the database owner ---
+ERROR:  public.ledger_entries is posted history and may not be rewritten by DDL (rewrite reason 4)
+HINT:  Add a new column or a new table; posted rows are not editable, by DDL either.
+CONTEXT:  PL/pgSQL function refuse_journal_ddl() line 13 at RAISE
+ERROR:  public.shadow_entries inherits from posted history: a child carries none of the parent's keys or triggers and is visible through it to every report
+CONTEXT:  PL/pgSQL function refuse_journal_ddl() line 45 at RAISE
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to view trial_balance
+drop cascades to view income_statement
+drop cascades to view balance_sheet
+ERROR:  public.ledger_entries is posted history and may not be dropped
+CONTEXT:  PL/pgSQL function refuse_journal_ddl() line 29 at RAISE
+UPDATE 1
+--- ...and an owned account, which the seed does not have: open one and try ---
+ERROR:  update or delete on table "ledger_accounts" violates foreign key constraint "fk_balances__account_owner" on table "ledger_account_balances"
+DETAIL:  Key (tenant_id, id, owner_type, owner_id_key)=(t1, 55555555-5555-5555-5555-555555555555, company, acme) is still referenced from table "ledger_account_balances".
+--- the reports are unchanged by any of it ---
+ entries 
+---------
+       8
+(1 row)
+
+ tenant_id | currency | fs_line | amount_minor 
+-----------+----------+---------+--------------
+ t1        | USD      | revenue |        30000
+ t2        | USD      | revenue |        70000
+(2 rows)
+
+--- census after ---
+ tgisinternal | tgenabled | count 
+--------------+-----------+-------
+ f            | A         |     6
+ t            | O         |    40
+(2 rows)
+
+        evtname         |    evtevent     | evtenabled 
+------------------------+-----------------+------------
+ ck_journal__no_drop    | sql_drop        | A
+ ck_journal__no_inherit | ddl_command_end | A
+ ck_journal__no_rewrite | table_rewrite   | A
+(3 rows)
+
+-- baseline applied by a NON-superuser owner: it loads --
+-- 1. can it set session_replication_role? --
+ERROR:  permission denied to set parameter "session_replication_role"
+-- 2. can it promote an FK's internal triggers to ENABLE ALWAYS? --
+ERROR:  permission denied: "RI_ConstraintTrigger_c_63126" is a system trigger
+-- 3. can it create the event trigger? --
+CREATE FUNCTION
+ERROR:  permission denied to create event trigger "e"
+HINT:  Must be superuser to create an event trigger.
+-- 4. can it run the pg_dump --disable-triggers restore path? --
+ERROR:  permission denied: "RI_ConstraintTrigger_c_63126" is a system trigger
+-- 5. ...but DISABLE TRIGGER USER, which is enough to delete history, it CAN --
+ALTER TABLE
+         tgname          | tgenabled 
+-------------------------+-----------
+ ck_entries__append_only | D
+ ck_entries__no_truncate | D
+(2 rows)
+

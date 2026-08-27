@@ -1,0 +1,616 @@
+############################################################################
+# SPIKE 020 -- close cost at scale.  PG18, localhost:5433 -- SHAPE, not bench.
+# PostgreSQL 18.6 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit
+############################################################################
+
+########################## Q1 -- CLOSE WRITE COST vs ACCOUNT POPULATION
+
+===================================== 10000 wallets (USD, one period)
+ spike_seed 
+------------
+ 
+(1 row)
+
+ wallets | accounts | entries | journal_size 
+---------+----------+---------+--------------
+   10000 |    10004 |   24000 | 8256 kB
+(1 row)
+
+=== EXPLAIN (ANALYZE, BUFFERS) of the checkpoint aggregation (the dominant term) ===
+                                                                                                   QUERY PLAN                                                                                                   
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ HashAggregate  (cost=1872.02..2022.07 rows=10003 width=80) (actual rows=10003.00 loops=1)
+   Group Key: e.account_id
+   Batches: 1  Memory Usage: 1809kB
+   Buffers: shared hit=579
+   ->  Hash Join  (cost=515.00..1572.02 rows=24000 width=28) (actual rows=24000.00 loops=1)
+         Hash Cond: (e.transaction_id = x.id)
+         Buffers: shared hit=579
+         ->  Seq Scan on ledger_entries e  (cost=0.00..994.00 rows=24000 width=46) (actual rows=24000.00 loops=1)
+               Filter: ((effective_at < '2026-02-01 00:00:00+00'::timestamp with time zone) AND (tenant_id = 't'::text) AND (currency = 'USD'::bpchar) AND (xact_id < pg_snapshot_xmin(pg_current_snapshot())))
+               Buffers: shared hit=394
+         ->  Hash  (cost=365.00..365.00 rows=12000 width=18) (actual rows=12000.00 loops=1)
+               Buckets: 16384  Batches: 1  Memory Usage: 714kB
+               Buffers: shared hit=185
+               ->  Seq Scan on ledger_transactions x  (cost=0.00..365.00 rows=12000 width=18) (actual rows=12000.00 loops=1)
+                     Filter: ((tenant_id = 't'::text) AND (status = 'posted'::ledger_txn_status))
+                     Buffers: shared hit=185
+ Planning:
+   Buffers: shared hit=118 read=2
+ Planning Time: 0.599 ms
+ Execution Time: 12.179 ms
+(20 rows)
+
+=== the close, timed (checkpoint + closing entries, one transaction) ===
+ closed 
+--------
+ t
+(1 row)
+
+Time: 344.851 ms
+ spike_attest 
+--------------
+ 
+(1 row)
+
+ checkpoint_rows | checkpoint_size | closes_size 
+-----------------+-----------------+-------------
+           10003 | 1360 kB         | 48 kB
+(1 row)
+
+=== the book is clean: reconciliation foots to zero ===
+ total_breaks 
+--------------
+            0
+(1 row)
+
+
+===================================== 100000 wallets (USD, one period)
+ spike_seed 
+------------
+ 
+(1 row)
+
+ wallets | accounts | entries | journal_size 
+---------+----------+---------+--------------
+  100000 |   100004 |  204000 | 68 MB
+(1 row)
+
+=== EXPLAIN (ANALYZE, BUFFERS) of the checkpoint aggregation (the dominant term) ===
+                                                                                                   QUERY PLAN                                                                                                   
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ HashAggregate  (cost=15905.52..16292.51 rows=25799 width=80) (actual rows=100003.00 loops=1)
+   Group Key: e.account_id
+   Batches: 5  Memory Usage: 5937kB  Disk Usage: 3632kB
+   Buffers: shared hit=3809 read=1106 written=1064, temp read=389 written=739
+   ->  Hash Join  (cost=4375.00..13355.52 rows=204000 width=28) (actual rows=204000.00 loops=1)
+         Hash Cond: (e.transaction_id = x.id)
+         Buffers: shared hit=3809 read=1106 written=1064
+         ->  Seq Scan on ledger_entries e  (cost=0.00..8445.00 rows=204000 width=46) (actual rows=204000.00 loops=1)
+               Filter: ((effective_at < '2026-02-01 00:00:00+00'::timestamp with time zone) AND (tenant_id = 't'::text) AND (currency = 'USD'::bpchar) AND (xact_id < pg_snapshot_xmin(pg_current_snapshot())))
+               Buffers: shared hit=3345
+         ->  Hash  (cost=3100.00..3100.00 rows=102000 width=18) (actual rows=102000.00 loops=1)
+               Buckets: 131072  Batches: 1  Memory Usage: 6005kB
+               Buffers: shared hit=464 read=1106 written=1064
+               ->  Seq Scan on ledger_transactions x  (cost=0.00..3100.00 rows=102000 width=18) (actual rows=102000.00 loops=1)
+                     Filter: ((tenant_id = 't'::text) AND (status = 'posted'::ledger_txn_status))
+                     Buffers: shared hit=464 read=1106 written=1064
+ Planning:
+   Buffers: shared hit=109 read=9 written=9
+ Planning Time: 0.655 ms
+ Execution Time: 126.658 ms
+(20 rows)
+
+=== the close, timed (checkpoint + closing entries, one transaction) ===
+ closed 
+--------
+ t
+(1 row)
+
+Time: 3806.314 ms (00:03.806)
+ spike_attest 
+--------------
+ 
+(1 row)
+
+ checkpoint_rows | checkpoint_size | closes_size 
+-----------------+-----------------+-------------
+          100003 | 14 MB           | 48 kB
+(1 row)
+
+=== the book is clean: reconciliation foots to zero ===
+ total_breaks 
+--------------
+            0
+(1 row)
+
+
+===================================== 1000000 wallets (USD, one period)
+ spike_seed 
+------------
+ 
+(1 row)
+
+ wallets | accounts | entries | journal_size 
+---------+----------+---------+--------------
+ 1000000 |  1000004 | 2004000 | 663 MB
+(1 row)
+
+=== EXPLAIN (ANALYZE, BUFFERS) of the checkpoint aggregation (the dominant term) ===
+                                                                                                   QUERY PLAN                                                                                                   
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ HashAggregate  (cost=203206.40..203651.60 rows=29680 width=80) (actual rows=1000003.00 loops=1)
+   Group Key: e.account_id
+   Batches: 49  Memory Usage: 9017kB  Disk Usage: 50248kB
+   Buffers: shared hit=11111 read=37158 written=34, temp read=28492 written=33303
+   ->  Hash Join  (cost=48843.00..178156.44 rows=2003997 width=28) (actual rows=2004000.00 loops=1)
+         Hash Cond: (e.transaction_id = x.id)
+         Buffers: shared hit=11111 read=37158 written=34, temp read=18198 written=18198
+         ->  Seq Scan on ledger_entries e  (cost=0.00..82952.93 rows=2003997 width=46) (actual rows=2004000.00 loops=1)
+               Filter: ((effective_at < '2026-02-01 00:00:00+00'::timestamp with time zone) AND (tenant_id = 't'::text) AND (currency = 'USD'::bpchar) AND (xact_id < pg_snapshot_xmin(pg_current_snapshot())))
+               Buffers: shared hit=11111 read=21742 written=1
+         ->  Hash  (cost=30446.00..30446.00 rows=1002000 width=18) (actual rows=1002000.00 loops=1)
+               Buckets: 131072  Batches: 8  Memory Usage: 7146kB
+               Buffers: shared read=15416 written=33, temp written=4062
+               ->  Seq Scan on ledger_transactions x  (cost=0.00..30446.00 rows=1002000 width=18) (actual rows=1002000.00 loops=1)
+                     Filter: ((tenant_id = 't'::text) AND (status = 'posted'::ledger_txn_status))
+                     Buffers: shared read=15416 written=33
+ Planning:
+   Buffers: shared hit=106 read=12 written=5
+ Planning Time: 0.683 ms
+ JIT:
+   Functions: 23
+   Options: Inlining false, Optimization false, Expressions true, Deforming true
+ Execution Time: 1951.551 ms
+(23 rows)
+
+=== the close, timed (checkpoint + closing entries, one transaction) ===
+ closed 
+--------
+ t
+(1 row)
+
+Time: 48953.458 ms (00:48.953)
+ spike_attest 
+--------------
+ 
+(1 row)
+
+ checkpoint_rows | checkpoint_size | closes_size 
+-----------------+-----------------+-------------
+         1000003 | 135 MB          | 48 kB
+(1 row)
+
+=== the book is clean: reconciliation foots to zero ===
+ total_breaks 
+--------------
+            0
+(1 row)
+
+
+===================================== per-currency: 3 currencies x 100k, one period
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_seed 
+------------
+ 
+(1 row)
+
+--- close mc/2026-01/USD ---
+ closed 
+ t
+Time: 3215.272 ms (00:03.215)
+--- close mc/2026-01/EUR ---
+ closed 
+ t
+Time: 3168.178 ms (00:03.168)
+--- close mc/2026-01/GBP ---
+ closed 
+ t
+Time: 3063.170 ms (00:03.063)
+EUR|100003
+GBP|100003
+USD|100003
+
+########################## Q2 -- THE CHECKPOINT READ BENEFIT (and its reader)
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_attest 
+--------------
+ 
+(1 row)
+
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_attest 
+--------------
+ 
+(1 row)
+
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_attest 
+--------------
+ 
+(1 row)
+
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_attest 
+--------------
+ 
+(1 row)
+
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_attest 
+--------------
+ 
+(1 row)
+
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_attest 
+--------------
+ 
+(1 row)
+
+=== 1. DOES balance_sheet_at READ THE CHECKPOINT? (static proof) ===
+       proname        | reads_checkpoint | reads_journal 
+----------------------+------------------+---------------
+ balance_sheet_at     | f                | t
+ income_statement_for | f                | t
+ trial_balance_at     | f                | t
+(3 rows)
+
+         what         |         relname         
+----------------------+-------------------------
+ reader_of_checkpoint | recon_checkpoint_breaks
+(1 row)
+
+=== 2. the inner plan of the as-of position: an Index/Seq Scan of ledger_entries ===
+                                                                                   QUERY PLAN                                                                                    
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ HashAggregate  (cost=19648.23..19818.71 rows=13639 width=48) (actual rows=20004.00 loops=1)
+   Group Key: e.account_id
+   Batches: 1  Memory Usage: 7441kB
+   Buffers: shared hit=6071
+   ->  Hash Join  (cost=5404.16..15868.23 rows=252000 width=28) (actual rows=252024.00 loops=1)
+         Hash Cond: (e.transaction_id = x.id)
+         Buffers: shared hit=6071
+         ->  Seq Scan on ledger_entries e  (cost=0.00..9802.54 rows=252000 width=46) (actual rows=252024.00 loops=1)
+               Filter: ((effective_at < '2026-07-01 00:00:00+00'::timestamp with time zone) AND (tenant_id = 'r'::text) AND (xact_id < pg_snapshot_xmin(pg_current_snapshot())))
+               Buffers: shared hit=4132
+         ->  Hash  (cost=3829.09..3829.09 rows=126006 width=18) (actual rows=126006.00 loops=1)
+               Buckets: 131072  Batches: 1  Memory Usage: 7177kB
+               Buffers: shared hit=1939
+               ->  Seq Scan on ledger_transactions x  (cost=0.00..3829.09 rows=126006 width=18) (actual rows=126006.00 loops=1)
+                     Filter: ((tenant_id = 'r'::text) AND (status = 'posted'::ledger_txn_status))
+                     Buffers: shared hit=1939
+ Planning:
+   Buffers: shared hit=360 read=2
+(18 rows)
+
+=== 3. balance_sheet_at at the last close boundary (what the integrator runs) ===
+ count 
+-------
+    10
+(1 row)
+
+Time: 456.608 ms
+ count 
+-------
+    10
+(1 row)
+
+Time: 454.894 ms
+=== 4. the from-inception aggregation the balance sheet is built on (its cost driver) ===
+ count 
+-------
+ 20004
+(1 row)
+
+Time: 95.839 ms
+=== 5. what a checkpoint READ would cost instead: read the stored rows for the last period ===
+ count 
+-------
+ 20004
+(1 row)
+
+Time: 2.411 ms
+ count 
+-------
+ 20004
+(1 row)
+
+Time: 1.881 ms
+=== sizes ===
+ entries | checkpoint_rows_last_period | closes 
+---------+-----------------------------+--------
+  252024 |                       20004 |      6
+(1 row)
+
+
+########################## Q3 -- RECONCILIATION SWEEP vs NUMBER OF CLOSES
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_attest 
+--------------
+ 
+(1 row)
+
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_attest 
+--------------
+ 
+(1 row)
+
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_attest 
+--------------
+ 
+(1 row)
+
+
+----------------------------------- after 3 closes
+ closes | entries | checkpoint_rows 
+--------+---------+-----------------
+      3 |   51612 |           24011
+(1 row)
+
+--- recon_checkpoint_breaks (must be 0 on a healthy book), timed x2 ---
+ checkpoint_breaks 
+-------------------
+                 0
+(1 row)
+
+Time: 72.152 ms
+ checkpoint_breaks 
+-------------------
+                 0
+(1 row)
+
+Time: 68.184 ms
+--- the whole reconciliation sweep, timed x2 ---
+ total_breaks 
+--------------
+            0
+(1 row)
+
+Time: 3591.546 ms (00:03.592)
+ total_breaks 
+--------------
+            0
+(1 row)
+
+Time: 3545.787 ms (00:03.546)
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_attest 
+--------------
+ 
+(1 row)
+
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_attest 
+--------------
+ 
+(1 row)
+
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_attest 
+--------------
+ 
+(1 row)
+
+
+----------------------------------- after 6 closes
+ closes | entries | checkpoint_rows 
+--------+---------+-----------------
+      6 |  103224 |           48023
+(1 row)
+
+--- recon_checkpoint_breaks (must be 0 on a healthy book), timed x2 ---
+ checkpoint_breaks 
+-------------------
+                 0
+(1 row)
+
+Time: 209.260 ms
+ checkpoint_breaks 
+-------------------
+                 0
+(1 row)
+
+Time: 235.961 ms
+--- the whole reconciliation sweep, timed x2 ---
+ total_breaks 
+--------------
+            0
+(1 row)
+
+Time: 4087.585 ms (00:04.088)
+ total_breaks 
+--------------
+            0
+(1 row)
+
+Time: 4027.045 ms (00:04.027)
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_attest 
+--------------
+ 
+(1 row)
+
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_attest 
+--------------
+ 
+(1 row)
+
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_attest 
+--------------
+ 
+(1 row)
+
+
+----------------------------------- after 9 closes
+ closes | entries | checkpoint_rows 
+--------+---------+-----------------
+      9 |  154836 |           72035
+(1 row)
+
+--- recon_checkpoint_breaks (must be 0 on a healthy book), timed x2 ---
+ checkpoint_breaks 
+-------------------
+                 0
+(1 row)
+
+Time: 417.950 ms
+ checkpoint_breaks 
+-------------------
+                 0
+(1 row)
+
+Time: 395.444 ms
+--- the whole reconciliation sweep, timed x2 ---
+ total_breaks 
+--------------
+            0
+(1 row)
+
+Time: 4705.466 ms (00:04.705)
+ total_breaks 
+--------------
+            0
+(1 row)
+
+Time: 4625.007 ms (00:04.625)
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_attest 
+--------------
+ 
+(1 row)
+
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_attest 
+--------------
+ 
+(1 row)
+
+ spike_seed 
+------------
+ 
+(1 row)
+
+ spike_attest 
+--------------
+ 
+(1 row)
+
+
+----------------------------------- after 12 closes
+ closes | entries | checkpoint_rows 
+--------+---------+-----------------
+     12 |  206448 |           96047
+(1 row)
+
+--- recon_checkpoint_breaks (must be 0 on a healthy book), timed x2 ---
+ checkpoint_breaks 
+-------------------
+                 0
+(1 row)
+
+Time: 588.529 ms
+ checkpoint_breaks 
+-------------------
+                 0
+(1 row)
+
+Time: 554.411 ms
+--- the whole reconciliation sweep, timed x2 ---
+ total_breaks 
+--------------
+            0
+(1 row)
+
+Time: 5126.016 ms (00:05.126)
+ total_breaks 
+--------------
+            0
+(1 row)
+
+Time: 5084.050 ms (00:05.084)
+
+############################################################################
+# done. localhost, PG18 -- ratios and shapes above, not a benchmark.
+############################################################################
