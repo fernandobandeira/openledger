@@ -1,4 +1,4 @@
-# Spike 005 — Can Postgres replace Temporal for durable timers?
+# Spike 003 — Can Postgres replace Temporal for durable timers?
 
 ## The question
 
@@ -70,7 +70,7 @@ Every property the ledger needs, confirmed:
 **Operationally, nothing.** River is a library, not a server — it runs inside our binary and adds
 5 tables and 7 migrations to the same database. *(River is Go, and so was this spike's stack. The
 four properties measured here were re-run against `graphile_worker` 0.13.5 on `sqlx` in
-[spike 010](/spikes/010-go-or-rust) and all four hold; the conclusion carried over, the driver
+[spike 007](/spikes/007-go-or-rust) and all four hold; the conclusion carried over, the driver
 did not.)*
 
 **What we give up**, honestly: workflow-as-code (a multi-step process reads as sequential Go with

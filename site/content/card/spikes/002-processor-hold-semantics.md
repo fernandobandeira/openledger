@@ -1,10 +1,10 @@
-# Spike 008 — what card processors and ledger APIs actually do
+# Spike 002 — what card processors and ledger APIs actually do
 
 **Status:** closed
-**Supersedes** the processor survey in [spike 006](/spikes/006-append-only-holds), which was
+**Supersedes** the processor survey in [spike 001](/card/spikes/001-append-only-holds), which was
 fabricated by an earlier agent and struck. **Nothing here is reused from it.**
 
-**Question.** [ADR-0008](/decisions/0008-authorization-holds) makes claims about how
+**Question.** [ADR-0001](/card/decisions/0001-authorization-holds) makes claims about how
 processors behave — delta versus cumulative totals, what an authorization does to a ledger, what
 reversal and expiry mean, what ordering is promised. Every one was asserted without a source. Are
 they true?
@@ -26,7 +26,7 @@ second reviewer — who also found two of them overstated, which is what checkin
 
 ## The headline: our central claim needs narrowing, not retracting
 
-ADR-0008 says **an authorization writes no ledger entry; only a clearing posts.**
+ADR-0001 says **an authorization writes no ledger entry; only a clearing posts.**
 
 That is **true of every posted balance surveyed** and **wrong as a blanket statement**. Roughly half
 of these systems write a durable, balance-affecting row at authorization time, into the same log as
@@ -55,7 +55,7 @@ same-instant authorization-plus-clearing pair.
 
 ---
 
-## Delta versus cumulative total — the question ADR-0008 was right to refuse to answer
+## Delta versus cumulative total — the question ADR-0001 was right to refuse to answer
 
 This is the finding that most vindicates the design. There is **no convention**, and one vendor
 contradicts itself on a single page.
@@ -105,7 +105,7 @@ rather than trusting any vendor's prose.
   to **zero**. Highnote goes furthest: notifications *"are not authoritative"* and *"Do not use
   webhook arrival order to drive money movement."* Modern Treasury, Lithic, Marqeta, Increase and
   Moov publish **no ordering statement at all** — an absence of documentation, not a guarantee.
-- **Stripe's two-event-ids caveat, which ADR-0008 already cites, is real:** *"In some cases, two
+- **Stripe's two-event-ids caveat, which ADR-0001 already cites, is real:** *"In some cases, two
   separate Event objects are generated and sent. To identify these duplicates, use the ID of the
   object in `data.object` along with the `event.type`."*
 

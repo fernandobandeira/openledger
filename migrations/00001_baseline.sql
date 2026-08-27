@@ -14,7 +14,7 @@
 --
 -- WHAT IT DOES NOT CONTAIN. The card reference product -- authorizations, holds
 -- and clearing -- is parked in `parked/card/` and is not applied by any migration
--- today. ADR-0009 decided it returns as its own `card` PostgreSQL schema inside
+-- today. ADR-0008 decided it returns as its own `card` PostgreSQL schema inside
 -- this same migration set; until someone invests in that, a deployment gets the
 -- ledger core and nothing else. The two trigger functions below are the only
 -- objects that half depended on.
@@ -391,15 +391,19 @@ CREATE TABLE ledger_entries (
     amount_minor   bigint NOT NULL,             -- never the amount
     currency       char(3) NOT NULL,
     account_seq    bigint NOT NULL,             -- monotonic per account
-    -- Running balance on the RECORDED axis only. It cannot answer a business-date
-    -- question once anything is backdated (ADR-0006).
+    -- NO RUNNING BALANCE. There was a balance_after column here, holding the
+    -- account's balance immediately after this entry, and spike 009 removed it.
     --
-    -- SIGN CONVENTION: debit-positive. balance_after is SUM(debits) - SUM(credits)
-    -- for this account, so a credit-normal account carries a negative running
-    -- balance. This was undefined until the drift view forced the question -- the
-    -- golden trace stored it natural-positive, which disagrees. Presentation flips
-    -- the sign using the account's normal_balance; storage does not.
-    balance_after  bigint NOT NULL,
+    -- A running balance is a point-in-time answer on the RECORDED axis, and the
+    -- recorded axis is not the one anybody asks about: every as-of question a
+    -- business asks -- "as of June 30" -- is an EFFECTIVE-date question, and
+    -- effective dates get backfilled. One backdated entry makes every later
+    -- running balance wrong, because each was computed without it -- which is the
+    -- failure ADR-0006 measured on this schema: 180 returned against a true 130.
+    --
+    -- What used to justify the column now lives elsewhere: "the balance now"
+    -- is ledger_account_balances, and "the balance as of a date" aggregates
+    -- over effective_at on ix_entries__effective (ADR-0006).
     recorded_at    timestamptz NOT NULL DEFAULT now(),
     -- denormalised from the transaction so the effective-axis aggregate is a
     -- single-table index scan.
@@ -408,7 +412,14 @@ CREATE TABLE ledger_entries (
     CONSTRAINT pk_entries PRIMARY KEY (tenant_id, id),
     CONSTRAINT ck_entries__amount_positive CHECK (amount_minor > 0),
     -- account_seq orders history: it is the key a drift check walks and the
-    -- key every as-of reconstruction depends on. Nothing enforced even POSITIVITY
+    -- key every as-of reconstruction depends on.
+    --
+    -- NOT A SEQUENCE, and the reason is in ADR-0004's alternatives. A Postgres
+    -- sequence counts per TABLE, not per account, and nextval() is not rolled
+    -- back -- an aborted transaction leaves a permanent hole. Gaplessness is the
+    -- property this column exists to provide, so the writer issues it inside the
+    -- same statement that advances the balance row, under the lock it already
+    -- holds. Nothing enforced even POSITIVITY
     -- -- a seq of -9999 inserted later silently reordered an account's past.
     -- Gaplessness itself is still only asserted by the suite, not enforced here.
     CONSTRAINT ck_entries__seq_positive CHECK (account_seq > 0),
@@ -454,10 +465,14 @@ CREATE TABLE ledger_account_balances (
     updated_at timestamptz NOT NULL DEFAULT now(),
 
     CONSTRAINT pk_balances PRIMARY KEY (tenant_id, account_id, currency),
-    -- currency is IN the foreign key, as it is for entries. Without it the cache
-    -- -- the copy the hot path reads, and the only one the app role may write --
-    -- accepted a second row for the same account under 'usd' or 'JPY', splitting
-    -- one account's balance across two rows.
+    -- currency is IN the foreign key, as it is for entries. Without it this row --
+    -- the only copy of a balance the app role may write -- accepted a second row
+    -- for the same account under 'usd' or 'JPY', splitting one account's balance
+    -- across two rows.
+    --
+    -- THIS ROW IS WHERE THE HOT PATH READS "the balance now". It is the only
+    -- copy left: spike 009 dropped the per-entry running balance that used to be
+    -- the other answer, so there is no longer a second number to disagree with.
     CONSTRAINT fk_balances__account FOREIGN KEY (tenant_id, account_id, currency)
         REFERENCES ledger_accounts (tenant_id, id, currency),
     CONSTRAINT ck_balances__non_negative CHECK (input >= 0 AND output >= 0),
@@ -470,8 +485,11 @@ CREATE TABLE ledger_account_balances (
 
 
 
-CREATE INDEX ix_entries__balance_lookup
-    ON ledger_entries (tenant_id, account_id, account_seq DESC) INCLUDE (balance_after);
+-- There is no ix_entries__balance_lookup. It was
+--     (tenant_id, account_id, account_seq DESC) INCLUDE (balance_after)
+-- and the INCLUDE was its whole reason to exist: the three key columns are
+-- already indexed by uq_entries__account_seq. Dropping the column (spike 009)
+-- left a straight duplicate, so the column took an entire index with it.
 
 CREATE INDEX ix_entries__asof_recorded
     ON ledger_entries (tenant_id, account_id, recorded_at DESC, account_seq DESC);
@@ -659,7 +677,7 @@ ORDER BY tenant_id, currency, sort_order;
 -- that bar, as six trigger objects; ADR-0004 records what happened to the other
 -- nineteen.
 --
--- The evidence for drawing the line here rather than elsewhere is spike 009.
+-- The evidence for drawing the line here rather than elsewhere is spike 006.
 -- Formance -- Go, PostgreSQL, in production, the closest analogue there is -- built
 -- a full PL/pgSQL write engine and then demolished it: migration 11
 -- `make-stateless` dropped five triggers that dispatched business flow, and
@@ -762,7 +780,7 @@ ALTER TABLE ledger_events ENABLE ALWAYS TRIGGER ck_events__no_truncate;
 --     TigerBeetle gets from a single Transfer row carrying both account ids, and
 --     what Formance gets from Posting{Source,Destination} -- their Validate() has
 --     no balance check at all, because there is nothing to check.
---   * recorded_at, account_seq, balance_after, xact_id -- ASSIGNED by the writer.
+--   * recorded_at, account_seq, xact_id -- ASSIGNED by the writer.
 --     There is no parameter for a caller to supply, which is stronger than a
 --     DEFAULT (a DEFAULT is overridable, and that was a measured defect here: a
 --     client-settable insertion axis let an already-issued report be rewritten by a

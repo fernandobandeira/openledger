@@ -1,4 +1,4 @@
-# Spike 009 — do real ledgers use triggers, and where does the balance invariant live?
+# Spike 006 — do real ledgers use triggers, and where does the balance invariant live?
 
 **Status:** closed
 

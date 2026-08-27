@@ -1,31 +1,19 @@
 # The database, drawn and explained
 
-Seven tables that record money movement so that it cannot quietly go wrong. This page is the
-guided tour: what each table is for, why it has the shape it has, and — just as carefully —
-**what it does not protect you from**. No prior experience with ledgers assumed.
-
-Two things to know before you start. **There is no application on top of this schema yet**: the
-service is not built, so where a guarantee depends on code that does not exist, this page says so
-rather than implying otherwise. And the schema is one file,
-[`migrations/00001_baseline.sql`](/source/baseline), applied by one command; the
-reasoning is in comments beside each object, and the decisions behind it are in
-[`decisions/`](/decisions), one file each.
-
 ## Start here if you have never built a ledger
 
-A ledger answers one question — *who is owed what* — in a way that cannot silently drift. Five
-ideas carry almost the whole design, and they are all quite small. If a word here is new, the
-[glossary](/glossary) defines every term this project uses.
+A ledger answers one question — *who is owed what* — in a way that cannot silently drift. If a word
+here is new, the [glossary](/glossary) defines every term this project uses.
 
 **Every movement is written twice.** Once as a **debit**, once as a **credit**, and the two sides
 of one transaction sum to the same amount. That is *double-entry*. It is not bureaucracy: it means
-an error has to be made twice, consistently, to survive. Here is one $500 card purchase, in full —
-`DR` marks a debit and `CR` a credit:
+an error has to be made twice, consistently, to survive. One $500 sale, with `DR` marking a debit
+and `CR` a credit:
 
 ```
 DR  customer_receivable         500.00    the customer owes us $500
-CR  network_settlement_payable  491.00    we owe the card network $491
-CR  interchange_revenue           9.00    we keep $9 as our fee
+CR  due_to_tenants              491.00    we owe the seller $491
+CR  fee_revenue                   9.00    we keep $9 as our fee
     ------------------------------------
     debits 500.00  =  credits 500.00      balanced
 ```
@@ -39,8 +27,7 @@ That one exception is why the database stores the normal balance instead of deri
 **Balances have to add up in a particular way.** Everything a business owns equals everything it
 owes plus what the owners have put in, adjusted by what it has earned and spent:
 **assets = liabilities + equity + (revenue − expenses)**. That identity is the *accounting
-equation*, and it falls straight out of writing every movement twice. Two sections below turn on
-it.
+equation*, and it falls straight out of writing every movement twice.
 
 **Nothing is ever edited.** A correction that rewrites history is indistinguishable from a lie, so
 a mistake is fixed by posting a new, opposite entry beside it. Every table that records what
@@ -52,7 +39,12 @@ be able to say so.
 
 **Two dates, always.** When something happened, and when we found out. They differ constantly — a
 card clearing carries the network's business date, days before the webhook that told us about it.
-Confusing them is the single most common way a correct ledger produces a wrong report.
+
+Three kinds of note appear throughout. **CAUGHT** is a real defect this design stopped, with what
+it cost when it got through — evidence the shape works. **STILL OPEN** is a gap that exists right
+now. **A LIMIT** is as good as the approach gets, and not a gap. The full inventory of what the
+schema does and does not hold is the decision log's [open list](/decisions#still-open), which is
+longer than this page.
 
 ## The map
 
@@ -62,18 +54,16 @@ what any of it means. Arrows point from a table to the table it depends on.
 
 ![The core ledger: seven tables in three layers, with the journal on top, the register in the middle and the chart of accounts at the bottom](/diagrams/04-database-erd.svg)
 
-Every arrow is a *composite* key — it carries more than an id. That is the recurring trick of this
-schema, and it is worth holding on to: **when a value is copied into a second table for speed, the
-copy is made part of a key, so it cannot disagree with the original.** Three report views (not
-drawn) read the chart at the bottom and the journal at the top.
+Every arrow is a *composite* key — it carries more than an id. **When a value is copied into a
+second table for speed, the copy is made part of a key, so it cannot disagree with the original.**
+Three report views (not drawn) read the chart at the bottom and the journal at the top.
 
-Two words that recur. A **tenant** is one customer of this ledger — one business whose books are
-kept separately inside a shared database. **PK** marks the columns that identify a row uniquely.
+A **tenant** is one customer of this ledger — one business whose books are kept separately inside
+a shared database. **PK** marks the columns that identify a row uniquely.
 
 ## Four ideas that explain the schema
 
-These four decide most of the column choices below. Read them first and the seven tables stop
-being a list.
+These four decide most of the column choices below.
 
 ### 1 · The tenant leads every key
 
@@ -109,9 +99,9 @@ So completeness is treated as a separate invariant from balance, and the fix is 
 
 ![Two ways to build a report: from the entries, where a line with no activity is never enumerated and silently absent; and from the chart, where every line is listed first and prints as zero](/diagrams/05-report-direction.svg)
 
-`balance_sheet` and `income_statement` enumerate outward. `trial_balance` still enumerates
-inward, and is the wrong thing to build a completeness claim on — it is kept because it is the
-right tool for a different job: showing what actually moved.
+`balance_sheet` and `income_statement` enumerate outward. `trial_balance` still enumerates inward,
+and is the wrong thing to build a completeness claim on — it is kept for a different job: showing
+what actually moved.
 
 ### 3 · Two time axes, two mechanisms — never one
 
@@ -119,21 +109,31 @@ right tool for a different job: showing what actually moved.
 
 An entry recorded today with a business date of last week is *backdated*, and it is completely
 normal: late clearings and chargebacks arrive that way. Which means the order entries were
-*recorded* in is not the order they *happened* in — and a running balance follows the recording
-order:
+*recorded* in is not the order they *happened* in.
 
-| account_seq | effective (business date) | amount | balance_after |
+Here is what that costs. Suppose each entry stored the account's balance immediately after it — a
+*running balance*, which is what most ledgers do and what this one used to do:
+
+| account_seq | effective (business date) | amount | running balance |
 | --- | --- | --- | --- |
 | 1 | Jan 10 | +100 | 100 |
 | 2 | Jan 30 | +50 | 150 |
 | 3 | Jan 20 — **backdated** | +30 | **180** |
 
-Ask for the balance *as of Jan 25* by reading the latest `balance_after` and you get **180**. The
-truth is **130**. The Jan 20 entry has a higher sequence number than Jan 30's, so the newest
-running balance already includes January 30.
+Ask for the balance *as of Jan 25* by reading the latest running balance and you get **180**. The
+truth is **130**. The Jan 20 entry has a higher sequence number than Jan 30's, so the newest running
+balance already includes January 30 — it was computed before anyone knew about Jan 20.
 
-So there are two mechanisms and each read names its axis. "What is this balance now" is one index
-lookup on `balance_after`. "What was it as of a business date" aggregates over `effective_at`,
+**This schema stores no running balance at all**, and that is the reason. Repairing one means
+rewriting every later row on every backdated insert, and refusing to repair it means keeping a
+number that is only right about the order rows were inserted in — an order nobody asks questions
+about. [Spike 009](/spikes/009-where-the-balance-lives) has the prior art, including Fragment's own
+sentence on why they store no such column: computing historical balances on write *"leads to
+cascading updates when posting a backdated Ledger Entry."*
+
+So there are two mechanisms and each read names its axis. "What is this balance now" is a
+primary-key read of the one row in `ledger_account_balances` that holds it. "What was it as of a
+business date" aggregates over `effective_at`,
 which is linear in history — and the accountants' answer to that is a **period close**, which
 stores each period's closing balance so the query becomes *prior close plus entries since*. That
 close is designed and not built.
@@ -153,8 +153,7 @@ Business logic in the database is a road other ledgers have walked and reversed 
 full stored-procedure write engine and then spent two migrations demolishing it, dropping five
 triggers and twenty-seven functions. So the rule here is that a trigger must state, in the schema
 beside it, the invariant it holds, why nothing declarative holds it, and *what it does not protect
-against*. Two clear that bar, as six trigger objects over two functions
-([ADR-0004](/decisions/0004-where-logic-lives)):
+against*. Two clear that bar ([ADR-0004](/decisions/0004-where-logic-lives)):
 
 - **The journal is append-only.** No row in `ledger_entries`, `ledger_transactions` or
   `ledger_events` may be updated or deleted. There is no `CHECK` for "this row may not change" and
@@ -167,8 +166,25 @@ against*. Two clear that bar, as six trigger objects over two functions
   would be the natural one object for the job, and PostgreSQL refuses that for `TRUNCATE`
   outright.
 
-Both are set to fire even on the replication apply path and under a restore that disables
-triggers. A replica that does not enforce its publisher's invariants is a laundering channel for
+**The actual objects: two functions, six triggers, three tables.** Measured on a fresh load, not
+asserted:
+
+| function | trigger | on | fires on |
+| --- | --- | --- | --- |
+| `refuse_mutation()` | `ck_entries__append_only` | `ledger_entries` | `UPDATE`, `DELETE` |
+| | `ck_txn__append_only` | `ledger_transactions` | `UPDATE`, `DELETE` |
+| | `ck_events__append_only` | `ledger_events` | `UPDATE`, `DELETE` |
+| `refuse_truncate()` | `ck_entries__no_truncate` | `ledger_entries` | `TRUNCATE` |
+| | `ck_txn__no_truncate` | `ledger_transactions` | `TRUNCATE` |
+| | `ck_events__no_truncate` | `ledger_events` | `TRUNCATE` |
+
+Each one raises and aborts the statement; there is nothing in them beyond refusing. Six objects
+rather than two because `TRUNCATE` needs a separate trigger from `UPDATE`/`DELETE`, and every table
+needs its own — `TRUNCATE a CASCADE` reaching `b` is refused by **b's** guard, naming b, so a test
+that only checks "something was refused" still passes with a's guard deleted.
+
+All six are `ENABLE ALWAYS`, so they fire even on the replication apply path and under a restore that
+disables triggers. A replica that does not enforce its publisher's invariants is a laundering channel for
 corrupt rows.
 
 > **What they do not protect against.** An owner who disables or drops a trigger, which is one
@@ -177,10 +193,29 @@ corrupt rows.
 > to callable-by-six, and Uber's cryptographic signatures over each record. Both live outside the
 > database. This is the cheap 80%, and it binds accidents rather than intent.
 
+## A transaction, and an entry
+
+A **transaction** is the event. An **entry** is one leg of it. The $500 sale above is *one*
+transaction and *three* entries:
+
+```
+transaction  ──┬── entry   DR customer_receivable   500.00
+   the sale    ├── entry   CR due_to_tenants        491.00
+               └── entry   CR fee_revenue             9.00
+```
+
+They hold different kinds of fact. The transaction knows *when* — both dates — what it resolves or
+reverses, and which event caused it. Each entry knows *where*: one account, one direction, one
+amount, and that account's own running position.
+
+The split is not bookkeeping neatness. **Balance is a property of the group, not the line**: a
+single entry is money appearing from nowhere, and "debits equal credits" cannot be checked against
+it. It also decides what a correction is — a whole new transaction pointing at the old one, never
+an edit to a leg.
+
 ## The seven tables
 
-In the order the diagram reads: the journal first, because it is the point; then the register; then
-the chart that gives it meaning.
+In the order the diagram reads: the journal, then the register, then the chart.
 
 ### `ledger_entries` — one leg of one movement
 
@@ -196,14 +231,27 @@ an integer of *minor units* — cents, not dollars, and never a floating-point n
 represent 0.10 exactly. Storing a negative amount *and* a direction gives you two ways to say the
 same thing, and eventually they disagree.
 
+**Why `currency` is here at all, when the account already has one.** It is redundant: an account
+holds exactly one currency, so `account_id` already determines it. The copy exists so a
+business-date or per-currency aggregate is a single-table scan instead of a join — and it is safe
+only because it is not trusted. It sits *inside* the foreign key
+`(tenant_id, account_id, currency)`, whose target index `uq_accounts__id_currency` exists for no
+other purpose. The copy cannot disagree with the original, because a row where it disagrees cannot
+be written.
+
 **Two columns are copied here on purpose.** `effective_at` is copied from the transaction so a
 business-date report is a single-table index scan rather than a join, and `currency` is copied from
 the account. Both copies sit inside composite foreign keys, so neither can drift from its source —
 that is what makes the copying safe rather than merely fast.
 
-`account_seq` is a per-account counter that orders one account's history, and `balance_after` is
-that account's running balance at that point. Together they turn "what is this account's balance
-right now" into a single index lookup instead of a sum over all its history.
+`account_seq` is a per-account counter that orders one account's history. It is what an as-of
+reconstruction walks, and its **gaplessness** is what makes "no entry is missing" a claim you can
+check: numbers 1 through N with nothing skipped.
+
+**Not a Postgres sequence**, and the difference is the point: a sequence counts per *table*, not per
+account, and `nextval()` is not rolled back — an aborted transaction leaves a permanent hole in the
+numbering, which destroys exactly the property the column exists for. So the writer issues it inside
+the same statement that updates the balance ([ADR-0004](/decisions/0004-where-logic-lives)).
 
 The keys that carry a rule: `uq_entries__account_seq` (one row per account per sequence number —
 arguably the journal's most important key); `fk_entries__account` on `(tenant, account, currency)`,
@@ -223,6 +271,15 @@ transaction may do one or the other but not both.
 This is why the table can be append-only at all. The usual design updates a status column in place,
 and then the answer to "what did this look like last Tuesday" is gone.
 
+The keys that carry a rule: `uq_txn__one_resolution` and `uq_txn__one_reversal` (once each — because
+we refuse to mutate, the usual `UPDATE … WHERE resolved_at IS NULL` guard is not available here);
+`ck_txn__not_both` and `ck_txn__no_self_reference` beside them; `uq_txn__one_per_event`, below; and
+`uq_txn__id_effective`, which adds no uniqueness the primary key did not already give. `(tenant_id,
+id)` is `pk_txn`; the third column is there so a composite foreign key can carry the business date
+along with the id, which is what makes the copy on the entry unable to drift. **Drop it and the
+schema does not load** — `there is no unique constraint matching given keys`. A guard whose absence
+is a build failure rather than a test failure needs no test.
+
 > **CAUGHT — `uq_txn__one_per_event`.** Without it, two transactions were produced from one event
 > row, so the idempotency spine did not by itself prevent double-posting.
 
@@ -236,10 +293,9 @@ External systems retry. A webhook arrives twice; a client resends after a timeou
 make the second attempt harmless, and it cannot be a key on the transactions table — because
 **most of what a ledger accepts writes no transaction at all**.
 
-An account being opened writes none. Neither does a credit-limit change, a rejected posting, or a
-metadata edit. In the card product that ratio is starker still: an authorization reserves money
-without moving it, and so do a decline, a hold expiring and a reversal. Put the retry key on the
-transaction and every one of those operations has nowhere to live
+An account being opened writes none. Neither does a limit change, a rejected posting, or a
+metadata edit. Put the retry key on the transaction and every one of those operations has nowhere
+to live
 ([ADR-0005](/decisions/0005-event-log-and-write-path)).
 
 **The retry contract:** same idempotency key and the same request body → replay the stored outcome.
@@ -275,6 +331,13 @@ The account carries a copy of its type's `category` and `normal_balance`, so a r
 join the chart just to learn the sign of a number — and that copy is a foreign key into the row it
 was copied from.
 
+The keys that carry a rule: `uq_accounts__owned` and `uq_accounts__house`, the two partial indexes
+that keep the owned and house worlds disjoint; and `uq_accounts__id_currency`, which — like
+`uq_txn__id_effective` on the transactions table — is a referenced-side index rather than a new rule.
+`(tenant_id, id)` is already the primary key; this one carries `currency` alongside it so
+`fk_entries__account` has something to point at. It is unbuildable-if-missing for the same reason,
+and untested for the same reason.
+
 > **CAUGHT — without the currency in the key.** USD entries sat happily inside EUR accounts and the
 > declared currency was decorative.
 
@@ -301,13 +364,35 @@ an expense caption" from a trigger into a key.
 
 ### `fs_lines` — the lines of the balance sheet and income statement
 
-The smallest table here, and the one that makes a whole class of bug impossible. Every account type
-maps to exactly one statement line, so a report can be built by enumerating from the chart outward
-— which is idea 2 above.
+One row per line of a financial statement — the rows a reader actually sees.
 
-`side` is declared, not inferred. It used to be derived from whatever had been posted, which meant
-a line with no activity evaluated to null and quietly landed on the wrong half of the balance sheet
-— in the report whose entire purpose is the opposite of inferring the chart from the data.
+**Why this is not just `category`.** A category is a *side* of the statement, and there are only
+five of them. A balance sheet has more lines than that: "Cash and cash equivalents", "Restricted
+cash", "Accounts receivable" and "Other assets" are all assets. So each account type names the line
+it appears on, and the mapping is many-to-one in both directions:
+
+```
+account_types  (what it MEANS)                    fs_lines  (where it SHOWS)
+
+operating_cash               asset  ───────────►  cash             Cash and cash equivalents
+fbo_cash                     asset  ───────────►  restricted_cash  Restricted cash
+      same category, deliberately different lines
+
+customer_receivable          asset  ──┐
+allowance_for_credit_losses  asset  ──┴────────►  receivables      Accounts receivable
+      different types, one line: the allowance nets against the receivable
+```
+
+Splitting the first pair is a money question, not a taxonomy one. `fbo_cash` is customer money held
+*for benefit of* the customer; `operating_cash` is the operator's own bank balance. Put them on one
+line and unrestricted liquidity is overstated **by the entire customer float** — the number a lender
+and a covenant both read.
+
+Because every account type names a line, a report can be built by enumerating from the chart
+outward, which is idea 2 above.
+
+`side` is declared, not inferred: derived from whatever has been posted, a line with no activity
+evaluates to null and quietly lands on the wrong half of the balance sheet.
 
 > **CAUGHT — `ck_fs_lines__side_matches_statement`.** A balance-sheet line carrying an
 > income-statement side was counted on *neither* side and vanished: 90% of a balance sheet missing,
@@ -316,23 +401,35 @@ a line with no activity evaluated to null and quietly landed on the wrong half o
 > **A LIMIT, NOT A GAP — captions are constrained and still not trusted.** Two lines sharing a
 > caption are indistinguishable to a reader, so a unique index trims and lowercases before
 > comparing. It is *not* a guarantee: one Cyrillic `ѕ` in place of a Latin `s` passes every check,
-> prints identically, and misreports earnings. Unicode look-alikes are unbounded, so the rule is
-> stated rather than pretended — consumers key on the *code*, and the balance sheet emits it for
-> exactly that reason.
+> prints identically, and misreports earnings. Unicode look-alikes are unbounded, so consumers key
+> on the *code*, and the balance sheet emits it for exactly that reason.
 
-### `ledger_account_balances` — the write-side lock, and the fast read, in one row
+### `ledger_account_balances` — the row a writer locks
 
 One row per (account, currency), holding total money in, total money out, and the last sequence
 number issued. It is the only table in the schema that is *supposed* to be updated, and it is
 rebuildable from the journal at any time.
 
-**Its real job is serialization.** A single statement adds this posting's amounts and returns both
+**The obvious objection first: why store a balance at all, when you can add up the entries?** You
+can, and it stays correct forever — that is what makes this table a *cache* and not the truth. But
+summing is linear in the account's history, and the accounts a business asks about most are the ones
+with the most entries. That is the read-side argument, and on its own it would be worth arguing
+about.
+
+**The write side is not arguable.** To append an entry you need the account's next sequence number,
+and there is nowhere to take it from. `SELECT max(account_seq) … FOR UPDATE` over the journal locks
+an append-only table, and — the part that actually breaks — **cannot lock a row that does not exist
+yet**, so the first two entries for a brand-new account race and both get sequence 1. The upsert
+below has no such gap: `INSERT … ON CONFLICT DO UPDATE` *is* the insert-and-lock, and it works
+identically whether or not the row already exists.
+
+**So its real job is serialization.** A single statement adds this posting's amounts and returns both
 the new balance and the next sequence number — so the row lock *is* the serialization point. No
 `SELECT max()`, no advisory lock, no retry loop, and no gap for two concurrent writers to race
 through:
 
 ```sql
-INSERT INTO ledger_account_balances AS b (…)
+INSERT INTO ledger_account_balances AS b (tenant_id, account_id, currency, input, output, last_seq)
 VALUES (…)
 ON CONFLICT (tenant_id, account_id, currency) DO UPDATE
    SET input    = b.input  + excluded.input,
@@ -341,81 +438,124 @@ ON CONFLICT (tenant_id, account_id, currency) DO UPDATE
 RETURNING b.last_seq, b.input - b.output;
 ```
 
-**Why a separate table:** balances change on every posting, account identity almost never. Folding
-them together would mean every posting updating a wide row carrying JSON and several indexes. A
+**And why a separate table, rather than two columns on `ledger_accounts`?** Because you would be
+locking the wrong row. A balance changes on every posting; account identity almost never. Folding
+them together means every posting updates a wide row carrying JSON and several indexes, where a
 narrow row is cheap to lock and stays in memory — and "cheap to lock" is the most
-performance-critical property in this schema. Keeping `input` and `output` apart rather than one
-signed number keeps the update commutative and makes gross turnover free.
+performance-critical property in this schema
+([ADR-0007](/decisions/0007-schema-conventions-and-chart)). Keeping `input` and `output` apart
+rather than as one signed number keeps the update commutative and makes gross turnover free.
+
+**Could there be a better lock?** [Spike 003](/spikes/003-throughput-ceiling) tried lock-free append
+and concluded *"the contention was always the thing worth removing; the lock never was"* — a
+sequence leaves holes, an advisory lock adds a second lock manager and still needs a `max()` read,
+and optimistic retry storms worst on the hot account, which is precisely the contended case.
+
+So this row is a lock and a counter that also caches. Worth knowing that `account_seq`'s gaplessness
+is enforced when the number is *issued* and checked nowhere afterwards
+([ADR-0004](/decisions/0004-where-logic-lives)).
+
+> **This table needs a scheduled `VACUUM`, and autovacuum will not provide one.** Measured: 800,000
+> updates to a single row produced **zero autovacuums**, because the trigger is
+> `50 + 0.2 × n_live_tup` over the *whole* table and HOT pruning keeps the dead-tuple count
+> oscillating far below it. The table grew **8.9 MB per 100,000 updates**, linearly and without
+> bound, because pruning frees space inside a page without telling the free-space map. Read latency
+> is unaffected — the cost is disk. One plain `VACUUM` fixes it completely, and after one, a further
+> 400,000 updates added zero pages. Either cron it or set `autovacuum_vacuum_scale_factor = 0` on
+> this table with a small absolute threshold, so the trigger stops scaling with the account count.
+> ([Spike 009](/spikes/009-where-the-balance-lives) has the run.)
+
+> **STILL OPEN — two copies, and nothing compares them.** The sum of the entries and this row are
+> two answers to the same question. No view compares them and no constraint relates them: the cache
+> was moved from 1,000.00 to 100.00 with `last_seq` forged, and every report stayed green. There
+> used to be a *third* copy — a running balance on each entry — and
+> [spike 009](/spikes/009-where-the-balance-lives) dropped it, which improves this rather than
+> worsening it: the third number was computed *from* this row in the same transaction, so it agreed
+> with the cache even when the cache was wrong. Recomputing from the append-only entries is the
+> first comparison that can actually fail. It is on the roadmap and it is not built.
+
+> **STILL OPEN — every entry-level read counts `pending`; the reports do not.** One posted 100.00
+> and one pending 500.00, measured on this schema in one instant:
+>
+> | read | answer |
+> | --- | --- |
+> | this cache row (`input - output`) | **600.00** |
+> | recompute from `ledger_entries` | **600.00** |
+> | recompute joined to `status = 'posted'` | 100.00 |
+> | `trial_balance`, `balance_sheet` | 100.00 |
+>
+> **This is not a cache defect**, which is what an earlier version of this paragraph called it. The
+> cache and the naive recompute agree exactly — and so did the running balance, before it was
+> dropped. The split is between *entry-level* reads and *status-aware* ones, because
+> `ledger_transactions.status` lives one join away and no entry-level read consults it. Only the
+> status-aware aggregate matches the statements, and it is the 4–14× more expensive query.
+>
+> Whether 600.00 is a bug or the definition of an *available* balance is
+> [roadmap question 2](/roadmap#2--does-the-ledgers-pending-inclusion-mean-available-balance-or-is-it-a-bug). TigerBeetle answers it by splitting the
+> counters — `debits_pending` and `debits_posted` are separate fields and a reported balance is
+> defined over the posted ones only, so a hold cannot silently inflate it. Fragment answers it by
+> refusing to model pending as a balance at all, making it a sibling account. This table does
+> neither.
 
 > **STILL OPEN — a hard deployment constraint.** This works under PostgreSQL's default `READ
 > COMMITTED` isolation. Raise the isolation level and, under contention, the same statement fails
 > with *could not serialize access* — it fails closed, so nothing corrupts, but a retry loop does
 > not rescue it. No document owns this constraint yet.
 
-## What the database does not enforce
+## What the schema enforces today
 
-Some of these are deliberate — the invariant lives somewhere better. Some are simply not done. The
-point of listing them together is that a reader should never have to guess which kind they are
-looking at. This is a shortened list: the full one, with the counterexample for each, is the
-[*Still open*](/decisions#still-open) section of the decision log, and it is longer.
+Measured against a fresh load of `migrations/00001_baseline.sql`, not asserted.
 
-| Not enforced | Kind | Why, and what it means for you |
-| --- | --- | --- |
-| **Debits equal credits** | **not yet** | The write API will accept a *posting* — a source account, a destination, an amount — so a single leg is unconstructible in the type system rather than refused in SQL. That is what every comparable system relies on. **Until that writer exists nothing enforces balance at all**, and nothing reports it either: `ledger_entries` stores independent rows carrying a direction, so an unbalanced transaction is fully expressible today. |
-| `recorded_at`, `account_seq`, `balance_after` | **not yet** | Assigned by the writer, with no parameter for a caller to supply — stronger than a database default, because a default is overridable. Today they are defaults or caller-supplied, and forgeable by an ordinary `INSERT`. *A column with a default is not a constraint.* |
-| **The cache and the journal have no relationship** | not done | Zero views compare `ledger_account_balances` to the entries behind it, and no constraint references one from the other. Using only the application's granted privileges the cache was moved from 1,000.00 to 100.00 with the sequence forged, and every report stayed green. |
-| `event_id` | not done | Nullable, so "every transaction references its causing event" is a convention. `NOT NULL` is the fix. |
-| **Foreign keys on the replication apply path** | not done | Foreign keys are implemented as triggers, and all 36 of the internal ones are left in the default state, which the logical-replication apply path skips. Verified: a two-tenant entry in a currency its account does not hold, dated 1999, committed cleanly on that path. |
-| **Table inheritance** | not done | A child table of `ledger_entries` inherits the checks and none of the keys, indexes or triggers — and stays visible through the parent to every view. One `INSERT … SELECT` doubles every number in every report; one `DELETE` on the child removes rows from the parent's view of history. |
-| **Schema changes** | not done | The append-only guard covers data statements only. An `ALTER TABLE … TYPE … USING` rewrote posted history with both triggers still armed and neither firing. |
-| **Reclassifying a statement line** | not done | The chart key blocks a move that *contradicts* a type's category. It does not block a move to a different line of the same statement and side — so customer float can be moved from restricted cash to unrestricted on an already-issued balance sheet, in one statement, with every check green. |
-| **One transaction, two currencies** | not done | Each leg satisfies its own account's currency, so 100.00 USD became 100.00 EUR at an implicit rate of 1.0. There is no FX gain/loss line in the chart, so even a correct writer would have nowhere to book the difference. |
-| `counterparty_scope`, `is_perimeter` | not done | Two columns on `account_types` stating real accounting rules — which accounts may be summed together, and which mirror an external balance that must reconcile. **No view, function or test reads either**, so a wrong value is undetectable, and a `CHECK` could not help: they are claims about the world, not about the row. Documentation stored in a column. |
-| **Row-level security** | not done | There is no policy anywhere. Tenant-leading keys are the prerequisite and they exist; the policies do not. Note the tension to resolve first: PostgreSQL refuses bulk `COPY` into a table with row-level security enabled, and bulk copy is what makes batched posting fast. |
+**7 tables · 3 views · 23 indexes · 9 foreign keys · 15 CHECKs · 6 triggers over 2 functions · 0 event triggers · 0 policies**
 
-## Applying it
+Those are the objects **the migration defines**. A database that has actually been migrated carries
+one more of each: `sqlx` creates its own `_sqlx_migrations` bookkeeping table, with a primary key —
+so `psql -f` gives 7 tables and 23 indexes, and `openledger migrate` gives 8 and 24. That extra
+table is also the single object in a migrated database whose name does not match convention 1
+(`_sqlx_migrations_pkey`), and it is not ours to rename. Stated because the difference between
+"loaded the file" and "ran the migrator" is now a real fork, and a census that does not say which
+one it counted is the kind of number this section exists to stop.
 
-The schema is one flat file — readability is worth more than a change history nobody reads — and
-every later change is a new numbered migration beside it. There are **no down migrations**: on a
-ledger, a down migration is either a lie or data loss. Dropping a column destroys real state,
-dropping an index restores one the data may no longer satisfy, and neither brings rows back. The
-honest operation is to roll forward.
+Every index and every named constraint matches `^(pk|uq|ix|ck|fk)_`; **0** carry a PostgreSQL default
+name. The card module's 4 tables, 2 views and 10 indexes are **parked** and applied by nothing —
+[`parked/card/`](/card/parked).
 
-```sh
-make up        # PostgreSQL 18 in Docker -- uuidv7() is a floor, not a preference
-make migrate   # openledger migrate: applies the baseline, then exits
-make chart     # seed an EXAMPLE chart of accounts -- yours will differ
-```
+**Enforced by the database:**
 
-`openledger migrate` is a subcommand of the same binary the ledger will be, so a deployment runs
-the same image with a different command. It runs as a pre-deploy job that must succeed before new
-pods roll: **a bad migration should stop a deploy, not crash-loop a ledger**, and a pre-deploy job
-is also the only ordering in which a schema change reaching old and new code at once is safe.
+- Single-row `CHECK`s — `amount_minor > 0`, ISO currency, house accounts having no owner, caption
+  cleanliness, statement/side agreement. *(The sign rule per authorization kind is real, and lives in
+  the parked card DDL, so nothing enforces it today.)*
+- **Chart integrity, by two composite foreign keys.** An account cannot claim a category or normal
+  balance its type does not have; a type cannot report under a statement line that contradicts its
+  category. A wrong chart is refused at seed time — verified, three of four mutant charts died on
+  load.
+- **Append-only on the three immutable logs** — `ledger_entries`, `ledger_transactions`,
+  `ledger_events` — by trigger, `ENABLE ALWAYS`, so it holds on the replication apply path too.
+  `TRUNCATE` refused on the same three.
+- Uniqueness — `uq_events__idempotency`, `uq_txn__one_per_event` (one transaction per event),
+  `uq_accounts__house` (one house account per tenant, purpose and currency), and **`uq_entries__account_seq`**, the
+  journal's per-account sequence, which is arguably its most important key.
+- Three more single-row rules worth naming because they are easy to miss: `ck_balances__non_negative`
+  on the cache, `ck_txn__no_self_reference`, and `ck_txn__not_both` (a transaction may resolve or
+  reverse, not both).
 
-It takes its own lock rather than the one the library ships, because the library's lock *waits* —
-and two waiting migrators plus one index being built in the background deadlock against each other.
-Ours asks, gives up, and asks again, which never joins that cycle. It waits for a budget an
-operator chooses, then gives up loudly, which under a re-runnable job is the right failure.
-[ADR-0003](/decisions/0003-migrations) has the reasoning and
-[`src/migrate.rs`](/source/migrate-rs) has the code.
+## What the database deliberately does not enforce
 
-## What is deliberately not here
+Two invariants live in the **write path** rather than in the schema, and that is a decision rather
+than a gap.
 
-The card product — authorizations, holds, clearing — has a full design and a written schema, and
-**no migration applies it**. It is parked in [`parked/card/`](/parked-card) until the
-ledger core underneath it is proven. Not one foreign key crosses that boundary in either direction,
-which is what made parking it a move rather than a rewrite.
+**Debits equal credits.** The primitive a caller can reach for is a *posting* — a source account, a
+destination, an amount — so a single leg is not expressible. A type is remembered by the compiler
+for every caller, forever, with no coordination; a `CHECK` has to be remembered by the next handler.
+That is what every comparable system relies on: Formance's `Postings.Validate()` contains no balance
+check at all, because there is nothing left to check
+([ADR-0005](/decisions/0005-event-log-and-write-path)).
 
-Also absent, and on the [roadmap](/roadmap) rather than forgotten: **hot-account striping**
-(splitting one contended balance row into several, the throughput lever that matters here), the
-**period close** that bounds business-date reads, the **as-of cursor** that makes an issued report
-reproducible, and the **schema snapshot test** — apply to an empty database, dump every index and
-constraint, diff against a committed file. That last one is the highest-leverage thing on the list
-and it does not exist yet.
+**`recorded_at` and `account_seq` are issued, never accepted.** The writer has no
+parameter for a caller to supply them, which is stronger than a database default — a default is
+overridable, and *a column with a default is not a constraint*
+([ADR-0004](/decisions/0004-where-logic-lives)).
 
----
-
-*Every count on this page was measured against a fresh load, not asserted; the canonical inventory
-is [what the schema enforces today](/decisions#what-the-schema-enforces-today). Figures
-attributed to other systems are shapes rather than benchmarks, and nothing in this repository has
-been measured over a real network.*
+Everything else the schema does not hold is a gap rather than a design, and each one has a
+counterexample that reaches it. They are inventoried, with those counterexamples, in the decision
+log's [open list](/decisions#still-open) — which is maintained, and longer than this page.

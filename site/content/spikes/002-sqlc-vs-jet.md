@@ -6,7 +6,7 @@ table. Which one survives our hardest queries, and does go-jet's requirement of 
 (rather than native `pgx`) cost too much?
 
 **Status:** closed, and **the question is now moot**. It produced an ADR on the Go data-access
-layer that no longer exists: [spike 010](/spikes/010-go-or-rust) moved the language and `sqlx`
+layer that no longer exists: [spike 007](/spikes/007-go-or-rust) moved the language and `sqlx`
 replaced both candidates. What outlived it is the silent-zero finding, which is the central argument
 of [ADR-0001](/decisions/0001-rust-and-postgres).
 

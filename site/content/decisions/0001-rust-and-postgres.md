@@ -2,7 +2,7 @@
 
 **Status:** accepted
 **Evidence:** [spike 003](/spikes/003-throughput-ceiling) for the database,
-[spike 010](/spikes/010-go-or-rust) for the language.
+[spike 007](/spikes/007-go-or-rust) for the language.
 
 ## The decision
 
@@ -13,7 +13,7 @@ procedural logic lives in Rust; Postgres holds the shape ([0004](/decisions/0004
 ## Why
 
 **Rust, because two of this project's guarantees were written down before they were true, and only
-a type system catches that.** Spike 010 built `post_transaction`, the authorization hot path and
+a type system catches that.** Spike 007 built `post_transaction`, the authorization hot path and
 the seven-variant `auth_event_kind` machine twice, against the real schema, then wrote this
 project's own bugs into both. Rust's compiler caught **5 of 5** with no tooling. Go's compiler and
 `go vet` caught **0 of 5**. Two of the five were guarantees an accepted ADR had already claimed:
@@ -44,6 +44,12 @@ unsharded and 6,970–7,897 striped at 64**, durability on, one 16-core machine 
 reference product needs. At the top of the ladder the curve "plateaus **because the machine ran out of
 cores rather than because of a lock**. The ceiling moved from the design to the hardware."
 
+**18 is a floor, not a preference.** `uuidv7()` is the default id on **four** tables in
+`migrations/00001_baseline.sql` (two more in the parked card DDL) and does not exist before
+PostgreSQL 18. It is chosen over `gen_random_uuid()` because it is time-ordered, so an append-only
+log reads chronologically by its own key. Nothing degrades gracefully on 17: the migration does not
+load. The roadmap targets RDS for M4 and M6, which must therefore run 18.
+
 **`sqlx`, because it checks the query against the database, not against a file.** A checked-in DDL
 file that has drifted from production is checked against confidently and wrongly; `sqlx` introspects
 the real thing. `ALTER TABLE credit_lines ALTER COLUMN limit_minor TYPE numeric`, no code touched:
@@ -69,7 +75,7 @@ procedural logic they reversed, not database-enforced correctness.
 
 | | Why not |
 | --- | --- |
-| **Go** | The prior decision, and it lost on the evidence it was re-examined against — 0 of 5. It also won one round cleanly, and that round is now a cost of this decision rather than a footnote: see below. Its original case rested partly on Temporal SDK quality, a premise [0008](/decisions/0008-authorization-holds) removed. |
+| **Go** | The prior decision, and it lost on the evidence it was re-examined against — 0 of 5. It also won one round cleanly, and that round is now a cost of this decision rather than a footnote: see below. Its original case rested partly on Temporal SDK quality, a premise [0001](/card/decisions/0001-authorization-holds) removed. |
 | **Diesel** | 0 of 5 views, 0 `joinable!` on composite foreign keys. A DSL that cannot see the reports is worse than no DSL. |
 | **Kotlin/JVM** | Sealed classes give exhaustive state machines, which was the strongest single argument against Go — and Rust gives the same thing without the stack weight. |
 | **TypeScript** | Default numeric type is a float. Every boundary would need `bigint` discipline forever. |

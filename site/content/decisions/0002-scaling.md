@@ -11,7 +11,7 @@ thing that runs out.
 
 The core is accounts, transactions, entries, balances, the two time axes and the event log. Cards,
 spend controls and credit lines are built *on* it; a marketplace wallet simply does not install them.
-**The core ships first and the card rail comes after it** — [0008](/decisions/0008-authorization-holds) is
+**The core ships first and the card rail comes after it** — [0001](/card/decisions/0001-authorization-holds) is
 scoped as future work on that basis. That line is what decides what is configurable: the product
 layer is meant to be replaceable, the core is not.
 
@@ -39,7 +39,7 @@ and maybe **20–50 TPS at a Monday-morning peak**. One Postgres instance handle
 
 The real constraints are correctness (every cent, no manual fixes), auditability (reproduce any
 number as of any date, forever), **one latency-bound path** (the authorization decision — see
-[0008](/decisions/0008-authorization-holds)), and product surface area (one engine serving several
+[0001](/card/decisions/0001-authorization-holds)), and product surface area (one engine serving several
 products without forking). *Anyone who opens by sharding the ledger has misread the problem.* Every
 multiple quoted below is against this figure, so the derivation is the number that matters.
 
@@ -71,28 +71,38 @@ Spike 003, durable settings, stock Postgres, one 16-core machine:
 | layer | what it is | needs a scheduler? | writes the ledger? |
 | --- | --- | --- | --- |
 | **1. Ledger core** | accounts, transactions, entries, balances, event log | **no** | it *is* the ledger |
-| **2. Rails** | card, ACH, wallet — each with its own state machine and deadlines | yes ([0008](/decisions/0008-authorization-holds)) | yes, on the events it decides are financial |
+| **2. Rails** | card, ACH, wallet — each with its own state machine and deadlines | yes ([0001](/card/decisions/0001-authorization-holds)) | yes, on the events it decides are financial |
 | **3. Product** | authorization decisions, spend controls, credit lines | no | **no** |
+
+![Architecture: the authorization decision runs synchronously against a store of holds, while the ledger write happens on a job outside that deadline](/diagrams/01-architecture.svg)
+
+*Drawn before the hold model was decided, and it shows.* The Postgres store it labels
+*"availability + holds — one row per hold group"*, fed by `SELECT … FOR UPDATE` and `INSERT hold`,
+**is not deployed** — that DDL is parked in [`parked/card/`](/card/parked) and applied by no
+migration. And the mutable row it draws is the shape
+[0001](/card/decisions/0001-authorization-holds) went on to **reject**: a hold is a `SUM` over an
+append-only log, never an amount anyone updates. What it still gets right is the split this section
+is about — the decision is synchronous, the ledger write is not.
 
 **The core needs no scheduler, ever** — every timer belongs to a rail. And a clearing is recorded as
 an event and posted by a job *in one transaction*, outside the authorization deadline, so the
 **outbox and the job queue are one component, not two**.
 
 **The authorization path writes no ledger entry** — only the hold tables
-([0008](/decisions/0008-authorization-holds)) — and **reads one number**, the `customer_receivable`
+([0001](/card/decisions/0001-authorization-holds)) — and **reads one number**, the `customer_receivable`
 balance. That single read is the product layer's entire coupling to the core, which is what makes the
 product a plug-in rather than a fork. **Keep the interface exactly that narrow; it is the seam to
 protect in M1.**
 
-**That is true of the code and was false of the schema**, and [0009](/decisions/0009-module-boundaries)
+**That is true of the code and was false of the schema**, and [0008](/decisions/0008-module-boundaries)
 closes the gap. Measured: not one foreign key crosses the card/core boundary in either direction, and
 a Cargo-feature build with the card crate out of the graph **compiles clean against a database that
 has never seen the card DDL**. The schema half is now true as well, though **not** by the route 0009 gave: rather
 than moving into a `card` schema, the card DDL was lifted out of the baseline entirely and parked in
-[`parked/card/`](/parked-card), applied by no migration. A wallet-only user gets seven
+[`parked/card/`](/card/parked), applied by no migration. A wallet-only user gets seven
 core tables and nothing else. What is still missing is what 0009 wanted and parking does not give —
 **removability**: there is no `DROP SCHEMA card CASCADE` to run, because there is nothing installed
-to drop. See [0009](/decisions/0009-module-boundaries).
+to drop. See [0008](/decisions/0008-module-boundaries).
 
 ## Alternatives
 
@@ -105,8 +115,13 @@ to drop. See [0009](/decisions/0009-module-boundaries).
 
 ## Why not TigerBeetle
 
-Three reasons, none of them that it is bad. It solves a throughput problem **we measured ourselves
-not to have**. Its fixed schema — no ad-hoc queries, joins or aggregation — leaves reporting,
+Three reasons, none of them that it is bad — and it deserves a straight answer, because the fit is
+real: its two-phase transfer maps onto card authorization almost exactly. A pending transfer with a
+timeout *is* a hold with an expiry, posting it for less *is* a partial clearing, voiding it *is* a
+reversal.
+
+It still loses, on grounds unrelated to the ledger core. It solves a throughput problem **we measured
+ourselves not to have**. Its fixed schema — no ad-hoc queries, joins or aggregation — leaves reporting,
 statements, multi-tenancy and RLS on Postgres anyway, so it *adds* a datastore and a consistency
 boundary rather than replacing one. And [TigerBeetle Cloud](https://tigerbeetle.com/cloud) exists on
 AWS/Azure/GCP, but with no AWS-*native* service, self-hosting means operating a six-replica NVMe

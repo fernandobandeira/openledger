@@ -80,10 +80,14 @@ better for reconciliation).
   ~0.5 ms, which *reorders* the levers (batching matters more, striping less). **No number here
   should be published as an AWS figure until an RDS benchmark exists.**
 
-  **A corroborating figure here was struck as fabricated.** pgledger publishes 10,636.8 transfers/s across
-  50 accounts and 7,558.9 across 10, both on localhost; it has never published a network benchmark,
-  and `1,631` appears nowhere in its history (checked across all refs). What its two figures DO
-  corroborate is this document's actual thesis: same machine, same worker count, 1.41x purely from
+  **A figure struck here as fabricated turns out to be real, and it was struck for the wrong
+  reason.** The repository grep was correct — `1,631` is in no commit — but the number is published
+  in the author's write-up, not the repository:
+  [1,631.2 transfers/s at 36.8 ms each](https://pgrs.net/2025/05/16/pgledger-in-postgresql-is-fast/),
+  measured on a Neon free tier against 10,636.8 and 7,558.9 on localhost. **That is the only
+  measured over-a-network ledger number this project has found anywhere**, and it corroborates the
+  RDS argument directly: 36.8 ms per transfer against 1.9 ms locally. The two localhost figures also
+  corroborate this document's own thesis — same machine, same worker count, 1.41x purely from
   account contention.
 - **`operating_cash`.** The benchmark posts only three legs and never touches the accounts that
   *cannot* be split (see [The account that breaks the model](#the-account-that-breaks-the-model)).
@@ -102,7 +106,7 @@ better for reconciliation).
 ## Method
 
 A Go harness (`main.go`) drives the clearing path from
-[the reference product spec §06 step 02](/reference-product):
+[the reference product spec §06 step 02](/card):
 
 ```
 DR customer_receivable   500     per-company — spreads across 500 companies
@@ -356,8 +360,10 @@ exactly linear and at a million entries is **~6,000× slower**, growing forever.
 the auth path's ~1s deadline, so **checkpointing becomes mandatory** (materialise at entry N, read
 `checkpoint + SUM(after N)`), which puts write work back and shrinks the gain further.
 
-Monzo shipped exactly this — precomputed "block" balances, P99 400–500 ms → ~200 ms — so it is a
-proven design, just not a free one.
+Monzo's latency figures are real — P99 400–500 ms falling to ~200 ms after March 2023 — but
+**they attribute that to time-series reindexing of the entries table, not to precomputed blocks**,
+which they describe as an option considered. "Monzo shipped exactly this" was this document's
+inference and is withdrawn.
 
 Three further losses beyond speed:
 
@@ -475,9 +481,7 @@ costs ~0.5 ms and reorders the levers. Treat the *ranking* as hardware-specific 
 ## External validation — what the industry does
 
 > **SOURCING: every third-party figure and quotation below is UNVERIFIED.** None
-> carries a fetchable URL, and the rule at
-> [`docs/decisions/README.md`](/decisions#on-sourcing) says
-> that makes it unverified, not merely unsourced. They are recorded because the
+> carries a fetchable URL, and that makes them unverified, not merely unsourced. They are recorded because the
 > *shapes* they describe shaped our design, and marking them is cheaper than
 > pretending. Do not quote any number here as evidence without finding the source
 > first. Twice already, a figure attributed to a named project turned out never to
@@ -497,7 +501,16 @@ stress case. Our `network_settlement_payable` is TPC-B's branch record.
 | **Uber** | 250 ms batch windows, one read + one write per batch | 3–4 → **30+ ops/sec per account**; bulk jobs 21–24 h → minutes |
 | **Modern Treasury** | Sync/async router; hot entries queued and coalesced | p90 processing 1 s; **1,200 txn/s** in production |
 | **TigerBeetle** | Batching up to 8,189 transfers per query ([docs](https://docs.tigerbeetle.com/coding/requests/)) | — |
-| **Fragment** | Coalesced balance updates | p95 staleness 10 s at 10k entries/s |
+| **Fragment** | Coalesced balance updates | p95 staleness 10 s at 10k entries/s ([source](https://fragment.dev/blog/building-balances-high-throughput-writes)) — **eventually-consistent path only** |
+
+> **The Fragment row carried no source until 2026-08-27; it does now.** Fragment's own words: *"With
+> 4 granularity levels, an average hierarchy depth of 5, and 4 lines per Ledger Entry, a typical
+> Ledger Entry triggers 80 balance updates. At 10k Ledger Entries per second, the eventually
+> consistent balance system has a p95 staleness of 10 seconds."* **Read the qualifier**: that path is
+> their *default*, but accounts an authorization depends on must be configured `strong` and update
+> synchronously, so the figure is not the latency of a balance you are allowed to enforce against.
+> [Spike 009](/spikes/009-where-the-balance-lives#on-the-sourcing-of-this-spike) has how this was
+> verified, and why that took two attempts.
 
 Uber: *"Using multiple DynamoDB rows for a single account complicates the single-balance concept
 and hot account detection."* TigerBeetle: *"a small number of hot accounts are often involved in a

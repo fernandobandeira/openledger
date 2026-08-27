@@ -1,6 +1,6 @@
-# Spike 011 — How does an optional module that owns tables get shipped?
+# Spike 008 — How does an optional module that owns tables get shipped?
 
-**Status:** closed. Produced [ADR-0009](/decisions/0009-module-boundaries).
+**Status:** closed. Produced [ADR-0008](/decisions/0008-module-boundaries).
 
 **Question.** [ADR-0002](/decisions/0002-scaling) calls the card product a plug-in whose
 entire coupling to the ledger core is one read. [ADR-0003](/decisions/0003-migrations)
@@ -94,7 +94,7 @@ Err(ExecuteMigration(Database([25001] DROP INDEX CONCURRENTLY cannot run inside 
 block**. Proved with a control: two statements where the second divides by zero leave the first's
 table absent. Either statement **alone** applies fine. **So every `CONCURRENTLY` migration is one
 statement, and the idempotent pair is two migrations.** The form was verified against goose in
-[spike 007](/spikes/007-schema-migrations) and carried into an `sqlx` decision without being
+[spike 005](/spikes/005-schema-migrations) and carried into an `sqlx` decision without being
 re-run — the same failure mode this repository keeps finding in itself.
 
 ## Not verified

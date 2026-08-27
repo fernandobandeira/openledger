@@ -25,9 +25,11 @@
 | --- | --- |
 | **9. The chart of accounts is data, not code** | Account *types* live in a table, each declaring a category, a normal balance, and the financial-statement line it rolls up to; `ledger_accounts.purpose` is a foreign key to it. Purposes like `platform_rev_share_payable` are business-specific — a card program funded by a warehouse line has them, a marketplace wallet does not — so the engine ships the *capability* and the card chart is seed data. |
 | **10. `normal_balance` is stored, never derived from `category`** | A loss allowance is an **asset** with a **credit** normal balance. Any design that computes one from the other is wrong the first time someone books one. |
-| **11. Completeness is a separate invariant from balance** | The accounting equation does not prove a report enumerated everything, so reports enumerate **from the chart outward**: [`balance_sheet`](/source/baseline) starts `FROM fs_lines` and left-joins the numbers on, so a line with no activity appears as a zero instead of vanishing. Every account type carries a `NOT NULL` financial-statement line so there is always something to enumerate. |
+| **11. Completeness is a separate invariant from balance** | The accounting equation does not prove a report enumerated everything, so reports enumerate **from the chart outward**: `balance_sheet` starts `FROM fs_lines` and left-joins the numbers on, so a line with no activity appears as a zero instead of vanishing. Every account type carries a `NOT NULL` financial-statement line so there is always something to enumerate. |
 | **12. The equation is evaluated per currency** | And a currency-blind one is vacuous — below. |
 | **13. Where one logical account is split across rows, summing them is netting, and netting has rules** | Each account type declares a `counterparty_scope`; where the split key *is* the counterparty, opposite-sign members must be presented gross rather than netted. |
+| **14. Every report reads `status = 'posted'` and nothing else** | All three views join `ledger_transactions … AND x.status = 'posted'`. A `pending` transaction is a claim about what may happen; a statement reports what did. Without the filter a pending authorization was recognised as revenue and its posted resolution counted it again — **500.00 of interchange, twice**. |
+| **15. Arithmetic is debit-positive; the normal-balance sign is presentation, and they are different columns** | `trial_balance` publishes both. `balance_minor` is normal-balance-signed — positive means more of what this account normally holds — which is right for showing *one* account and wrong for summing a category, because a contra account (asset with a credit normal balance) would then *add* to assets. `balance_debit_positive` never reads `normal_balance`, so a contra account carries its own sign instead of being flipped twice. **Every report does its addition in the second and its display in the first.** |
 
 ## Why the conventions
 
@@ -41,7 +43,7 @@ They are **process** mistakes a convention would have caught:
   `accounts_metadata`. The real gap — a sequential scan on every metadata write, forever — was hidden
   by the name.
 - Two composite primary keys are named in a way that reads like single-column indexes.
-- At the commit [spike 009](/spikes/009-how-other-ledgers-enforce) read, Formance's
+- At the commit [spike 006](/spikes/006-how-other-ledgers-enforce) read, Formance's
   census is **four `CHECK` constraints, all four unvalidated, and zero foreign keys** — an earlier
   read of five-of-nine was true at a different commit.
 - Their canonical record of money movement is a `varchar` holding pretty-printed JSON. It cannot be
@@ -57,12 +59,11 @@ layer exists for. Omit a single account and it drops out of exactly *one* side o
 dropping `interchange_revenue` from the golden trace leaves the two sides differing by exactly that
 account's balance, which the equation catches and quantifies. What it cannot catch is omitting a whole
 **balanced** sub-book: an entire tenant, an entire currency, an entire entity, any date range
-containing only whole transactions. Three tenants holding 10.00 of interchange each, and a report that
+containing only whole transactions. Three tenants holding 10.00 of fee revenue each, and a report that
 misses one shows **20.00 against a true 30.00**, with every check reading `BALANCED`, because what was
 dropped was itself balanced. So the risk is not a stray missing account; it is a **dropped sub-book**
-— an RLS predicate, a tenant filter, a `date_trunc` boundary, a timezone. The reference product
-already says it: *"the bug is never in storage, it's at every boundary that turns an instant into a
-bucket."*
+— an RLS predicate, a tenant filter, a `date_trunc` boundary, a timezone. The bug is never in
+storage; it is at every boundary that turns an instant into a bucket.
 
 **A currency-blind equation is vacuous the moment a second currency exists.** `A = L + E + (R − X)`
 follows from total debits equalling total credits, which holds for **any** union of
@@ -70,13 +71,26 @@ per-currency-balanced transactions *regardless of denomination* — so a currenc
 `true` for arbitrary currency mixing and can never detect it. Measured before the fix: 100.00 USD plus
 100.00 EUR reported *"assets 200.00, balanced."*
 
+**Two lines a reader cannot tell apart are one line, and the caption is what a reader groups by.**
+Three constraints on `fs_lines` close that family, and the interesting one is the caption rather than
+the code. `balance_sheet` *synthesises* the un-closed earnings plug, emitting its code and its caption
+as **literals** — so the synthesised row sits outside `uq_fs_lines__caption` entirely, and a chart line
+under any other code could take that caption and be accepted. Measured: 44,000.00 of customer suspense
+liability booked to such a line showed a reader **268,000.00 of current year earnings against a true
+224,000.00**, with `balanced = t` and the drift views empty. Hence `ck_fs_lines__caption_reserved`,
+the half that does the harm; `ck_fs_lines__code_reserved`, so a real chart line may not shadow the
+plug's code either; and `uq_fs_lines__caption`, which trims and lowercases before comparing, because a trailing space got
+a line past an earlier version of the reservation, and a tab, a newline, an NBSP and a zero-width
+space each got one past the version that replaced it — every time putting customer suspense under a
+caption pixel-identical to the plug's. **None
+of the three makes a caption safe to key on** — `Undistributed earnings (ѕince inception)` with a
+Cyrillic U+0455 for the Latin `s` passes all three and prints identically. Unicode confusables are
+unbounded, so the rule is that consumers key on `fs_line`, the code, which is why the balance sheet
+emits it.
+
 **Netting is a presentation rule with a standard behind it.** IAS 32.42 and ASC 210-20-45-1 permit
 offsetting only for amounts due to and from the **same party**, which is why the scope has to be
-declared on the type rather than inferred from the split. *Unverified, like every accounting-standard
-citation here — see [the sourcing rule](/decisions#on-sourcing). An earlier draft cited this as
-IAS 1.32 in four files and IAS 32.42 in three; 1.32 is the general prohibition on offsetting and
-32.42 carries the legally-enforceable-right-of-set-off test, so 32.42 is what the tree says
-throughout.*
+declared on the type rather than inferred from the split. *The standard is paywalled, so this is a paraphrase.*
 
 **Prior art, checked rather than assumed.** Xero's published [OpenAPI
 spec](https://raw.githubusercontent.com/XeroAPI/Xero-OpenAPI/master/xero_accounting.yaml) carries
@@ -119,7 +133,7 @@ converted into a claim.)*
 | **An enum value cannot be removed** | And reordering requires recreating the type. |
 | **CI needs the snapshot-diff step before M1 lands** | It is worth more than any test we would write by hand, and until it exists convention 2 is aspiration. |
 | **Rule names are not greppable by column** | *"Does this table have an index on X"* still means reading the definitions, which is the price of names that don't go stale. |
-| **PostgreSQL 18 adds ~90 catalog rows nobody wrote** | Verified against [`migrations/00001_baseline.sql`](/source/baseline): **every index and every named constraint matches `^(pk\|uq\|ix\|ck\|fk)_`**, and no object carries a PostgreSQL default name. But PG18 materialises `NOT NULL` as a real catalog constraint, so `pg_constraint` lists **57** server-generated rows named `<table>_<column>_not_null` (89 with the parked card DDL loaded as well). *The ~90 quoted here before the split was the eleven-table figure and was left standing when the path was swapped — the exact drift this convention exists to catch.* They cannot be supplied in `CREATE TABLE`, and nothing references them. |
+| **PostgreSQL 18 adds ~90 catalog rows nobody wrote** | Verified against `migrations/00001_baseline.sql`: **every index and every named constraint matches `^(pk\|uq\|ix\|ck\|fk)_`**, and no object carries a PostgreSQL default name. But PG18 materialises `NOT NULL` as a real catalog constraint, so `pg_constraint` lists **57** server-generated rows named `<table>_<column>_not_null` (89 with the parked card DDL loaded as well). *The ~90 quoted here before the split was the eleven-table figure and was left standing when the path was swapped — the exact drift this convention exists to catch.* They cannot be supplied in `CREATE TABLE`, and nothing references them. |
 | **Reclassification is blocked while accounts exist — in one direction only** | `fk_accounts__type` refuses a change to a type's `category` or `normal_balance` while accounts reference it. It does **not** refuse a move of `fs_line` to another line of the same statement and side: verified, `fbo_cash` moved from `restricted_cash` to `cash` and 440.00 of customer float silently became unrestricted liquidity on an already-issued balance sheet — the exact harm `schema/chart.sql` cites Reg S-X 5-02.1 and ASC 230-10-45-4 for. Open. The blocked direction was worth blocking: changing a type's category silently rewrote the income statement, revenue 9.00 → 0.00 on the golden trace with every check green, because reports join through the type while the guard only fired on the account. |
 | **`trial_balance` still enumerates inward** | And is the wrong thing to build a completeness claim on. The accounting-equation view enumerates `FROM ledger_accounts` with the entry aggregate left-joined on, like `balance_sheet`; `trial_balance` has not been rebuilt that way. |
 | **A mis-typed reporting axis raises** | Rather than returning an empty, balanced report — the right failure, but at read time rather than an unrepresentable state. |

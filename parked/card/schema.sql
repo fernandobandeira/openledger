@@ -2,7 +2,7 @@
 --
 -- This is the authorization / hold / clearing half of what used to be
 -- `schema/schema.sql`, lifted out when the core ledger became
--- `migrations/00001_baseline.sql`. Nothing loads it today. See site/content/parked-card.md for
+-- `migrations/00001_baseline.sql`. Nothing loads it today. See site/content/card/parked.md for
 -- why it is here and what has to be true before it comes back.
 --
 -- NOT QUITE VERBATIM, and the difference is worth naming: 24 of the 25 statements
@@ -16,10 +16,10 @@
 -- and `refuse_truncate()` trigger functions and the `openledger_app` role, all three
 -- from the core migration -- plus `uuidv7()`, which is PostgreSQL 18 and makes 18 a
 -- floor here as it is there. Nothing else crosses the boundary -- not one foreign
--- key, in either direction (ADR-0009, read from `pg_constraint`). The DO block below
+-- key, in either direction (ADR-0008, read from `pg_constraint`). The DO block below
 -- checks the first three; the fourth fails on its own with a clear message.
 --
--- WHEN IT RETURNS IT DOES NOT RETURN LIKE THIS. ADR-0009 puts these objects in
+-- WHEN IT RETURNS IT DOES NOT RETURN LIKE THIS. ADR-0008 puts these objects in
 -- their own `card` PostgreSQL schema, inside the same migration set and the same
 -- lock, so that `DROP SCHEMA card CASCADE` removes the module in one statement.
 -- That rewrite is the work; this file is the content it starts from.
@@ -102,7 +102,7 @@ CREATE TABLE card_auth_events (
     -- an opaque constraint error.
     -- A totals event MUST keep its wire amount. The only recovery from a message
     -- mis-grouped into a totals group is to split it to a new, empty group and
-    -- recompute `delta = raw_amount - 0` (ADR-0008, Known #1). That recovery is
+    -- recompute `delta = raw_amount - 0` (ADR-0001, Known #1). That recovery is
     -- unavailable if raw_amount is null, and nothing else in the schema would
     -- notice, so it is a constraint rather than a convention.
     CONSTRAINT ck_auth_events__totals_keep_wire
@@ -129,7 +129,7 @@ CREATE TABLE card_auth_events (
         -- This is a WHITELIST over kinds, not a blacklist, and that is worth more
         -- than it looks: a value added to auth_event_kind later matches no arm, so
         -- it can carry NO delta at all -- positive, negative or zero. Verified in
-        -- spike 010 by adding 'financial_authorization' to the enum; the first
+        -- spike 007 by adding 'financial_authorization' to the enum; the first
         -- INSERT was refused here. The database is the only layer in the stack that
         -- noticed. Go's generated enum is `type AuthEventKind string`, an open set
         -- that decoded the unknown value silently with err == nil.
@@ -291,7 +291,7 @@ CREATE INDEX ix_event_group__event ON card_auth_event_group (tenant_id, event_id
 
 
 -- Serves the AUTHORIZATION read -- "sum the live holds for this company" -- which
--- is the one lookup inside the ~1s deadline (ADR-0008). It does NOT serve the
+-- is the one lookup inside the ~1s deadline (ADR-0001). It does NOT serve the
 -- expiry sweep, and an earlier comment claiming it did was wrong: the partial
 -- predicate `held_minor > 0` matched 100.0% of 20,733 groups in a populated
 -- database, so it has no selectivity to offer a scan that has no tenant or
@@ -321,7 +321,7 @@ ALTER TABLE card_auth_events ENABLE ALWAYS TRIGGER ck_auth_events__no_truncate;
 -- rule keeps views; it kept the three report views. They were lost because the
 -- script that extracted this file from the old migrations selected report views by
 -- name and never looked for these. Nobody noticed until an adversarial reviewer
--- pointed out that ADR-0008 names `card_hold_drift` EIGHT TIMES as the alarm that
+-- pointed out that ADR-0001 names `card_hold_drift` EIGHT TIMES as the alarm that
 -- catches every failure it records -- including the three it declines to fix on the
 -- grounds that the alarm sees them -- while the schema had no such object.
 --
@@ -371,7 +371,7 @@ WITH live AS (
            -- Decreases that moved NO MONEY. A clearing posts to the ledger, so a
            -- group whose total went negative from clearings is not under-reserving
            -- -- the cleared amount is a receivable in the journal, and exposure is
-           -- posted + held. ADR-0008 declines the over-capture report on exactly
+           -- posted + held. ADR-0001 declines the over-capture report on exactly
            -- that argument, and the argument covers `clearing` AND NOTHING ELSE.
            -- `reversal` and negative `advice` post nothing. Two reversals against
            -- one authorization left total_minor at -10000 with zero clearings in
@@ -473,10 +473,10 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
    -- reversal that arrives before its authorization and a reversal that should
    -- never have been sent are the same three columns. Deciding it needs the
    -- processor's own reversal-to-authorization linkage, which this design
-   -- deliberately does not model -- ADR-0008 argues that grouping is a revisable
+   -- deliberately does not model -- ADR-0001 argues that grouping is a revisable
    -- inference precisely because that linkage is unreliable. So the alarm reports
    -- the precursor state, `low_water_minor` keeps the durable evidence that the
-   -- group was ever there, and the ambiguity is recorded in ADR-0008 rather than
+   -- group was ever there, and the ambiguity is recorded in ADR-0001 rather than
    -- papered over with a guard that would fire on honest traffic.
    --
    -- AND A CLEARING BLINDED IT COMPLETELY. `total_minor` is
@@ -489,7 +489,7 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
    -- times over: 300.00 under-reserved, and the hidden residue is bounded only by
    -- the group's cleared amount.
    --
-   -- That falsifies the precise restatement ADR-0008 wrote to close the declined
+   -- That falsifies the precise restatement ADR-0001 wrote to close the declined
    -- over-capture report -- "an over-capture never makes the reported hold smaller
    -- than the un-cleared exposure of that group" -- in a state the system itself
    -- flags as an over-capture.
@@ -508,14 +508,14 @@ WHERE g.total_minor IS DISTINCT FROM COALESCE(l.recomputed, 0)
 -- The card tables: the hold flow appends events and rewrites its own materialised
 -- group rows.
 --
--- NOTE, AND IT IS A REAL GAP: ADR-0008's fix for the attach/regroup deadlock is
+-- NOTE, AND IT IS A REAL GAP: ADR-0001's fix for the attach/regroup deadlock is
 -- "take the event row lock first, explicitly" -- and `SELECT ... FOR UPDATE` on
 -- card_auth_events requires UPDATE privilege, which this role is NOT granted and is
 -- explicitly revoked below. The application role cannot currently execute the ADR's
 -- own remedy. Deciding between
 -- granting UPDATE (and leaning on the append-only trigger to keep it a lock rather
 -- than mutability) and finding a lock that does not need it is open work, recorded
--- in ADR-0008's *What it costs*, beside the re-grouping lock order it makes unavailable.
+-- in ADR-0001's *What it costs*, beside the re-grouping lock order it makes unavailable.
 GRANT SELECT, INSERT ON card_auth_events, card_auth_event_group TO openledger_app;
 GRANT SELECT, INSERT, UPDATE ON card_auth_event_group TO openledger_app;
 GRANT SELECT, INSERT, UPDATE ON card_hold_groups TO openledger_app;

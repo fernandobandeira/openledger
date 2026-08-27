@@ -3,6 +3,9 @@
 An open-source **double-entry ledger** — Postgres for storage, Rust for the service. A single
 binary and a database you already know how to operate.
 
+**This is a personal design project. Nobody has run it in production, and it is not asking to be.**
+The schema and the command that applies it are built; the ledger service is not.
+
 **The documentation is the deliverable, and it lives in [`site/content/`](./site/content/).** It is
 ordinary markdown, readable straight from that directory, and it is also a site:
 
@@ -28,8 +31,7 @@ make chart     # seed an EXAMPLE chart of accounts; yours will differ
 ```
 site/content/     THE DELIVERABLE — vision, glossary, the database page,
                   the decision log, the roadmap, the spike write-ups.
-site/             the viewer over it: `make docs`. Generated pages for the
-                  files below land in content/source/ and are not committed.
+site/             the viewer over it: `make docs`.
 migrations/       the schema, as one numbered migration, with the reasoning
                   in comments beside each object.
 schema/           chart.sql: an EXAMPLE chart of accounts, seeded separately
@@ -40,10 +42,8 @@ spikes/           timeboxed investigations, one directory each: the code
                   stays here, the write-up is in site/content/spikes/.
 ```
 
-**Status: design stage, with the first thing built.** The schema and the command that applies it are
-real. There is still no service and no test suite beyond the two that guard ADR-0003's rules — a SQL
-implementation and its harness were deleted, and why is
-[ADR-0004](./site/content/decisions/0004-where-logic-lives.md).
+**What exists and what does not** is the [roadmap](./site/content/roadmap.md); what the database
+does not enforce yet is the decision log's *Still open* list.
 
 ## Licence
 
