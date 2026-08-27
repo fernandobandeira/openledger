@@ -3,6 +3,11 @@ name: Deploy docs to GitHub Pages
 on:
   push:
     branches: [main]
+    # The docs build reads only site/ — nothing outside it — so a push that
+    # touches only the Rust code, migrations, or spikes does not redeploy.
+    paths:
+      - 'site/**'
+      - '.github/workflows/pages.yml'
   workflow_dispatch:
 
 permissions:
