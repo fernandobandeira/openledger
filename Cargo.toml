@@ -6,6 +6,11 @@ license = "MIT"
 publish = false
 
 [dependencies]
+# Trimmed to what a migration job needs. Notably absent: `color` (a pre-deploy
+# job's output is a log, not a terminal), `wrap_help` (which pulls a terminal-size
+# probe in to reflow text this file has already laid out), and `suggestions`
+# ("did you mean" over a two-word command surface, for one more crate).
+clap = { version = "4.6", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "migrate", "macros"] }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
 
