@@ -2663,3 +2663,214 @@ CREATE POLICY rls_period_balances__recon ON ledger_period_balances
     FOR SELECT TO openledger_recon USING (true);
 CREATE POLICY rls_perimeter_attest__recon ON perimeter_attestations
     FOR SELECT TO openledger_recon USING (true);
+
+
+-- ----------------------------------------------------------------------
+-- CATALOG DOCUMENTATION (ADR-0007)
+--
+-- COMMENT ON, so the LIVE schema documents itself: a client, an ORM introspector
+-- or an AI reading `\d+`, obj_description()/col_description() or information_schema
+-- gets the intent of each object from the catalog, without opening this file.
+-- Distilled from the inline comments above: each is navigational -- what the object
+-- is plus the one gotcha -- and cites the ADR that carries the rationale rather than
+-- repeating it. The schema-snapshot test dumps pg_description, so a dropped or
+-- drifted comment shows in the diff like any other schema change (ADR-0007 conv. 2).
+
+-- ------------------------------------------------------------ tables
+COMMENT ON TABLE ledger_events IS
+  'The idempotency spine: every accepted operation, INCLUDING the ones that write no ledger transaction (an account opened, a limit changed, a posting rejected). Append-only. One event causes at most one transaction (uq_txn__one_per_event). Replay contract: same idempotency_key + same idempotency_hash replays the stored result, same key + different hash is rejected (ADR-0005, ADR-0013).';
+COMMENT ON TABLE ledger_transactions IS
+  'The unit of atomicity and the event''s bookkeeping. Append-only; status NEVER mutates -- a pending->posted change is a NEW row via resolves_id, not an UPDATE. Every transaction references the event that caused it (event_id NOT NULL). Reports read status=''posted'' only (ADR-0009, ADR-0011).';
+COMMENT ON TABLE ledger_entries IS
+  'The append-only journal: one leg of one movement (direction + amount_minor), the ground truth every report and drift check derives from. NO running balance (spike 009) -- ''balance now'' is ledger_account_balances and ''as of a business date'' aggregates over effective_at. For a reproducible as-of read, filter effective_at and xact_id < :cursor (ADR-0006, ADR-0009, ADR-0011).';
+COMMENT ON TABLE ledger_accounts IS
+  'The account register: whose money, in what currency, of what type (purpose). NOT history -- metadata is editable -- but an account''s identity (purpose/category/normal_balance) and owner are FROZEN while any balance row references them (NO ACTION on fk_balances__account_purpose / _owner) (ADR-0009, ADR-0012).';
+COMMENT ON TABLE ledger_account_balances IS
+  'The O(1) cached POSTED balance AND the write-side serialization point: one atomic upsert returns the new balance and the next account_seq together, so the row lock IS the serialization. balance = input - output. Physically striped -- a reader SUMs the stripe rows that exist for an account, never a range. Kept honest against the journal by recon_balance_breaks (ADR-0010, ADR-0013).';
+COMMENT ON TABLE account_types IS
+  'The chart of accounts -- what an account MEANS. IDENTITY only (category, normal_balance, counterparty_scope, is_perimeter, mirror_type); which financial-statement line a type reports under is PRESENTATION and lives in chart_presentation, keyed by chart_version. Seed data, shipped by schema/chart.sql, not by this migration (ADR-0012).';
+COMMENT ON TABLE fs_lines IS
+  'The financial-statement lines, one set PER chart_version. Reports enumerate FROM here outward (LEFT JOIN the numbers on), so an inactive line prints a zero instead of vanishing -- omission is structurally impossible. Consumers key on the code, NOT the caption (a caption is display text and Unicode-confusable) (ADR-0007, ADR-0012).';
+COMMENT ON TABLE chart_versions IS
+  'The chart as append-only history. A reclassification is a NEW version carrying a complete chart, never an edit -- an issued statement names the version it was presented under. "Current" is DERIVED as max(version) (see chart_version_current), never stored (ADR-0012).';
+COMMENT ON TABLE chart_presentation IS
+  'Which fs_line a type reports under, per chart_version. Append-only: so "which line was this presented under" is one key lookup, never a walk of overrides. category and counterparty_scope are copied from account_types under a composite FK; fs_statement/fs_side are GENERATED from category (ADR-0012).';
+COMMENT ON TABLE ledger_periods IS
+  'A resolved period boundary [starts_at, ends_at). HALF-OPEN, and the instants are resolved ONCE from (local date, tz) at creation and never re-resolved -- IANA rules change, so a stored (date, zone) pair is not a stable instant. A tenant''s periods may not overlap (ex_periods__no_overlap) (ADR-0011).';
+COMMENT ON TABLE ledger_period_closes IS
+  'One close per tenant/period/currency: names the transaction that closed the period (an ordinary posting, kind=''period_close'') and the commit cursor computed_at_xid it was computed at. Lets the income statement exclude closing entries declaratively instead of matching a free-text kind (ADR-0011).';
+COMMENT ON TABLE ledger_period_balances IS
+  'The effective-axis checkpoint: the at-close balance per account per period. DERIVED and exactly recomputable from ledger_entries at (effective_at < ends_at, xact_id < computed_at_xid); reconciled by recon_checkpoint_breaks. Same input/output convention as ledger_account_balances, posted entries only (ADR-0011).';
+COMMENT ON TABLE perimeter_attestations IS
+  'What a third party (bank, network, trustee) said an is_perimeter account''s balance was on their statement date. The only thing that can falsify is_perimeter''s "must reconcile against an external balance" claim, since a CHECK cannot. Compared on the EFFECTIVE axis by perimeter_drift; append-only (ADR-0012).';
+
+-- ------------------------------------------------------------ columns: ledger_events
+COMMENT ON COLUMN ledger_events.idempotency_key IS
+  'The retry key. Same key + same idempotency_hash replays the stored result; same key + DIFFERENT hash is rejected -- silently replaying the wrong result is worse than failing (ADR-0013).';
+COMMENT ON COLUMN ledger_events.idempotency_hash IS
+  'sha256 of the canonical request body. Distinguishes a genuine replay (same body) from a same-key/different-body conflict (ADR-0013).';
+COMMENT ON COLUMN ledger_events.effective_at IS
+  'The business-date axis: the source''s clock. Contrast recorded_at, the wall clock (ADR-0006).';
+COMMENT ON COLUMN ledger_events.recorded_at IS
+  'The wall-clock axis: when we recorded the event. Contrast effective_at, the business date (ADR-0006).';
+COMMENT ON COLUMN ledger_events.xact_id IS
+  'The commit-ordering key (ADR-0011) for an operation that writes no transaction -- where it records its position on the commit axis.';
+
+-- ------------------------------------------------------------ columns: ledger_transactions
+COMMENT ON COLUMN ledger_transactions.event_id IS
+  'The event that caused this transaction. NOT NULL: every transaction references its event, and one event causes at most one transaction (ADR-0013).';
+COMMENT ON COLUMN ledger_transactions.status IS
+  'pending or posted, and it NEVER mutates. Reports read status=''posted'' only; a pending->posted transition is a NEW row (resolves_id), not an update (ADR-0009, ADR-0011).';
+COMMENT ON COLUMN ledger_transactions.effective_at IS
+  'The business date, copied from the SOURCE''s clock (a clearing''s network date), never now(). Finite (no +/-infinity). The axis every as-of report filters on (ADR-0006).';
+COMMENT ON COLUMN ledger_transactions.recorded_at IS
+  'The wall clock: when this row was written. Contrast effective_at, the business date (ADR-0006).';
+COMMENT ON COLUMN ledger_transactions.xact_id IS
+  'The commit-ordering key the as-of cursor pins to. Filter xact_id < :cursor for a reproducible as-of read: a later arrival carries its own, HIGHER id and cannot rewrite an already-issued report (ADR-0011).';
+
+-- ------------------------------------------------------------ columns: ledger_entries
+COMMENT ON COLUMN ledger_entries.direction IS
+  'debit or credit -- direction carries the SIGN of the leg; amount_minor never does.';
+COMMENT ON COLUMN ledger_entries.amount_minor IS
+  'The leg amount in minor units, always POSITIVE (> 0). The sign lives in direction. Roll up as SUM(CASE WHEN direction=''debit'' THEN amount ELSE -amount END) for a debit-positive value (ADR-0007 rule 15).';
+COMMENT ON COLUMN ledger_entries.currency IS
+  'ISO 4217, uppercase. Part of a composite FK to the account, so an entry cannot carry a currency its account does not hold.';
+COMMENT ON COLUMN ledger_entries.stripe IS
+  'Which of the account''s physical balance stripes issued this entry''s account_seq. A reader SUMs the stripes that exist; unstriped accounts write stripe 0 (ADR-0013).';
+COMMENT ON COLUMN ledger_entries.account_seq IS
+  'Monotonic, GAPLESS per account per stripe -- issued by the writer under the balance-row lock, not a Postgres sequence (an aborted nextval leaves a hole). The key a drift check walks and every as-of reconstruction depends on; gaplessness is asserted afterwards by recon_balance_breaks (ADR-0004, ADR-0013).';
+COMMENT ON COLUMN ledger_entries.effective_at IS
+  'The business date, DENORMALISED from the transaction and held honest by a composite FK (fk_entries__txn_effective) so it cannot disagree. The basis of ADR-0006 and every business-date report; the effective-axis aggregate is a single-table index scan on ix_entries__effective.';
+COMMENT ON COLUMN ledger_entries.recorded_at IS
+  'The wall clock. NOT the axis as-of questions are asked on -- that is effective_at (ADR-0006).';
+COMMENT ON COLUMN ledger_entries.xact_id IS
+  'The entry''s OWN commit-ordering key (ADR-0011). Filter xact_id < :cursor for a reproducible as-of read. Deliberately NOT tied to the transaction''s xact_id under an FK: a leg appended to an already-committed transaction carries a HIGHER id, so a report pinned before the append cannot see it.';
+
+-- ------------------------------------------------------------ columns: ledger_accounts
+COMMENT ON COLUMN ledger_accounts.purpose IS
+  'The account''s type: a FK to account_types.code. Carried into composite keys that freeze identity while balance rows exist.';
+COMMENT ON COLUMN ledger_accounts.category IS
+  'Copied from the account''s type and held honest by fk_accounts__type, so a report need not join the chart to know a balance''s sign (ADR-0012).';
+COMMENT ON COLUMN ledger_accounts.normal_balance IS
+  'Copied from the type (fk_accounts__type). NOT derivable from category: a loss allowance is an asset with a CREDIT normal balance (ADR-0007 rule 10).';
+COMMENT ON COLUMN ledger_accounts.counterparty_scope IS
+  'Copied from the type (fk_accounts__scope). Drives the balance sheet''s gross routing; a CHECK may not read another table, so the copy is held honest by a composite FK (ADR-0012).';
+COMMENT ON COLUMN ledger_accounts.owner_id_key IS
+  'A NULL-free copy of owner_id (coalesce to '''') so the owner-freeze composite key (MATCH SIMPLE) is not silently satisfied by a NULL on house accounts (ADR-0009).';
+COMMENT ON COLUMN ledger_accounts.stripe_count IS
+  'How many stripes the writer should spread this account''s balance across. A HINT, not an invariant: a reader SUMs the stripe rows that exist, so lowering it strands nothing and raising it needs no backfill (ADR-0013).';
+
+-- ------------------------------------------------------------ columns: ledger_account_balances
+COMMENT ON COLUMN ledger_account_balances.stripe IS
+  'Which physical stripe of one account''s balance this row is -- a partition, not an account. Each stripe is a separate lock; a reader SUMs the stripes that exist. Unstriped accounts hold row 0 (ADR-0013).';
+COMMENT ON COLUMN ledger_account_balances.input IS
+  'Accumulates DEBIT legs of POSTED transactions. balance = input - output (the debit-positive value of ADR-0007 rule 15); a credit-normal account reads negative and the reader applies the presentation flip (ADR-0010).';
+COMMENT ON COLUMN ledger_account_balances.output IS
+  'Accumulates CREDIT legs of POSTED transactions. balance = input - output. Kept separate from input so the upsert stays commutative and gross turnover is free (ADR-0010).';
+COMMENT ON COLUMN ledger_account_balances.last_seq IS
+  'The account_seq counter for this stripe. Advances on EVERY entry, PENDING included (it issues the seq), whereas input/output move on posted entries only (ADR-0010).';
+COMMENT ON COLUMN ledger_account_balances.owner_type IS
+  'A frozen copy of the account''s owner, held honest by fk_balances__account_owner (NO ACTION), so an account with any balance row cannot have its owner nulled or reassigned (ADR-0009).';
+COMMENT ON COLUMN ledger_account_balances.owner_id_key IS
+  'A frozen copy of the account''s owner_id_key; with owner_type, the owner freeze (fk_balances__account_owner) (ADR-0009).';
+COMMENT ON COLUMN ledger_account_balances.purpose IS
+  'A frozen copy of the account''s identity; with category/normal_balance, held by fk_balances__account_purpose (NO ACTION) so a posted account cannot be reclassified (ADR-0009, ADR-0012).';
+COMMENT ON COLUMN ledger_account_balances.category IS
+  'Part of the frozen identity copy (fk_balances__account_purpose) (ADR-0012).';
+COMMENT ON COLUMN ledger_account_balances.normal_balance IS
+  'Part of the frozen identity copy (fk_balances__account_purpose) (ADR-0012).';
+
+-- ------------------------------------------------------------ columns: account_types
+COMMENT ON COLUMN account_types.normal_balance IS
+  'Which direction increases this type. NOT derivable from category: a loss allowance is an asset with a CREDIT normal balance -- storing both is the only correct option (ADR-0007 rule 10).';
+COMMENT ON COLUMN account_types.counterparty_scope IS
+  'none / shared / per_shard. Can a set of these accounts be summed for reporting? Only if all face ONE counterparty (IAS 32.42). Consumed by the balance sheet''s gross routing and by chart_lint (ADR-0012).';
+COMMENT ON COLUMN account_types.is_perimeter IS
+  'This type mirrors exactly one EXTERNAL balance and must reconcile against it. Consumed by perimeter_attestations, perimeter_drift and chart_lint -- a claim about the world, falsifiable only by an attestation (ADR-0012).';
+COMMENT ON COLUMN account_types.mirror_type IS
+  'The account type holding the OTHER side of the same cross-scope obligation (e.g. due_from_treasury <-> due_to_tenants). Declared on one side, arbitrarily the asset side; read by recon_scope_breaks to eliminate the pair to zero (ADR-0010, ADR-0012).';
+
+-- ------------------------------------------------------------ columns: fs_lines / chart
+COMMENT ON COLUMN fs_lines.chart_version IS
+  'The chart version this line belongs to. A line''s identity is (chart_version, code); the same caption may recur across versions -- that is what makes them comparable (ADR-0012).';
+COMMENT ON COLUMN fs_lines.code IS
+  'The STABLE identity of the line -- what consumers key on and what the balance sheet emits. The caption is display text and is Unicode-confusable, so it is never keyed on (ADR-0007).';
+COMMENT ON COLUMN fs_lines.caption IS
+  'Display text a reader sees, NOT an identity: never key on it (Unicode confusables pass every CHECK and print identically). Whitespace/case-normalised as defence in depth against typos only (ADR-0007).';
+COMMENT ON COLUMN fs_lines.statement IS
+  'balance_sheet or income_statement. Carried into a composite FK with side so a type cannot report under a line that contradicts its category (ADR-0012).';
+COMMENT ON COLUMN fs_lines.side IS
+  'Which side of the statement the line sits on -- declared, not inferred. THREE-valued on the balance sheet (asset/liability/equity), two-valued on the income statement (credit/debit) (ADR-0012).';
+COMMENT ON COLUMN chart_versions.note IS
+  'The IAS 1.41 REASON for a reclassification. NOT NULL and non-empty -- the half of the disclosure a schema can hold; the amounts are derivable by presenting one period under both versions (ADR-0012).';
+COMMENT ON COLUMN chart_presentation.chart_version IS
+  'The chart version this mapping belongs to. A reclassification is a new version, so which line a type presented under is one key lookup (ADR-0012).';
+COMMENT ON COLUMN chart_presentation.category IS
+  'Copied from account_types under a composite FK (fk_presentation__type), because fs_statement/fs_side are GENERATED from it and a generated column may not read another table (ADR-0012).';
+COMMENT ON COLUMN chart_presentation.counterparty_scope IS
+  'Copied from account_types under fk_presentation__type; determines whether a contra line is required (per_shard) (ADR-0012).';
+COMMENT ON COLUMN chart_presentation.fs_line IS
+  'The financial-statement line this type reports under, in this chart version. Held to the type''s statement and side by a composite FK (ADR-0012).';
+COMMENT ON COLUMN chart_presentation.fs_line_contra IS
+  'The line an OPPOSITE-SIGN position of this type presents under (a payable gone into a receivable). Required for per_shard, allowed for any balance-sheet type, meaningless on the income statement (IAS 32.42, ADR-0012).';
+COMMENT ON COLUMN chart_presentation.fs_statement IS
+  'GENERATED from category (revenue/expense -> income_statement, else balance_sheet), so it cannot disagree with the category; carried into the fs_line FK (ADR-0012).';
+COMMENT ON COLUMN chart_presentation.fs_side IS
+  'GENERATED from category ONLY (not normal_balance) and THREE-valued on the balance sheet. Derived so a contra-revenue type cannot be forced onto a cost line; carried into the fs_line FK (ADR-0012).';
+
+-- ------------------------------------------------------------ columns: periods
+COMMENT ON COLUMN ledger_period_closes.transaction_id IS
+  'The closing transaction, posted through the ordinary write primitive; this row only NAMES it. Typed to kind=''period_close'' and to a date inside the period by composite FKs (ADR-0011).';
+COMMENT ON COLUMN ledger_period_closes.computed_at_xid IS
+  'The commit cursor the checkpoint was computed at: everything below it had committed, nothing below it can ever appear. A backdated arrival lands ABOVE it and is a tail term (close_disclosures enumerates them), never an invalidation (ADR-0011).';
+COMMENT ON COLUMN ledger_period_closes.closing_kind IS
+  'A generated constant (''period_close'') carried into fk_closes__txn_kind, turning "the named transaction is a close" into a key rather than a free-text match (ADR-0011).';
+COMMENT ON COLUMN perimeter_attestations.as_of IS
+  'The COUNTERPARTY''s statement date -- a business date, so the comparison is on the effective axis (a bank statement is dated by the bank''s book) (ADR-0006, ADR-0012).';
+COMMENT ON COLUMN perimeter_attestations.external_balance_minor IS
+  'What the third party said the balance was, in OUR debit-positive sign convention, so the comparison needs no normal_balance flip (ADR-0007 rule 15).';
+COMMENT ON COLUMN perimeter_attestations.as_of_end IS
+  'GENERATED exclusive end instant of the as_of business day in tz, resolved once at write time so perimeter_drift compares a fixed instant rather than a session-resolved bare date (ADR-0011).';
+
+-- ------------------------------------------------------------ report surfaces (views + functions)
+COMMENT ON VIEW trial_balance IS
+  'Per-account gross arithmetic at "now" and the reconciliation substrate half the recon views read. security_invoker, so RLS scopes it. Publishes both balance_minor (normal-balance-signed, for showing one account) and balance_debit_positive (roll up with THIS one). Enumerates INWARD from entries -- not the completeness surface (ADR-0011).';
+COMMENT ON VIEW chart_version_current IS
+  'The current chart version, DERIVED as max(version) -- the default the statement functions read when no version is passed (ADR-0012).';
+COMMENT ON FUNCTION report_cursor() IS
+  'The commit cursor a report pins itself to: pg_snapshot_xmin of the current snapshot. Everything strictly below it has committed or aborted and can never grow; a row invisible now carries a HIGHER id. Pass it as :cursor to the statement functions (ADR-0011).';
+COMMENT ON FUNCTION trial_balance_at(text, timestamptz, timestamptz, xid8) IS
+  'The trial balance pinned: per-account debits/credits/debit-positive balance for one tenant over an effective range [p_from, p_to) at a commit cursor (xact_id < p_cursor). Sums as numeric to survive a huge legal row (ADR-0011, ADR-0013).';
+COMMENT ON FUNCTION income_statement_for(text, timestamptz, timestamptz, xid8, int) IS
+  'The income statement over an effective range [p_from, p_to), at a commit cursor, under a chart version (default: current). Enumerates FROM the chart; RAISES if the version does not exist or does not present every posted account type in-window; excludes the period''s closing transaction. Returns its pinned cursor (ADR-0011).';
+COMMENT ON FUNCTION balance_sheet_at(text, timestamptz, xid8, int) IS
+  'The balance sheet as at an instant p_asof (effective_at < p_asof, half-open), at a commit cursor, under a chart version (default: current). Enumerates FROM the chart; positions are per-account then routed to a contra line on sign-swing; synthesises the un-closed-earnings plug; RAISES on an unpresented type. Returns its pinned cursor (ADR-0011, ADR-0012).';
+COMMENT ON FUNCTION recon_equation_breaks(xid8, timestamptz) IS
+  'The accounting equation on the FACE of the balance sheet: runs balance_sheet_at per tenant at (p_cursor, p_asof) and returns a row only where assets <> liabilities + equity + earnings, per currency. The highest-leverage check -- no journal-level test can falsify presentation (ADR-0011).';
+
+COMMENT ON VIEW recon_balance_breaks IS
+  'The cached balance against the recomputed sum over the journal, per account/currency/stripe -- a nonzero row is drift the cache introduced. Six break classes (balance_drift, seq_behind/ahead/gap, no_cache_row, no_entries); input/output vs POSTED entries, last_seq vs ALL entries (ADR-0010).';
+COMMENT ON VIEW recon_entry_breaks IS
+  'Journal entries that fail one of the three joins every report makes -- no_transaction, no_account or no_account_type, one row each. Empty wherever the foreign keys are enforced; a pending entry is not an orphan (ADR-0009).';
+COMMENT ON VIEW recon_transaction_breaks IS
+  'Transactions whose entries do not balance per currency (debits_ne_credits), plus single-leg and entryless ones. The exception list for the balance invariant the writer''s type will eventually make unrepresentable (ADR-0005, ADR-0007).';
+COMMENT ON VIEW recon_scope_breaks IS
+  'The two sides of a cross-scope obligation that fail to eliminate: for a mirrored account-type pair, the debit-positive sum over both types must be zero, per currency and per counterparty. The one check that aggregates across tenants (ADR-0010).';
+COMMENT ON VIEW recon_journal_to_reports IS
+  'A reconciliation statement (one row per tenant/currency, always footing): journal debits minus the named reconciling items -- pending, superseded, out_of_window, orphan -- against what trial_balance actually shows; the unexplained remainder must be zero (ADR-0010).';
+COMMENT ON VIEW recon_pending_bridge IS
+  'The available balance derived, not stored: the posted cache plus the live pending population (retired holds excluded), per account. A reconciling population, not a break list (ADR-0010).';
+COMMENT ON VIEW recon_checkpoint_breaks IS
+  'The stored period checkpoint against ledger_entries recomputed at the checkpoint''s own cursor, per account -- missing, spurious or value-drifted rows. Compares values, so a dormant 0/0 row is not a break (ADR-0011).';
+COMMENT ON VIEW close_disclosures IS
+  'Entries legally backdated past a close (effective_at before ends_at, xact_id at/after computed_at_xid) -- not a break: the analogue of IAS 1.41''s reclassification disclosure, so a row here means an already-issued report no longer matches a re-run at "now" (ADR-0011).';
+COMMENT ON VIEW perimeter_drift IS
+  'What a third party attested against what our book says on the same business date (effective axis, bounded by the stored as_of_end instant), per is_perimeter account -- the drift is the difference. Fed into chart_lint (ADR-0012).';
+COMMENT ON VIEW chart_lint IS
+  'Chart claims the account register contradicts: a type no version presents, a per_shard type in a house account, a same-side mirror pair, an unattested perimeter account, live drift, and more -- ten shape rules a CHECK or key cannot reach. Empty is passing; reconciliation counts the error-severity rows (ADR-0012).';
+COMMENT ON VIEW recon_close_breaks IS
+  'Closes whose computed_at_xid precedes their own closing transaction''s xact_id -- a checkpoint computed at a cursor that could not have seen the close it records (ADR-0011).';
+COMMENT ON VIEW recon_cursor_breaks IS
+  'Entries whose commit key is impossible -- an xact_id above the current snapshot horizon, or below its own transaction''s (a leg claiming to predate its transaction). Where a forged xact_id shows, since it silences no other check (ADR-0011).';
+COMMENT ON VIEW reconciliation IS
+  'The daily sweep operators run (openledger reconcile, roadmap M2): one row per check -- cache-vs-journal, orphan entries, imbalance, cross-scope, journal-vs-reports, checkpoint, close typing, cursor forgery, the accounting equation, chart lint -- with its break count, all zero on a healthy book. SELECT * FROM reconciliation WHERE breaks <> 0 is the whole interface; the pending bridge and close disclosures are excluded as legitimate populations (ADR-0004, ADR-0010).';
