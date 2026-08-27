@@ -22,6 +22,11 @@ const MERMAID_COMPONENT_ABS = fileURLToPath(new URL('./mermaid-component.jsx', i
 // an absolute path.
 const MERMAID_COMPONENT_REL = './' + path.relative(process.cwd(), MERMAID_COMPONENT_ABS)
 
+// GitHub Pages serves a project site under /<repo>, so ONLY the Pages build sets
+// this basePath (the deploy workflow exports GITHUB_PAGES=true). Local `npm run
+// dev` and a plain `npm run build` leave it unset and stay at the root.
+const basePath = process.env.GITHUB_PAGES === 'true' ? '/openledger' : undefined
+
 const withNextra = nextra({
   defaultShowCopyCode: true,
   // Index code blocks. Four of these pages ARE code -- the migration, the chart,
@@ -48,6 +53,7 @@ export default withNextra({
   // A static export: `npm run build` produces `out/`, which is a directory of
   // plain files anyone can host or open. No server, no runtime.
   output: 'export',
+  ...(basePath ? { basePath } : {}),
   images: { unoptimized: true },
   trailingSlash: true,
   eslint: { ignoreDuringBuilds: true },
