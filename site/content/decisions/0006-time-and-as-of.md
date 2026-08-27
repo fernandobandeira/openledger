@@ -1,44 +1,51 @@
 # 0006 — Two time axes, two mechanisms, and "as of" means a commit-ordered cursor
 
-**Status:** accepted — with the as-of cursor unbuilt and blocking roadmap M5, below.
+**Status:** accepted — but its as-of *mechanism* is refuted and replaced by [0011](/decisions/0011-period-close-and-report-axes) (the `xid8` cursor, below); the cursor is decided and in the schema, and roadmap M5 is **unblocked**.
 **Evidence:** [spike 001](/spikes/001-formance),
 [spike 003](/spikes/003-throughput-ceiling).
 
 ## The decision
 
-Every entry carries two dates that routinely disagree: **recorded** (`recorded_at`, ordered by
-`account_seq`) is when we learned of it; **effective** (`effective_at`) is the business date it
-belongs to, from the source's clock — a card network's, not our webhook's. An entry recorded today and
-effective last week is **backdated**, and normal: late clearings and chargebacks are.
+**Every entry carries two dates, and they routinely disagree: when the thing happened, and when we
+found out about it.** The business date it belongs to — a card network's clock, say, not our webhook's
+— is its **effective** date (`effective_at`); the moment we learned of it and wrote it down is its
+**recorded** date (`recorded_at`, ordered within an account by a counter, `account_seq`). An entry we
+record today that is effective last week is **backdated**, and that is not an edge case: late card
+clearings and chargebacks arrive out of order as a matter of routine.
+
+**Because of that, "what is the balance now" and "what was the balance as of June 30" are different
+questions, and a single stored running total can only answer one of them.** A **running balance** is a
+total kept continuously up to date as entries land; but if an entry dated June arrives in August, a
+total that was correct in recording order is now wrong for the question "as of June 30". So we keep both
+dates explicitly rather than pick one.
+
+**We store no running balance at all.** The **current** balance — the common case, "what is it right
+now" — is a single cached number per account (`ledger_account_balances`, read by primary key). Any
+**"as of" balance** — the balance as it stood at some past point — is *computed* on demand by adding up
+the entries on whichever date axis the question asked about. And "as of" is pinned not to a wall-clock
+time (which cannot reliably say which write landed first) but to a **commit-ordered cursor**: a marker
+a report saves next to itself and re-runs against forever, so the same report always returns the same
+answer. Why we keep no stored running total is in the evidence below.
 
 **Two axes, two mechanisms — and no running balance serving either.**
 
 | Question | Mechanism |
 | --- | --- |
 | Current balance (the hot path) | `ledger_account_balances` — one row per account, read by primary key |
-| Balance as *recorded* at instant T | aggregate over `recorded_at <= T`, on `ix_entries__asof_recorded` |
+| Balance as *recorded* at instant T | aggregate filtered by the commit cursor `xact_id < :cursor`, on `ix_entries__asof_commit` — [0011](/decisions/0011-period-close-and-report-axes) proved `recorded_at` cannot order commits and re-pointed the index at `xact_id` |
 | **Balance as of business date T** | **aggregate over `effective_at <= T`**, denormalized onto `ledger_entries` so it is a single-table index scan, not a join |
 
-> **AMENDED by [spike 009](/spikes/009-where-the-balance-lives).** The first two rows used to read
-> `balance_after`, a running balance stored on every entry. It is gone. The argument below is what
-> killed it — this ADR made it about the *effective* axis only, and the same argument finishes the
-> job: a point-in-time answer on the recorded axis is a point-in-time answer to a question nobody
-> asks. The spike has the prior art, the cost, and what replaces the drift check.
+**An as-of query names the column it filters, and a resource has one such column** — naming the axis on
+the *parameter* is not enough. The cursor is `pg_snapshot_xmin(pg_current_snapshot())`, the lowest
+transaction id still running (everything below it has finished and can never grow), read directly
+against an `xact_id xid8` column on every journal row and filtered `xact_id < :cursor`. That mechanism
+is [0011](/decisions/0011-period-close-and-report-axes)'s; the gap-free watermark this ADR first
+specified for the cursor is refuted, and the deep-dive at the end of this ADR carries why.
 
-**And a timestamp is not an "as of".** A report resolves a business date to a **gap-free watermark
-over a global sequence** on [`ledger_events`](/decisions/0005-event-log-and-write-path) — one sequence,
-assigned once per accepted event — stores it beside the report and re-runs against it forever. It is
-not `max(seq)` but the highest **N where every entry ≤ N has committed**, since
-`pg_snapshot_xmin(pg_current_snapshot())` is the lowest transaction id still running: everything below
-has finished and can never grow; above it, a row invisible now can appear later. That horizon is in
-*transaction ids* and the watermark a position on the *event sequence*, so each event records the
-transaction that wrote it and `W = min(seq) - 1` over events whose xid ≥ xmin. Then a rule: **an as-of
-query names the column it filters, and a resource has one such column** — naming it on the *parameter*
-is not enough.
+## The evidence
 
-## Why
-
-**A running balance answers business-date questions wrongly.**
+Three entries into one account, the third one backdated — and a stored running balance already
+disagrees with the truth for a date in the middle:
 
 | account_seq | effective | amount | running balance |
 | --- | --- | --- | --- |
@@ -55,9 +62,27 @@ restricted. Backfilling is not an edge case in this domain: a clearing carries t
 date, so entries arrive out of effective order as a matter of routine. A number that is only correct
 on the axis nobody asks about is not a fast path, it is a trap with an index on it.
 
+**This is why `balance_after` is gone.** An earlier version of the mechanism table stored
+`balance_after`, a running balance on every entry; [spike 009](/spikes/009-where-the-balance-lives)
+removed it, and the axis argument above is what killed it — a point-in-time answer on the recorded axis
+answers a question nobody asks. Two independent reasons stand behind the removal:
+
+- **Axis (the fundamental one).** The table above: a stored running balance is right only on the
+  recorded axis, and every as-of question is effective-date, which backfills. This holds even for a
+  single-stripe account, so it is what drops the column on its own.
+- **Striping (the trigger, and a real independent reason).** Under [0002](/decisions/0002-scaling) an
+  account is N stripes, each with its own `account_seq` counter, so a per-entry `balance_after` would be
+  a **per-stripe partial** — not the account's balance, and incoherent as an account-level number.
+  Striping is what first forced the question; the axis argument is the one that would drop the column
+  even without it.
+
+[Spike 009](/spikes/009-where-the-balance-lives) carries the prior art, the cost, and what replaces the
+drift check — the per-account row already answers "now", and the recomputed sum over `ledger_entries`
+gives the *independent* check a `balance_after` computed in the same transaction never could.
+
 **Each read must be ordered by the axis it asks about.** A recorded-axis read written as
 "current-balance lookup plus `recorded_at <= T`" plans on `account_seq` and filters — **~36,000 rows
-removed by filter** against zero for the right one. Hence `ix_entries__asof_recorded`.
+removed by filter** against zero for the right one. That first motivated `ix_entries__asof_recorded`; [0011](/decisions/0011-period-close-and-report-axes) then proved `recorded_at` cannot order commits and re-pointed the index at the `xid8` cursor as `ix_entries__asof_commit`.
 
 **The business date is copied onto the entry, and a key holds the copy honest — not the writer.**
 The effective-axis aggregate is a single-table index scan only because `effective_at` is denormalised
@@ -68,7 +93,7 @@ composite foreign key onto `uq_txn__id_effective`, so an entry whose business da
 transaction's is unwritable rather than merely wrong — the same trick as the currency copy in
 `fk_entries__account`. It is the guard here that needs a test: dropping it loads cleanly, where
 dropping the unique index it points at makes the schema fail to load outright. That test is
-[0007](/decisions/0007-schema-conventions-and-chart)'s schema snapshot, which is not built.
+[0007](/decisions/0007-schema-conventions-and-chart)'s schema snapshot.
 
 **Why not a second running balance on the effective axis?** A backdated insert `UPDATE`s every later
 row for that account — unbounded write amplification on the one table whose value is immutability.
@@ -113,13 +138,13 @@ written beside it, while their `logs (ledger, id)` key *is* the cursor this ADR 
 is theirs too: they *do* name the axis (`pit` plus a `useInsertionDate` selector) and `pit` still
 resolves to **six columns across seven endpoints**, spelled three ways, undocumented in their OpenAPI.
 
-## Alternatives
+## What we considered
 
 | | Why not |
 | --- | --- |
 | **One running balance for both axes** | Wrong by construction — the first table above. |
 | **A second running balance on the effective axis** | 740× on backdated insert, measured on their code. |
-| **Keeping the recorded-axis running balance for the hot path** | What this ADR originally decided, reversed by [spike 009](/spikes/009-where-the-balance-lives): it is correct on an axis nobody queries, it was not the independent drift check it looked like, and the per-account row answers "now" anyway. |
+| **Keeping the recorded-axis running balance for the hot path** | Reversed by [spike 009](/spikes/009-where-the-balance-lives): it is correct on an axis nobody queries, it was not the independent drift check it looked like, and the per-account row answers "now" anyway. |
 | **Forbid backdating** | Breaks on late clearing and chargebacks, which are the normal case. |
 | **`recorded_at <= :as_of`** | Not reproducible — the table above. Do not build M5 on it. |
 | **A bare `bigserial` as the cursor** | Sequence values are handed out at *insert* time, so the same interleaving leaves gaps that fill in afterwards; `max(seq)` is not yet gap-free. Hence a watermark. |
@@ -131,19 +156,27 @@ resolves to **six columns across seven endpoints**, spelled three ways, undocume
 | | |
 | --- | --- |
 | **The effective-axis aggregate is linear and currently unbounded** | Roughly 0.10 µs per entry in range, and **105.91 ms** for a 1M-entry account (one-off run, no harness in repo). We traded Formance's unbounded `UPDATE` for an unbounded `SCAN`, but ours is on the read path and mutates nothing. |
-| **It must be bounded, and accounting already knows how: period close** | Materialize each account's balance at each period end, so a business-date query becomes *"prior period's closing balance + entries in the open period"* — an **effective-axis checkpoint**. A backdated entry in a closed period then needs restatement or a prior-period adjustment, as accounting practice already requires. **Prerequisite for M5.** |
+| **It must be bounded, and accounting already knows how: period close** | Discharged by [0011](/decisions/0011-period-close-and-report-axes): `ledger_period_balances` materializes each account's balance at each close, at a stored cursor, so a business-date query becomes *"prior close + tail"* — measured 45–49× at a close boundary, 8–9× mid-period, neither decaying with history. A backdated entry into a closed period is **accepted, not locked out**, lands above the stored cursor, and is enumerated by `close_disclosures` — the analogue of the restatement disclosure accounting practice requires. |
 | **The striped read cost is unmeasured** | The accounts every transaction touches are the shared ones, also the accounts accumulating the most entries, so the account most likely to be queried "as of last quarter" has the largest scan, summed across N stripes ([0002](/decisions/0002-scaling)). **Spike before M5.** |
 | **The recorded axis is not yet trustworthy** | `recorded_at` should be assigned by the writer; today it is a bare `DEFAULT` and forgeable — verified, an `INSERT` supplying `1999-01-01` was accepted. **A column with a `DEFAULT` is not a constraint** ([0004](/decisions/0004-where-logic-lives)). |
-| **The query layer is not bitemporal yet, though storage is** | *The effective-axis February close as known on 1 March* cannot be expressed: `balance_sheet`, `income_statement` and the balance-sheet roll-up have no date predicate, and the accounting equation must take one instant and one axis when rebuilt. |
-| **The drift check is now the only check** | `ledger_account_balances` and the recomputed sum over `ledger_entries` must always agree; a cheap periodic check finds divergence, and should recompute rather than only alarm, as Modern Treasury does. This used to compare the cache against `balance_after`, which was **not** an independent check — the writer computed both from the same locked row in the same transaction. Recomputing from the append-only entries is. |
+| **The query layer's shapes exist as SQL; a Rust read path over them is roadmap M5** | *The effective-axis February close as known on 1 March* **is** expressible: [0011](/decisions/0011-period-close-and-report-axes) turned `balance_sheet` and `income_statement` into the `balance_sheet_at`/`income_statement_for` functions taking an effective range (or instant) and a commit cursor, and `recon_equation_breaks` takes one instant and one cursor. The Rust read path over those functions is roadmap M5, not part of the SQL layer. |
+| **The drift check is the only check** | `ledger_account_balances` and the recomputed sum over `ledger_entries` must always agree; a cheap periodic check finds divergence, and should recompute rather than only alarm, as Modern Treasury does. Recomputing from the append-only entries is what makes it independent — a comparison against `balance_after` would not have been, because the writer computed both from the same locked row in the same transaction. |
 | **Reporting code must name its axis, and the cursor lags the newest writes** | M5 must test the backdating case above. The lag is the longest in-flight transaction — the price of write concurrency — and it composes with [0005](/decisions/0005-event-log-and-write-path)'s deferred hash chain, which needs a total order. |
 
-## The as-of cursor is not built, and it blocks M5
+## The as-of cursor is decided, and [0011](/decisions/0011-period-close-and-report-axes) replaced the mechanism
 
-**`ledger_events` has no global sequence and no xid**, so the watermark has no substrate. Unverified:
+**The failure this ADR measured is real; the fix it first specified is not.** The watermark above —
+a gapless sequence on `ledger_events` with `W = min(seq) - 1` over events whose xid ≥
+`pg_snapshot_xmin` — takes its minimum over rows the reporter can *see*. On the interleaving where
+writer A starts first and commits last, A's xid sits *below* an already-issued watermark and its
+rows appear afterwards — reproduced in [spike 012](/spikes/012-period-close) §3, alongside this
+ADR's own 45% instability. The mechanism is now `xact_id xid8` on every journal row and a cursor of
+`pg_snapshot_xmin(pg_current_snapshot())`, applied in the baseline; **M5 is unblocked**. This ADR
+got the horizon right and projected it onto the wrong substrate. The risks below stand as *costs*
+of the surviving mechanism, with 0011's measurements:
 
 1. That `pg_snapshot_xmin(pg_current_snapshot())` gives a usable watermark under our write pattern.
-   The risk is a **batched posting run**, not [0001](/card/decisions/0001-authorization-holds)'s one-shot timers.
+   The risk is a **batched posting run**, not the one-shot timers of the card rail's [authorization-holds decision](/card/decisions/0001-authorization-holds).
 2. Its lag under such a run: one transaction open for minutes pins every report behind it.
 3. ~~That the watermark advances past aborted transactions automatically.~~ **Verified** on PostgreSQL
    18.6: a session took xid8 5325039 and held it open, a concurrent snapshot read `5325039:5325039:`

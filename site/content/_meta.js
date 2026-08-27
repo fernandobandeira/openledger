@@ -3,11 +3,12 @@ export default {
   index: 'Overview',
   '-- design': { type: 'separator', title: 'The ledger' },
   vision: 'Vision',
-  glossary: 'Glossary',
   database: 'The database',
+  roadmap: 'Roadmap',
   decisions: 'Decisions',
   spikes: 'Spikes',
-  roadmap: 'Roadmap',
   '-- card': { type: 'separator', title: 'The reference product' },
-  card: 'The card rail'
+  card: { title: 'The card rail', display: 'children' },
+  '-- reference': { type: 'separator', title: 'Reference' },
+  glossary: 'Glossary'
 }

@@ -42,21 +42,83 @@ card clearing carries the network's business date, days before the webhook that 
 
 Three kinds of note appear throughout. **CAUGHT** is a real defect this design stopped, with what
 it cost when it got through — evidence the shape works. **STILL OPEN** is a gap that exists right
-now. **A LIMIT** is as good as the approach gets, and not a gap. The full inventory of what the
-schema does and does not hold is the decision log's [open list](/decisions#still-open), which is
-longer than this page.
+now. **A LIMIT** is as good as the approach gets, and not a gap. The unbuilt work the
+schema is waiting on is on the [roadmap](/roadmap); every limitation a decision accepted is in that
+ADR's own *"What it costs"*.
 
 ## The map
 
-Seven tables in three layers. **The journal** records what happened, in order. **The register**
+Thirteen tables in five layers. **The journal** records what happened, in order. **The register**
 says whose money it is — and holds the one cached number the fast path reads. **The chart** says
-what any of it means. Arrows point from a table to the table it depends on.
+what any of it means, per version, and it is now a four-table layer of its own
+([0012](/decisions/0012-chart-governance)). Two more layers close the set: the **period close**
+(`ledger_periods`, `ledger_period_closes`, `ledger_period_balances`,
+[0011](/decisions/0011-period-close-and-report-axes)) stores each period's closing balance on the
+business-date axis, and a single **perimeter** table
+([0012](/decisions/0012-chart-governance)) records what a third party said an account's balance was.
+The three period and one perimeter tables, plus the two new chart tables, arrived with the merge of
+[0009](/decisions/0009-append-only-perimeter)–[0013](/decisions/0013-write-path-contract). Arrows
+point from a table to the table it depends on.
 
-![The core ledger: seven tables in three layers, with the journal on top, the register in the middle and the chart of accounts at the bottom](/diagrams/04-database-erd.svg)
+The diagram below draws all thirteen, grouped by layer — the versioned chart is `chart_presentation`
+sitting between `chart_versions` and the two tables it maps together, `account_types` (what an
+account means) and `fs_lines` (where it shows):
+
+```mermaid
+flowchart TD
+    subgraph journal["JOURNAL — what happened, in order"]
+        ledger_events["ledger_events"]
+        ledger_transactions["ledger_transactions"]
+        ledger_entries["ledger_entries"]
+    end
+
+    subgraph register["REGISTER — whose money it is"]
+        ledger_accounts["ledger_accounts"]
+        ledger_account_balances["ledger_account_balances"]
+    end
+
+    subgraph chart["CHART — what it means, per version"]
+        chart_versions["chart_versions"]
+        chart_presentation["chart_presentation"]
+        account_types["account_types"]
+        fs_lines["fs_lines"]
+    end
+
+    subgraph close["PERIOD CLOSE — the business-date checkpoint"]
+        ledger_periods["ledger_periods"]
+        ledger_period_closes["ledger_period_closes"]
+        ledger_period_balances["ledger_period_balances"]
+    end
+
+    subgraph perimeter["PERIMETER — what a third party said"]
+        perimeter_attestations["perimeter_attestations"]
+    end
+
+    ledger_transactions -->|event_id| ledger_events
+    ledger_entries -->|transaction_id| ledger_transactions
+    ledger_entries -->|account_id, currency| ledger_accounts
+    ledger_entries -->|stripe| ledger_account_balances
+    ledger_account_balances -->|account_id| ledger_accounts
+    ledger_accounts -->|purpose → code| account_types
+
+    fs_lines -->|chart_version| chart_versions
+    chart_presentation -->|chart_version| chart_versions
+    chart_presentation -->|type_code| account_types
+    chart_presentation -->|fs_line| fs_lines
+
+    ledger_period_closes -->|period_code| ledger_periods
+    ledger_period_closes -->|transaction_id| ledger_transactions
+    ledger_period_balances -->|period_code| ledger_period_closes
+    ledger_period_balances -->|account_id| ledger_accounts
+
+    perimeter_attestations -->|account_id| ledger_accounts
+```
 
 Every arrow is a *composite* key — it carries more than an id. **When a value is copied into a
 second table for speed, the copy is made part of a key, so it cannot disagree with the original.**
-Three report views (not drawn) read the chart at the bottom and the journal at the top.
+Three report readers (not drawn) — `trial_balance`, still a view, and `balance_sheet_at` and
+`income_statement_for`, now set-returning functions — read the chart at the bottom and the journal
+at the top.
 
 A **tenant** is one customer of this ledger — one business whose books are kept separately inside
 a shared database. **PK** marks the columns that identify a row uniquely.
@@ -97,11 +159,29 @@ balance-checking can see it.
 
 So completeness is treated as a separate invariant from balance, and the fix is structural:
 
-![Two ways to build a report: from the entries, where a line with no activity is never enumerated and silently absent; and from the chart, where every line is listed first and prints as zero](/diagrams/05-report-direction.svg)
+Two ways to build a report — from the entries, where a line with no activity is never enumerated
+and is silently absent; and from the chart, where every line is listed first and a line with no
+activity prints as zero:
 
-`balance_sheet` and `income_statement` enumerate outward. `trial_balance` still enumerates inward,
-and is the wrong thing to build a completeness claim on — it is kept for a different job: showing
-what actually moved.
+```mermaid
+flowchart TB
+    subgraph inward["INWARD — from the entries (trial_balance)"]
+        direction TB
+        e1["ledger_entries<br/>what actually moved"] --> e2["group by account"]
+        e2 --> e3["only lines with activity appear"]
+        e3 --> e4["a line with no activity is never<br/>enumerated — silently absent"]
+    end
+
+    subgraph outward["OUTWARD — from the chart (balance_sheet_at, income_statement_for)"]
+        direction TB
+        c1["fs_lines + chart_presentation<br/>every line, listed first"] --> c2["left join the entries"]
+        c2 --> c3["a line with no activity<br/>prints as a visible zero"]
+    end
+```
+
+`balance_sheet_at` and `income_statement_for` enumerate outward. `trial_balance` still enumerates
+inward, and is the wrong thing to build a completeness claim on — it is kept for a different job:
+showing what actually moved.
 
 ### 3 · Two time axes, two mechanisms — never one
 
@@ -135,8 +215,9 @@ So there are two mechanisms and each read names its axis. "What is this balance 
 primary-key read of the one row in `ledger_account_balances` that holds it. "What was it as of a
 business date" aggregates over `effective_at`,
 which is linear in history — and the accountants' answer to that is a **period close**, which
-stores each period's closing balance so the query becomes *prior close plus entries since*. That
-close is designed and not built.
+stores each period's closing balance so the query becomes *prior close plus entries since*. Those
+close tables (`ledger_periods`, `ledger_period_closes`, `ledger_period_balances`) are applied in the
+baseline; the writer that computes a close is not yet built.
 
 The tempting alternative — a second running balance on the business-date axis — is the one thing
 this design refuses outright, because a backdated insert then has to rewrite every later row for
@@ -166,7 +247,11 @@ against*. Two clear that bar ([ADR-0004](/decisions/0004-where-logic-lives)):
   would be the natural one object for the job, and PostgreSQL refuses that for `TRUNCATE`
   outright.
 
-**The actual objects: two functions, six triggers, three tables.** Measured on a fresh load, not
+**The actual objects: two functions, and one `UPDATE`/`DELETE` guard plus one `TRUNCATE` guard on
+each of the nine append-only logs — eighteen triggers in all.** The journal trio is the worked
+example below; the same pair now guards the chart's history (`chart_versions`, `fs_lines`,
+`chart_presentation`), the perimeter attestations and the period record too, and
+[the census](#what-the-schema-enforces-today) lists every one. Measured on a fresh load, not
 asserted:
 
 | function | trigger | on | fires on |
@@ -178,12 +263,12 @@ asserted:
 | | `ck_txn__no_truncate` | `ledger_transactions` | `TRUNCATE` |
 | | `ck_events__no_truncate` | `ledger_events` | `TRUNCATE` |
 
-Each one raises and aborts the statement; there is nothing in them beyond refusing. Six objects
-rather than two because `TRUNCATE` needs a separate trigger from `UPDATE`/`DELETE`, and every table
-needs its own — `TRUNCATE a CASCADE` reaching `b` is refused by **b's** guard, naming b, so a test
-that only checks "something was refused" still passes with a's guard deleted.
+Each one raises and aborts the statement; there is nothing in them beyond refusing. Six objects for
+the trio rather than two because `TRUNCATE` needs a separate trigger from `UPDATE`/`DELETE`, and
+every table needs its own — `TRUNCATE a CASCADE` reaching `b` is refused by **b's** guard, naming b,
+so a test that only checks "something was refused" still passes with a's guard deleted.
 
-All six are `ENABLE ALWAYS`, so they fire even on the replication apply path and under a restore that
+All of them are `ENABLE ALWAYS`, so they fire even on the replication apply path and under a restore that
 disables triggers. A replica that does not enforce its publisher's invariants is a laundering channel for
 corrupt rows.
 
@@ -206,16 +291,17 @@ transaction  ──┬── entry   DR customer_receivable   500.00
 
 They hold different kinds of fact. The transaction knows *when* — both dates — what it resolves or
 reverses, and which event caused it. Each entry knows *where*: one account, one direction, one
-amount, and that account's own running position.
+amount, and its place in that account's sequence (`account_seq`) — no running balance among them.
 
 The split is not bookkeeping neatness. **Balance is a property of the group, not the line**: a
 single entry is money appearing from nowhere, and "debits equal credits" cannot be checked against
 it. It also decides what a correction is — a whole new transaction pointing at the old one, never
 an edit to a leg.
 
-## The seven tables
+## The thirteen tables
 
-In the order the diagram reads: the journal, then the register, then the chart.
+In the order the diagram reads: the journal, then the register and the chart, then the period close
+and the perimeter.
 
 ### `ledger_entries` — one leg of one movement
 
@@ -247,6 +333,12 @@ that is what makes the copying safe rather than merely fast.
 `account_seq` is a per-account counter that orders one account's history. It is what an as-of
 reconstruction walks, and its **gaplessness** is what makes "no entry is missing" a claim you can
 check: numbers 1 through N with nothing skipped.
+
+Each journal row also carries `xact_id` — an `xid8` defaulted to `pg_current_xact_id()` — that
+stamps it with commit order. That is the axis a report pins to: `report_cursor()` hands back one
+`xid8`, `balance_sheet_at` and `income_statement_for` take it and return it as `pinned_cursor`, and
+`ix_entries__asof_commit (tenant_id, account_id, xact_id)` is the index that serves the read, so a
+report sees a single consistent cursor rather than a moving target.
 
 **Not a Postgres sequence**, and the difference is the point: a sequence counts per *table*, not per
 account, and `nextval()` is not rolled back — an aborted transaction leaves a permanent hole in the
@@ -283,9 +375,11 @@ is a build failure rather than a test failure needs no test.
 > **CAUGHT — `uq_txn__one_per_event`.** Without it, two transactions were produced from one event
 > row, so the idempotency spine did not by itself prevent double-posting.
 
-> **STILL OPEN — `event_id` is nullable.** A transaction *can* be written with no causing event, so
-> "every transaction references the event that caused it" is a convention here, not yet an
-> invariant. That is why that one arrow is drawn dashed. `NOT NULL` is the fix and it is not done.
+> **CLOSED — `event_id` is `NOT NULL`** ([0013](/decisions/0013-write-path-contract) §3). "Every
+> transaction references the event that caused it" is an invariant now, and it landed while the
+> journal was empty — the only time it is free: with one event-less row committed, `SET NOT NULL`
+> is refused and the `DELETE` that would fix it is refused by `refuse_mutation()`, so the routes
+> left are `DISABLE TRIGGER` or fabricating history. The dashed arrow is solid.
 
 ### `ledger_events` — every accepted operation, including the ones that move no money
 
@@ -306,11 +400,15 @@ failing.
 bug, or an export to another deployment, both need that, and it is far cheaper to honour in the
 first migration than to retrofit.
 
-> **STILL OPEN — the replay path does not exist.** `idempotency_hash` is written and read by
-> nothing. The unique index makes a second attempt *fail*; it does not yet make the first attempt's
-> answer come back. And an `INSERT … ON CONFLICT DO NOTHING` — exactly what a retry loop reaches
-> for — swallows a same-key-different-body replay in silence, which no index can distinguish from a
-> deliberate one.
+> **DECIDED, WRITER-SIDE — the replay contract is two statements**
+> ([0013](/decisions/0013-write-path-contract) §2): `INSERT … ON CONFLICT DO NOTHING RETURNING`,
+> then — when the insert returned nothing — a *separate* `SELECT` returning
+> `(event_id, transaction_id, body_matches)`, refusing loudly on a hash mismatch. Two traps are
+> measured rather than assumed: the elegant one-statement CTE form returns **zero rows** under
+> exactly the race it exists to handle, and the claim itself fails with `40001` under
+> `REPEATABLE READ`, so the replay path cannot exist at a stricter isolation level. The writer that
+> runs these statements is not built; the unique index alone still only makes the second attempt
+> fail.
 
 ### `ledger_accounts` — whose money, in what currency
 
@@ -345,7 +443,9 @@ and untested for the same reason.
 
 A *type* is a kind of account: `customer_receivable`, `fbo_cash` (money held *for benefit of* a
 customer), `interchange_revenue`. Each declares its category — asset, liability, equity, revenue or
-expense — its normal balance, and the line of the financial statements it rolls up to.
+expense — and its normal balance. It does *not* carry the statement line it rolls up to: that
+presentation lives in `chart_presentation`, keyed by chart version (below), so a reclassification is
+a new chart version rather than an edit here.
 
 **The chart lives in a table because every business needs a different one.** A card programme has a
 `platform_rev_share_payable`; a marketplace wallet does not. It also has to *store* each type's
@@ -353,9 +453,10 @@ normal balance rather than compute it, because some accounts break the pattern �
 is an asset that grows with credits — and code that derives the balance from the category gets
 those wrong.
 
-`fs_statement` and `fs_side` are **derived by the database** from the category and can never be
-supplied, then carried into the foreign key below. That turns "a revenue type may not report under
-an expense caption" from a trigger into a key.
+In `chart_presentation`, where that mapping actually lives, `fs_statement` and `fs_side` are
+**generated columns** — derived by the database from the category and never supplied — and they sit
+inside the composite foreign key `(chart_version, fs_line, fs_statement, fs_side)` into `fs_lines`.
+That turns "a revenue type may not report under an expense caption" from a trigger into a key.
 
 > **CAUGHT — two silent failures, by the same key.** Pointing a revenue type at a cost-of-revenue
 > line put 6,000.00 of revenue on the expense side of the income statement — with net income still
@@ -368,8 +469,9 @@ One row per line of a financial statement — the rows a reader actually sees.
 
 **Why this is not just `category`.** A category is a *side* of the statement, and there are only
 five of them. A balance sheet has more lines than that: "Cash and cash equivalents", "Restricted
-cash", "Accounts receivable" and "Other assets" are all assets. So each account type names the line
-it appears on, and the mapping is many-to-one in both directions:
+cash", "Accounts receivable" and "Other assets" are all assets. So `chart_presentation` names, per
+chart version, the line each account type appears on, and the mapping is many-to-one in both
+directions:
 
 ```
 account_types  (what it MEANS)                    fs_lines  (where it SHOWS)
@@ -388,8 +490,8 @@ Splitting the first pair is a money question, not a taxonomy one. `fbo_cash` is 
 line and unrestricted liquidity is overstated **by the entire customer float** — the number a lender
 and a covenant both read.
 
-Because every account type names a line, a report can be built by enumerating from the chart
-outward, which is idea 2 above.
+Because the presentation names a line for every account type, a report can be built by enumerating
+from the chart outward, which is idea 2 above.
 
 `side` is declared, not inferred: derived from whatever has been posted, a line with no activity
 evaluates to null and quietly lands on the wrong half of the balance sheet.
@@ -404,11 +506,46 @@ evaluates to null and quietly lands on the wrong half of the balance sheet.
 > prints identically, and misreports earnings. Unicode look-alikes are unbounded, so consumers key
 > on the *code*, and the balance sheet emits it for exactly that reason.
 
+### `chart_versions` — the chart as an append-only history
+
+A chart version is a snapshot of the whole presentation: created, never edited, never deleted. There
+is no stored "current version" and no singleton row to update — `max(version)` *is* the current
+chart (the view `chart_version_current`), so "current" cannot disagree with what exists. Each version
+carries a `note`, `NOT NULL` and non-empty, because IAS 1.41 requires the *reason* for a
+reclassification to be disclosed and that is the half a schema can hold.
+
+The point of versioning is that a reclassification is a **new version, never an edit** — which is
+what lets an issued statement name the version it was presented under and stay reproducible. A
+version whose content could change would identify nothing.
+
+### `chart_presentation` — which line a type reports under, per version
+
+This is where `fs_line` now lives. `account_types` carries a type's *identity* — its category and
+normal balance — and says nothing about where it prints. `chart_presentation` names, per
+`(chart_version, type_code)`, the `fs_line` that type rolls up to. Identity is unversioned;
+presentation is versioned, because IAS 1.41 requires presentation to change (with comparatives moving
+alongside) while identity may not change under posted history ([ADR-0012](/decisions/0012-chart-governance)).
+
+**A report resolves an account's line by looking up `chart_presentation` at a chosen
+`chart_version`.** Pass the current version and you get today's chart; pass the version an old
+statement was issued under and it still shows its old line, because the mapping it read is still a
+row, not something an edit overwrote. That is the whole reason `fs_line` was moved out of
+`account_types`: it used to live there unversioned, so a reclassification silently restated every
+statement ever issued.
+
+The integrity is two composite foreign keys — one into `account_types` carrying `category` and
+`counterparty_scope`, one into `fs_lines` carrying the generated `fs_statement` and `fs_side` — which
+is what turns "a revenue type may not report under an expense caption" into a key rather than a
+trigger. The two CAUGHT defects under `account_types` above are the ones that key stops.
+
 ### `ledger_account_balances` — the row a writer locks
 
-One row per (account, currency), holding total money in, total money out, and the last sequence
-number issued. It is the only table in the schema that is *supposed* to be updated, and it is
-rebuildable from the journal at any time.
+One row per (account, currency, `stripe`), holding total money in, total money out, and the last
+sequence number issued. It is the only table in the schema that is *supposed* to be updated, and it
+is rebuildable from the journal at any time. A **stripe** is a shard of a hot account's balance row
+(ADR-0013): to spread lock contention the balance is stored as N physical rows, a reader SUMs them,
+and an unstriped account holds exactly stripe 0 — so the primary key is `(tenant_id, account_id,
+currency, stripe)` and each stripe is a separate lock.
 
 **The obvious objection first: why store a balance at all, when you can add up the entries?** You
 can, and it stays correct forever — that is what makes this table a *cache* and not the truth. But
@@ -429,9 +566,9 @@ the new balance and the next sequence number — so the row lock *is* the serial
 through:
 
 ```sql
-INSERT INTO ledger_account_balances AS b (tenant_id, account_id, currency, input, output, last_seq)
+INSERT INTO ledger_account_balances AS b (tenant_id, account_id, currency, stripe, input, output, last_seq)
 VALUES (…)
-ON CONFLICT (tenant_id, account_id, currency) DO UPDATE
+ON CONFLICT (tenant_id, account_id, currency, stripe) DO UPDATE
    SET input    = b.input  + excluded.input,
        output   = b.output + excluded.output,
        last_seq = b.last_seq + 1
@@ -465,16 +602,20 @@ is enforced when the number is *issued* and checked nowhere afterwards
 > this table with a small absolute threshold, so the trigger stops scaling with the account count.
 > ([Spike 009](/spikes/009-where-the-balance-lives) has the run.)
 
-> **STILL OPEN — two copies, and nothing compares them.** The sum of the entries and this row are
-> two answers to the same question. No view compares them and no constraint relates them: the cache
-> was moved from 1,000.00 to 100.00 with `last_seq` forged, and every report stayed green. There
+> **CLOSED — two copies, and `recon_balance_breaks` compares them.** The sum of the entries and this row are
+> two answers to the same question. For a long time no view compared them and no constraint related
+> them: the cache was moved from 1,000.00 to 100.00 with `last_seq` forged, and every report stayed
+> green. There
 > used to be a *third* copy — a running balance on each entry — and
 > [spike 009](/spikes/009-where-the-balance-lives) dropped it, which improves this rather than
 > worsening it: the third number was computed *from* this row in the same transaction, so it agreed
 > with the cache even when the cache was wrong. Recomputing from the append-only entries is the
-> first comparison that can actually fail. It is on the roadmap and it is not built.
+> first comparison that can actually fail — **and it now ships**:
+> [ADR-0010](/decisions/0010-reconciliation) designed the comparison as `recon_balance_breaks`, in
+> six classes so the row's three jobs fail visibly apart, and it is applied in the baseline. The
+> forged-cache reproduction above is now one row in that view.
 
-> **STILL OPEN — every entry-level read counts `pending`; the reports do not.** One posted 100.00
+> **DECIDED — the cache means posted; entry-level reads that count `pending` are the *available* question.** One posted 100.00
 > and one pending 500.00, measured on this schema in one instant:
 >
 > | read | answer |
@@ -482,7 +623,7 @@ is enforced when the number is *issued* and checked nowhere afterwards
 > | this cache row (`input - output`) | **600.00** |
 > | recompute from `ledger_entries` | **600.00** |
 > | recompute joined to `status = 'posted'` | 100.00 |
-> | `trial_balance`, `balance_sheet` | 100.00 |
+> | `trial_balance`, `balance_sheet_at` | 100.00 |
 >
 > **This is not a cache defect**, which is what an earlier version of this paragraph called it. The
 > cache and the naive recompute agree exactly — and so did the running balance, before it was
@@ -490,35 +631,85 @@ is enforced when the number is *issued* and checked nowhere afterwards
 > `ledger_transactions.status` lives one join away and no entry-level read consults it. Only the
 > status-aware aggregate matches the statements, and it is the 4–14× more expensive query.
 >
-> Whether 600.00 is a bug or the definition of an *available* balance is
-> [roadmap question 2](/roadmap#2--does-the-ledgers-pending-inclusion-mean-available-balance-or-is-it-a-bug). TigerBeetle answers it by splitting the
-> counters — `debits_pending` and `debits_posted` are separate fields and a reported balance is
-> defined over the posted ones only, so a hold cannot silently inflate it. Fragment answers it by
-> refusing to model pending as a balance at all, making it a sibling account. This table does
-> neither.
+> [Roadmap question 2](/roadmap#the-cache-means-posted)
+> is answered: **the cache means POSTED** ([ADR-0010](/decisions/0010-reconciliation)). The writer
+> accumulates `input`/`output` for posted transactions only, while `last_seq` advances on every
+> entry — a pending entry still needs its `account_seq` issued under the same lock. TigerBeetle
+> reached the same split by separating `debits_pending` from `debits_posted`; this schema keeps one
+> pair of posted columns and *derives* "available" as posted plus the pending population, which
+> `recon_pending_bridge` enumerates and ages. The 600.00 row above describes the pre-decision
+> behaviour and is what the bridge now makes visible instead of implicit.
 
-> **STILL OPEN — a hard deployment constraint.** This works under PostgreSQL's default `READ
-> COMMITTED` isolation. Raise the isolation level and, under contention, the same statement fails
-> with *could not serialize access* — it fails closed, so nothing corrupts, but a retry loop does
-> not rescue it. No document owns this constraint yet.
+> **CLOSED — a hard deployment constraint, now owned and issued**
+> ([0013](/decisions/0013-write-path-contract) §1). This works under PostgreSQL's default `READ
+> COMMITTED` isolation. Raise the level and, under contention, the same statement fails with
+> *could not serialize access* — measured: 64–82% of writes lost at 8 writers, and an
+> in-transaction retry rescued **0 of 25,074** failures, because the snapshot does not move. So the
+> writer issues `BEGIN ISOLATION LEVEL READ COMMITTED` explicitly, which overrides a stricter
+> deployment default.
+
+### The period-close tables — a checkpoint on the business-date axis
+
+Idea 3 named the accountants' answer to "what was the balance as of a business date": a **period
+close**, which stores each period's closing balance so the query becomes *prior close plus entries
+since* rather than a walk of all history. Three tables hold it, and the close itself is an ordinary
+posting — nothing here computes it, these tables only record it:
+
+- `ledger_periods` — a resolved, half-open `[starts_at, ends_at)` boundary in absolute instants, with
+  the source timezone recorded as provenance. IANA rules are legislation and change, so a stored
+  (local date, zone) pair is not a stable instant; the instants are resolved once, at creation. A
+  tenant's periods may not overlap, enforced declaratively by an exclusion constraint — the one
+  reason the `btree_gist` extension is required ([ADR-0011](/decisions/0011-period-close-and-report-axes)).
+- `ledger_period_closes` — names the transaction that closed a period and the commit cursor the
+  checkpoint was computed at. The transaction is typed `period_close` and pinned inside the period by
+  composite keys, so a close cannot quietly name a revenue transaction and erase it from the income
+  statement.
+- `ledger_period_balances` — the effective-axis checkpoint itself: one row per account per period,
+  exactly recomputable from `ledger_entries` and reconciled by `recon_checkpoint_breaks`. It is a
+  bounded, rebuildable cache on the axis people actually query — not the per-entry running balance
+  [spike 009](/spikes/009-where-the-balance-lives) deleted.
+
+The tables are applied in the baseline; the writer that computes a close is not yet built.
+
+### `perimeter_attestations` — what a third party said
+
+Some account types are marked `is_perimeter`: they mirror exactly one *external* balance and must
+reconcile against it. That is a claim about the world, not about the row, so no `CHECK` can falsify
+it — only data about the world can. This table stores that data: what a bank, a network or a trustee
+said an account's balance was, on their statement date. The statement date is a business date with
+its timezone stored and resolved once to an instant (ADR-0011), so `perimeter_drift` compares a fixed
+instant rather than a session-resolved bare date. Like the journal, it is append-only.
 
 ## What the schema enforces today
 
 Measured against a fresh load of `migrations/00001_baseline.sql`, not asserted.
 
-**7 tables · 3 views · 23 indexes · 9 foreign keys · 15 CHECKs · 6 triggers over 2 functions · 0 event triggers · 0 policies**
+**13 tables · 15 views · 35 indexes · 25 foreign keys · 44 CHECKs · 1 exclusion constraint · 20 triggers over 3 functions · 3 event triggers over 1 function · 5 report functions · 27 policies · 3 roles**
+
+Counted 2026-08-27 on a fresh `psql -f` load. One extension, `btree_gist`
+([0011](/decisions/0011-period-close-and-report-axes)), installs its own operator-support functions
+into `public` — the "5 report functions" figure counts only ours (`report_cursor`,
+`trial_balance_at`, `income_statement_for`, `balance_sheet_at`, `recon_equation_breaks`), filtered
+by extension dependency.
 
 Those are the objects **the migration defines**. A database that has actually been migrated carries
 one more of each: `sqlx` creates its own `_sqlx_migrations` bookkeeping table, with a primary key —
-so `psql -f` gives 7 tables and 23 indexes, and `openledger migrate` gives 8 and 24. That extra
+so `psql -f` gives 13 tables and 35 indexes, and `openledger migrate` gives 14 and 36. That extra
 table is also the single object in a migrated database whose name does not match convention 1
 (`_sqlx_migrations_pkey`), and it is not ours to rename. Stated because the difference between
 "loaded the file" and "ran the migrator" is now a real fork, and a census that does not say which
 one it counted is the kind of number this section exists to stop.
 
-Every index and every named constraint matches `^(pk|uq|ix|ck|fk)_`; **0** carry a PostgreSQL default
-name. The card module's 4 tables, 2 views and 10 indexes are **parked** and applied by nothing —
-[`parked/card/`](/card/parked).
+Every index and every named constraint matches `^(pk|uq|ix|ck|fk|ex|rls)_`; **0** carry a PostgreSQL
+default name. The card module's 4 tables, 2 views and 10 indexes are **parked** and applied by
+nothing — [`parked/card/`](/card/parked), loaded by CI on top of the core on every push
+([0008](/decisions/0008-module-boundaries)).
+
+One convention that used to live only in a spike is now stated by the schema itself:
+**`ledger_account_balances.input` accumulates DEBIT legs and `output` CREDIT legs**, so
+`input - output` is the debit-positive arithmetic value of ADR-0007 rule 15 — and under the other
+reading every credit-normal account would report drift on its first entry, which is what makes the
+stated mapping falsifiable ([0010](/decisions/0010-reconciliation)).
 
 **Enforced by the database:**
 
@@ -529,9 +720,13 @@ name. The card module's 4 tables, 2 views and 10 indexes are **parked** and appl
   balance its type does not have; a type cannot report under a statement line that contradicts its
   category. A wrong chart is refused at seed time — verified, three of four mutant charts died on
   load.
-- **Append-only on the three immutable logs** — `ledger_entries`, `ledger_transactions`,
-  `ledger_events` — by trigger, `ENABLE ALWAYS`, so it holds on the replication apply path too.
-  `TRUNCATE` refused on the same three.
+- **Append-only on the nine immutable logs** — the journal trio (`ledger_entries`,
+  `ledger_transactions`, `ledger_events`), the chart's history (`chart_versions`, `fs_lines`,
+  `chart_presentation`), the attestation log, and the period record (`ledger_periods`,
+  `ledger_period_closes`) — by trigger, `ENABLE ALWAYS`, so it holds on the replication apply path
+  too. `TRUNCATE` refused on the same nine. **And the DDL channel is guarded**: three event
+  triggers refuse a table rewrite, a drop and an inheritance child on any of them
+  ([0009](/decisions/0009-append-only-perimeter)).
 - Uniqueness — `uq_events__idempotency`, `uq_txn__one_per_event` (one transaction per event),
   `uq_accounts__house` (one house account per tenant, purpose and currency), and **`uq_entries__account_seq`**, the
   journal's per-account sequence, which is arguably its most important key.
@@ -557,5 +752,5 @@ overridable, and *a column with a default is not a constraint*
 ([ADR-0004](/decisions/0004-where-logic-lives)).
 
 Everything else the schema does not hold is a gap rather than a design, and each one has a
-counterexample that reaches it. They are inventoried, with those counterexamples, in the decision
-log's [open list](/decisions#still-open) — which is maintained, and longer than this page.
+counterexample that reaches it. They are inventoried, with those counterexamples, in each ADR's *"What it costs"*, and the unbuilt
+work they imply is on the [roadmap](/roadmap).

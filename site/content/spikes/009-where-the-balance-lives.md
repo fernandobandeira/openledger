@@ -211,7 +211,7 @@ parent's balance is the sum of its children, the parent *includes* pending; anyt
 
 `ledger_account_balances` today has `input`/`output` and no such split, and the card product's holds
 are exactly the pending money in question. That is
-[roadmap question 2](/roadmap#2--does-the-ledgers-pending-inclusion-mean-available-balance-or-is-it-a-bug)'s
+[roadmap question 2](/roadmap#the-cache-means-posted)'s
 territory, not this spike's.
 
 ---

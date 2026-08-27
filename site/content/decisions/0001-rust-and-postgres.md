@@ -10,13 +10,21 @@
 checks every query against a live database at compile time and gives back typed rows. The ledger's
 procedural logic lives in Rust; Postgres holds the shape ([0004](/decisions/0004-where-logic-lives)).
 
-## Why
+**Why Rust: the compiler catches more, before the code ever runs.** A ledger's worst failures are
+the quiet ones — a balance that reads zero instead of erroring, a case the code forgot to handle —
+and Rust refuses to compile a class of them outright, with no linter, no config, and no test anyone
+has to remember to write. That's safety by construction instead of by discipline, and it matters
+double for AI-written code, where "it compiled" is a far stronger promise than "a test passed."
+**Postgres**, because one boring instance already has 16–40× the headroom this needs; **`sqlx` and
+no ORM**, because the hot queries are meant to be read as SQL and checked against the real database,
+not a file that can drift.
 
-**Rust, because two of this project's guarantees were written down before they were true, and only
-a type system catches that.** Spike 007 built `post_transaction`, the authorization hot path and
-the seven-variant `auth_event_kind` machine twice, against the real schema, then wrote this
-project's own bugs into both. Rust's compiler caught **5 of 5** with no tooling. Go's compiler and
-`go vet` caught **0 of 5**. Two of the five were guarantees an accepted ADR had already claimed:
+## The evidence
+
+Spike 007 built `post_transaction`, the authorization hot path and the seven-variant
+`auth_event_kind` machine twice against the real schema, then seeded this project's own bugs into
+both. **Rust's compiler caught 5 of 5 with no tooling; Go's compiler and `go vet` caught 0 of 5.**
+Two of the five were guarantees an accepted ADR had already claimed in writing:
 
 - **"An unbalanced transaction is unconstructible."** With four unexported fields and one validating
   constructor, `ledger.Posting{}` still compiles from another package — an empty composite literal
@@ -30,7 +38,7 @@ project's own bugs into both. Rust's compiler caught **5 of 5** with no tooling.
   same trap. 50.00 of real headroom, `posted_minor` dropped from a `SELECT` in a refactor, scanned as
   `0` with `err == nil`, and a **200.00 authorization approved**. Build clean, vet clean.
 
-Three more that matter for a ledger. A `match` missing `expiry_reversal` is `error[E0004]`, with no
+**Three more that matter for a ledger.** A `match` missing `expiry_reversal` is `error[E0004]`, with no
 linter, no configuration and no third-party binary — where Go's `switch` needs `nishanths/exhaustive`,
 which last released **2023-11-11** and no longer installs under Go 1.26. **A `Result` cannot be
 dropped**: `let posted = posted_balance(...)` will not type-check into an `i64`, so every one of the
@@ -39,43 +47,46 @@ character and `go vet` is silent. And a **nullable column is `Option<i64>`**, so
 simply does not compile — Go dereferences the nil and panics. *The panic is the good case; it is
 loud and it aborts the transaction. The silent zero is the one that reconciles.*
 
-**PostgreSQL, because the headroom is measured, not assumed.** Spike 003 recorded **~800 clearings/s
-unsharded and 6,970–7,897 striped at 64**, durability on, one 16-core machine — **16–40×** the volume the
-reference product needs. At the top of the ladder the curve "plateaus **because the machine ran out of
+Spike 003 recorded **~800 clearings/s unsharded and 6,970–7,897 striped at 64**, durability on, one
+16-core machine — **16–40× the volume the reference product needs**. At the top of the ladder the curve "plateaus **because the machine ran out of
 cores rather than because of a lock**. The ceiling moved from the design to the hardware."
 
 **18 is a floor, not a preference.** `uuidv7()` is the default id on **four** tables in
 `migrations/00001_baseline.sql` (two more in the parked card DDL) and does not exist before
 PostgreSQL 18. It is chosen over `gen_random_uuid()` because it is time-ordered, so an append-only
 log reads chronologically by its own key. Nothing degrades gracefully on 17: the migration does not
-load. The roadmap targets RDS for M4 and M6, which must therefore run 18.
+load. Any [RDS deployment or benchmark](/roadmap#if-this-ever-wants-a-production-story) the roadmap
+defers must therefore run 18.
 
-**`sqlx`, because it checks the query against the database, not against a file.** A checked-in DDL
-file that has drifted from production is checked against confidently and wrongly; `sqlx` introspects
-the real thing. `ALTER TABLE credit_lines ALTER COLUMN limit_minor TYPE numeric`, no code touched:
+A column's type changed under the code — `ALTER TABLE credit_lines ALTER COLUMN limit_minor TYPE
+numeric`, nothing else touched — and **`sqlx` refused to compile while Go built clean and coerced
+`numeric` into `int64`:**
 
 ```
 Rust:  error: SQLx feature `bigdecimal` required for type NUMERIC of column #1 ("limit_minor")
 Go:    go build exit=0 -- and it RAN, coercing numeric into int64 and printing a number
 ```
 
-**No ORM, because the hot queries are hand-tuned artifacts meant to be read as SQL** — by us and
-plausibly by an auditor. The authorization decision is one transaction using `FOR UPDATE`, a filtered
-aggregate and `ON CONFLICT … DO NOTHING`; a balance is an index lookup on `(account_id, account_seq
-DESC)`. Diesel was tried against the real schema and produced **0 of 5 views and 0 `joinable!`
-entries**, because every foreign key here is composite — the entire reporting layer
-[0007](/decisions/0007-schema-conventions-and-chart) builds its completeness argument on is invisible to it.
+`sqlx` introspects the live database, so a DDL file that has drifted from production cannot be checked
+against confidently and wrongly.
+
+Diesel, tried against the real schema, produced **0 of 5 views and 0 `joinable!` entries** — because
+every foreign key here is composite, the entire reporting layer
+[0007](/decisions/0007-schema-conventions-and-chart) builds its completeness argument on is invisible
+to it. The hot queries are hand-tuned artifacts meant to be read as SQL, by us and plausibly by an
+auditor: the authorization decision is one transaction using `FOR UPDATE`, a filtered aggregate and
+`ON CONFLICT … DO NOTHING`; a balance is an index lookup on `(account_id, account_seq DESC)`.
 
 **Formance reached the same "no procedural logic in the database" position, expensively.** Their v1
 put the ledger *in* PL/pgSQL; migration 37 drops 27 stored functions and moves it into Go
 ([spike 001](/spikes/001-formance)). Note what they **kept**: the constraints. It is
 procedural logic they reversed, not database-enforced correctness.
 
-## Alternatives
+## What we considered
 
 | | Why not |
 | --- | --- |
-| **Go** | The prior decision, and it lost on the evidence it was re-examined against — 0 of 5. It also won one round cleanly, and that round is now a cost of this decision rather than a footnote: see below. Its original case rested partly on Temporal SDK quality, a premise [0001](/card/decisions/0001-authorization-holds) removed. |
+| **Go** | The prior decision, and it lost on the evidence it was re-examined against — 0 of 5. It also won one round cleanly, and that round is now a cost of this decision rather than a footnote: see below. Its original case rested partly on Temporal SDK quality, a premise the card rail's [authorization-holds decision](/card/decisions/0001-authorization-holds) removed. |
 | **Diesel** | 0 of 5 views, 0 `joinable!` on composite foreign keys. A DSL that cannot see the reports is worse than no DSL. |
 | **Kotlin/JVM** | Sealed classes give exhaustive state machines, which was the strongest single argument against Go — and Rust gives the same thing without the stack weight. |
 | **TypeScript** | Default numeric type is a float. Every boundary would need `bigint` discipline forever. |
@@ -88,7 +99,7 @@ procedural logic they reversed, not database-enforced correctness.
   linter then forces you to visit every `match`. **Rust has no codegen step, so the hand-written enum
   does not grow and `cargo build` stays clean while the database has a value the code has never
   heard of.** The mitigation is a test that reads `pg_enum` and asserts it equals the Rust enum,
-  variant for variant; it is not written. Without it, this decision trades a compile error for a
+  variant for variant. Without it, this decision trades a compile error for a
   runtime one — `sqlx` *does* refuse the unknown value at decode rather than accepting it silently,
   so it fails loudly, but it fails in production rather than in CI.
 - **`#[sqlx(default)]` is this stack's `Lax`, and it is banned on money fields.** It reproduces the
@@ -110,6 +121,11 @@ procedural logic they reversed, not database-enforced correctness.
   56.46% — **a retention signal among people who already cleared the learning curve, not a hiring
   pool.** This cuts against [the open-source goal in `vision.md`](/vision) and is the
   clearest thing this decision gives up.
-- **Tenant isolation is meant to be row-level security and is not built.** `tenant_id` leading every
-  key is the prerequisite and it exists; the policies do not.
+- **Tenant isolation is row-level security on the READ path only** — the qualifier
+  [0013](/decisions/0013-write-path-contract) forces. The policies exist now (nine tables, three
+  roles, an unscoped reader fails closed), but the writer is admitted whole by an explicit policy:
+  the write path is the one code path reviewed line by line, it carries `tenant_id` in every key,
+  and `BYPASSRLS` — the other way to say this — is ungrantable on RDS and Aurora at all. "Tenant
+  isolation *is* row-level security" was always half a claim; the writer's half is the type system
+  and the keys.
 - Correctness pressure moves into Rust, SQL, migrations and tests rather than into a framework.

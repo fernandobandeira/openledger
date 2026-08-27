@@ -11,11 +11,11 @@ the two things an ADR cannot: **the chart of accounts in detail**, and **the car
 text**, where each step can be diffed, grepped and argued with.
 
 Two things to hold while reading. Durable timers run **in-process on Postgres**
-([ADR-0001](/card/decisions/0001-authorization-holds)), not on an external workflow engine. And the hold
+([card 0001 · authorization holds](/card/decisions/0001-authorization-holds)), not on an external workflow engine. And the hold
 tables named in the trace below are the *shape* of the design, not what shipped: `card_holds`,
 `credit_lines`, `spend_controls` and `card_transactions` do not exist. The hold model is **written and parked** as an
 append-only trio — `card_auth_events`, `card_auth_event_group`, `card_hold_groups`
-([ADR-0001](/card/decisions/0001-authorization-holds)) — in
+([card 0001 · authorization holds](/card/decisions/0001-authorization-holds)) — in
 `parked/card/schema.sql`, which **no migration applies**. The
 credit-line and spend-control tables were never written at all (roadmap M7).
 
@@ -34,7 +34,7 @@ interchange is recognized. That is **our choice, not the field's** — about hal
 write a durable, balance-affecting row at authorization time and about half keep it outside the
 ledger as we do. [Spike 002](/card/spikes/002-processor-hold-semantics) has the split per
 vendor; it is not repeated here, because a list in two places drifts out of step with itself.
-See also [ADR-0001](/card/decisions/0001-authorization-holds).
+See also [card 0001 · authorization holds](/card/decisions/0001-authorization-holds).
 
 ## The chart of accounts
 
@@ -85,14 +85,22 @@ Six things in that table are not obvious, and each of them is a way to get the b
   opposite-sign positions against *different* tenants into one number: owing t1 425.00 while t2 owes
   425.00 prints a payables line of zero. IAS 32.42 and ASC 210-20-45-1 permit offset only between
   the same two parties with an enforceable right of setoff.
-- **`is_perimeter` and `counterparty_scope` are declarative.** No view, function or test reads
-  either, so a wrong value is undetectable — mutation testing flips it and nothing fails.
-  `is_perimeter` asserts "this account mirrors exactly one external balance and must reconcile
-  against it", and nothing reconciles yet. A `CHECK` could not help: the column is a claim about the
-  world, not about the row. Recorded as open in ADR-0007.
+- **`is_perimeter` and `counterparty_scope` are now read, not merely declared.**
+  `counterparty_scope` is held by a composite foreign key onto `account_types` and linted by
+  `chart_lint`: a `per_shard` type in a house account, a `shared` type keyed to many owners, or a
+  `none` type on an owner-keyed account each raise an error
+  ([ADR-0012](/decisions/0012-chart-governance)). `is_perimeter` asserts "this account mirrors
+  exactly one external balance and must reconcile against it", and now something does — `perimeter_drift`
+  compares that balance against a third party's attestation in `perimeter_attestations`, `chart_lint`
+  flags a perimeter account carrying entries with no attestation (and an attestation against a
+  non-perimeter type), and mirrored pairs net out through the `cross_scope_mirror` reconciliation
+  check ([ADR-0010](/decisions/0010-reconciliation)). A plain `CHECK` still can't settle whether the
+  external claim is right — that is what the attestation is for.
 
-`retained_earnings` has nothing written to it — there is no closing process yet, so un-closed
-earnings appear as the derived `current_year_earnings` line in the `balance_sheet` view.
+`retained_earnings` receives its balance only at period close, swept there by a `period_close`
+transaction ([ADR-0011](/decisions/0011-period-close-and-report-axes)); until then, earnings posted
+since the last close appear as the derived `current_year_earnings` line that the `balance_sheet_at`
+function synthesises.
 
 ## Reading a balance, and the trap in the as-of query
 
@@ -106,12 +114,12 @@ correct on the order rows were inserted in.
 SELECT input - output FROM ledger_account_balances
 WHERE tenant_id = :tenant AND account_id = :acct AND currency = :ccy;
 
--- balance as of a past RECORDING instant: an aggregate, not a lookup. The ORDER BY
--- and the predicate must both match ix_entries__asof_recorded. tenant_id is not
--- optional -- it leads every index, and without it this plans as a Seq Scan.
+-- balance as of a pinned COMMIT cursor: an aggregate, not a lookup. The predicate
+-- must match ix_entries__asof_commit (tenant_id, account_id, xact_id). tenant_id is
+-- not optional -- it leads every index, and without it this plans as a Seq Scan.
 SELECT sum(CASE WHEN direction = 'debit' THEN amount_minor ELSE -amount_minor END)
 FROM ledger_entries
-WHERE tenant_id = :tenant AND account_id = :acct AND recorded_at <= :as_of;
+WHERE tenant_id = :tenant AND account_id = :acct AND xact_id < :cursor;
 ```
 
 > **The current-balance read is the one the ~1s authorization deadline depends on**, and dropping
@@ -121,15 +129,17 @@ WHERE tenant_id = :tenant AND account_id = :acct AND recorded_at <= :as_of;
 > deliberately, and the card rail is where it is felt first.
 
 **The as-of query is not "the current balance with one more predicate".** It cannot be, now: the
-current balance is a different table. `ix_entries__asof_recorded` exists for exactly the second
+current balance is a different table. `ix_entries__asof_commit` exists for exactly the second
 query, and the predicate above is what reaches it — written any other way the planner scans and
 discards.
 
-Two limits on what that second query answers. It is a *recording*-axis question only: a business-date
-balance must aggregate over `effective_at`, because a backdated entry lands with a later sequence
-number ([ADR-0006](/decisions/0006-time-and-as-of)). And it is **not yet reproducible** —
-`recorded_at` defaults to transaction *start* time and is not monotonic with commit order, so the
-same as-of query can re-run to a different answer ([ADR-0006](/decisions/0006-time-and-as-of)).
+Two limits on what that second query answers. It is a *commit*-axis question only: a business-date
+balance must aggregate over `effective_at` instead — on `ix_entries__effective` — because a backdated
+entry lands with a later `xact_id` than the business date it belongs to
+([ADR-0006](/decisions/0006-time-and-as-of)). And the cursor is a **horizon, not an instant**:
+pinning `pg_snapshot_xmin(pg_current_snapshot())` makes an issued statement reproducible, but it also
+lags the newest writes by the longest in-flight transaction — the price of committing without a
+global lock ([ADR-0006](/decisions/0006-time-and-as-of)).
 
 ## Edge cases that decide whether you've built this before
 

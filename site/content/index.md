@@ -42,8 +42,8 @@ leaves them **empty**: the chart is data, seeded separately, and yours will diff
 [**The database**](/database) has the diagram, every table, and why each one has the shape it has.
 Read it before the SQL.
 
-**What exists today** is the [roadmap](/roadmap); what the database does not hold yet is the
-decision log's [open list](/decisions#still-open).
+**What exists today** is the [roadmap](/roadmap); what the database does not hold yet is a roadmap
+milestone, and every limitation a decision accepted is in that ADR's own *"What it costs"*.
 
 ## Two rules run through everything
 
