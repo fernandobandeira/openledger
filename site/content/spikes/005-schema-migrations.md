@@ -122,7 +122,7 @@ error is the silent variant: `atlas schema inspect --format '{{ sql . }}' > insp
 259 clean-looking lines and **zero `CREATE VIEW`** in them; the "Skipping… Upgrade to Pro" notice
 only appears on a TTY. psqldef v3.11.20 **SIGSEGVs** on `trial_balance`. Adopting either means paying
 for Pro or deleting from `schema.sql` the objects it exists to prove are expressible — the same shape
-as River's periodic jobs in [ADR-0001](/card/decisions/0001-authorization-holds).
+as River's periodic jobs in [card 0001 · authorization holds](/card/decisions/0001-authorization-holds).
 
 **The declarative half was never about applying anything, and we keep it.** What one flat file buys
 is readability and diffability. The synthesis is **versioned application, declarative verification**:
@@ -159,7 +159,7 @@ avoided. One `sql.Open("pgx", dsn)` at startup, closed after migrating; the hot 
 
 And a ceiling read from source, not exercised: goose polls every 5 s, 60 times — **five minutes**.
 A baseline slower than that makes the *other* instances give up. `lock.WithLockTimeout` needs setting
-deliberately before M4.
+deliberately before any RDS benchmark.
 
 ## What could not be verified
 

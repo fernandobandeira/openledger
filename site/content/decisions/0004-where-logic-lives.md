@@ -9,6 +9,15 @@ for the survey, [spike 001](/spikes/001-formance) for Formance.
 **The ledger is Rust. PostgreSQL holds the shape** — tables, types, `NOT NULL`, single-row `CHECK`s,
 foreign keys, unique indexes. No PL/pgSQL logic, no orchestration, no derivation-with-backfill.
 
+**The database holds the shape of the data; the reasoning about it lives in Rust.** A database is
+good at holding a shape — this column can't be null, these two values must match — and the wrong
+place for logic. Rules pushed into it as triggers and stored procedures are *magical*: they fire
+invisibly, and they're hard to read, maintain, and reason about. In Rust the same rules are
+declarative and readable, in code we control and can test. So the constraints that guard shape stay
+in the database and the procedural work lives in Rust — and a trigger is the exception that has to
+earn its place in writing, because a `DEFAULT` a caller can override is a convenience, not a
+guarantee.
+
 **A trigger needs a written justification in the schema beside it, and the default is none:** **the
 invariant** it holds, **why nothing declarative holds it** — no `CHECK`, no key, no `GENERATED`
 column, not simply withholding the privilege — and **what it does NOT protect against**. Two clear
@@ -17,12 +26,12 @@ immutable logs. Nineteen did not; the table below sums 27 removed-or-kept. *(It 
 over four logs while the card event log shipped in the same file; that log is now parked, and the
 two functions are unchanged.)*
 
-## Why
+## The evidence
 
-**A column with a `DEFAULT` is not a constraint.** `recorded_at`, `account_seq`, `xact_id` and
-`uuidv7()` ids had a default and nothing else, and every one proved forgeable by an `INSERT`;
-`effective_at` was made honest inside a composite key. Each row below is a state the design claimed
-impossible, reached with the application role's ordinary `INSERT` grant and every check green.
+`recorded_at`, `account_seq`, `xact_id` and the `uuidv7()` ids each had a `DEFAULT` and nothing
+else, and **every one proved forgeable by an ordinary `INSERT`** — only `effective_at` was made honest,
+inside a composite key. Each row below is a state the design claimed impossible, reached with the
+application role's ordinary `INSERT` grant and every check green.
 
 | The invariant | What was reached without it |
 | --- | --- |
@@ -33,9 +42,9 @@ impossible, reached with the application role's ordinary `INSERT` grant and ever
 | **Immutability on the event log**, not just assignment. | `ledger_events` stamped `recorded_at` on insert and let an `UPDATE` rewrite it afterwards — and `idempotency_hash` with it, the column whose entire job is *same key, different body, refuse*. Rewrite the hash and the next replay of that key returns the wrong stored result. |
 | **An account's owner frozen.** `purpose`, `currency` and `tenant_id` are frozen by unique indexes and composite foreign keys; the owner is not. | One `UPDATE` moved 110,000 of receivable from a named company to `owner_id NULL`: every balance identical, trial balance balanced, drift silent — because no report reads the owner. A receivable owed by nobody is not a receivable, and there is no entry to reverse. |
 | **A correction pointing at something it can correct.** `resolves_id` and `reverses_id` have foreign keys, so the target must *exist*. | Nothing requires the target to be in a state the correction means anything against. A posted transaction "resolved" by another posted one, and a pending one "reversed", took revenue to **−49,223** with drift at 0 and the equation balanced. The referential integrity was real; the semantic linkage was assumed. |
-| **`ENABLE ALWAYS` on triggers — including the foreign keys' own.** | `session_replication_role = 'replica'` (the logical-replication apply path, and what `pg_restore --disable-triggers` sets) skips triggers left in the default `ENABLE ORIGIN` state, **and foreign keys are implemented as triggers**. With the FK triggers left in that state, a transaction spanning two tenants, both legs in a currency their account does not hold, dated 27 years before its own transaction, committed cleanly on that path. *(Open: all **36** internal FK triggers in the shipped schema are `ENABLE ORIGIN` — nine foreign keys, four triggers each, re-counted after the card split took the tenth.)* |
+| **`ENABLE ALWAYS` on triggers — including the foreign keys' own.** | `session_replication_role = 'replica'` (the logical-replication apply path, and what `pg_restore --disable-triggers` sets) skips triggers left in the default `ENABLE ORIGIN` state, **and foreign keys are implemented as triggers**. With the FK triggers left in that state, a transaction spanning two tenants, both legs in a currency their account does not hold, dated 27 years before its own transaction, committed cleanly on that path. *(Deliberately left `ENABLE ORIGIN` by [0009](/decisions/0009-append-only-perimeter): the one-`ALTER TABLE`-per-key fix once proposed here **is not a statement PostgreSQL accepts** — a foreign key's internal triggers have OID-derived names, the catalog-loop spelling that works needs a real superuser, and so does the replica channel itself. The consequence is detected instead: an entry laundered past its keys is enumerated by `recon_entry_breaks`, [0010](/decisions/0010-reconciliation).)* |
 | **A chart that cannot contradict itself.** | Pointing a `revenue` type at a cost-of-revenue line put 6,000 of revenue on the expense side of the income statement — the harm [0007](/decisions/0007-schema-conventions-and-chart) is about — with every check green. A balance-sheet line carrying side `debit` was counted on *neither* side and vanished: 90% of a sheet missing, reporting balanced. Now a composite foreign key rather than a trigger, which is strictly better. |
-| **One convention per hold group; expiry measured against a snapshot.** | Mixing deltas with cumulative totals is *irreconcilable*, not merely awkward. And `assigned_at > expired_at` compares two `now()` values, so any writer whose transaction opened before the release timer fired was invisible. Both are [0001](/card/decisions/0001-authorization-holds)'s, and both survive in the card DDL — now parked in [`parked/card/`](/card/parked) and applied by no migration. |
+| **One convention per hold group; expiry measured against a snapshot.** | Mixing deltas with cumulative totals is *irreconcilable*, not merely awkward. And `assigned_at > expired_at` compares two `now()` values, so any writer whose transaction opened before the release timer fired was invisible. Both come from the card rail's [authorization-holds decision](/card/decisions/0001-authorization-holds), and both survive in the card DDL — now parked in [`parked/card/`](/card/parked) and applied by no migration. |
 
 **A finding is a claim, too.** One escape once recorded here — plant a transaction carrying a *future*
 `xact_id`, wait for the counter to reach it, then append legs — reached an ADR and a migration on a
@@ -88,7 +97,7 @@ It is not designed to handle complicated business data flow."* **Neither removed
 balance limits are enforced within the database"* — but not in SQL: no `UPDATE`, no `DELETE`, no half
 a transfer, nothing for a guard to police.
 
-## Alternatives
+## What we considered
 
 | | Why not |
 | --- | --- |
@@ -101,7 +110,7 @@ a transfer, nothing for a guard to police.
 
 These invariants bind only writers that are ours — not **direct DML by the owner**, not **a second
 adapter** written later, not the `session_replication_role = 'replica'` paths above, where the manual
-says *"in the default configuration, triggers do not fire on replicas"*. The six triggers are
+says *"in the default configuration, triggers do not fire on replicas"*. The eighteen append-only and no-truncate triggers are
 `ENABLE ALWAYS`, firing *"regardless of the current replication role"* — by counterexample: with it
 removed, `SET session_replication_role='replica'; DELETE FROM ledger_events` deletes the row; with it,
 refused.
@@ -117,15 +126,17 @@ over each record. Both published answers live outside the database; this is the 
 | --- | --- |
 | **`REVOKE CREATE ON SCHEMA public FROM PUBLIC` is a no-op here** | Since PostgreSQL 15, PUBLIC has no `CREATE` on `public` to revoke — load-bearing only on PG ≤ 14, and our floor is 18. Not a defence. |
 | **`GRANT ALL` re-grants everything** | And a superuser can set `session_replication_role` or drop the triggers. There the defence is backups and audit, not the schema. |
-| **Table inheritance disarms every constraint — open** | `CHECK`s are inherited; foreign keys, unique indexes and triggers are not. A child of `ledger_entries` plus one `INSERT … SELECT * FROM ONLY` took an income statement from 900 to 1,800, and the child stays visible through the parent to every view. `pg_event_trigger` is empty. |
+| **Table inheritance disarms every constraint — speed-bumped by [0009](/decisions/0009-append-only-perimeter)** | `CHECK`s are inherited; foreign keys, unique indexes and triggers are not. A child of `ledger_entries` plus one `INSERT … SELECT * FROM ONLY` took an income statement from 900 to 1,800, and the child stays visible through the parent to every view — and it was worse than this row first said: `DELETE FROM` the child *removes* parent-visible rows too. An event trigger on `ddl_command_end` now refuses the **naive** child of any append-only table (a state assertion over `pg_inherits`, so `CREATE TABLE … INHERITS` and `ALTER TABLE … INHERIT` are both caught) and `pg_event_trigger` is no longer empty — but it is a speed-bump, not a close: a `RENAME`/`SET SCHEMA` walks past it, so [0009](/decisions/0009-append-only-perimeter) records the owner-accident DDL class as an accepted limitation backstopped by the CI snapshot test. |
+| **`ENABLE TRIGGER ALL` forgets `ENABLE ALWAYS`** | One data-only restore (`pg_restore --disable-triggers`, which the circular keys on `ledger_transactions` force) downgrades all the append-only triggers to `ENABLE ORIGIN`, silently and permanently. The rule — restore schema-and-data, never data-only — and the snapshot test dumping `pg_trigger.tgenabled` are the coverage ([0009](/decisions/0009-append-only-perimeter)). |
 | **Gaplessness is enforced at issue, not verified at rest** | Nothing scans the journal for a gap that arrived some other way. |
 | **The chart is not versioned** | `fk_types__fs_line` blocks a statement-line change only across a statement or a side; **within one statement and side it is accepted, under posted history** ([0007](/decisions/0007-schema-conventions-and-chart)). Reclassifying `fbo_cash` from `restricted_cash` to `cash` moved 440.00 of customer float into unrestricted liquidity, one statement, no error. A stopgap, since IAS 1.41 *requires* reclassifying comparatives. |
 
-**Until the write path exists, nothing enforces balance at all.** `ledger_entries` stores independent
-rows carrying a `direction`, so an unbalanced transaction is expressible and the deferred trigger that
-refused it is gone. Every system in the survey that made this move shipped the enforcing code path
-first; we did not. The fix is a posting-shaped write primitive, not a grant and not a trigger
-([0005](/decisions/0005-event-log-and-write-path)).
+**The schema alone enforces no balance; the posting primitive does.** `ledger_entries` stores
+independent rows carrying a `direction`, so an unbalanced transaction is expressible at the table
+level and the deferred trigger that refused it is gone. Balance is enforced by construction in the
+write primitive — not by a grant and not by a trigger
+([0005](/decisions/0005-event-log-and-write-path)) — and every system in the survey enforces it in
+that write path rather than in the schema.
 
 **What survives:** `migrations/00001_baseline.sql`, applied by
 `openledger migrate` — the counted inventory of what is in it lives in one place,

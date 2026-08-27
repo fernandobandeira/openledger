@@ -24,14 +24,14 @@ load guard and a header that were not in the original.
 | `card_auth_unmatched`, `card_hold_drift` | the review queue and the alarm |
 | 2 append-only triggers, 10 indexes, 7 CHECKs, 1 foreign key, 4 GRANTs, 1 REVOKE | Measured, not asserted: load `migrations/00001_baseline.sql` then this file into an empty database and the counts move by exactly that. The 10 indexes are 4 primary keys plus 6 `CREATE INDEX`. The one foreign key is `card_auth_event_group → card_auth_events`; none crosses into the core, in either direction. An earlier version of this row said "4 indexes" three lines above a sentence saying ten, and listed neither the CHECKs, the foreign key nor the REVOKE. |
 
-Its design is [ADR-0001](/card/decisions/0001-authorization-holds), which is unaffected —
+Its design is the card rail's [authorization-holds decision](/card/decisions/0001-authorization-holds), which is unaffected —
 the decision stands, the DDL is just not deployed.
 
 ## Why it is parked rather than shipped
 
 **Because [ADR-0003](/decisions/0003-migrations) forbids editing an applied migration,
 and this DDL has recorded, unfixed defects.**
-[ADR-0001 §*Known, and not fixed*](/card/decisions/0001-authorization-holds#known-and-not-fixed)
+[card 0001 · authorization holds §*Known, and not fixed*](/card/decisions/0001-authorization-holds#known-and-not-fixed)
 lists open findings in this model, **at least four of which under-reserve credit** — the failure this
 project calls the cardinal sin. `migrations/00001_baseline.sql` has been applied to real databases.
 Had these tables shipped inside it, every one of those defects would now be frozen into an
@@ -54,19 +54,27 @@ enum it never writes to is real, and it is *not* why this file is here — it is
 **And parking does not deliver what [ADR-0008](/decisions/0008-module-boundaries)
 wanted, which is removability.** A `card` schema gives you `DROP SCHEMA card CASCADE` — one
 statement, verified to leave every core table, foreign key and view intact. A parked file gives you a
-file nothing installs, nothing loads and nothing tests. Those are not the same property, and this
-directory buys the weaker one. It is recorded as open in
-[the decision log](/decisions#still-open).
+file no *migration* installs — CI now loads and smoke-tests it
+([0008](/decisions/0008-module-boundaries)), which asserts the dependency and still is not
+removability. Those are not the same property, and this directory buys the weaker one. The removability
+work — migration 00002 creating the `card` schema — is roadmap [M7](/roadmap#m7--cards).
 
 So: the design is kept, the evidence is kept, the DDL is kept and stays editable, and the database
-stays clean until someone invests the time.
+stays clean until someone invests the time. The card rail's [hold-corrections decision](/card/decisions/0002-hold-corrections) is the
+rewrite this argument was protecting — the exact hunks are in it, and this file is where they land.
+And parking is no longer guard-free: since [0008](/decisions/0008-module-boundaries), CI
+loads this file on top of the core on every push, so a core rename that would strand it fails a
+check instead of nothing.
 
 ## What has to happen before it comes back
 
-1. **[ADR-0008](/decisions/0008-module-boundaries) gets applied** — these objects move
-   into their own `card` PostgreSQL schema so the module is *removable* (`DROP SCHEMA card CASCADE`)
-   rather than merely unused, and the collision test that ADR requires gets written. 0009 is still
-   `proposed`.
+1. **[ADR-0008](/decisions/0008-module-boundaries)'s surviving half gets applied** — these objects
+   move into their own `card` PostgreSQL schema so the module is *removable*
+   (`DROP SCHEMA card CASCADE`) rather than merely unused, and the collision test that ADR requires
+   gets written. It is **migration 00002**, and the seven core tables stay in `public`: 0008's
+   symmetric `core` schema is dead, because 00001 is applied
+   ([0008](/decisions/0008-module-boundaries)). 0008 is `accepted` with its artifact
+   parked, so item 2 below is no longer in tension with this one.
 2. **It becomes a second migration, not an edit to 00001.** `00001_baseline.sql` has been applied to
    real databases by then; changing an applied migration is not a thing you get to do.
 3. **The three core objects it leans on stay put** — `refuse_mutation()`, `refuse_truncate()` and the

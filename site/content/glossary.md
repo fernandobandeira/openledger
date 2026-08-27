@@ -116,7 +116,7 @@ pump authorization clearing at $95. **Forced post** — a clearing with no autho
 
 An authorization is not one message. A purchase can produce an authorization, several increments, a
 reversal and several clearings, arriving in any order and sometimes twice. The designed model
-([ADR-0001](/card/decisions/0001-authorization-holds)) keeps every message as an immutable row in
+([card 0001 · authorization holds](/card/decisions/0001-authorization-holds)) keeps every message as an immutable row in
 `card_auth_events` and derives the hold from them. That DDL is written and **parked** in
 [`parked/card/`](/card/parked); no migration applies it.
 
@@ -158,9 +158,11 @@ forty-year-old problem: it is the branch record in the 1985 DebitCredit benchmar
 disk, which is why a bigger instance doesn't help.
 
 **Striping** — storing one logical account as N physical rows so writers spread across them;
-balance = sum of the stripes. **Not built** ([roadmap](/roadmap)). Measured in [spike
-003](/spikes/003-throughput-ceiling) only, on the same single machine as the figure above:
-872 → 6,970 clearings/s at 64 stripes.
+balance = sum of the stripes. **The schema is applied** — `ledger_account_balances.stripe`, the
+`(tenant_id, account_id, currency, stripe)` primary key and `fk_entries__stripe`
+([0013](/decisions/0013-write-path-contract)) — but the **writer that picks a stripe is not built**
+(roadmap M3). Measured in [spike 003](/spikes/003-throughput-ceiling) only, on the same single machine
+as the figure above: 872 → 6,970 clearings/s at 64 stripes.
 
 **Skew** — how unevenly traffic is spread across customers. Uniform = everyone equal; skewed = one
 customer is most of your volume, which is what real platforms look like. It matters because giving

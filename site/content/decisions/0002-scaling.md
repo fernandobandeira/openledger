@@ -9,17 +9,23 @@
 and it stays on one PostgreSQL instance, treating the hot account rather than the hardware as the
 thing that runs out.
 
+**The thing that runs out first is a single row, not the server.** Nearly every transaction touches
+a few shared accounts — settlement, fee revenue — and writers to the same row have to queue one
+behind another. A bigger machine or a second datastore does not clear that queue, because the
+contention is on the row, not the hardware. So the fix is to split one hot account into several
+physical rows and let writers spread across them — and we sized the real load first, which confirmed
+that one ordinary Postgres has room to spare.
+
 The core is accounts, transactions, entries, balances, the two time axes and the event log. Cards,
 spend controls and credit lines are built *on* it; a marketplace wallet simply does not install them.
-**The core ships first and the card rail comes after it** — [0001](/card/decisions/0001-authorization-holds) is
+**The core ships first and the card rail comes after it** — [the card rail's authorization-holds decision](/card/decisions/0001-authorization-holds) is
 scoped as future work on that basis. That line is what decides what is configurable: the product
 layer is meant to be replaceable, the core is not.
 
 Four things follow from the scaling half:
 
-1. **Hot-account striping is a first-class feature.** One logical account is stored as N physical
-   balance rows, summed to read it, so N writers take N row locks instead of queueing on one. An
-   account declares a stripe count; writes pick a stripe; reads `SUM`.
+1. **Hot-account striping is a first-class feature.** An account declares a stripe count; writes pick
+   a stripe; reads `SUM`.
 2. **House accounts are per tenant.** `uq_accounts__house` is `(tenant_id, purpose, currency) WHERE
    owner_type = 'house'` — a modelling fix and a prerequisite for tenant isolation, **not** a
    throughput mechanism.
@@ -30,16 +36,42 @@ Four things follow from the scaling half:
    localhost and ~0.5 ms on managed Postgres, which changes the *ranking* of the levers, not just
    their size.
 
-## Why
+**What a stripe is — and what it never touches.** Striping splits one logical account into N physical
+balance rows, so N writers take N different row locks instead of all queueing behind one. That is its
+whole job: it shards the *write lock* and the per-stripe sequence counter, nothing else. **A stripe
+is never the unit a balance is read or decided against** — every read `SUM`s the stripes, so a
+balance, and any check on it, always sees the true account total. So "what if a debit is bigger than
+one stripe's balance?" is a non-question: the write lands on that shard, its net simply moves — a
+stripe has no floor of its own, since `ck_balances__non_negative` guards the debit and credit
+*counters*, not the net — and the account's real balance is the sum. The ledger enforces no
+sufficiency or overdraft rule anywhere, deliberately ([the vision](/vision)); a card authorization's
+"enough funds?" decision is the rail's job ([the card rail's authorization-holds decision](/card/decisions/0001-authorization-holds)), a
+`SUM` over the hold log against the customer's balance read as one summed number. The rule that
+follows: **stripe the hot *house* accounts** — settlement, fee revenue — whose balance gates nothing;
+a balance-gated account can be striped too, but its gated read then costs O(stripes). Correctness is
+never at risk, only read cost.
 
-**Size it before designing it, because throughput is not the constraint here.** A $30M facility
-divided by a ~35-day receivable turn is **$100–300M/yr of card spend** at full utilization. At a
-$150–400 average B2B ticket that is **30k–150k transactions per month** — under **1 TPS average**,
-and maybe **20–50 TPS at a Monday-morning peak**. One Postgres instance handles that on a laptop.
+**How an account gets striped: in place, and without moving anything.** When an account turns into a
+hot spot, an operator just raises its `stripe_count`. There is no new account — the `ledger_accounts`
+row and its id never change — and no data migration: the existing history stays on stripe 0, and the
+new stripes fill lazily as ordinary writes land on them, the first writer to pick a new stripe
+creating its row with the upsert it was going to run anyway
+([0013](/decisions/0013-write-path-contract)). The balance is the `SUM` over whatever stripe rows
+exist, so it stays correct at every instant of the transition. Because that read sums the rows that
+exist rather than `0..stripe_count`, you can stripe *down* as safely as up — lowering the count only
+stops new writes from spreading, it never strands a stripe's balance. `stripe_count` is an
+operator's write-side tuning knob, not part of the account's frozen identity.
+
+## The evidence
+
+A $30M facility divided by a ~35-day receivable turn is **$100–300M/yr of card spend** at full
+utilization. At a $150–400 average B2B ticket that is 30k–150k transactions per month — **under 1 TPS
+average, and maybe 20–50 TPS at a Monday-morning peak**. One Postgres instance handles that on a
+laptop; throughput was never the constraint, which is why it is sized before it is designed.
 
 The real constraints are correctness (every cent, no manual fixes), auditability (reproduce any
 number as of any date, forever), **one latency-bound path** (the authorization decision — see
-[0001](/card/decisions/0001-authorization-holds)), and product surface area (one engine serving several
+[the card rail's authorization-holds decision](/card/decisions/0001-authorization-holds)), and product surface area (one engine serving several
 products without forking). *Anyone who opens by sharding the ledger has misread the problem.* Every
 multiple quoted below is against this figure, so the derivation is the number that matters.
 
@@ -66,30 +98,54 @@ Spike 003, durable settings, stock Postgres, one 16-core machine:
   bottleneck; striping removes it. Per-tenant accounts stay anyway, for the data model, per-tenant
   reconciliation, and as the prerequisite for RLS.
 
-**The layering, because it decides what needs a scheduler.**
+**Three layers, and only the middle one owns a scheduler.**
 
 | layer | what it is | needs a scheduler? | writes the ledger? |
 | --- | --- | --- | --- |
 | **1. Ledger core** | accounts, transactions, entries, balances, event log | **no** | it *is* the ledger |
-| **2. Rails** | card, ACH, wallet — each with its own state machine and deadlines | yes ([0001](/card/decisions/0001-authorization-holds)) | yes, on the events it decides are financial |
+| **2. Rails** | card, ACH, wallet — each with its own state machine and deadlines | yes ([the card rail's authorization-holds decision](/card/decisions/0001-authorization-holds)) | yes, on the events it decides are financial |
 | **3. Product** | authorization decisions, spend controls, credit lines | no | **no** |
 
-![Architecture: the authorization decision runs synchronously against a store of holds, while the ledger write happens on a job outside that deadline](/diagrams/01-architecture.svg)
+The authorization decision runs synchronously against a store of holds, while the ledger write
+happens on a job outside that deadline:
 
-*Drawn before the hold model was decided, and it shows.* The Postgres store it labels
-*"availability + holds — one row per hold group"*, fed by `SELECT … FOR UPDATE` and `INSERT hold`,
-**is not deployed** — that DDL is parked in [`parked/card/`](/card/parked) and applied by no
-migration. And the mutable row it draws is the shape
-[0001](/card/decisions/0001-authorization-holds) went on to **reject**: a hold is a `SUM` over an
-append-only log, never an amount anyone updates. What it still gets right is the split this section
-is about — the decision is synchronous, the ledger write is not.
+```mermaid
+flowchart LR
+    req["Authorization request"]
+
+    subgraph sync["Synchronous — inside the latency deadline"]
+        auth{"Authorization decision"}
+        holds[("Holds: append-only log<br/>(parked, not deployed)")]
+    end
+
+    subgraph asyncjob["A job — outside the deadline"]
+        event["Clearing recorded as an event"]
+        posting["Posting job — one transaction"]
+    end
+
+    ledger[("Ledger core: entries and balances")]
+
+    req --> auth
+    auth -->|"reads customer_receivable + SUM of holds, writes a hold"| holds
+    auth -->|"approve / decline"| req
+    auth -.->|"the clearing, later"| event
+    event --> posting
+    posting -->|"writes entries, updates balances"| ledger
+```
+
+The holds store is [`parked/card/`](/card/parked)'s DDL, applied by no migration — **it is not
+deployed**. And a hold is a `SUM` over an append-only log, never an amount anyone updates: an earlier
+version of this diagram drew a single mutable *"one row per hold group"*, fed by `SELECT … FOR
+UPDATE` and `INSERT hold`, which [the card rail's authorization-holds decision](/card/decisions/0001-authorization-holds)
+went on to **reject**. What the split gets right is this section's point — the decision is
+synchronous, the ledger write is not.
 
 **The core needs no scheduler, ever** — every timer belongs to a rail. And a clearing is recorded as
 an event and posted by a job *in one transaction*, outside the authorization deadline, so the
 **outbox and the job queue are one component, not two**.
 
 **The authorization path writes no ledger entry** — only the hold tables
-([0001](/card/decisions/0001-authorization-holds)) — and **reads one number**, the `customer_receivable`
+([the card rail's authorization-holds decision](/card/decisions/0001-authorization-holds)) — and **reads one number**, the `customer_receivable`
 balance. That single read is the product layer's entire coupling to the core, which is what makes the
 product a plug-in rather than a fork. **Keep the interface exactly that narrow; it is the seam to
 protect in M1.**
@@ -97,14 +153,14 @@ protect in M1.**
 **That is true of the code and was false of the schema**, and [0008](/decisions/0008-module-boundaries)
 closes the gap. Measured: not one foreign key crosses the card/core boundary in either direction, and
 a Cargo-feature build with the card crate out of the graph **compiles clean against a database that
-has never seen the card DDL**. The schema half is now true as well, though **not** by the route 0009 gave: rather
+has never seen the card DDL**. The schema half is now true as well, though **not** by the route 0008 gave: rather
 than moving into a `card` schema, the card DDL was lifted out of the baseline entirely and parked in
 [`parked/card/`](/card/parked), applied by no migration. A wallet-only user gets seven
-core tables and nothing else. What is still missing is what 0009 wanted and parking does not give —
+core tables and nothing else. What is still missing is what 0008 wanted and parking does not give —
 **removability**: there is no `DROP SCHEMA card CASCADE` to run, because there is nothing installed
 to drop. See [0008](/decisions/0008-module-boundaries).
 
-## Alternatives
+## What we considered
 
 | | Why not |
 | --- | --- |
@@ -130,19 +186,21 @@ ours. **Revisit if** a user sustains thousands of clearings/s after striping.
 
 ## What it costs
 
-- **Striping is not built.** There is no stripe column in `migrations/`, and `uq_accounts__house` would
-  currently prevent one on exactly the accounts that need it. Every figure above that says "striped"
-  describes a configuration this repository cannot currently express.
+- **A stripe is a row in `ledger_account_balances`, not a second account.** One logical account is N
+  physical balance rows, so `uq_accounts__house` — which refuses two house accounts of one purpose —
+  is orthogonal, and N stripes of one account coexist under it
+  ([0013](/decisions/0013-write-path-contract)). Measured at 7.7–9.2× over three runs on the baseline
+  plus the stripe column.
 - **The ceiling is global** — shared by every tenant on a database, not granted to each.
 - **Cross-tenant transactions exist and must be modelled.** `operating_cash` mirrors *one* real bank
   account and the facility is one line from one lender, so neither splits per tenant: **7 of the
   reference trace's 24 transactions touch `operating_cash`**, none of them clearings. Clearings are
   tenant-local; treasury is not. Splitting the book in two, joined by intercompany due-from/due-to
-  accounts, restores locality — and [0007](/decisions/0007-schema-conventions-and-chart) records that
-  nothing currently reconciles the two sides.
+  accounts, restores locality — and `recon_scope_breaks` ([0010](/decisions/0010-reconciliation)) now
+  reconciles the two sides, summing the mirror pair **per counterparty** so a third scope cannot cancel a real gap.
 - **The striped balance read grows with the stripe count**, the authorization path's one read
   included. See [0006](/decisions/0006-time-and-as-of) for the as-of version, which is worse.
 - **Three things are unmeasured**: the authorization path (a latency deadline, not a throughput
   target — it needs its own spike), anything over a network (the largest caveat, and why nothing is
-  published until M4 measures on RDS), and replication (one node; synchronous replication costs every
+  published until an [RDS benchmark](/roadmap#if-this-ever-wants-a-production-story) measures it), and replication (one node; synchronous replication costs every
   commit).

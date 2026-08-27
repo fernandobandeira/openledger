@@ -4,7 +4,7 @@
 **Supersedes** the processor survey in [spike 001](/card/spikes/001-append-only-holds), which was
 fabricated by an earlier agent and struck. **Nothing here is reused from it.**
 
-**Question.** [ADR-0001](/card/decisions/0001-authorization-holds) makes claims about how
+**Question.** [card 0001 · authorization holds](/card/decisions/0001-authorization-holds) makes claims about how
 processors behave — delta versus cumulative totals, what an authorization does to a ledger, what
 reversal and expiry mean, what ordering is promised. Every one was asserted without a source. Are
 they true?

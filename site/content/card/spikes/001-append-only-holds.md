@@ -3,7 +3,7 @@
 
 > ⚠️ **The verification in this spike does not run, and its headline survey was
 > invented.** Both are recorded here rather than quietly repaired, because this
-> spike is the evidence base for [ADR-0001](/card/decisions/0001-authorization-holds).
+> spike is the evidence base for [card 0001 · authorization holds](/card/decisions/0001-authorization-holds).
 >
 >   *(This bullet has itself been corrected. It previously listed three schema
 >   mismatches, two of which describe `schema/schema.sql` and not the file in this

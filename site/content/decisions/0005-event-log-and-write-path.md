@@ -6,8 +6,30 @@
 
 ## The decision
 
-**`ledger_events`**: an append-only record of every accepted external event, written in the same
-transaction as whatever it causes.
+**Every change to the ledger arrives as a message from the outside** — a card was approved, a payment
+cleared, a credit limit changed — **and we write every one of those messages down, in order, before we
+act on it.** That ordered list is the **event log**, the table `ledger_events`, and it is
+*append-only*: rows are only ever added, never edited or deleted. Writing the message down first, in
+the same database transaction as whatever it causes, is what lets us recognise a repeat — external
+systems retry, so the same message often arrives twice, and because the first copy was recorded under a
+caller-supplied **idempotency key** (a unique id for *this* request), the second is spotted and not
+acted on a second time.
+
+**When a message does move money, the only thing a caller can hand us is a balanced *posting*.** A
+posting names a source account, a destination account and an amount — money leaving one place and
+arriving in another — so it always has two equal sides. There is no way to express a single dangling
+leg, so an unbalanced transaction is not something the code rejects; it is something no caller can
+express in the first place. Most of what a ledger accepts moves no money at all — an approval, a
+declined charge, a limit change — which is exactly why every event goes in one log rather than being
+keyed off the money-moving transactions: the log is the only place a retry can be recognised whatever
+the message does.
+
+**One log doing two jobs a reader may know by name.** From the outside in, `ledger_events` is an
+**inbox**: every incoming message recorded once on arrival and deduplicated on its key plus a hash of
+its body, so a duplicate is recognised and ignored — the *idempotent consumer* pattern. From the inside
+out, it is also an **outbox**: when an event has to trigger follow-on work — per
+[0002](/decisions/0002-scaling), a clearing is recorded and then posted by a background job in one
+transaction — that same log is the queue the job reads from. One table, both roles.
 
 - `idempotency_key` + `idempotency_hash`, tenant-scoped, under `uq_events__idempotency`.
 - `kind`, `source`, `payload jsonb`, `effective_at`, `recorded_at`.
@@ -19,8 +41,14 @@ transaction as whatever it causes.
   second index two transactions were produced from one event row. Reproduced.
 
 **The retry contract, stated once:** same key + same hash → replay the stored outcome. Same key +
-*different* hash → reject. A caller bug that silently returns the wrong stored result is worse than
-a failure.
+*different* hash → reject. The `idempotency_key` under `uq_events__idempotency` **deduplicates the
+event** — a second attempt with the same key cannot insert. The `idempotency_hash` — a hash of the
+request body — is what makes the replay-vs-reject decision *correct*: a genuine retry carries the same
+body and replays the stored outcome; a different request that reused the key carries a different body
+and is rejected loudly. Without the hash, the `INSERT … ON CONFLICT DO NOTHING` a naive retry loop
+reaches for silently swallows a same-key/different-body call as a fake success. The key gives dedup;
+the hash gives a correct replay-vs-reject decision. A caller bug that silently returns the wrong stored
+result is worse than a failure.
 
 **This is not event sourcing.** The ledger stays the system of record; we do not rebuild it by
 replay. But `payload` must be **complete enough to replay from**, not merely complete enough to
@@ -90,7 +118,7 @@ it structural. Formance *did* once enforce a different invariant with a
 `CREATE CONSTRAINT TRIGGER … DEFERRABLE INITIALLY DEFERRED` — and **deleted it in migration 15 in
 favour of a partial unique index.**
 
-## Alternatives
+## What we considered
 
 | | Why not |
 | --- | --- |
@@ -106,8 +134,10 @@ favour of a partial unique index.**
 - Write amplification is one insert per event into an uncontended append-only table. Unmeasured,
   but not the shape of thing that caused any bottleneck
   [spike 003](/spikes/003-throughput-ceiling) found.
-- **`ledger_transactions.event_id` is nullable and unenforced**, so an event-less transaction
-  inserts without complaint. `NOT NULL` is the obvious fix and is not yet done.
+- **`ledger_transactions.event_id` is `NOT NULL`** — decided and applied by
+  [0013](/decisions/0013-write-path-contract) §3, which also records the deadline this fix had:
+  once one event-less row commits, append-only makes the repair a choice between `DISABLE TRIGGER`
+  and fabricating history. It landed while the journal was empty.
 - **The `NULLS NOT DISTINCT` on the idempotency index is inert** — both `tenant_id` and
   `idempotency_key` are `NOT NULL`. It is kept as documentation of a real hazard: in the spike
   schema `tenant_id` *was* nullable, and without that clause a unique index does not constrain
@@ -123,13 +153,13 @@ favour of a partial unique index.**
   FX rate is implicit in the difference between two amounts and is not stored. We should store it.
 - **None of this binds direct DML.** A posting type is a guarantee about our code, and says nothing
   about a psql session, a backfill, `pg_restore --disable-triggers`, or the replication apply path.
-  That is what the two triggers in `migrations/00001_baseline.sql` are for, and why
+  That is what the append-only and no-truncate triggers in `migrations/00001_baseline.sql` are for, and why
   [0004](/decisions/0004-where-logic-lives) keeps them: they are the outer layer, and they bind accidents,
   not intent.
-- **And nothing enforces balance today.** `ck_entries__balances` is gone and the write path does not
-  exist. Between those two facts, `ledger_entries` stores independent rows with a `direction`, so an
-  unbalanced transaction is fully expressible right now. Every system in the survey that made this
-  move shipped the enforcing path first; we did not, and this ADR exists partly to say so out loud.
+- **Nothing enforces balance at the database level.** `ck_entries__balances` is gone, and
+  `ledger_entries` stores independent rows carrying a `direction`, so an unbalanced transaction is
+  expressible through direct DML. The guarantee is the posting type on our write path, not a database
+  check — which is where every system in the survey that made this move puts it too.
 
 ## Deferred: hash chaining
 

@@ -27,8 +27,11 @@ declares its financial-statement line, so
 reconstructed beside it. Formance leaves
 that to you — there is no normal balance anywhere in its schema, a balance is `input - output` so a
 liability reads negative. It *does* have a chart — a versioned `schemas(chart jsonb)` table since
-v2.3, typed account patterns in v3 — but it is an address *naming grammar*, and its rules type is
-literally `struct{}`. The differentiator is normal balance and the equation, not the chart. Either
+**v2.4** (the introducing commit `6c8b565` is not an ancestor of `v2.3.22`; the earliest tags
+containing it are `v2.4.0-beta.1` and `v2.4.0`), and typed account patterns **drafted** for v3
+(`docs/drafts/chart-of-accounts.md`, headed `Status: Draft`, present only on the `v3.0.0-alpha.*`
+tags and not on `HEAD`) — but it is an address *naming grammar*, and its rules type is literally
+`struct{}`. The differentiator is normal balance and the equation, not the chart. Either
 way you cannot get a trial balance or a balance sheet out of it without writing a mapping layer
 first. Two smaller consequences of the same opinion:
 [0006](/decisions/0006-time-and-as-of) refuses a running balance on the business-date axis, where
@@ -87,14 +90,16 @@ optimization.
 a round trip costs 0.05 ms against roughly ten times that on managed Postgres — which *reorders*
 the tuning levers rather than scaling the result down. No throughput figure is published until one
 is measured over a real network. What a balance read costs at a million entries is **unmeasured**;
-what is structural is that it is a *lookup* — every entry carries its account's running balance, so
-the current balance is one index hit, not a scan.
+what is structural is that it is a *lookup* — the balance cache row is the only copy
+([spike 009](/spikes/009-where-the-balance-lives) dropped the per-entry running balance), so the
+current balance is one primary-key hit, not a scan — and a reconciliation view is what keeps that
+copy honest against the journal ([0010](/decisions/0010-reconciliation)).
 
 The ceiling is set by **contention, not hardware**. Every clearing writes the same
 `network_settlement_payable` row — a *hot account* — and Postgres holds that row's lock until the
 transaction commits, so those clearings queue behind one another. The lock is not incidental: the
 same statement that adds the amounts also issues the account's next sequence number, so it is what
-keeps the running balance correct ([0002](/decisions/0002-scaling)).
+keeps the sequence gapless and the cached balance correct ([0002](/decisions/0002-scaling)).
 [Spike 003](/spikes/003-throughput-ceiling) measured that row at 872 clearings/s and, **striped** 64
 ways, at 6,970 — but the same contended configuration re-measured at 833 and then 482 purely from
 machine load, so the ratio is the finding, not the number.
