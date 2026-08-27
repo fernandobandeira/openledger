@@ -3,8 +3,12 @@
  * The theme supplies the sidebar, the table of contents and the reading measure;
  * this file supplies the things that are specific to a ledger: a wider measure
  * than the default so the prose does not cut short, a typeface pairing, and the
- * two callout treatments the documents rely on. Everything is a token override
- * so light and dark stay in step. */
+ * two callout treatments the documents rely on. Everything is a token override.
+ *
+ * The site is dark-only: the palette is Vesper's, Vesper has no light variant,
+ * and the light values this file used to carry were inventions. `layout.jsx`
+ * forces the theme, so `.dark` is always on `<html>` and every token can live
+ * on `:root`. */
 
 /* ---- neutralising the theme's greys ----------------------------------------
    The dark mode read blue, and `--nextra-bg` was only half the reason. The docs
@@ -39,21 +43,13 @@
   --ol-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --ol-display: var(--ol-sans);
 
-  --ol-credit: #a8392a;
-  --ol-credit-bg: #f8e9e4;
-  --ol-ok: #1f6f57;
-  --ol-ok-bg: #e2f0ea;
-  --ol-rule: #e6e0d8;
-  --ol-code-bg: rgba(0, 0, 0, 0.055);
-}
-
-/* The two callout colours are Vesper's, not inventions: `#99FFE4` is what it
-   paints strings and `#FF8080` what it paints invalid. Taking them from the code
-   theme means a caught defect and a still-open one are the same two colours in
-   the prose as in the SQL beside it. It also resolves a collision the previous
-   palette had no way to avoid -- the old `--ol-credit` was a peach, and the
-   accent is now Vesper's peach, so the two would have been indistinguishable. */
-.dark {
+  /* The two callout colours are Vesper's, not inventions: `#99FFE4` is what it
+     paints strings and `#FF8080` what it paints invalid. Taking them from the
+     code theme means a caught defect and a still-open one are the same two
+     colours in the prose as in the SQL beside it. It also resolves a collision
+     the previous palette had no way to avoid -- the old `--ol-credit` was a
+     peach, and the accent is now Vesper's peach, so the two would have been
+     indistinguishable. */
   --ol-credit: #ff8080;
   --ol-credit-bg: #1c1210;
   --ol-ok: #99ffe4;
@@ -249,9 +245,10 @@ article blockquote.ol-note strong:first-child {
    a thumbnail of a thing that has to be read. Claim the column back; the theme's
    click-to-zoom is the fallback for the detail that still will not fit.
 
-   The SVGs carry their own `prefers-color-scheme` rules. Loaded through `<img>`
-   they answer to the operating system rather than to this site's toggle, which
-   is a limitation of the element, not of the drawing. */
+   The SVGs are dark-only in Vesper's palette, same as the site, and paint their
+   own `#101010` ground. They used to carry `prefers-color-scheme` rules, which
+   through `<img>` answered to the operating system rather than to the site's
+   toggle; with the toggle gone there is exactly one rendering everywhere. */
 article td:has(img) {
   width: 46%;
   min-width: 13rem;

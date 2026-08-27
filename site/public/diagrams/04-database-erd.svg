@@ -1,38 +1,32 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 780" role="img" aria-label="Entity relationship diagram of the seven core tables. The journal — ledger_entries, ledger_transactions, ledger_events — sits on top; ledger_entries points down to ledger_accounts, which points down to account_types and then to fs_lines; ledger_account_balances points back at ledger_accounts."><title>The core ledger: seven tables in three layers</title><style>
+  /* Vesper, dark-only, same as the site: #101010 ground, #FFC799 -- the site's
+     link colour -- for the FK edges and key annotations, #FF8080 for the one
+     relationship flagged as a defect. One palette, no media query: through
+     `img` the old `prefers-color-scheme` block answered to the OS, not the
+     site. The arrowhead fills in `defs` repeat the edge colours because a
+     marker cannot see its line's class. */
   text { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
-  .box      { fill: #ffffff; stroke: #8695a3; stroke-width: 1; }
-  .box-head { fill: #e9eef3; }
-  .rule     { stroke: #d6dee6; stroke-width: 1; }
-  .t-name   { font-size: 13px; font-weight: 600; fill: #11171e; }
-  .t-field  { font-size: 11.5px; fill: #55636f; }
-  .t-key    { font-size: 10px; fill: #1c4f86; letter-spacing: .04em; }
-  .t-band   { font-size: 10px; letter-spacing: .14em; fill: #8695a3; }
-  .t-edge   { font-size: 10.5px; fill: #1c4f86; }
-  .t-warn   { font-size: 10.5px; fill: #9e3a24; }
-  .t-legend { font-size: 10.5px; fill: #55636f; }
-  .edge     { stroke: #1c4f86; stroke-width: 1.7; fill: none; }
-  .edge-warn{ stroke: #9e3a24; stroke-width: 1.7; fill: none; stroke-dasharray: 5 4; }
-  @media (prefers-color-scheme: dark) {
-    .box      { fill: #161d25; stroke: #6c7b8a; }
-    .box-head { fill: #1f2831; }
-    .rule     { stroke: #2a343f; }
-    .t-name   { fill: #e3e9ef; }
-    .t-field  { fill: #97a4b1; }
-    .t-key    { fill: #82b2e8; }
-    .t-band   { fill: #6c7b8a; }
-    .t-edge   { fill: #82b2e8; }
-    .t-warn   { fill: #e08b6e; }
-    .t-legend { fill: #97a4b1; }
-    .edge     { stroke: #82b2e8; }
-    .edge-warn{ stroke: #e08b6e; }
-  }
+  .bg       { fill: #101010; }
+  .box      { fill: #161616; stroke: #666666; stroke-width: 1; }
+  .box-head { fill: #1f1f1f; }
+  .rule     { stroke: #2e2e2e; stroke-width: 1; }
+  .t-name   { font-size: 13px; font-weight: 600; fill: #ffffff; }
+  .t-field  { font-size: 11.5px; fill: #a0a0a0; }
+  .t-key    { font-size: 10px; fill: #ffc799; letter-spacing: .04em; }
+  .t-band   { font-size: 10px; letter-spacing: .14em; fill: #7a7a7a; }
+  .t-edge   { font-size: 10.5px; fill: #ffc799; }
+  .t-warn   { font-size: 10.5px; fill: #ff8080; }
+  .t-legend { font-size: 10.5px; fill: #a0a0a0; }
+  .edge     { stroke: #ffc799; stroke-width: 1.7; fill: none; }
+  .edge-warn{ stroke: #ff8080; stroke-width: 1.7; fill: none; stroke-dasharray: 5 4; }
 </style>
+<rect class="bg" x="0" y="0" width="100%" height="100%"/>
 <defs>
   <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
-    <path d="M0 1L10 5L0 9z" fill="#1c4f86"/>
+    <path d="M0 1L10 5L0 9z" fill="#ffc799"/>
   </marker>
   <marker id="aw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
-    <path d="M0 1L10 5L0 9z" fill="#9e3a24"/>
+    <path d="M0 1L10 5L0 9z" fill="#ff8080"/>
   </marker>
 </defs>
 

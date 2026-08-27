@@ -35,19 +35,23 @@ export default async function RootLayout({ children }) {
       {/* The palette is Vesper's, read off the theme itself rather than guessed:
           `#FFC799` is its link/focus colour and `#101010` its editor background,
           which is a true neutral black -- zero chroma -- and the reason the site
-          no longer reads blue. Light mode is invented; Vesper is dark-only. */}
+          no longer reads blue. Vesper is dark-only, and so is the site: the old
+          light values here were an invention with no source to check them
+          against, so they are gone rather than maintained. */}
       <Head
-        color={{
-          hue: { light: 24, dark: 27 },
-          saturation: { light: 85, dark: 100 },
-          lightness: { light: 40, dark: 80 }
-        }}
-        backgroundColor={{ light: '#fffdfa', dark: '#101010' }}
+        color={{ hue: 27, saturation: 100, lightness: 80 }}
+        backgroundColor={{ dark: '#101010', light: '#101010' }}
       />
       <body>
         <Layout
           navbar={navbar}
           pageMap={await getPageMap()}
+          // Dark-only, enforced rather than defaulted: `forcedTheme` pins
+          // next-themes regardless of any stored preference or the OS setting,
+          // and `darkMode={false}` removes the toggle that would otherwise
+          // promise a light mode that no longer exists.
+          darkMode={false}
+          nextThemes={{ forcedTheme: 'dark', defaultTheme: 'dark' }}
           // There is no public repository to edit against or file issues in, so
           // the theme's two default GitHub links -- which point at Nextra's own
           // repo -- are removed rather than left pointing somewhere wrong.

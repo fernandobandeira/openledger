@@ -1,35 +1,30 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 360" role="img" aria-label="Two ways to build a report. Building it from the entries lists only accounts that moved, so a chart line with no activity this period leaves an empty slot nobody can see. Building it from the chart lists every line first and attaches the numbers, so a line with no activity prints as zero."><title>Two ways to build a report, and the line that goes missing</title><style>
+  /* Vesper, dark-only, same as the site: #101010 ground, #FFC799 -- the site's
+     link colour -- for the flow edges, and the callout pair straight from the
+     prose: #FF8080 for the line that goes missing, #99FFE4 for the one that
+     prints as zero. One palette, no media query: through `img` the old
+     `prefers-color-scheme` block answered to the OS, not the site. The
+     arrowhead fill in `defs` repeats the edge colour because a marker cannot
+     see its line's class. */
   text { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
-  .box     { fill: #ffffff; stroke: #8695a3; stroke-width: 1; }
-  .box-head{ fill: #e9eef3; }
-  .rule    { stroke: #d6dee6; stroke-width: 1; }
-  .divider { stroke: #d6dee6; stroke-width: 1; stroke-dasharray: 3 5; }
-  .gap     { fill: none; stroke: #9e3a24; stroke-width: 1.2; stroke-dasharray: 4 3; }
-  .t-name  { font-size: 12px; font-weight: 600; fill: #11171e; }
-  .t-row   { font-size: 12px; fill: #55636f; }
-  .t-band  { font-size: 10px; letter-spacing: .14em; fill: #8695a3; }
-  .t-edge  { font-size: 10.5px; fill: #1c4f86; }
-  .t-warn  { font-size: 11px; fill: #9e3a24; }
-  .t-ok    { font-size: 11px; fill: #2c6a4d; }
-  .edge    { stroke: #1c4f86; stroke-width: 1.7; fill: none; }
-  @media (prefers-color-scheme: dark) {
-    .box     { fill: #161d25; stroke: #6c7b8a; }
-    .box-head{ fill: #1f2831; }
-    .rule    { stroke: #2a343f; }
-    .divider { stroke: #2a343f; }
-    .gap     { stroke: #e08b6e; }
-    .t-name  { fill: #e3e9ef; }
-    .t-row   { fill: #97a4b1; }
-    .t-band  { fill: #6c7b8a; }
-    .t-edge  { fill: #82b2e8; }
-    .t-warn  { fill: #e08b6e; }
-    .t-ok    { fill: #74c096; }
-    .edge    { stroke: #82b2e8; }
-  }
+  .bg      { fill: #101010; }
+  .box     { fill: #161616; stroke: #666666; stroke-width: 1; }
+  .box-head{ fill: #1f1f1f; }
+  .rule    { stroke: #2e2e2e; stroke-width: 1; }
+  .divider { stroke: #2e2e2e; stroke-width: 1; stroke-dasharray: 3 5; }
+  .gap     { fill: none; stroke: #ff8080; stroke-width: 1.2; stroke-dasharray: 4 3; }
+  .t-name  { font-size: 12px; font-weight: 600; fill: #ffffff; }
+  .t-row   { font-size: 12px; fill: #a0a0a0; }
+  .t-band  { font-size: 10px; letter-spacing: .14em; fill: #7a7a7a; }
+  .t-edge  { font-size: 10.5px; fill: #ffc799; }
+  .t-warn  { font-size: 11px; fill: #ff8080; }
+  .t-ok    { font-size: 11px; fill: #99ffe4; }
+  .edge    { stroke: #ffc799; stroke-width: 1.7; fill: none; }
 </style>
+<rect class="bg" x="0" y="0" width="100%" height="100%"/>
 <defs>
   <marker id="r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
-    <path d="M0 1L10 5L0 9z" fill="#1c4f86"/>
+    <path d="M0 1L10 5L0 9z" fill="#ffc799"/>
   </marker>
 </defs>
 
