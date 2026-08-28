@@ -1,0 +1,430 @@
+//! The pure hexagon core's entities and value objects: the posting types,
+//! their validation, the canonical byte form the idempotency hash is computed
+//! over, and the versioned payload rendering the event log stores. The
+//! posting math the writer runs between its SQL statements lives next door in
+//! `postings`.
+//!
+//! Nothing here imports `sqlx` — that property is the point of the module, not
+//! an accident of what happened to land in it. Everything in this file is
+//! constructible, checkable and hashable without a database in the room, which
+//! is what makes an unbalanced transaction *unconstructible* rather than
+//! refused by a layer further down (ADR-0005).
+
+use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use uuid::Uuid;
+
+/// A movement of money: an amount leaves `source` and arrives at `destination`.
+/// Two equal sides by construction — the caller cannot express one dangling leg,
+/// so an unbalanced transaction is unconstructible rather than refused
+/// (ADR-0005). The fields are private and there is no `Default`; `new` is the
+/// only door.
+// Fields are `pub(crate)`: readable by `postings::expand_postings` and the
+// payload rendering below, still unconstructible and unwritable outside this
+// crate — `new` stays the only door. The Postgres adapter (its own crate
+// since the deny.toml capability map) sees postings only through that
+// expansion.
+pub struct Posting {
+    pub(crate) source: Uuid,
+    pub(crate) destination: Uuid,
+    pub(crate) amount_minor: i64,
+    pub(crate) currency: String,
+}
+
+impl Posting {
+    pub fn new(
+        source: Uuid,
+        destination: Uuid,
+        amount_minor: i64,
+        currency: String,
+    ) -> Result<Self, Invalid> {
+        if amount_minor <= 0 {
+            return Err(Invalid::new("amount_minor must be positive"));
+        }
+        // ISO 4217 is uppercase; 'usd' and 'USD' must not be two currencies.
+        // The same rule the schema states in ck_entries__currency_iso.
+        if currency.len() != 3 || !currency.bytes().all(|b| b.is_ascii_uppercase()) {
+            return Err(Invalid::new(
+                "currency must be three uppercase ASCII letters",
+            ));
+        }
+        // pgledger's rule, adopted: a self-transfer nets to zero by definition
+        // and records nothing an account history can use.
+        if source == destination {
+            return Err(Invalid::new("source and destination are the same account"));
+        }
+        Ok(Self {
+            source,
+            destination,
+            amount_minor,
+            currency,
+        })
+    }
+}
+
+/// The cap on the two caller-chosen identity strings, in bytes. They land
+/// together in the `(tenant_id, idempotency_key)` btree unique index, and
+/// PostgreSQL refuses btree index rows past roughly 2704 bytes (a third of an
+/// 8KB page) — at insert time, as an error the caller would see as a 500.
+/// 512 bytes each keeps the pair, plus tuple overhead, far under that limit,
+/// and is far beyond any honest key or tenant name.
+const MAX_IDENTITY_BYTES: usize = 512;
+
+/// One accepted operation: post these movements atomically under this
+/// idempotency key, or return the stored result of having done so.
+// `pub(crate)` for the same reason as `Posting`'s fields; the adapter crate
+// reads through the accessors below.
+pub struct PostTransaction {
+    pub(crate) tenant_id: String,
+    pub(crate) idempotency_key: String,
+    pub(crate) effective_at: OffsetDateTime,
+    pub(crate) postings: Vec<Posting>,
+}
+
+impl PostTransaction {
+    pub fn new(
+        tenant_id: String,
+        idempotency_key: String,
+        effective_at: OffsetDateTime,
+        postings: Vec<Posting>,
+    ) -> Result<Self, Invalid> {
+        if tenant_id.trim().is_empty() {
+            return Err(Invalid::new("tenant_id must not be blank"));
+        }
+        if idempotency_key.is_empty() {
+            return Err(Invalid::new("idempotency_key must not be empty"));
+        }
+        // PostgreSQL's text type cannot store a NUL byte — without this check
+        // the refusal would arrive from the driver, as a 500 with the reason
+        // buried in an encoding error instead of named here.
+        if tenant_id.contains('\0') {
+            return Err(Invalid::new("tenant_id must not contain NUL bytes"));
+        }
+        if idempotency_key.contains('\0') {
+            return Err(Invalid::new("idempotency_key must not contain NUL bytes"));
+        }
+        // The byte cap both identity strings share; MAX_IDENTITY_BYTES'
+        // comment carries the index-row arithmetic.
+        if tenant_id.len() > MAX_IDENTITY_BYTES {
+            return Err(Invalid::new("tenant_id must be at most 512 bytes"));
+        }
+        if idempotency_key.len() > MAX_IDENTITY_BYTES {
+            return Err(Invalid::new("idempotency_key must be at most 512 bytes"));
+        }
+        if postings.is_empty() {
+            return Err(Invalid::new("postings must not be empty"));
+        }
+        // Finite (ck_txn__effective_finite) and RFC 3339-renderable AFTER the
+        // UTC normalization the canonical hash performs — the range check
+        // must run on the normalized instant, not the caller's rendering:
+        // `9999-12-31T23:00:00-05:00` is year 9999 where it stands and year
+        // 10000 in UTC, and a bare `to_offset` on it aborts the process (the
+        // time crate panics past its representable range). `checked_to_offset`
+        // is the non-aborting form; `None` means the normalization itself
+        // left the representable years.
+        let utc = effective_at
+            .checked_to_offset(time::UtcOffset::UTC)
+            .ok_or_else(|| Invalid::new("effective_at must fall between year 1 and 9999 UTC"))?;
+        if !(1..=9999).contains(&utc.year()) {
+            return Err(Invalid::new(
+                "effective_at must fall between year 1 and 9999 UTC",
+            ));
+        }
+        Ok(Self {
+            tenant_id,
+            idempotency_key,
+            effective_at,
+            postings,
+        })
+    }
+
+    /// The canonical byte form the idempotency hash is computed over. Owned by
+    /// the writer and versioned, per ADR-0013's closing warning: Formance hashes
+    /// its language-level JSON encoding, which couples every stored hash to
+    /// field names — renaming a field silently invalidates all of them. This
+    /// form names no fields: a version tag, then each value length-prefixed, so
+    /// no concatenation of values is ambiguous and a rename cannot touch it.
+    fn canonical_bytes(&self) -> Result<Vec<u8>, Invalid> {
+        fn put(buf: &mut Vec<u8>, bytes: &[u8]) {
+            buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"openledger.post.v1");
+        put(&mut buf, self.tenant_id.as_bytes());
+        // Normalized to UTC before formatting: "12:00+02:00" and "10:00Z" are
+        // the same instant and must hash the same, or a genuine retry through a
+        // client that re-renders its timestamps is refused as poisoned. `new`
+        // already validated this exact normalization, so both failure arms are
+        // belt over that check, not a live path.
+        let effective = self
+            .effective_at
+            .checked_to_offset(time::UtcOffset::UTC)
+            .ok_or_else(|| Invalid::new("effective_at must fall between year 1 and 9999 UTC"))?
+            .format(&Rfc3339)
+            .map_err(|_| Invalid::new("effective_at is not representable"))?;
+        put(&mut buf, effective.as_bytes());
+        buf.extend_from_slice(&(self.postings.len() as u64).to_le_bytes());
+        for posting in &self.postings {
+            buf.extend_from_slice(posting.source.as_bytes());
+            buf.extend_from_slice(posting.destination.as_bytes());
+            buf.extend_from_slice(&posting.amount_minor.to_le_bytes());
+            put(&mut buf, posting.currency.as_bytes());
+        }
+        Ok(buf)
+    }
+
+    /// The SHA-256 over `canonical_bytes` — computed here, beside the form it
+    /// is computed over, so the two cannot drift apart. The adapter stores it;
+    /// it never derives it.
+    pub fn idempotency_hash(&self) -> Result<Vec<u8>, Invalid> {
+        Ok(Sha256::digest(self.canonical_bytes()?).to_vec())
+    }
+
+    /// The event payload the writer stores beside the claim — the command,
+    /// rendered field-by-field HERE, versioned, never by a derived
+    /// `Serialize`: the same ADR-0013 closing warning `canonical_bytes`
+    /// carries applies to the stored rendering too — Formance stores its
+    /// language-level JSON encoding, which couples every stored artifact to
+    /// field names a refactor can silently move. This function is the one
+    /// place the stored shape is decided, so a Rust-side rename cannot touch
+    /// it without editing the string literals below.
+    ///
+    /// `version` is the marker a future reader dispatches on. Adding it
+    /// changed the stored shape from the pre-versioned derive rendering —
+    /// acceptable now, pre-v0.1, while no kept database exists (the same
+    /// license the ADR-0003 baseline freeze took). `effective_at` stays the
+    /// caller's own offset rendering, exactly as the derive stored it; the
+    /// UTC normalization belongs to the hash, not the payload.
+    pub(crate) fn payload(&self) -> Result<serde_json::Value, Invalid> {
+        let effective = self
+            .effective_at
+            .format(&Rfc3339)
+            .map_err(|_| Invalid::new("effective_at is not representable"))?;
+        let postings: Vec<serde_json::Value> = self
+            .postings
+            .iter()
+            .map(|posting| {
+                serde_json::json!({
+                    "source": posting.source,
+                    "destination": posting.destination,
+                    "amount_minor": posting.amount_minor,
+                    "currency": posting.currency,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "version": 1,
+            "tenant_id": self.tenant_id,
+            "idempotency_key": self.idempotency_key,
+            "effective_at": effective,
+            "postings": postings,
+        }))
+    }
+
+    // Read access for the adapter crate: the fields stay unwritable and the
+    // type unconstructible outside `new` — these give the writer its binds
+    // without opening the door.
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+    pub fn effective_at(&self) -> OffsetDateTime {
+        self.effective_at
+    }
+    pub fn postings(&self) -> &[Posting] {
+        &self.postings
+    }
+}
+
+/// The stored result of an accepted operation, ADR-0013's replay contract:
+/// `(event_id, transaction_id)`, re-rendered by the caller — never a cached
+/// response body. `transaction_id` stays an `Option` because most accepted
+/// operations write no transaction at all (ADR-0005); this endpoint always
+/// does, but a replay reads whatever was stored.
+pub struct Posted {
+    pub event_id: Uuid,
+    pub transaction_id: Option<Uuid>,
+    pub replayed: bool,
+}
+
+/// A request the writer refuses before touching the database.
+#[derive(Debug)]
+pub struct Invalid(&'static str);
+
+impl Invalid {
+    pub(crate) fn new(detail: &'static str) -> Self {
+        Self(detail)
+    }
+    pub fn detail(&self) -> &'static str {
+        self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The constructors' refusals that only exist to keep a can't-happen
+    //! path can't-happen: the effective_at range check runs on the UTC
+    //! NORMALIZATION (the value the hash formats — checking the caller's
+    //! rendering let `to_offset` abort the process), the identity strings
+    //! are refused before PostgreSQL would refuse them worse (NUL, the
+    //! btree-index byte cap), and the stored payload is the versioned shape
+    //! this file owns. The everyday refusals (zero amount, self-posting,
+    //! non-ISO currency) are held on the wire by the e2e suite; an
+    //! UNBALANCED transaction needs no test anywhere — `Posting` makes it
+    //! unconstructible (ADR-0005).
+
+    use super::*;
+
+    fn posting() -> Result<Posting, Invalid> {
+        Posting::new(
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            100,
+            "USD".to_owned(),
+        )
+    }
+
+    fn command_at(effective_at: OffsetDateTime) -> Result<PostTransaction, Invalid> {
+        PostTransaction::new(
+            "acme".to_owned(),
+            "key-1".to_owned(),
+            effective_at,
+            vec![posting()?],
+        )
+    }
+
+    /// The C1 reproduction: year 9999 in the caller's offset, year 10000 in
+    /// UTC. Before the normalized-year check this PANICKED in
+    /// `canonical_bytes` (`to_offset` aborts past the representable range);
+    /// now the constructor refuses it with the honest message.
+    #[test]
+    fn an_effective_at_that_leaves_year_9999_under_utc_normalization_is_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let last_hour = OffsetDateTime::parse("9999-12-31T23:00:00-05:00", &Rfc3339)?;
+
+        let refused = command_at(last_hour);
+
+        let detail = refused.err().map(|invalid| invalid.detail());
+        assert_eq!(
+            detail,
+            Some("effective_at must fall between year 1 and 9999 UTC"),
+            "a year-10000-in-UTC effective_at must be refused"
+        );
+        Ok(())
+    }
+
+    /// The lower edge stays open: year 1 UTC is accepted, and its hash is
+    /// computable — the refusal above must not have narrowed the range.
+    #[test]
+    fn the_year_one_lower_edge_stays_accepted() -> Result<(), Box<dyn std::error::Error>> {
+        let first_instant = OffsetDateTime::parse("0001-01-01T00:00:00Z", &Rfc3339)?;
+
+        let command = command_at(first_instant);
+
+        let command = command.map_err(|invalid| invalid.detail())?;
+        assert!(
+            !command
+                .idempotency_hash()
+                .map_err(|e| e.detail())?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    /// A NUL byte in either identity string is refused HERE: PostgreSQL's
+    /// text type cannot store one, so without this check the refusal would
+    /// be the driver's — a 500, not a named 422.
+    #[test]
+    fn a_nul_byte_in_an_identity_string_is_refused() -> Result<(), Invalid> {
+        let nul_tenant = PostTransaction::new(
+            "ac\0me".to_owned(),
+            "key-1".to_owned(),
+            OffsetDateTime::UNIX_EPOCH,
+            vec![posting()?],
+        );
+        let nul_key = PostTransaction::new(
+            "acme".to_owned(),
+            "key\0".to_owned(),
+            OffsetDateTime::UNIX_EPOCH,
+            vec![posting()?],
+        );
+
+        assert!(nul_tenant.is_err(), "a NUL tenant_id must be refused");
+        assert!(nul_key.is_err(), "a NUL idempotency_key must be refused");
+        Ok(())
+    }
+
+    /// The byte cap: 512 bytes pass, 513 are refused — the bound that keeps
+    /// the (tenant_id, idempotency_key) pair out of PostgreSQL's btree
+    /// index-row limit (~2704 bytes), where the failure would be a 500.
+    #[test]
+    fn an_identity_string_past_512_bytes_is_refused() -> Result<(), Invalid> {
+        let at_cap = PostTransaction::new(
+            "acme".to_owned(),
+            "k".repeat(512),
+            OffsetDateTime::UNIX_EPOCH,
+            vec![posting()?],
+        );
+        let past_cap_key = PostTransaction::new(
+            "acme".to_owned(),
+            "k".repeat(513),
+            OffsetDateTime::UNIX_EPOCH,
+            vec![posting()?],
+        );
+        let past_cap_tenant = PostTransaction::new(
+            "t".repeat(513),
+            "key-1".to_owned(),
+            OffsetDateTime::UNIX_EPOCH,
+            vec![posting()?],
+        );
+
+        assert!(at_cap.is_ok(), "512 bytes is within the cap");
+        assert!(
+            past_cap_key.is_err(),
+            "a 513-byte idempotency_key must be refused"
+        );
+        assert!(
+            past_cap_tenant.is_err(),
+            "a 513-byte tenant_id must be refused"
+        );
+        Ok(())
+    }
+
+    /// The stored shape, pinned literally: the version marker plus exactly
+    /// the fields the pre-versioned rendering stored, with `effective_at` in
+    /// the CALLER's offset (the UTC normalization belongs to the hash). A
+    /// Rust-side rename cannot move this test without moving `payload` too —
+    /// which is the point.
+    #[test]
+    fn the_payload_is_the_versioned_rendering_of_todays_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let command = command_at(OffsetDateTime::parse(
+            "2026-08-27T14:00:00+02:00",
+            &Rfc3339,
+        )?)
+        .map_err(|invalid| invalid.detail())?;
+
+        let payload = command.payload().map_err(|invalid| invalid.detail())?;
+
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "version": 1,
+                "tenant_id": "acme",
+                "idempotency_key": "key-1",
+                "effective_at": "2026-08-27T14:00:00+02:00",
+                "postings": [{
+                    "source": Uuid::from_u128(1),
+                    "destination": Uuid::from_u128(2),
+                    "amount_minor": 100,
+                    "currency": "USD",
+                }],
+            })
+        );
+        Ok(())
+    }
+}

@@ -1,4 +1,4 @@
-// Tell cargo that a change in `migrations/` invalidates the build.
+// Tell cargo that a change in the repo-root `migrations/` invalidates the build.
 //
 // `sqlx::migrate!()` is a proc macro: it reads the migration directory at COMPILE
 // time and bakes the files into the binary. Cargo tracks source files, not
@@ -11,5 +11,5 @@
 // survives casual testing and fails on the one path that matters: shipping a
 // migration someone just wrote.
 fn main() {
-    println!("cargo:rerun-if-changed=migrations");
+    println!("cargo:rerun-if-changed=../../migrations");
 }

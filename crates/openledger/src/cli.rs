@@ -1,27 +1,11 @@
-//! openledger — an open-source double-entry ledger.
-//!
-//! The ledger service is not built yet (see the roadmap in `site/content/roadmap.md`). The one thing
-//! this binary does today is apply migrations, and that is deliberate rather
-//! than incidental: ADR-0003 makes `migrate` a *subcommand of the same binary*,
-//! so a deployment runs the same image with a different command, and the ledger
-//! process never migrates.
+//! The shape of the command line — `clap`'s derive, and the prose it prints.
 //!
 //! The command line is `clap`'s derive, so the *shape* of the interface — flag
 //! forms, environment fallbacks, the range on the lock budget, the help text —
 //! is declared on the fields below rather than parsed by hand. What is not
-//! `clap`'s is the **exit code**, which for this binary is an operator-facing
-//! contract rather than a detail: `Failure` below defines 1, 2 and 3, and the
-//! only reason `main` handles `clap`'s errors separately is to keep a usage
-//! error at 2 whether it came from `clap` or from us.
+//! `clap`'s is the **exit code**, which lives in `failure.rs`.
 
-mod migrate;
-
-use std::io::Write;
-use std::process::ExitCode;
-use std::time::Duration;
-
-use clap::error::ErrorKind;
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 
 /// How long a migrator waits for another one to finish before giving up.
 ///
@@ -60,6 +44,15 @@ PostgreSQL connection string.
 Prefer DATABASE_URL over this flag, which is visible to
 anyone who can read the process table.";
 
+const SERVE_ABOUT: &str = "\
+Serve the ledger API until stopped.
+
+One endpoint today: POST /v1/transactions, the posting engine
+behind it (M3). Run `openledger migrate` first: serve checks
+that the schema is current before it listens, and an unmigrated
+or behind database is exit 1 naming that command. The check
+takes no locks — the serving process never migrates (ADR-0003).";
+
 const LOCK_SECS_HELP: &str = "\
 Seconds to wait for another migrator to finish before
 giving up.
@@ -95,13 +88,13 @@ CONNECTING
     // flag would answer a question this binary cannot yet answer honestly.
     disable_version_flag = true
 )]
-struct Cli {
+pub struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
+    pub command: Option<Command>,
 }
 
 #[derive(Subcommand)]
-enum Command {
+pub enum Command {
     /// Apply every pending migration, then exit
     #[command(long_about = MIGRATE_ABOUT)]
     Migrate {
@@ -136,115 +129,53 @@ enum Command {
         )]
         lock_secs: u64,
     },
-}
 
-/// What went wrong, and what an operator should do about it. The distinction is
-/// the whole point: a job that gives up on the lock should be retried, and a job
-/// that failed a migration must not be.
-pub enum Failure {
-    /// The invocation is wrong. Retrying changes nothing.
-    Usage(String),
-    /// Someone else held the lock for the whole budget. Safe to re-run.
-    Locked(String),
-    /// The migration or the connection failed. Read the error first.
-    Failed(String),
-}
+    /// Serve the ledger API
+    #[command(long_about = SERVE_ABOUT)]
+    Serve {
+        /// PostgreSQL connection string
+        #[arg(
+            long,
+            env = "DATABASE_URL",
+            hide_env_values = true,
+            value_name = "URL",
+            long_help = DATABASE_URL_HELP
+        )]
+        database_url: Option<String>,
 
-impl Failure {
-    fn message(&self) -> &str {
-        match self {
-            Self::Usage(m) | Self::Locked(m) | Self::Failed(m) => m,
-        }
-    }
-
-    fn code(&self) -> u8 {
-        match self {
-            Self::Failed(_) => 1,
-            Self::Usage(_) => 2,
-            Self::Locked(_) => 3,
-        }
-    }
-}
-
-/// `println!` panics on a broken pipe, and this crate denies `panic`. A closed
-/// stdout after a committed migration must not turn a success into exit 101.
-pub fn say(message: &str) {
-    let _ = writeln!(std::io::stdout(), "{message}");
-}
-
-fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
-        Err(error) => return clap_exit(error),
-    };
-
-    match dispatch(cli) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(failure) => {
-            eprintln!("openledger: {}", failure.message());
-            ExitCode::from(failure.code())
-        }
-    }
-}
-
-/// `clap` formats its own errors, so they are printed as they come rather than
-/// through `Failure`'s `openledger: ` prefix — a usage error is several lines
-/// and a prefix on the first one reads as a truncated message.
-///
-/// The exit code, though, is ours. `clap`'s own convention already agrees on 2,
-/// but that agreement is a coincidence this pins down: everything that is not a
-/// request to *print something* is a usage error, which this binary defines as
-/// exit 2. Asking for help is exit 0, on stdout, which is what `error.print()`
-/// does for those two kinds.
-fn clap_exit(error: clap::Error) -> ExitCode {
-    let _ = error.print();
-    match error.kind() {
-        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => ExitCode::SUCCESS,
-        _ => ExitCode::from(2),
-    }
-}
-
-fn dispatch(cli: Cli) -> Result<(), Failure> {
-    match cli.command {
-        // Bare `openledger`, which a container started with no command gets.
-        // Help on stdout and exit 0, the same as asking for it.
-        None => {
-            let _ = Cli::command().print_long_help();
-            Ok(())
-        }
-        Some(Command::Migrate {
-            database_url,
-            lock_secs,
-        }) => {
-            let database_url = database_url.ok_or_else(|| {
-                Failure::Usage(
-                    "no database URL — set DATABASE_URL or pass --database-url".to_owned(),
-                )
-            })?;
-            block_on(migrate::run(&database_url, Duration::from_secs(lock_secs)))
-        }
-    }
-}
-
-/// One current-thread runtime, built by hand rather than by `#[tokio::main]`,
-/// so that its failure is a message instead of a panic — ADR-0001 denies
-/// `unwrap`, `expect` and `panic` across this crate.
-fn block_on(future: impl Future<Output = Result<(), Failure>>) -> Result<(), Failure> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| Failure::Failed(format!("could not start the async runtime: {e}")))?
-        .block_on(future)
+        /// Address to listen on
+        ///
+        // A typed `SocketAddr`, so a malformed address is CLAP's usage error
+        // (exit 2, the flag named) — the api crate receives an address, never
+        // a string to re-refuse.
+        #[arg(
+            long,
+            env = "OPENLEDGER_BIND",
+            hide_env_values = true,
+            value_name = "ADDR",
+            default_value = "127.0.0.1:8080",
+            value_parser = clap::value_parser!(std::net::SocketAddr)
+        )]
+        bind: std::net::SocketAddr,
+    },
 }
 
 #[cfg(test)]
 mod tests {
+    //! `clap` builds the parser at runtime from the derive, and an
+    //! inconsistent one — a duplicate long flag, a default that its own
+    //! `value_parser` rejects — panics on first use rather than failing to
+    //! compile. This module is that check, and it is why the assertion is
+    //! worth a test at all. What the flags MEAN (the exit codes, the
+    //! migrate-then-serve split) is held by the e2e suite against the
+    //! compiled binary: `startup.rs` holds exit 1's serve refusals,
+    //! `exit_codes.rs` holds 2 (a malformed flag) and 3 (the lock budget
+    //! spent, safe to re-run).
+
+    use clap::CommandFactory;
+
     use super::*;
 
-    /// `clap` builds the parser at runtime from the derive, and an inconsistent
-    /// one — a duplicate long flag, a default that its own `value_parser`
-    /// rejects — panics on first use rather than failing to compile. This is
-    /// that check, and it is why the assertion is worth a test at all.
     #[test]
     fn the_command_line_is_well_formed() {
         Cli::command().debug_assert();

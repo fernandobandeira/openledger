@@ -1,0 +1,22 @@
+# The HTTP surface. Depends on the `Ledger` PORT, not on PostgreSQL: the sqlx
+# types this crate sees are the ones the port's error carries, and the pool it
+# used to build now comes wired in by the composition root (crates/openledger).
+[package]
+name    = "api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum.workspace       = true
+ledger.workspace     = true
+serde.workspace      = true
+serde_json.workspace = true
+time.workspace       = true
+tokio.workspace      = true
+utoipa.workspace     = true
+uuid.workspace       = true
+
+[lints]
+workspace = true

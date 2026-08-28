@@ -1,0 +1,23 @@
+# The binary ONLY, and the composition root: main.rs owns the command line and
+# the exit codes, and is the one place the Postgres repository is wired into
+# the writer service, and the service into the api router as its `Ledger`. No
+# sqlx here, dev-dependencies included — the e2e suite lives in crates/e2e
+# with its own capability allowances, and this crate sees the database only
+# through `db::Database` and `ledger_postgres::PgRepository`.
+[package]
+name    = "openledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+api.workspace             = true
+clap.workspace            = true
+db.workspace              = true
+ledger.workspace          = true
+ledger-postgres.workspace = true
+tokio.workspace           = true
+
+[lints]
+workspace = true

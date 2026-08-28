@@ -3,10 +3,13 @@ name: Deploy docs to GitHub Pages
 on:
   push:
     branches: [main]
-    # The docs build reads only site/ — nothing outside it — so a push that
-    # touches only the Rust code, migrations, or spikes does not redeploy.
+    # The docs build reads site/ plus ONE file outside it: the committed
+    # OpenAPI spec, which the build inlines into /api-reference/ — so a
+    # spec-only change must redeploy too, or the site serves a stale contract.
+    # Everything else (Rust code, migrations, spikes) does not redeploy.
     paths:
       - 'site/**'
+      - 'crates/api/openapi.json'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 

@@ -7,7 +7,9 @@
 ## The decision
 
 **Rust, on a single PostgreSQL 18 instance, with `sqlx` and no ORM.** We write the SQL; `sqlx`
-checks every query against a live database at compile time and gives back typed rows. The ledger's
+can check every query against a live database at compile time and gives back typed rows —
+*can*, because the shipped code binds through the runtime `query_as` form, so the compile-time
+checking is available and not yet in use. The ledger's
 procedural logic lives in Rust; Postgres holds the shape ([0004](/decisions/0004-where-logic-lives)).
 
 **Why Rust: the compiler catches more, before the code ever runs.** A ledger's worst failures are
@@ -106,12 +108,15 @@ procedural logic they reversed, not database-enforced correctness.
   silent zero exactly. The difference from Go is that it is opt-in per field, written at the money
   column, and visible in review rather than being one whole-struct switch — which is a difference in
   blast radius, not in kind.
-- **198 crates against Go's 17 modules**, for a project whose stated value is *small team, boring
-  tech*. That is 198 to audit, pin and upgrade. Cold build 17.8 s vs 5.5 s; incremental is a wash at
+- **198 crates against Go's 17 modules** when this was decided, for a project whose stated value is
+  *small team, boring tech* — and the graph has grown with the code: today's `Cargo.lock`
+  (2026-08-27) resolves **328 packages**, 322 of them external, the HTTP API and the workspace split
+  included. That is 322 to audit, pin and upgrade. Cold build 17.8 s vs 5.5 s; incremental is a wash at
   1.2 s vs 0.4 s. **The claim that the ratio worsens at scale is an extrapolation, not a measurement.**
 - **`sqlx`'s compile-time checking is viral and needs a committed `.sqlx/`.** Compiling a dependency
   that uses `query!` will try to introspect *your* database. CI needs either a live schema or
-  `SQLX_OFFLINE=true` with the query cache in version control.
+  `SQLX_OFFLINE=true` with the query cache in version control. A cost deferred, not paid: the
+  shipped queries are the runtime form, so no `.sqlx/` exists yet.
 - **The async story has two loose ends.** `dyn`-compatible async traits are an accepted 2026 Project
   Goal, not shipped, and Return Type Notation is still nightly — so `Send` bounds on async traits go
   through the `trait-variant` crate. The runtime is a tokio monoculture: `async-std` is sunset in

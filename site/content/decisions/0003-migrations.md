@@ -39,17 +39,21 @@ deadlocks against CONCURRENTLY.
   trade for a job that can be re-run. `CREATE INDEX CONCURRENTLY` is unaffected: its lock
   acquisitions are brief.
 - **No down migrations.**
-- **The baseline is editable in place until v0.1 is tagged — a written exception to "never edit an
-  applied migration", with a named cut-off.** The rule exists to protect databases that have already
+- **The baseline was editable in place until it froze — a written exception to "never edit an
+  applied migration", with a named cut-off (originally the v0.1 tag).** The rule exists to protect databases that have already
   applied a migration; no kept database has applied this one, so editing it buys the single flat
   readable file this ADR argues for at exactly the stage it is worth most, and a stack of
   00002/00003 patches before anyone has deployed once would be history nobody lived. The exception
   has been used three times: dropping `balance_after`
   ([spike 009](/spikes/009-where-the-balance-lives)), the index that went with it, and folding the
   schema decisions of [0009](/decisions/0009-append-only-perimeter)–[0013](/decisions/0013-write-path-contract)
-  into the baseline (2026-08-27). **The cut-off is the first tagged release**: from v0.1, every
-  change is a new numbered migration, no exceptions, because from that moment a kept database may
-  exist.
+  into the baseline (2026-08-27). **The cut-off arrived early: the baseline froze on 2026-08-27,
+  ahead of any tag** — once the merged baseline was committed and re-verified, editing it further was
+  refused on the rule's own reasoning, a kept database now being one `git pull && make up` away
+  rather than one release away. From that date every change is a new numbered migration, no
+  exceptions, and the freeze is mechanical rather than textual:
+  `scripts/check-migrations-immutable.sh` fails CI on any modified, renamed or deleted migration —
+  the baseline included, with deliberately no opt-out marker.
 - **There are two SQL schema files, and a migration owns exactly one of them.**
   `migrations/00001_baseline.sql` is the ledger core, applied by `openledger migrate`.
   [`parked/card/schema.sql`](/card/parked) is the card product's DDL — no migration applies it,
@@ -57,7 +61,7 @@ deadlocks against CONCURRENTLY.
   every push** ([0008](/decisions/0008-module-boundaries)), so the dependency is asserted rather than pasted. "The database matches the file"
   is a claim about the baseline; the parked file's claim is one CI job narrower.
 - **The command line is `clap`'s derive, and the exit codes are not.** The interface is declared on
-  the fields in `src/main.rs` — flag forms, the `DATABASE_URL` and
+  the fields in `crates/openledger/src/cli.rs` — flag forms, the `DATABASE_URL` and
   `OPENLEDGER_MIGRATE_LOCK_SECS` fallbacks, the 1–86400 range, the help text — rather than parsed by
   a hand-written loop, which is where the argument handling in this repository started. `clap` is
   five crates against [0001](/decisions/0001-rust-and-postgres)'s dependency-count cost, taken
@@ -66,8 +70,8 @@ deadlocks against CONCURRENTLY.
   code**, because for this binary it is an operator-facing contract and not a detail: `clap`'s own
   convention already puts a usage error at 2, and `main` maps its errors explicitly anyway so that
   the agreement is pinned rather than inherited.
-- **This one is built** — `src/migrate.rs`, 255 lines, of which the try-lock
-  poll is 32. Two of the rules above are tests in that file rather than sentences in this one: no
+- **This one is built** — `crates/db/src/migrate.rs`, 302 lines, of which the try-lock
+  poll (`acquire_lock`) is 43. Two of the rules above are tests in that file rather than sentences in this one: no
   `.down.sql` in the set, and a `-- no-transaction` migration holding exactly one statement.
 
 ## The evidence
@@ -148,12 +152,12 @@ file's. (`make chart` is a `psql -f` of a file no migration owns, and gets the s
 | **`refinery`** | Cannot run `CREATE INDEX CONCURRENTLY` at all — every migration is wrapped in a transaction with no opt-out. Disqualifying for a project whose next schema change is a concurrent index on a populated table. |
 | **`diesel_migrations`, `sea-orm-migration`, `geni`** | All handle `CONCURRENTLY`; none has any cross-process lock, so we would be writing the same poll *and* adopting a second query layer. `sqlx` is already [0001](/decisions/0001-rust-and-postgres)'s. |
 | **Atlas** | Community **refuses this schema**: `views are available to logged-in users only`. RLS policies are gated the same way, and we know we need them. `migrate lint` is Pro. A dev database is mandatory. |
-| **goose (via a Go sidecar)** | It is the tool that gets the lock right, and running it would mean a second language and a second binary in the deploy path to avoid writing the thirty-two-line poll ourselves. |
+| **goose (via a Go sidecar)** | It is the tool that gets the lock right, and running it would mean a second language and a second binary in the deploy path to avoid writing the forty-three-line poll ourselves. |
 
 ## What it costs
 
-- **We own the locker.** A `pg_try_advisory_lock` poll in `src/migrate.rs` —
-  32 lines of that file's 255 — and the bug reports about them come to us. This is the sharpest cost
+- **We own the locker.** A `pg_try_advisory_lock` poll in `crates/db/src/migrate.rs` —
+  43 lines of that file's 302 — and the bug reports about them come to us. This is the sharpest cost
   of [0001](/decisions/0001-rust-and-postgres) that is not about types. **The poll ceiling had to be set
   deliberately** — a migration slower than the retry budget makes a *second* migrator give up rather
   than wait. With a pre-deploy job that is the right failure, because a job that gives up is visible
@@ -164,6 +168,19 @@ file's. (`make chart` is a `psql -f` of a file no migration owns, and gets the s
   setting is that someone chose the number. Giving up on the lock exits **3** and a failed migration
   exits **1**, so "re-run this" and "do not retry blindly" are distinguishable by an operator who
   reads neither.
+- **Known issue: `openledger migrate` races itself on a FRESH CLUSTER.** The try-lock is an
+  advisory lock, and an advisory lock is **per database** — the database is part of the lock tag —
+  while the baseline's role-creation guard reads the cluster-wide `pg_roles` (`CREATE ROLE` guarded
+  by `IF NOT EXISTS (SELECT 1 FROM pg_roles …)`). Two first-migrates into *sibling* databases on a
+  cluster that has never seen the baseline therefore both hold their own lock, both find the roles
+  absent, and race their `CREATE ROLE` into the cluster-wide `pg_authid_rolname_index`. Observed
+  where it was always going to be: the e2e suite migrates a scratch database per test, in parallel,
+  on one fresh cluster — and the suite now **serializes its migrate runs** as the mitigation, with
+  the comment beside the mutex (`crates/e2e/tests/e2e/support/postgres.rs`). No adopter runs two
+  first-migrates into sibling databases of one cluster at once, which is why this is a known issue
+  rather than an incident. The fix is an exception-handled `CREATE ROLE` — catch `duplicate_object`
+  and carry on — **as migration `00002`: scheduled work, not done.** It cannot be a baseline edit,
+  because the freeze above forbids exactly that, on its own reasoning.
 - **A killed migrator leaves an INVALID index behind, and the retry does not heal it.** This is the
   failure a pre-deploy job makes *more* likely, because pods get evicted, `activeDeadlineSeconds`
   fires and nodes drain. Reproduced against PostgreSQL 18: kill the backend mid-build and

@@ -6,10 +6,13 @@ are a *reference implementation* built on it
 ([ADR-0002](/decisions/0002-scaling)). So the core must be verifiable by strangers before a reference
 product matters.
 
-**The schema is applied and verified; almost none of the Rust exists.**
-`migrations/00001_baseline.sql` and `openledger migrate` are built and run in CI. The writer that
-posts against that schema is not, and neither is the read path over it. That gap — not a deployment —
-is the story now. Phase 1 is the ordered list of code to build to close it.
+**The schema is applied and verified, and the first vertical slice of the Rust exists.**
+`migrations/00001_baseline.sql` and `openledger migrate` are built and run in CI — and since
+2026-08-27 so are M3's lean writer, the one HTTP endpoint in front of it
+([ADR-0014](/decisions/0014-http-api)), and the e2e suite that spawns the binary and posts over the
+wire. What is missing is the load-bearing half of the writer — batching under load, stripe
+selection, single-call posting, pending → posted, the concurrency proof — and the read path. That
+gap — not a deployment — is the story now. Phase 1 is the ordered list of code to build to close it.
 
 ---
 
@@ -19,8 +22,9 @@ is the story now. Phase 1 is the ordered list of code to build to close it.
 
 1. **The writer** ([M3](#m3--the-posting-engine)) — the posting API that is balanced by
    construction, the two-statement idempotency replay, the posted-only cache update and the
-   transaction seal. The single largest gap between the design and the tree, and it unblocks
-   everything below. **This is the immediate next step.**
+   transaction seal. **The lean core of this landed on 2026-08-27**, behind one HTTP endpoint
+   ([ADR-0014](/decisions/0014-http-api)); what remains of M3 is batching under load, stripe
+   selection, single-call posting, and pending → posted.
 2. **`openledger reconcile`** ([M2](#m2--openledger-reconcile-and-the-concurrency-proof)) — wire the
    ten reconciliation views to an exit code so the daily sweep is a real command. The views already
    ship in the baseline; the command does not.
@@ -65,7 +69,7 @@ down migrations, and a wait budget an operator chooses (900 s by default,
 database.
 ***Idempotent on re-run* is verified, and now checked on every push.** Run twice against a fresh
 database on 2026-08-27 it exited 0 both times, 51 ms then 1 ms, and `.github/workflows/test.yml`
-runs it twice. The tests in `src/migrate.rs`
+runs it twice. The tests in `crates/db/src/migrate.rs`
 additionally assert that the set carries no down migration and that a `-- no-transaction` migration
 holds exactly one statement.
 
@@ -106,10 +110,12 @@ must dump `pg_class.relrowsecurity`/`relforcerowsecurity`, `pg_get_viewdef` for 
 
 ## M3 · The posting engine
 
-**This is the immediate next step — the single largest gap between the design and the tree, and it
-unblocks everything else in Phase 1.** Given a balanced set of entries and an idempotency key: post
-atomically or return the stored result. Pending → posted is a **new** transaction with
-`resolves_id`, never an UPDATE. Three design constraints, not later optimizations:
+**The lean core of this landed on 2026-08-27** ([ADR-0014](/decisions/0014-http-api)): given a
+balanced set of entries and an idempotency key, post atomically or return the stored result — built,
+behind `POST /v1/transactions`, and verified by the caller-shaped e2e suite with
+`SELECT * FROM reconciliation` as its oracle. What remains here is the load-bearing half.
+Pending → posted is a **new** transaction with `resolves_id`, never an UPDATE — not yet built. Three
+design constraints, not later optimizations, none of them in the lean core yet:
 
 - **Coalesced batching.** N postings to one account collapse into a single upsert advancing the
   balance by the total and `last_seq` by the count; each entry's running balance is derived by
@@ -123,7 +129,7 @@ atomically or return the stored result. Pending → posted is a **new** transact
 
 **Decided: RLS and batching are not mutually exclusive, and the `BYPASSRLS` sketch is refused**
 ([ADR-0013](/decisions/0013-write-path-contract) §5, answering the [settled RLS framing decision](#rls-guards-reads-the-writer-is-admitted-not-exempt)
-above). `unnest`-based multi-row `INSERT` measured within 2% of `COPY` on `ledger_entries` at
+below). `unnest`-based multi-row `INSERT` measured within 2% of `COPY` on `ledger_entries` at
 25–10,000 rows — the composite foreign keys dominate, not the wire format — and `BYPASSRLS` cannot
 be granted on RDS or Aurora at all. The writer posts under an explicit admit-all policy; RLS scopes
 the read role.
@@ -136,7 +142,8 @@ without batching, and with striping on and off.
 Two things live here: a command that is buildable now, and a proof that waits on the writer above.
 
 **Buildable now — the `openledger reconcile` subcommand.** The ten reconciliation views ship in
-`migrations/00001_baseline.sql`, but nothing runs them: `src/main.rs` carries only `migrate` today.
+`migrations/00001_baseline.sql`, but nothing runs them on a schedule: the binary carries `migrate`
+and `serve` today, and the e2e suite reads `reconciliation` per test rather than as a sweep.
 The command is the same binary and shape as `openledger migrate` ([ADR-0010](/decisions/0010-reconciliation)),
 running the reconciliation views once a day in one `REPEATABLE READ READ ONLY` transaction as
 `openledger_recon` and turning `SELECT * FROM reconciliation` into an exit code. The views exist; the
@@ -189,7 +196,8 @@ checkpoints (measured at ~40–230× at a close boundary, ~8–9× mid-period, n
 history), so a business-date query could read "prior close + entries since". **But that benefit is real
 and not yet wired in**: the shipped `balance_sheet_at` / `income_statement_for` / `trial_balance_at`
 never read `ledger_period_balances` — proven from `pg_get_functiondef` — so they scan `ledger_entries`
-from inception, and the checkpoint's only reader is `recon_checkpoint_breaks` ([spike 020](/spikes/016-close-cost-at-scale)).
+from inception, and the checkpoint's only reader is `recon_checkpoint_breaks` ([spike 020](/spikes/016-close-cost-at-scale)
+— this site's spike 016; the spike directories carry their own numbering).
 
 **Make the checkpoint pay for itself** (moved here from the decision log): teach `balance_sheet_at` to
 read `ledger_period_balances` plus the two tails, partition the checkpoint by period, and bound
@@ -266,19 +274,32 @@ place is owning the *sweep* that consolidates suspense accounts, and draining ev
 
 ## Open questions
 
-Both answered, neither in a hurry when they were asked:
+Both answered, neither in a hurry when they were asked — and the first answer has since
+been reversed:
 
-- **Does v0.1 need an HTTP API?** No — v0.1's adoption surface is `openledger migrate`, the schema
-  it applies, and a Rust crate once [M3](#m3--the-posting-engine)'s writer exists. The split in the
-  field is not "API or no API" but *who owns the database*, and [ADR-0003](/decisions/0003-migrations)
-  answered that before the question was asked: the command runs against a database the operator
-  already has, and you cannot hide a schema that is the product. [ADR-0005](/decisions/0005-event-log-and-write-path)
-  already refused the API as a place a guarantee can live — *"that is a check, not a shape"* — and
-  there is no `src/lib.rs` to put an API in front of yet. The shape is not hypothetical: `sqlx-ledger`
-  (Galoy, in production) and `pgledger` ship exactly it, a Rust crate handing the adopter its
-  migrations. **Revisit when both hold: M3 exists, and a consumer that is not written in Rust actually
-  needs to post** — a fact about the world, not a date. This is build order, not an invariant, which
-  is why it lives here and not in the decision log.
+- **Does v0.1 need an HTTP API?** It does now — **reversed on 2026-08-27**, with the original *no*
+  kept below because half of its reasoning still binds. The writer will not ship as a library crate:
+  a crate is callable from exactly one language, and the adopter this project wants is anyone who can
+  speak HTTP. So **the API is the adoption surface**, and [M3](#m3--the-posting-engine) ships behind
+  it as one vertical slice — a `tokio` + `axum` service in the same binary, with the e2e suite
+  calling the endpoint over HTTP against a real Postgres and reading `SELECT * FROM reconciliation`
+  as its oracle. What the reversal does *not* move is the guarantee:
+  [ADR-0005](/decisions/0005-event-log-and-write-path)'s refusal — *"that is a check, not a shape"* —
+  still holds, so balance lives in the posting type the handlers deserialize into and the API stays a
+  thin mapping over error types the writer names. [ADR-0013](/decisions/0013-write-path-contract)'s
+  HTTP semantics — 422 for the poisoned replay, `Idempotency-Replayed: true`, no invented 409 —
+  finally get the surface they were specified against. [ADR-0003](/decisions/0003-migrations)'s half
+  is unchanged: the service runs against a database the operator already has, and you cannot hide a
+  schema that is the product. The OpenAPI story is settled: **`utoipa` core only** — `utoipa-axum` refused on
+  its 19-month-stale release and RUSTSEC-2024-0436, `aide` on maintenance and its silent naive
+  failure mode — with the spec a committed, snapshot-tested artifact in the spirit of
+  [0007](/decisions/0007-schema-conventions-and-chart)'s convention 2
+  ([ADR-0014](/decisions/0014-http-api), [spike 017](/spikes/017-openapi-tooling)).
+  *(The original answer, for the record: v0.1's surface was to be `openledger migrate` plus a Rust
+  crate — the `sqlx-ledger`/`pgledger` shape — revisited only when a consumer not written in Rust
+  actually needed to post. The condition fired early because the deciding argument changed: a writer
+  only Rust code can call is not a deliverable, and the HTTP boundary is what makes the e2e tests
+  caller-shaped.)*
 - **How much of the card product belongs in this repository?** All of it that exists, with
   [`parked/`](/card/parked) as the boundary, then a `card` schema, then a migration set only at the
   second rail ([0008](/decisions/0008-module-boundaries)).
@@ -342,14 +363,15 @@ there is worth more than the verdict alone. Each names the ADR that owns it. **E
 either a milestone on this roadmap or an accepted cost in the owning ADR — none of it waiting on an
 answer here.**
 
-### The baseline is editable until v0.1
+### The baseline was editable until it froze — on 2026-08-27, ahead of v0.1
 
-`migrations/00001_baseline.sql` may be edited in place until the first tagged release, then it
-freezes; the exception is written into [ADR-0003](/decisions/0003-migrations) with that cut-off named.
-A migration no kept database has ever seen is not history, and one flat readable file is worth more
-than a file plus a stack of patches at this stage. Every queued schema fix from
-[0009](/decisions/0009-append-only-perimeter)–[0013](/decisions/0013-write-path-contract) landed under
-that exception and the merged baseline was re-verified end to end.
+`migrations/00001_baseline.sql` could be edited in place while no kept database had seen it; every
+queued schema fix from [0009](/decisions/0009-append-only-perimeter)–[0013](/decisions/0013-write-path-contract)
+landed under that exception and the merged baseline was re-verified end to end. The freeze then came
+early: with the merged baseline committed, [ADR-0003](/decisions/0003-migrations)'s own reasoning cut
+the exception off before any tag, and the rule is now enforced by CI —
+`scripts/check-migrations-immutable.sh` refuses any edit to an existing migration, the baseline
+included, with no opt-out. From here every schema change is a new numbered migration.
 
 ### The cache means posted
 

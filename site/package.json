@@ -3,8 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "next dev",
-    "build": "next build && pagefind --site out --output-subdir _pagefind",
+    "dev": "node scripts/api-reference.mjs && next dev",
+    "build": "node scripts/api-reference.mjs && next build && pagefind --site out --output-subdir _pagefind",
     "start": "npx serve out"
   },
   "dependencies": {
@@ -16,10 +16,12 @@
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },
-  "description": "A viewer over the repository’s own markdown. The docs live in ../docs; this renders them.",
+  "description": "A viewer over the repository’s own markdown. The docs live in ./content; this renders them.",
   "devDependencies": {
-    "pagefind": "1.5.2"
+    "pagefind": "1.5.2",
+    "redoc": "2.5.3"
   },
+  "//redoc": "Exact-pinned: scripts/api-reference.mjs inlines its standalone bundle verbatim into public/api-reference/index.html, so the rendered API page changes only when this number does. 2.5.3 is the version spike 021 measured (1.10 MB, 3.5x smaller than Scalar for the same page).",
   "//zod": "nextra-theme-docs' Layout strips `children` from its props and then validates the remainder against a schema that still requires it. zod <4.4 lets a missing key through z.custom(); 4.4 made it 'expected nonoptional', which throws on every page. Held below 4.4 until nextra fixes the schema.",
   "overrides": {
     "zod": "<4.4"

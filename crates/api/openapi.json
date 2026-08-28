@@ -1,0 +1,246 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "OpenLedger API",
+    "description": "The write path of OpenLedger, an open-source double-entry ledger on PostgreSQL. One endpoint while the core structure is under review: posting a transaction, under the idempotent replay contract of ADR-0013 — the same key with the same body returns the stored result, marked by the `Idempotency-Replayed` header.",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "0.0.0"
+  },
+  "paths": {
+    "/v1/transactions": {
+      "post": {
+        "tags": [
+          "transactions"
+        ],
+        "summary": "Post a transaction.",
+        "description": "The response set below is this endpoint's real one, not a shared error\nenum's: the three 422 `type`s named are the three the writer can produce\nhere, and nothing else is documented (spike 021 found both candidate\nlibraries fanning shared enums across statuses their endpoints cannot\nreturn — the fix is to declare per endpoint, so this project does).",
+        "operationId": "postTransaction",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TransactionBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Replayed: this key was already accepted with this same body. The stored result is re-rendered — never a cached response body — and nothing was written (ADR-0013 §2).",
+            "headers": {
+              "Idempotency-Replayed": {
+                "schema": {
+                  "type": "boolean"
+                },
+                "description": "`true`: this response re-renders a previously stored result."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransactionCreated"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Posted: this call claimed the idempotency key and wrote the transaction atomically.",
+            "headers": {
+              "Idempotency-Replayed": {
+                "schema": {
+                  "type": "boolean"
+                },
+                "description": "`false`: this response is the first for its idempotency key."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransactionCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request body is not syntactically valid JSON. `type` is `invalid_request`; `detail` carries the parser's message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The request body exceeds the size limit. `type` is `invalid_request`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The request's `Content-Type` is not `application/json`. `type` is `invalid_request`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Refused, and nothing was written. The caller must CHANGE the request to escape — which is why this is 422, not 400 or 409 (ADR-0013 §2). `type` is one of: `invalid_request` (a precondition on the body failed, or a field failed to deserialize into its documented type), `idempotency_key_reused` (same key, different body — send a new key or resend the original request unchanged), `unknown_account` (a posting names an account that does not exist or does not hold that currency).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The write failed; nothing was committed. `type` is `internal`, and the caller gets no internals — the operator's log has the error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ErrorBody": {
+        "type": "object",
+        "description": "The error body: a stable machine-readable `type`, prose in `detail`.",
+        "required": [
+          "type",
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "Human-readable explanation. Not stable; do not parse."
+          },
+          "type": {
+            "type": "string",
+            "description": "Stable machine-readable identifier. Parse this, never `detail`.",
+            "example": "invalid_request"
+          }
+        }
+      },
+      "PostingBody": {
+        "type": "object",
+        "description": "One movement of money: `amount_minor` leaves `source` and arrives at\n`destination`. Direction is carried by the pair, never by a sign.",
+        "required": [
+          "source",
+          "destination",
+          "amount_minor",
+          "currency"
+        ],
+        "properties": {
+          "amount_minor": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Minor units of `currency`. Strictly positive.",
+            "example": 2500,
+            "minimum": 1
+          },
+          "currency": {
+            "type": "string",
+            "description": "ISO 4217 alphabetic code, three uppercase ASCII letters.",
+            "example": "USD",
+            "maxLength": 3,
+            "minLength": 3
+          },
+          "destination": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Account the amount arrives at."
+          },
+          "source": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Account the amount leaves."
+          }
+        }
+      },
+      "TransactionBody": {
+        "type": "object",
+        "description": "The body of `POST /v1/transactions`.",
+        "required": [
+          "tenant_id",
+          "idempotency_key",
+          "effective_at",
+          "postings"
+        ],
+        "properties": {
+          "effective_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the movement is deemed to have happened, RFC 3339."
+          },
+          "idempotency_key": {
+            "type": "string",
+            "description": "Caller-supplied replay key, unique per tenant. Sending the same key\nwith the same body replays the stored result; with a different body it\nis refused as `idempotency_key_reused` (ADR-0013 §2).",
+            "example": "charge-1",
+            "minLength": 1
+          },
+          "postings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PostingBody"
+            },
+            "description": "At least one posting.",
+            "minItems": 1
+          },
+          "tenant_id": {
+            "type": "string",
+            "description": "The book this transaction belongs to. Named in the body for now: the\ntrust story is the deployment perimeter's until an auth decision exists.",
+            "example": "t1"
+          }
+        }
+      },
+      "TransactionCreated": {
+        "type": "object",
+        "description": "The stored result of an accepted operation: the event, and the transaction\nit caused.",
+        "required": [
+          "event_id",
+          "transaction_id"
+        ],
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The event row this call claimed — or, on a replay, the one it found."
+          },
+          "transaction_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The transaction the event caused. Nullable by contract: most accepted\noperations write no transaction at all (ADR-0013 §2). This endpoint\nalways writes one, but a replay re-renders whatever was stored."
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "transactions",
+      "description": "The write path."
+    }
+  ]
+}

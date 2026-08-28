@@ -1,0 +1,25 @@
+# The core: the posting types, the canonical hash, the pure posting math, the
+# `Ledger` and `Repository` ports, and the writer service that orchestrates
+# between them. NO sqlx — deny.toml's capability map forbids it here, and
+# that ban is what makes the hexagonal boundary machine-checked (the crate-level
+# doc comment in src/lib.rs says how this supersedes ADR-0004's co-location).
+# The `postgres/` directory underneath is NOT this crate: it is the nested
+# workspace member `ledger-postgres`, with its own manifest and allowances.
+[package]
+name    = "ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The event payload the service hands the repository is the command's
+# versioned rendering, built field-by-field in the domain (never a serde
+# derive — ADR-0013's Formance warning); storage stays in the adapter.
+serde_json.workspace = true
+sha2.workspace       = true
+time.workspace       = true
+uuid.workspace       = true
+
+[lints]
+workspace = true

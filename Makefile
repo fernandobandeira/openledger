@@ -38,8 +38,26 @@ psql: ## Open a psql shell
 	psql "$(DB_URL)"
 
 .PHONY: test
-test: ## Run the tests
-	cargo test
+test: ## Run all tests on the `make up` postgres; without DATABASE_URL, `cargo test --workspace` self-starts a container
+	@# Bare `cargo test` tests only the binary crate (default-members); the
+	@# container fallback fires for `cargo test --workspace` / `-p e2e` run
+	@# without DATABASE_URL. The e2e suite (crates/e2e) spawns the compiled
+	@# `openledger` binary resolved from the test executable's own path — a
+	@# separate crate never sees CARGO_BIN_EXE_* — and resolving an existing
+	@# file guarantees no build, so build the binary explicitly first.
+	cargo build -p openledger
+	DATABASE_URL="$(DB_URL)" cargo test --workspace
+
+.PHONY: openapi
+openapi: ## Regenerate crates/api/openapi.json from the annotations
+	@# The committed spec is written by the snapshot test itself, under an
+	@# explicit opt-in — so a normal test run can only ever FAIL on drift,
+	@# never paper over it by rewriting the file it was about to compare.
+	OPENLEDGER_WRITE_SPEC=1 cargo test -p api --test spec
+
+.PHONY: openapi-check
+openapi-check: ## Fail if crates/api/openapi.json drifted from the annotations
+	cargo test -p api --test spec
 
 .PHONY: build
 build: ## Build the binary
@@ -56,4 +74,10 @@ docs-build: ## Build the docs site to site/out/ -- plain files, host them anywhe
 
 .PHONY: tidy
 tidy: ## Check formatting and lints
-	cargo fmt --check && cargo clippy --all-targets -- -D warnings
+	cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
+
+.PHONY: deny
+deny: ## Check dependencies against deny.toml (CI always runs this; local needs cargo-deny installed)
+	@# Not part of `tidy` on purpose: tidy must not fail on a machine that
+	@# has no cargo-deny. CI runs the same check unconditionally.
+	cargo deny check

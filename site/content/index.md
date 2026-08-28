@@ -1,10 +1,11 @@
 # OpenLedger
 
-An open-source **double-entry ledger** — Postgres for the schema, Rust for the service that will
-sit on it.
+An open-source **double-entry ledger** — Postgres for the schema, Rust for the service that sits
+on it.
 
 **This is a personal design project. Nobody has run it in production, and it is not asking to be.**
-The schema and the command that applies it are built; the ledger service is not. If you need a
+The schema, the command that applies it, and the first slice of the service — one endpoint,
+`POST /v1/transactions` — are built. If you need a
 ledger in production, [use Formance](https://github.com/formancehq/ledger); [the vision](/vision)
 says why, and what this does differently.
 
@@ -12,6 +13,7 @@ says why, and what this does differently.
 | --- | --- |
 | [Vision](/vision) | Why this exists when Formance already does |
 | [The database](/database) | The schema drawn and explained, assuming nothing |
+| [The service](/service) | The code that runs against it: one binary, two commands, one endpoint |
 | [Decisions](/decisions) | One file per decision, with its evidence and its cost |
 | [Roadmap](/roadmap) | What gets built next, and why in that order |
 
@@ -34,6 +36,10 @@ make migrate   # openledger migrate -- the same subcommand a deploy runs
 make chart     # seed an example chart of accounts
 make docs      # read all of this at localhost:3000
 ```
+
+The service is the same binary: `openledger serve` — in development,
+`DATABASE_URL=… cargo run -- serve` — checks the schema is current and then serves the one
+endpoint, `POST /v1/transactions`, on `127.0.0.1:8080`. [The service](/service) is that page.
 
 `migrations/00001_baseline.sql` is the ledger core. It creates the chart-of-accounts tables and
 leaves them **empty**: the chart is data, seeded separately, and yours will differ

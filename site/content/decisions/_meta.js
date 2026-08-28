@@ -14,4 +14,6 @@ export default {
   '0011-period-close-and-report-axes': '0011 · Period close, and a report is its parameters',
   '0012-chart-governance': '0012 · The chart is versioned',
   '0013-write-path-contract': '0013 · The write path contract',
+  '0014-http-api': '0014 · The API is the adoption surface',
+  '0015-workspace-enforcement': '0015 · The workspace, machine-enforced',
 }

@@ -1,0 +1,143 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "",
+    "version": ""
+  },
+  "paths": {
+    "/v1/transactions": {
+      "post": {
+        "requestBody": {
+          "description": "The body of `POST /v1/transactions`.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTransactionRequest"
+              }
+            }
+          },
+          "required": true
+        }
+      }
+    },
+    "/v1/accounts/{id}/balance": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "The current balance of one account, summed over its stripes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountBalance"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AccountBalance": {
+        "description": "The current balance of one account, summed over its stripes.",
+        "type": "object",
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "balance": {
+            "description": "Minor units. May be negative.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "currency": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_id",
+          "currency",
+          "balance"
+        ]
+      },
+      "CreateTransactionRequest": {
+        "description": "The body of `POST /v1/transactions`.",
+        "type": "object",
+        "properties": {
+          "effective_at": {
+            "description": "When the movement is deemed to have happened, RFC 3339.",
+            "type": "string",
+            "format": "date-time"
+          },
+          "idempotency_key": {
+            "description": "Caller-supplied replay key. Scoped to the tenant; never expires (ADR-0013 §2).",
+            "type": "string",
+            "examples": [
+              "5f0a1e4c-1c0f-4b1e-8f9d-2b7a9f0e4c11"
+            ],
+            "minLength": 1
+          },
+          "postings": {
+            "description": "At least one posting.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Posting"
+            },
+            "minItems": 1
+          }
+        },
+        "required": [
+          "idempotency_key",
+          "effective_at",
+          "postings"
+        ]
+      },
+      "Posting": {
+        "description": "One leg of a transaction. Amounts are in minor units and always positive;\n direction is carried by `source` / `destination`, never by the sign.",
+        "type": "object",
+        "properties": {
+          "amount": {
+            "description": "Minor units. Positive.",
+            "type": "integer",
+            "format": "int64",
+            "examples": [
+              25000
+            ],
+            "minimum": 1
+          },
+          "currency": {
+            "description": "ISO-4217 alphabetic code.",
+            "type": "string",
+            "examples": [
+              "USD"
+            ],
+            "maxLength": 3,
+            "minLength": 3
+          },
+          "destination": {
+            "description": "Account the value arrives at.",
+            "type": "string",
+            "examples": [
+              "liabilities:customer:9f3a"
+            ]
+          },
+          "source": {
+            "description": "Account the value leaves.",
+            "type": "string",
+            "examples": [
+              "assets:cash:usd"
+            ]
+          }
+        },
+        "required": [
+          "source",
+          "destination",
+          "amount",
+          "currency"
+        ]
+      }
+    }
+  }
+}

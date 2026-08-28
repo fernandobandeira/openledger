@@ -24,13 +24,14 @@ the ADRs don't each stop to re-explain them.
 - **Postgres for durable timers too** — an in-process job queue, no scheduler cluster to run.
 - **Migrations are `sqlx` plus our own try-lock**, run as `openledger migrate`, a pre-deploy command.
   Exactly one Rust migrator attempts cross-process coordination and it does it the wrong way. **This
-  one is built** — `src/migrate.rs`, and `migrations/00001_baseline.sql` is what it applies. The
-  baseline is **editable in place until v0.1 is tagged**, then frozen — the written exception in
+  one is built** — `crates/db/src/migrate.rs`, and `migrations/00001_baseline.sql` is what it applies. The
+  baseline is **frozen — since 2026-08-27, ahead of any tag**, CI-enforced with no opt-out; the
+  written exception that let it be edited until then, and why it closed early, are in
   [0003](/decisions/0003-migrations).
 
 ## The decisions
 
-Thirteen, each one file, each stating the decision first and then its evidence, its alternatives and
+Fifteen, each one file, each stating the decision first and then its evidence, its alternatives and
 what it costs. Each decision shows its `Status` — the decision itself — and, where useful, an
 `Artifact:` line for what is actually in the tree, with build status tracked on the [roadmap](/roadmap).
 The card rail's own two live under [the card decisions](/card). There is no separate
@@ -41,7 +42,7 @@ decision accepted lives in that ADR's own *"What it costs"*.
 | --- | --- | --- | --- |
 | [0001](/decisions/0001-rust-and-postgres) | **Rust** on one Postgres 18, with sqlx and no ORM | Two of this project's written guarantees turned out false in Go, and only a type system catches that. Postgres has measured headroom of 16–40× what we sized for | accepted |
 | [0002](/decisions/0002-scaling) | One Postgres, with the hot account striped | The bottleneck is one contended row, not the hardware — and splitting per tenant *relocates* it (1.07× under a dominant tenant) where striping removes it | accepted |
-| [0003](/decisions/0003-migrations) | `sqlx` + our own try-lock, as an `openledger migrate` pre-deploy command — and the baseline editable until v0.1 | A *blocking* advisory lock deadlocks against `CREATE INDEX CONCURRENTLY`. sqlx blocks; every other Rust migrator has no lock at all | accepted |
+| [0003](/decisions/0003-migrations) | `sqlx` + our own try-lock, as an `openledger migrate` pre-deploy command — and the baseline editable until it froze (2026-08-27) | A *blocking* advisory lock deadlocks against `CREATE INDEX CONCURRENTLY`. sqlx blocks; every other Rust migrator has no lock at all | accepted |
 | [0004](/decisions/0004-where-logic-lives) | **The ledger goes in Rust. Postgres holds the shape, and a trigger needs a written justification** | The schema had quietly become the ledger — 27 triggers and 26 functions against 11 lines of application code. And a column with a `DEFAULT` is not a constraint: `recorded_at`, `account_seq` and `xact_id` each had one and each was forgeable by an `INSERT` | accepted |
 | [0005](/decisions/0005-event-log-and-write-path) | An append-only `ledger_events` table, and **a posting — not an entry — as the write primitive** | Most accepted operations write no ledger transaction, so idempotency cannot live on the transactions table. And "one service owns the writes" is a hope about deployment; a type that cannot express an unbalanced transaction holds for every caller | accepted |
 | [0006](/decisions/0006-time-and-as-of) | Running balance for "now", aggregate-on-read for "as of a business date" — and reports pinned to a commit-ordered cursor | A backdated entry lands with a *later* sequence number. And `recorded_at` is transaction-*start* time, so the same "as of" query re-runs to a different answer | accepted; its cursor *mechanism* is superseded by [0011](/decisions/0011-period-close-and-report-axes) |
@@ -52,6 +53,8 @@ decision accepted lives in that ADR's own *"What it costs"*.
 | [0011](/decisions/0011-period-close-and-report-axes) | **The close is an ordinary posting, the as-of cursor is an `xid8`, and the statements become functions of an effective range and that cursor** | A timestamp cannot order commits and neither can a sequence — 0006's own watermark admits a row below a watermark already issued. And the same cursor is what makes a stored period-end balance safe under a backdated entry: the late arrival lands in a tail, not in a contradiction | accepted |
 | [0012](/decisions/0012-chart-governance) | **The chart splits into identity and a versioned, append-only presentation — and netting is declared per type** | Reclassifying a line silently restated issued statements and IAS 1.41 requires the comparatives to move with it. And the balance-sheet side was two-valued, so 1,000.00 of paid-in capital presented under "Accounts payable and accrued" with every check green | accepted |
 | [0013](/decisions/0013-write-path-contract) | **`READ COMMITTED` on the write path, a two-statement replay contract, `event_id NOT NULL`, and the stripe below the account** | A retry loop rescues 0 of 25,074 serialization failures because the snapshot never moves; the one-statement replay returns zero rows under its own race; `NOT NULL` is free today and needs `DISABLE TRIGGER` tomorrow; and `uq_accounts__house` was never what blocked striping | accepted |
+| [0014](/decisions/0014-http-api) | **The HTTP API is the adoption surface — tokio + axum, `utoipa` core only, the spec a committed snapshot-tested artifact** — reversing the roadmap's original "no API in v0.1" | A writer only Rust code can call is not a deliverable, and the HTTP boundary is what makes the e2e tests caller-shaped. `utoipa-axum` is 19 months stale and ships RUSTSEC-2024-0436; `aide`'s naive failure mode is an endpoint with no `responses` at all, silently | accepted |
+| [0015](/decisions/0015-workspace-enforcement) | **Five crates plus a test-only crate, hexagonal by dependency direction — and the boundary machine-enforced** by deny.toml's capability ratchet, strict advisories, and the clock lint | An in-crate module cannot be forbidden a dependency; a crate can. The domain crate holds zero sqlx and `cargo deny check` fails the build if that ever changes — the boundary is a refusal, not a review habit | accepted |
 
 ## Non-negotiable
 

@@ -16,5 +16,6 @@ export default {
   '013-chart-governance': '013 · Who owns the chart?',
   '014-write-path-contract': '014 · What the write path requires',
   '015-managed-postgres-event-triggers': '015 · Event triggers on managed Postgres',
-  '016-close-cost-at-scale': '016 · What a period close costs at scale'
+  '016-close-cost-at-scale': '016 · What a period close costs at scale',
+  '017-openapi-tooling': '017 · aide or utoipa for the OpenAPI spec'
 }

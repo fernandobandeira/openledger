@@ -6,9 +6,10 @@
 # pattern matches at any depth, so it would also ignore a directory of that name.
 /openledger
 
-# sqlx offline query cache is COMMITTED, not ignored -- ADR-0001 depends on it:
-# CI has no database, so `.sqlx/` is what makes the compile-time checking run
-# there. Do not add it here.
+# No `.sqlx/` exists yet: the shipped queries are the runtime `query_as` form,
+# not the compile-time `query!` macros (ADR-0001 records the checking as
+# available, not in use). If `query!` ever lands, its offline cache `.sqlx/`
+# gets COMMITTED, not ignored -- CI has no database. Do not add it here.
 
 # Local
 .env
@@ -21,6 +22,10 @@
 /site/node_modules/
 /site/.next/
 /site/out/
+# Generated on every site build by site/scripts/api-reference.mjs from
+# crates/api/openapi.json -- committing it would create the second copy of the
+# spec that the whole arrangement exists to prevent.
+/site/public/api-reference/
 # Next.js writes these; they are not this repository's to own.
 /site/AGENTS.md
 /site/CLAUDE.md

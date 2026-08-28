@@ -21,10 +21,13 @@ guarantee.
 **A trigger needs a written justification in the schema beside it, and the default is none:** **the
 invariant** it holds, **why nothing declarative holds it** — no `CHECK`, no key, no `GENERATED`
 column, not simply withholding the privilege — and **what it does NOT protect against**. Two clear
-that bar, as six trigger objects over two functions: append-only and `TRUNCATE`-refusal on the three
-immutable logs. Nineteen did not; the table below sums 27 removed-or-kept. *(It was eight objects
-over four logs while the card event log shipped in the same file; that log is now parked, and the
-two functions are unchanged.)*
+that bar: append-only and `TRUNCATE`-refusal — today eighteen trigger objects over the same two
+functions, as the baseline's append-only perimeter grew to nine tables. Nineteen did not; the table
+below sums 27 removed-or-kept. *(It was six objects over three immutable logs when this was
+decided, and eight over four while the card event log shipped in the same file; that log is now
+parked, and the two functions are unchanged. [0012](/decisions/0012-chart-governance) later
+justified a third, `refuse_stale_chart_version`, as two more triggers — twenty in the baseline
+today.)*
 
 ## The evidence
 
@@ -129,7 +132,7 @@ over each record. Both published answers live outside the database; this is the 
 | **Table inheritance disarms every constraint — speed-bumped by [0009](/decisions/0009-append-only-perimeter)** | `CHECK`s are inherited; foreign keys, unique indexes and triggers are not. A child of `ledger_entries` plus one `INSERT … SELECT * FROM ONLY` took an income statement from 900 to 1,800, and the child stays visible through the parent to every view — and it was worse than this row first said: `DELETE FROM` the child *removes* parent-visible rows too. An event trigger on `ddl_command_end` now refuses the **naive** child of any append-only table (a state assertion over `pg_inherits`, so `CREATE TABLE … INHERITS` and `ALTER TABLE … INHERIT` are both caught) and `pg_event_trigger` is no longer empty — but it is a speed-bump, not a close: a `RENAME`/`SET SCHEMA` walks past it, so [0009](/decisions/0009-append-only-perimeter) records the owner-accident DDL class as an accepted limitation backstopped by the CI snapshot test. |
 | **`ENABLE TRIGGER ALL` forgets `ENABLE ALWAYS`** | One data-only restore (`pg_restore --disable-triggers`, which the circular keys on `ledger_transactions` force) downgrades all the append-only triggers to `ENABLE ORIGIN`, silently and permanently. The rule — restore schema-and-data, never data-only — and the snapshot test dumping `pg_trigger.tgenabled` are the coverage ([0009](/decisions/0009-append-only-perimeter)). |
 | **Gaplessness is enforced at issue, not verified at rest** | Nothing scans the journal for a gap that arrived some other way. |
-| **The chart is not versioned** | `fk_types__fs_line` blocks a statement-line change only across a statement or a side; **within one statement and side it is accepted, under posted history** ([0007](/decisions/0007-schema-conventions-and-chart)). Reclassifying `fbo_cash` from `restricted_cash` to `cash` moved 440.00 of customer float into unrestricted liquidity, one statement, no error. A stopgap, since IAS 1.41 *requires* reclassifying comparatives. |
+| **The chart was not versioned — closed by [0012](/decisions/0012-chart-governance)** | `fk_types__fs_line` blocked a statement-line change only across a statement or a side; within one statement and side it was accepted, under posted history. Reclassifying `fbo_cash` from `restricted_cash` to `cash` moved 440.00 of customer float into unrestricted liquidity, one statement, no error — a stopgap, since IAS 1.41 *requires* reclassifying comparatives. The presentation is now versioned and append-only, and the same `UPDATE` is refused ([0012](/decisions/0012-chart-governance)). |
 
 **The schema alone enforces no balance; the posting primitive does.** `ledger_entries` stores
 independent rows carrying a `direction`, so an unbalanced transaction is expressible at the table

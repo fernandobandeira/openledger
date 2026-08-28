@@ -1,0 +1,28 @@
+# The end-to-end suite, and nothing else: this crate exists so the e2e tests'
+# capabilities — sqlx to read the database as the oracle, reqwest to be a real
+# caller on the wire, testcontainers for the no-DATABASE_URL fallback — are
+# allowed HERE, visibly and scoped, in deny.toml's capability map, instead of
+# leaking onto the binary crate. Everything is a dev-dependency; the lib is an
+# empty doc-comment shell.
+[package]
+name    = "e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dev-dependencies]
+# For the exported route table ONLY: conformance.rs holds `api::ROUTES` —
+# the table the router itself is built from — against the committed spec and
+# the live wire, so the suite carries no hand copy of the surface.
+api.workspace                    = true
+reqwest.workspace                = true
+serde_json.workspace             = true
+sqlx.workspace                   = true
+testcontainers.workspace         = true
+testcontainers-modules.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+uuid.workspace                   = true
+
+[lints]
+workspace = true

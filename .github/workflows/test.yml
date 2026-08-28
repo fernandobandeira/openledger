@@ -1,4 +1,5 @@
-# CI. Two jobs: the Rust one, and the one that puts DDL into a real PostgreSQL 18.
+# CI. Four jobs: the Rust one, the one that puts DDL into a real PostgreSQL 18,
+# the dependency policy (cargo deny), and the migrations-immutability guard.
 #
 # This file was deleted once already, with the SQL conformance suite it ran
 # (ADR-0004). What it must not become is the thing this project keeps citing as
@@ -7,7 +8,7 @@
 # a server, and where a check is designed but not built it is a comment, not a
 # step that exits 0.
 #
-# ADR-0014 is the reasoning for the `parked-ddl` job; ADR-0003 for `migrate`
+# ADR-0008 is the reasoning for the parked-DDL steps in `schema`; ADR-0003 for `migrate`
 # being a subcommand rather than a shell script; ADR-0007 §2 for the schema
 # snapshot that is still missing.
 
@@ -36,6 +37,9 @@ jobs:
   rust:
     name: fmt, clippy, test
     runs-on: ubuntu-latest
+    # Finite on every job: a hung container pull or a wedged test must become
+    # a failed run, not a six-hour default. Observed runs fit well inside.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -47,23 +51,36 @@ jobs:
       - name: Record what actually ran
         run: cargo --version && rustc --version && cargo clippy --version
 
-      # `make tidy`, split so a failure names which half failed.
+      # `make tidy`, split so a failure names which half failed. `--workspace`
+      # everywhere below: the root's default-members is just the binary (so
+      # `cargo run -- migrate` stays the documented invocation), and without
+      # the flag the library crates would be a green check that did not run.
       - name: cargo fmt --check
         run: cargo fmt --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # Today this is two tests and neither touches a database: that a migration
-      # set carries no down migration, and that a `-- no-transaction` migration
-      # holds exactly one statement (spike 008 found why the second matters).
-      # M0's conformance suite comes back here, in Rust, after M3.
+      # No DATABASE_URL here — and no skip: without it the e2e suite starts
+      # its own postgres:18-alpine testcontainer, and GitHub's ubuntu runners
+      # have Docker, so the whole suite runs on the fallback path. The schema
+      # job below runs it again on the env-URL path. (The fallback container
+      # is named and reused, not leaked — support/postgres.rs; on a throwaway
+      # runner that distinction costs nothing.)
+      #
+      # The binary is built FIRST, explicitly: the suite lives in crates/e2e
+      # and spawns `openledger` resolved from the test executable's own path
+      # (CARGO_BIN_EXE_* only exists for the package defining the binary), and
+      # resolving an existing file guarantees no build.
+      - name: cargo build -p openledger
+        run: cargo build -p openledger
       - name: cargo test
-        run: cargo test --all-targets
+        run: cargo test --workspace --all-targets
 
   schema:
     name: migrations against PostgreSQL 18
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     services:
       db:
@@ -134,8 +151,8 @@ jobs:
         run: cargo run --locked -- migrate
 
       # Re-running the pre-deploy command is what a redeploy does, and the
-      # roadmap records "idempotent on re-run" as UNVERIFIED because nothing in
-      # the tree ran it twice. This step is that verification.
+      # roadmap records "idempotent on re-run" as verified and checked on
+      # every push. This step is that check.
       - name: openledger migrate, again
         run: cargo run --locked -- migrate
 
@@ -143,6 +160,22 @@ jobs:
       # loading it here proves the chart guard accepts the one we publish.
       - name: Seed the reference chart
         run: psql -d openledger -v ON_ERROR_STOP=1 --single-transaction -q -f schema/chart.sql
+
+      # ---------------------------------------------------------------
+      # The e2e suite: spawns the compiled binary, talks HTTP to it, and reads
+      # `SELECT * FROM reconciliation` as the oracle. The rust job already ran
+      # it on the container fallback; this run is NOT redundant — DATABASE_URL
+      # is in the job env above, so it exercises the env-URL fast path that
+      # `make test` and this job's own steps document. The suite creates its
+      # own scratch databases, so the `openledger` database the snapshot test
+      # will one day dump stays clean. (`-p e2e`: the suite is its own crate,
+      # holding the test-only capability allowances; the binary it spawns was
+      # built by the `cargo run -- migrate` steps above, and the explicit
+      # build keeps that true if those steps ever move.)
+      - name: e2e — a caller on the wire
+        run: |
+          cargo build --locked -p openledger
+          cargo test --locked -p e2e --test e2e
 
       - name: What the applied schema is
         run: |
@@ -168,7 +201,7 @@ jobs:
       # which is why the card DDL below is loaded into a database of its own.
 
       # ---------------------------------------------------------------
-      # The parked-DDL guard (ADR-0014). `parked/card/schema.sql` is applied by
+      # The parked-DDL guard (ADR-0008). `parked/card/schema.sql` is applied by
       # no migration and owned by no test; its only attestation before this job
       # existed was that somebody pasted it into a database once by hand. It
       # depends on three objects the baseline creates. Nothing declares that
@@ -191,3 +224,61 @@ jobs:
           # The file is 4 tables. Asserting the delta rather than just the exit
           # status is what makes a silently-shrinking parked file fail here.
           test "$after" = "$((before + 4))" || { echo "::error::expected 4 card tables, got $((after - before))"; exit 1; }
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # The policy is deny.toml at the workspace root: advisories (the whole
+      # graph, dev-dependencies included), the explicit license allowlist,
+      # crates.io as the only source, and duplicate-version bans with the
+      # commented skip list. The action pins its own cargo-deny build, so a
+      # contributor without the binary still gets the same verdict here that
+      # `make deny` gives locally.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  migrations-immutable:
+    name: migrations are immutable
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The guard diffs HEAD against a base commit, so history must be
+          # present — a depth-1 tip has no merge base to compare against.
+          fetch-depth: 0
+
+      # ADR-0003: migrations are immutable once committed — the 00001
+      # baseline included (frozen 2026-08-27, ahead of v0.1), and the script
+      # carries deliberately no opt-out. On a pull request the base is the
+      # PR's base commit and HEAD is the merge ref, which is the only place
+      # two branches both claiming "the next number" are visible together.
+      # On a push the base is the commit this push replaced.
+      - name: migrations unchanged since base
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base='${{ github.event.pull_request.base.sha }}'
+          else
+            base='${{ github.event.before }}'
+          fi
+          # A force-push or a first push has no usable `before` (empty or the
+          # zero SHA), and a force-push may have discarded the commit it names.
+          # Skip LOUDLY — a visible warning, never a diff against nothing that
+          # exits 0 and reads as verified. Every other bad base is the
+          # script's to refuse (it exits 2 rather than passing).
+          zero='0000000000000000000000000000000000000000'
+          if [ -z "$base" ] || [ "$base" = "$zero" ]; then
+            echo "::warning title=migrations guard did not run::no usable base ref on this ${{ github.event_name }} event (first push, force-push, or manual dispatch); the next pull request diffs the full change"
+            exit 0
+          fi
+          if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "::warning title=migrations guard did not run::base $base is not in the fetched history (a force-push discarded it); the next pull request diffs the full change"
+            exit 0
+          fi
+          ./scripts/check-migrations-immutable.sh "$base"

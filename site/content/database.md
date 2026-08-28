@@ -450,8 +450,9 @@ first migration than to retrofit.
 > measured rather than assumed: the elegant one-statement CTE form returns **zero rows** under
 > exactly the race it exists to handle, and the claim itself fails with `40001` under
 > `REPEATABLE READ`, so the replay path cannot exist at a stricter isolation level. The writer that
-> runs these statements is not built; the unique index alone still only makes the second attempt
-> fail.
+> runs these statements is now built — `crates/ledger/postgres/src/repository.rs`, orchestrated by
+> `ledger::LedgerService` ([the service](/service)); without it the unique index alone only makes
+> the second attempt fail.
 
 ### `ledger_accounts` — whose money, in what currency
 

@@ -1,0 +1,153 @@
+# cargo-deny: the supply-chain half of "every check must compare something
+# real". CI runs `cargo deny check` on every push (test.yml); `make deny` runs
+# the same thing locally. Policy: nothing yanked, unmaintained, unsound or
+# vulnerable anywhere in the graph — dev-dependencies included, deliberately:
+# the e2e suite's tree (reqwest, testcontainers and the bollard stack under
+# it) runs on every contributor machine and in CI, which is exactly where a
+# compromised crate wants to be. Schema is cargo-deny 0.20's (advisories and
+# licenses "version 2" are the defaults there: deny unless said otherwise).
+
+[advisories]
+# The ignore list is empty today, and the convention for it is written down
+# NOW, before the first entry exists: any future `ignore` must state (a) the
+# crate, (b) the transitive path that pulls it in, and (c) the condition under
+# which the ignore is removed. A removed ignore does not vanish — it stays as
+# a tombstone comment naming what removed it, so the list's history is
+# readable in the file rather than in `git log`.
+#
+# Vulnerabilities, unmaintained crates and unsound crates are all denied by
+# default under the version-2 advisories config — no keys needed.
+yanked = "deny"
+
+[licenses]
+# The explicit allowlist, built from what this tree actually resolves to —
+# nothing blanket. Every entry is load-bearing today; a new dependency wanting
+# a new license is a review, not an edit.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  # matchit (axum's router) is `MIT AND BSD-3-Clause`; subtle is BSD-3-Clause.
+  "BSD-3-Clause",
+  # ring is `Apache-2.0 AND ISC`; rustls-webpki and untrusted are ISC.
+  "ISC",
+  # unicode-ident is `(MIT OR Apache-2.0) AND Unicode-3.0`; the icu_* crates
+  # under idna are Unicode-3.0 outright.
+  "Unicode-3.0",
+  # foldhash (via hashbrown) and tinyvec.
+  "Zlib",
+  # webpki-roots: the compiled-in TLS trust anchors sqlx's rustls stack ships.
+  # Mozilla's CCADB data, published under CDLA-Permissive-2.0 — permissive,
+  # attribution-free; the one crate in the tree carrying it.
+  "CDLA-Permissive-2.0",
+]
+
+[licenses.private]
+# Every workspace crate is `publish = false`; their MIT is the repository's
+# LICENSE, not a crates.io claim, so the license check skips them rather than
+# demanding metadata nothing will ever read.
+ignore = true
+
+[bans]
+# Deny duplicate major versions outright; the skips below are the reviewed
+# exceptions, each one a transitive pair this workspace cannot collapse by a
+# feature or a bump. Every skip names both sides. Re-check the list when
+# bumping sqlx or testcontainers — a skip that no longer fires is stale and
+# cargo-deny warns about it.
+multiple-versions = "deny"
+# A `*` requirement is an unreviewed dependency by construction.
+# `allow-wildcard-paths` carves out the one shape this workspace itself uses:
+# path dependencies between its own `publish = false` crates carry no version,
+# which cargo (and this check) read as a wildcard.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+# The workspace's capability-ownership map, machine-checked: each entry names
+# a capability crate and the ONLY workspace crates allowed to speak it. A new
+# crate reaching for one of these fails `cargo deny check` and must be added
+# here — a wrapper is argued in review, never just appended. Each one is
+# justified inline or it goes.
+deny = [
+  # sqlx is PostgreSQL's dialect. The `ledger` domain crate is deliberately
+  # absent — forbidding it sqlx outright is what this map exists for.
+  { crate = "sqlx", wrappers = [
+    # Connections, migrations and the schema gate are this crate's whole
+    # subject.
+    "db",
+    # The adapter, a nested member at crates/ledger/postgres (the name stays
+    # flat): the `Repository` port's Postgres implementation is sqlx by
+    # definition. Only the SQL lives there now — the writer service that
+    # drives it moved into `ledger`, which stays absent from this list.
+    "ledger-postgres",
+    # Test instrumentation, scoped on purpose: the suite reads the database
+    # as its oracle (`SELECT * FROM reconciliation`) and builds scratch
+    # databases with raw SQL.
+    "e2e",
+  ] },
+  # The workspace's own adapter and pool crates are capabilities too, not
+  # conveniences — these two entries are what close the api -> adapter edge
+  # by machine, which until they existed was a convention review had to hold:
+  # `api` importing `ledger-postgres` (or `db`) compiled clean. Only the
+  # composition root may name the adapter; only the adapter and the root may
+  # name the pool crate. `e2e` is deliberately absent from both lists: it
+  # spawns the compiled binary and reads the database through its own sqlx
+  # allowance above, never through these crates.
+  { crate = "ledger-postgres", wrappers = ["openledger"] },
+  { crate = "db", wrappers = ["ledger-postgres", "openledger"] },
+  # ...and the api crate itself: without this row, a lower ring could reach the
+  # HTTP surface through api's re-exports and no axum ban would fire. The
+  # binary composes it; the e2e crate reads ROUTES (a dev-dependency).
+  { crate = "api", wrappers = ["openledger", "e2e"] },
+  # The HTTP surface is one crate's job; a second router is a design change.
+  # tonic is not ours: bollard's buildkit gRPC stack (dev-only, under
+  # testcontainers) serves its streams over axum, and a wrapper entry must
+  # name every DIRECT parent in the graph — workspace or not. It grants no
+  # workspace crate anything.
+  { crate = "axum", wrappers = ["api", "tonic"] },
+  # Spec generation lives beside the handlers it annotates, nowhere else.
+  { crate = "utoipa", wrappers = ["api"] },
+  # The command line belongs to the binary; a library crate parsing argv is a
+  # layering violation this line makes loud.
+  { crate = "clap", wrappers = ["openledger"] },
+  # The e2e suite is the one real HTTP caller in the tree; production code
+  # making outbound HTTP would be a new capability to argue for.
+  { crate = "reqwest", wrappers = ["e2e"] },
+  # The no-DATABASE_URL fallback container. testcontainers-modules wraps
+  # testcontainers by construction, so it appears as that crate's wrapper.
+  { crate = "testcontainers", wrappers = ["e2e", "testcontainers-modules"] },
+  { crate = "testcontainers-modules", wrappers = ["e2e"] },
+]
+skip = [
+  # The RustCrypto 0.10 -> 0.11 migration, mid-flight in sqlx 0.9:
+  # sqlx-postgres is on the digest 0.11 stack (sha2 0.11, md-5 0.11, hmac
+  # 0.13), while sqlx-core, sqlx-macros-core and this workspace's own sha2
+  # (the ADR-0013 idempotency hash) are still on digest 0.10. Collapses when
+  # sqlx finishes the migration and sha2 0.11 goes stable enough to follow.
+  { crate = "block-buffer@0.10", reason = "digest 0.10 side of the RustCrypto migration" },
+  { crate = "cpufeatures@0.2", reason = "digest 0.10 side of the RustCrypto migration" },
+  { crate = "crypto-common@0.1", reason = "digest 0.10 side of the RustCrypto migration" },
+  { crate = "digest@0.10", reason = "sha2 0.10 (ours, sqlx-core's) vs sqlx-postgres's 0.11 stack" },
+  { crate = "sha2@0.10", reason = "ours and sqlx-core's, until the 0.11 line is worth moving to" },
+
+  # Two getrandom lines, neither ours to pick: ring pins 0.2, rand 0.10
+  # (sqlx-postgres, ferroid) wants 0.4. Goes away as ring converges.
+  { crate = "getrandom@0.2", reason = "ring 0.17 pins it" },
+
+  # hashlink (sqlx's LRU) is on hashbrown 0.16; indexmap is on 0.17.
+  { crate = "hashbrown@0.16", reason = "hashlink 0.11 vs indexmap 2" },
+
+  # The syn 2 -> 3 migration: serde_derive, clap_derive and friends have
+  # moved; darling, prost-derive and the tonic derive stack (dev-only) have
+  # not. The oldest story in the proc-macro ecosystem; it collapses upstream.
+  { crate = "syn@2", reason = "proc-macro crates mid syn 2 -> 3 migration" },
+
+  # Windows-only, and only in the cross-platform lockfile cargo-deny checks:
+  # nothing here compiles on this project's targets, but the graph carries
+  # mio/socket2 (0.52) beside newer crates (0.61).
+  { crate = "windows-sys@0.52", reason = "windows-only transitive pair" },
+]
+
+[sources]
+# crates.io only. A git dependency is a policy change, not a convenience.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

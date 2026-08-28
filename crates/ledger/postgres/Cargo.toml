@@ -1,0 +1,24 @@
+# The Postgres adapter: the one shipped implementation of the `Repository`
+# port — the SQL, and nothing that decides when to run it (the writer service
+# behind the `Ledger` port lives in crates/ledger). A nested workspace member:
+# the directory sits under crates/ledger/, the package name stays flat. Split
+# out of crates/ledger so that deny.toml's capability map can forbid sqlx to
+# the domain outright — this crate, db and the e2e suite are the only ones
+# allowed to speak it. The pool arrives through `db::Database`, so the
+# composition root never names an sqlx type either.
+[package]
+name    = "ledger-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+db.workspace         = true
+ledger.workspace     = true
+serde_json.workspace = true
+sqlx.workspace       = true
+uuid.workspace       = true
+
+[lints]
+workspace = true

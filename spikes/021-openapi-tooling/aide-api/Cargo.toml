@@ -1,0 +1,27 @@
+[package]
+name    = "aide-api"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Spike 021. `aide` 0.15.1 is the latest STABLE release (2025-08-19); it pins
+# schemars ^0.9.0, which is a version schemars itself superseded on 2025-06-23.
+# The only aide release that speaks schemars 1.x is 0.16.0-alpha.4 (a prerelease).
+[dependencies]
+axum       = { version = "=0.8.9" }
+tokio      = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "net"] }
+serde      = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.151" }
+uuid       = { version = "=1.26.0", features = ["serde", "v4"] }
+chrono     = { version = "=0.4.45", default-features = false, features = ["serde", "clock"] }
+indexmap   = { version = "=2.14.0" }
+aide       = { version = "=0.15.1", features = ["axum", "axum-json", "scalar", "redoc"] }
+schemars   = { version = "=0.9.0", features = ["uuid1", "chrono04"] }
+
+[[bin]]
+name = "aide-api"
+path = "src/main.rs"
+
+[[bin]]
+name = "aide-naive"
+path = "src/bin/naive.rs"

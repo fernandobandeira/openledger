@@ -37,6 +37,15 @@ excludes code from the index by default.
 The index is built from `out/`, so **search does not work under `npm run dev`** — the box is
 there and returns nothing. Use `npm run build && npm start` to try it.
 
+## The API reference
+
+`/api-reference/` is the one page that is not markdown: a single self-contained HTML rendering
+`crates/api/openapi.json` with Redoc. `scripts/api-reference.mjs` regenerates it into
+`public/api-reference/` (gitignored) at the front of both `npm run dev` and `npm run build`, with
+the spec **and** the pinned viewer bundle inlined — no CDN, no fetch, renders from `file://`. The
+spec is read from the one committed copy the api crate's snapshot test owns, so the page cannot go
+stale without the Pages workflow redeploying it (`pages.yml` triggers on the spec path too).
+
 ## The one version constraint
 
 Every package here is on its latest release. **`zod` is the exception, held below 4.4** by an
@@ -59,6 +68,7 @@ app/layout.jsx        navbar, footer, theme tokens, Layout options
 app/theme.css         the only styling this site adds on top of the theme
 app/[[...mdxPath]]/   the catch-all that renders a content page
 mdx-components.js     blockquote classification (CAUGHT vs STILL OPEN callouts)
+scripts/              api-reference.mjs: regenerates the API reference page into
+                      public/api-reference/ on every dev run and build.
 content/              THE DOCUMENTATION. Committed, and the source of truth.
-public/diagrams/      leftover SVGs; most diagrams are now inline Mermaid in the markdown itself.
 ```

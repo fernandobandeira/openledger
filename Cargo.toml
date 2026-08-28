@@ -1,26 +1,84 @@
-[package]
-name    = "openledger"
+# The workspace, laid out so that deny.toml's capability map stays honest:
+# `ledger` is the domain, the ports and the writer service with NO sqlx,
+# `ledger-postgres` — a nested member at crates/ledger/postgres, its own
+# manifest, never a module — is the adapter that implements the outbound
+# repository port (ADR-0004's co-location, superseded — the crate boundary is
+# what the deny ratchet enforces), `db` owns connections and migrations, `api`
+# speaks HTTP against the `Ledger` port, `openledger` is the one binary that
+# wires them together, and `e2e` is the test-only crate that holds the
+# end-to-end suite and its capability allowances.
+[workspace]
+resolver = "3"
+members = [
+  "crates/ledger",
+  "crates/ledger/postgres",
+  "crates/db",
+  "crates/api",
+  "crates/openledger",
+  "crates/e2e",
+]
+# `cargo run -- migrate` and `cargo build` from the root keep meaning the
+# binary, exactly as they did when this was a single crate. `cargo test` and
+# `cargo clippy` take `--workspace` now; the Makefile and CI say so.
+default-members = ["crates/openledger"]
+
+[workspace.package]
 version = "0.0.0"
 edition = "2024"
 license = "MIT"
 publish = false
 
-[dependencies]
+[workspace.dependencies]
 # Trimmed to what a migration job needs. Notably absent: `color` (a pre-deploy
 # job's output is a log, not a terminal), `wrap_help` (which pulls a terminal-size
 # probe in to reflow text this file has already laid out), and `suggestions`
 # ("did you mean" over a two-word command surface, for one more crate).
 clap = { version = "4.6", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "migrate", "macros"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "migrate", "macros", "uuid", "time"] }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
 
-[lints.rust]
+# The API surface (roadmap: the HTTP API is the adoption surface; the guarantee
+# stays in the writer, ADR-0005). Same trimming instinct as clap above.
+axum       = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+serde      = { version = "1", default-features = false, features = ["derive", "std"] }
+serde_json = "1"
+# sha256 for the idempotency hash over a canonical byte form the writer owns
+# (ADR-0013: never hash a language-level serialization).
+sha2       = { version = "0.10", default-features = false, features = ["std"] }
+time       = { version = "0.3", default-features = false, features = ["std", "formatting", "parsing", "serde-well-known"] }
+uuid       = { version = "1", default-features = false, features = ["std", "serde"] }
+
+# Spec generation only — the annotations compile into the api crate, but the
+# document is emitted by a test, committed, and diffed; nothing runs at request
+# time. Core crate ONLY: `utoipa-axum` is refused — 19 months without a release
+# and it still ships `paste` (RUSTSEC-2024-0436, unmaintained). Spike 021 has
+# the full verdict, including what the missing `routes!` macro protected
+# against: path drift, which the e2e conformance test covers instead.
+utoipa = { version = "5", features = ["uuid", "time"] }
+
+# Workspace-internal.
+ledger          = { path = "crates/ledger" }
+ledger-postgres = { path = "crates/ledger/postgres" }
+db              = { path = "crates/db" }
+api             = { path = "crates/api" }
+
+# The e2e suite is a real caller: it spawns the compiled binary and talks HTTP.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+testcontainers-modules = { version = "0.15.0", features = ["postgres", "blocking"] }
+# Named directly to turn on `reusable-containers`, which testcontainers-modules
+# does not re-export: it is what lets the no-DATABASE_URL fallback keep ONE
+# named container across runs instead of leaking one per run (support.rs).
+testcontainers = { version = "0.27", features = ["reusable-containers"] }
+
+[workspace.lints.rust]
 unsafe_code = "forbid"
 
-[lints.clippy]
+[workspace.lints.clippy]
 # A ledger has no business panicking on a value it read from the database.
 # These are the Rust half of ADR-0001: the reason for this stack is that the
 # compiler refuses what Go accepted, so the escape hatches are denied too.
+# Suppressions in this workspace use `#[expect]` with a reason, never
+# `#[allow]` — a suppression that stops suppressing must warn itself out.
 unwrap_used      = "deny"
 expect_used      = "deny"
 panic            = "deny"

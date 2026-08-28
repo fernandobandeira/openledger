@@ -1,0 +1,8 @@
+# A ledger's time must be injectable: `recorded_at` is the database's clock,
+# `effective_at` is the caller's, and nothing in this codebase gets to invent
+# a third clock ad hoc (ADR-0006 is where those two are defined). Ambient
+# clock reads are therefore disallowed at the lint level; the one legitimate
+# use today — the migrator's operator-facing wait deadline and elapsed-ms
+# report — carries `#[expect(clippy::disallowed_methods)]` with its reason at
+# the call site.
+disallowed-methods = ["std::time::SystemTime::now", "std::time::Instant::now"]

@@ -254,6 +254,7 @@ query that *reads the checkpoint*; the statement functions this ADR ships do **n
 `pg_get_functiondef`), so they aggregate `ledger_entries` from inception, and the checkpoint's only
 reader is `recon_checkpoint_breaks`. Wiring the read benefit into the report path — plus partitioning
 the checkpoint by period — is roadmap **M5** work, re-measured at scale in [spike 020](/spikes/016-close-cost-at-scale)
+(this site's spike 016; the spike directories carry their own numbering)
 (the read benefit reproduces at ~40–230× at a close boundary on a million-entry book).
 
 The checkpoint costs **24 rows and 32 kB against 800,024 entries and 253 MB**.

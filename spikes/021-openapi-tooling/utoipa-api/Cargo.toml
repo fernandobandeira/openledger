@@ -1,0 +1,17 @@
+[package]
+name    = "utoipa-api"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Spike 021. Versions are pinned exactly so the emitted spec is reproducible:
+# a spec that changes because a patch release changed is not a diffable artifact.
+[dependencies]
+axum        = { version = "=0.8.9" }
+tokio       = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "net"] }
+serde       = { version = "=1.0.229", features = ["derive"] }
+serde_json  = { version = "=1.0.151" }
+uuid        = { version = "=1.26.0", features = ["serde", "v4"] }
+chrono      = { version = "=0.4.45", default-features = false, features = ["serde", "clock"] }
+utoipa      = { version = "=5.5.0", features = ["axum_extras", "uuid", "chrono"] }
+utoipa-axum = { version = "=0.2.0" }
