@@ -1,13 +1,12 @@
 # The service, built and running
 
-## What this page is
-
-The [database page](/database) explains the schema. This page is its sibling for the code that now
-runs against that schema: **one binary, `openledger`, with two subcommands and one endpoint** —
-`migrate`, `serve`, and `POST /v1/transactions`. Everything below is written from the tree
-(`crates/`), the same way the database page is written from the migration: counted where a count
-exists, cited to the ADR that decided it, and separated into what is enforced and what is
-[still open](#still-open--what-is-not-there).
+**One binary, `openledger`, with two subcommands and one endpoint.** `openledger migrate` applies
+the schema the [database page](/database) explains, and exits. `openledger serve` refuses to start
+against a database that schema never reached, then answers `POST /v1/transactions`: post a balanced
+transaction, or replay the stored answer for an idempotency key it has already seen. The rest of
+this page walks that code — the startup gate, the write path and what it guarantees, the wire
+contract, the crate boundaries that enforce the design, what the e2e suite proves, and
+[what is not built yet](#still-open--what-is-not-there).
 
 The census, counted 2026-08-27 against the workspace: **6 crates · 2 subcommands · 1 endpoint ·
 4 exit codes · 17 end-to-end tests · 10 reconciliation checks asserted at zero after every
