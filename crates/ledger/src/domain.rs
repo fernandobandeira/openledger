@@ -82,6 +82,26 @@ pub struct PostTransaction {
     pub(crate) postings: Vec<Posting>,
 }
 
+/// The contract the two identity strings — `tenant_id` and
+/// `idempotency_key` — share, in one place so the fields cannot drift: no
+/// NUL byte (PostgreSQL's text type cannot store one — without this check
+/// the refusal would arrive from the driver, as a 500 with the reason
+/// buried in an encoding error instead of named here), and the byte cap
+/// (MAX_IDENTITY_BYTES' comment carries the index-row arithmetic).
+fn validate_identity(
+    value: &str,
+    nul_bytes: &'static str,
+    too_long: &'static str,
+) -> Result<(), Invalid> {
+    if value.contains('\0') {
+        return Err(Invalid::new(nul_bytes));
+    }
+    if value.len() > MAX_IDENTITY_BYTES {
+        return Err(Invalid::new(too_long));
+    }
+    Ok(())
+}
+
 impl PostTransaction {
     pub fn new(
         tenant_id: String,
@@ -95,23 +115,20 @@ impl PostTransaction {
         if idempotency_key.is_empty() {
             return Err(Invalid::new("idempotency_key must not be empty"));
         }
-        // PostgreSQL's text type cannot store a NUL byte — without this check
-        // the refusal would arrive from the driver, as a 500 with the reason
-        // buried in an encoding error instead of named here.
-        if tenant_id.contains('\0') {
-            return Err(Invalid::new("tenant_id must not contain NUL bytes"));
-        }
-        if idempotency_key.contains('\0') {
-            return Err(Invalid::new("idempotency_key must not contain NUL bytes"));
-        }
-        // The byte cap both identity strings share; MAX_IDENTITY_BYTES'
-        // comment carries the index-row arithmetic.
-        if tenant_id.len() > MAX_IDENTITY_BYTES {
-            return Err(Invalid::new("tenant_id must be at most 512 bytes"));
-        }
-        if idempotency_key.len() > MAX_IDENTITY_BYTES {
-            return Err(Invalid::new("idempotency_key must be at most 512 bytes"));
-        }
+        // Both identity strings live under the one contract
+        // `validate_identity` holds; each caller names its own refusals
+        // (`Invalid` carries a &'static str, so the messages cannot be
+        // formatted in).
+        validate_identity(
+            &tenant_id,
+            "tenant_id must not contain NUL bytes",
+            "tenant_id must be at most 512 bytes",
+        )?;
+        validate_identity(
+            &idempotency_key,
+            "idempotency_key must not contain NUL bytes",
+            "idempotency_key must be at most 512 bytes",
+        )?;
         if postings.is_empty() {
             return Err(Invalid::new("postings must not be empty"));
         }

@@ -33,6 +33,32 @@ fn storage(e: sqlx::Error) -> StorageError {
     Box::new(e)
 }
 
+/// Transpose the legs into the parallel column arrays `unnest` binds — one
+/// Vec per SQL array, in the statement's order: account_id, direction,
+/// amount_minor, currency. The domain's `Direction` is rendered into the
+/// SQL dialect's string here, at the bind site, and nowhere else —
+/// exhaustively, so a third variant would refuse to compile rather than
+/// default to a side.
+fn columns_for_insert(legs: &[Leg]) -> (Vec<Uuid>, Vec<String>, Vec<i64>, Vec<String>) {
+    let mut account_ids = Vec::with_capacity(legs.len());
+    let mut directions = Vec::with_capacity(legs.len());
+    let mut amounts = Vec::with_capacity(legs.len());
+    let mut currencies = Vec::with_capacity(legs.len());
+    for leg in legs {
+        account_ids.push(leg.account_id);
+        directions.push(
+            match leg.direction {
+                Direction::Debit => "debit",
+                Direction::Credit => "credit",
+            }
+            .to_owned(),
+        );
+        amounts.push(leg.amount_minor);
+        currencies.push(leg.currency.clone());
+    }
+    (account_ids, directions, amounts, currencies)
+}
+
 impl Repository for PgRepository {
     type Tx = Transaction<'static, Postgres>;
 
@@ -168,9 +194,7 @@ impl Repository for PgRepository {
     /// Append all entries in one multi-row statement — `unnest` measured
     /// within 2% of COPY on this table, the composite foreign keys
     /// dominating (ADR-0013 §5). `seqs` is parallel to `legs`, one seq per
-    /// row. The domain's `Direction` is rendered into the SQL dialect's
-    /// string here, at the bind site, and nowhere else — exhaustively, so a
-    /// third variant would refuse to compile rather than default to a side.
+    /// row; the other columns are transposed by [`columns_for_insert`].
     async fn insert_entries(
         &self,
         tx: &mut Self::Tx,
@@ -179,22 +203,7 @@ impl Repository for PgRepository {
         legs: &[Leg],
         seqs: &[i64],
     ) -> Result<(), StorageError> {
-        let mut account_ids = Vec::with_capacity(legs.len());
-        let mut directions = Vec::with_capacity(legs.len());
-        let mut amounts = Vec::with_capacity(legs.len());
-        let mut currencies = Vec::with_capacity(legs.len());
-        for leg in legs {
-            account_ids.push(leg.account_id);
-            directions.push(
-                match leg.direction {
-                    Direction::Debit => "debit",
-                    Direction::Credit => "credit",
-                }
-                .to_owned(),
-            );
-            amounts.push(leg.amount_minor);
-            currencies.push(leg.currency.clone());
-        }
+        let (account_ids, directions, amounts, currencies) = columns_for_insert(legs);
         sqlx::query(
             "INSERT INTO ledger_entries
                     (tenant_id, transaction_id, account_id, direction, amount_minor,

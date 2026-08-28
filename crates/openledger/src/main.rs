@@ -62,6 +62,15 @@ fn clap_exit(error: clap::Error) -> ExitCode {
     }
 }
 
+/// The database URL both commands require, from the flag or DATABASE_URL.
+/// clap leaves it optional so its absence can be refused HERE, as a usage
+/// error naming both spellings — with our exit code, not clap's error.
+fn require_database_url(database_url: Option<String>) -> Result<String, Failure> {
+    database_url.ok_or_else(|| {
+        Failure::Usage("no database URL — set DATABASE_URL or pass --database-url".to_owned())
+    })
+}
+
 fn dispatch(cli: Cli) -> Result<(), Failure> {
     match cli.command {
         // Bare `openledger`, which a container started with no command gets.
@@ -74,11 +83,7 @@ fn dispatch(cli: Cli) -> Result<(), Failure> {
             database_url,
             lock_secs,
         }) => {
-            let database_url = database_url.ok_or_else(|| {
-                Failure::Usage(
-                    "no database URL — set DATABASE_URL or pass --database-url".to_owned(),
-                )
-            })?;
+            let database_url = require_database_url(database_url)?;
             block_on(async {
                 db::migrate::run(&database_url, Duration::from_secs(lock_secs))
                     .await
@@ -86,11 +91,7 @@ fn dispatch(cli: Cli) -> Result<(), Failure> {
             })
         }
         Some(Command::Serve { database_url, bind }) => {
-            let database_url = database_url.ok_or_else(|| {
-                Failure::Usage(
-                    "no database URL — set DATABASE_URL or pass --database-url".to_owned(),
-                )
-            })?;
+            let database_url = require_database_url(database_url)?;
             // The composition root: this is the one place the Postgres
             // repository is chosen as the writer service's storage, and the
             // service as the api router's `Ledger`. The api crate never sees
