@@ -63,6 +63,32 @@ impl Posting {
     }
 }
 
+/// Whether the transaction lands on the books or is a claim about what may
+/// happen — the schema's `ledger_txn_status`, in the domain's own type. Two
+/// variants and no catch-all, so a third status is a compile error rather
+/// than a transaction silently posted. Status NEVER mutates (the baseline's
+/// own words on `ledger_transactions.status`): a pending transaction becomes
+/// posted by a NEW transaction carrying `resolves_id`, never by an UPDATE
+/// (roadmap M3, ADR-0016). The SQL string (`'pending'`/`'posted'`) is
+/// rendered by the adapter at its bind site; the canonical form the hash
+/// covers is rendered here, beside the hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionStatus {
+    Pending,
+    Posted,
+}
+
+impl TransactionStatus {
+    /// The status word the canonical byte form covers — owned here, beside
+    /// the hash that consumes it, so a rename in Rust cannot move it.
+    fn canonical(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Posted => "posted",
+        }
+    }
+}
+
 /// The cap on the two caller-chosen identity strings, in bytes. They land
 /// together in the `(tenant_id, idempotency_key)` btree unique index, and
 /// PostgreSQL refuses btree index rows past roughly 2704 bytes (a third of an
@@ -79,6 +105,8 @@ pub struct PostTransaction {
     pub(crate) tenant_id: String,
     pub(crate) idempotency_key: String,
     pub(crate) effective_at: OffsetDateTime,
+    pub(crate) status: TransactionStatus,
+    pub(crate) resolves_id: Option<Uuid>,
     pub(crate) postings: Vec<Posting>,
 }
 
@@ -107,8 +135,21 @@ impl PostTransaction {
         tenant_id: String,
         idempotency_key: String,
         effective_at: OffsetDateTime,
+        status: TransactionStatus,
+        resolves_id: Option<Uuid>,
         postings: Vec<Posting>,
     ) -> Result<Self, Invalid> {
+        // A resolution IS the posted half of pending → posted (roadmap M3):
+        // a pending transaction that "resolves" another would retire the
+        // target from the pending population (recon_pending_bridge excludes
+        // it by reference) while its replacement is still only a claim — a
+        // book no bridge could foot. The schema does not refuse the shape;
+        // this constructor does (ADR-0016).
+        if resolves_id.is_some() && status == TransactionStatus::Pending {
+            return Err(Invalid::new(
+                "a resolving transaction cannot itself be pending",
+            ));
+        }
         if tenant_id.trim().is_empty() {
             return Err(Invalid::new("tenant_id must not be blank"));
         }
@@ -152,6 +193,8 @@ impl PostTransaction {
             tenant_id,
             idempotency_key,
             effective_at,
+            status,
+            resolves_id,
             postings,
         })
     }
@@ -168,6 +211,13 @@ impl PostTransaction {
             buf.extend_from_slice(bytes);
         }
         let mut buf = Vec::new();
+        // The layout covers EVERY semantic field — status and resolves_id
+        // included (below), or a same-key retry that changed only its status
+        // would silently REPLAY instead of being refused as a reused key;
+        // the e2e reuse tests hold that red on the wire. Still the v1 tag:
+        // pre-v0.1 the canonical layout changes freely under the one tag,
+        // because no kept database exists to hold bytes an older binary
+        // wrote — versioning ceremony begins at launch, not before.
         buf.extend_from_slice(b"openledger.post.v1");
         put(&mut buf, self.tenant_id.as_bytes());
         // Normalized to UTC before formatting: "12:00+02:00" and "10:00Z" are
@@ -182,6 +232,14 @@ impl PostTransaction {
             .format(&Rfc3339)
             .map_err(|_| Invalid::new("effective_at is not representable"))?;
         put(&mut buf, effective.as_bytes());
+        put(&mut buf, self.status.canonical().as_bytes());
+        // A missing target is zero bytes under the length prefix — distinct
+        // from every real uuid's sixteen, so absence cannot collide with a
+        // value.
+        match self.resolves_id {
+            Some(resolves_id) => put(&mut buf, resolves_id.as_bytes()),
+            None => put(&mut buf, b""),
+        }
         buf.extend_from_slice(&(self.postings.len() as u64).to_le_bytes());
         for posting in &self.postings {
             buf.extend_from_slice(posting.source.as_bytes());
@@ -208,12 +266,13 @@ impl PostTransaction {
     /// place the stored shape is decided, so a Rust-side rename cannot touch
     /// it without editing the string literals below.
     ///
-    /// `version` is the marker a future reader dispatches on. Adding it
-    /// changed the stored shape from the pre-versioned derive rendering —
-    /// acceptable now, pre-v0.1, while no kept database exists (the same
-    /// license the ADR-0003 baseline freeze took). `effective_at` stays the
-    /// caller's own offset rendering, exactly as the derive stored it; the
-    /// UTC normalization belongs to the hash, not the payload.
+    /// `version` is the marker a future reader dispatches on — and it stays
+    /// 1 while the shape grows fields: pre-v0.1 the stored shape changes
+    /// freely under the one marker, because no kept database exists to hold
+    /// a rendering an older binary wrote; versioning ceremony begins at
+    /// launch (the same license the ADR-0003 baseline freeze took).
+    /// `effective_at` stays the caller's own offset rendering; the UTC
+    /// normalization belongs to the hash, not the payload.
     pub(crate) fn payload(&self) -> Result<serde_json::Value, Invalid> {
         let effective = self
             .effective_at
@@ -236,6 +295,11 @@ impl PostTransaction {
             "tenant_id": self.tenant_id,
             "idempotency_key": self.idempotency_key,
             "effective_at": effective,
+            // Always present, `resolves_id` as an explicit null when there is
+            // no target: a reader never has to ask whether a missing key
+            // means "posted" or "not rendered".
+            "status": self.status.canonical(),
+            "resolves_id": self.resolves_id,
             "postings": postings,
         }))
     }
@@ -251,6 +315,12 @@ impl PostTransaction {
     }
     pub fn effective_at(&self) -> OffsetDateTime {
         self.effective_at
+    }
+    pub fn status(&self) -> TransactionStatus {
+        self.status
+    }
+    pub fn resolves_id(&self) -> Option<Uuid> {
+        self.resolves_id
     }
     pub fn postings(&self) -> &[Posting] {
         &self.postings
@@ -310,6 +380,8 @@ mod tests {
             "acme".to_owned(),
             "key-1".to_owned(),
             effective_at,
+            TransactionStatus::Posted,
+            None,
             vec![posting()?],
         )
     }
@@ -361,12 +433,16 @@ mod tests {
             "ac\0me".to_owned(),
             "key-1".to_owned(),
             OffsetDateTime::UNIX_EPOCH,
+            TransactionStatus::Posted,
+            None,
             vec![posting()?],
         );
         let nul_key = PostTransaction::new(
             "acme".to_owned(),
             "key\0".to_owned(),
             OffsetDateTime::UNIX_EPOCH,
+            TransactionStatus::Posted,
+            None,
             vec![posting()?],
         );
 
@@ -384,18 +460,24 @@ mod tests {
             "acme".to_owned(),
             "k".repeat(512),
             OffsetDateTime::UNIX_EPOCH,
+            TransactionStatus::Posted,
+            None,
             vec![posting()?],
         );
         let past_cap_key = PostTransaction::new(
             "acme".to_owned(),
             "k".repeat(513),
             OffsetDateTime::UNIX_EPOCH,
+            TransactionStatus::Posted,
+            None,
             vec![posting()?],
         );
         let past_cap_tenant = PostTransaction::new(
             "t".repeat(513),
             "key-1".to_owned(),
             OffsetDateTime::UNIX_EPOCH,
+            TransactionStatus::Posted,
+            None,
             vec![posting()?],
         );
 
@@ -411,11 +493,13 @@ mod tests {
         Ok(())
     }
 
-    /// The stored shape, pinned literally: the version marker plus exactly
-    /// the fields the pre-versioned rendering stored, with `effective_at` in
-    /// the CALLER's offset (the UTC normalization belongs to the hash). A
-    /// Rust-side rename cannot move this test without moving `payload` too —
-    /// which is the point.
+    /// The stored shape, pinned literally: the version marker — still 1,
+    /// under the pre-launch license that lets the shape grow fields freely —
+    /// plus every semantic field of today's command, `status` and
+    /// `resolves_id` included, with `effective_at` in the CALLER's offset
+    /// (the UTC normalization belongs to the hash). A Rust-side rename
+    /// cannot move this test without moving `payload` too — which is the
+    /// point.
     #[test]
     fn the_payload_is_the_versioned_rendering_of_todays_fields()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -434,6 +518,8 @@ mod tests {
                 "tenant_id": "acme",
                 "idempotency_key": "key-1",
                 "effective_at": "2026-08-27T14:00:00+02:00",
+                "status": "posted",
+                "resolves_id": null,
                 "postings": [{
                     "source": Uuid::from_u128(1),
                     "destination": Uuid::from_u128(2),
@@ -441,6 +527,31 @@ mod tests {
                     "currency": "USD",
                 }],
             })
+        );
+        Ok(())
+    }
+
+    /// A pending resolution is refused by the constructor, with the honest
+    /// message: the schema accepts the shape (`status` and `resolves_id` are
+    /// independent columns), so this refusal exists only here — remove it
+    /// and a claim-about-a-claim reaches the book (ADR-0016).
+    #[test]
+    fn a_pending_resolution_is_refused() -> Result<(), Invalid> {
+        let refused = PostTransaction::new(
+            "acme".to_owned(),
+            "key-1".to_owned(),
+            OffsetDateTime::UNIX_EPOCH,
+            TransactionStatus::Pending,
+            Some(Uuid::from_u128(7)),
+            vec![posting()?],
+        );
+
+        let detail = refused.err().map(|invalid| invalid.detail());
+
+        assert_eq!(
+            detail,
+            Some("a resolving transaction cannot itself be pending"),
+            "pending + resolves_id must be refused before any SQL"
         );
         Ok(())
     }

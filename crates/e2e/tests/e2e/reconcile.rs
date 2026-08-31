@@ -209,29 +209,25 @@ async fn a_pending_transaction_is_a_named_population_not_a_break() -> TestResult
     let book = TestBook::new("reconcile_pending").await?;
     let (receivable, revenue) = post_one_charge(&book).await?;
 
-    // A real event and a real pending transaction, every FK enforced — this
-    // injection is legitimate bookkeeping, not a perimeter bypass, which is
-    // the point: the API has no pending endpoint yet (service.md), so the
-    // admin connection stands in for the writer the roadmap still owes.
-    sqlx::raw_sql(AssertSqlSafe(format!(
-        "INSERT INTO ledger_events (tenant_id, id, kind, source, idempotency_key,
-                                    idempotency_hash, payload, effective_at)
-         VALUES ('t1', '0e2e0000-0000-7000-8000-000000000001', 'hold', 'internal',
-                 'pending-hold-1', decode('00', 'hex'), '{{}}'::jsonb, '2026-08-28T00:00:00Z');
-         INSERT INTO ledger_transactions (tenant_id, id, event_id, kind, status, effective_at)
-         VALUES ('t1', '0e2e0000-0000-7000-8000-000000000002',
-                 '0e2e0000-0000-7000-8000-000000000001', 'hold', 'pending', '2026-08-28T00:00:00Z');
-         INSERT INTO ledger_entries (tenant_id, transaction_id, account_id, direction,
-                                     amount_minor, currency, account_seq, effective_at)
-         VALUES ('t1', '0e2e0000-0000-7000-8000-000000000002', '{receivable}',
-                 'debit', 500, 'USD', 2, '2026-08-28T00:00:00Z'),
-                ('t1', '0e2e0000-0000-7000-8000-000000000002', '{revenue}',
-                 'credit', 500, 'USD', 2, '2026-08-28T00:00:00Z');
-         UPDATE ledger_account_balances SET last_seq = last_seq + 1, updated_at = now()
-         WHERE tenant_id = 't1' AND account_id IN ('{receivable}', '{revenue}')"
-    )))
-    .execute(&book.pool)
-    .await?;
+    // Through the front door since ADR-0016: the endpoint posts the hold as
+    // `status: pending` — the writer books it exactly as the schema means it
+    // (ADR-0010's ruling: entries carry the next account_seq and advance
+    // `last_seq`, while `input`/`output` stay put, because the cache means
+    // POSTED). The endpoint's own contract lives in
+    // endpoints/transactions/pending.rs; here the question is the SWEEP's.
+    let held = book
+        .post(&serde_json::json!({
+            "tenant_id": "t1",
+            "idempotency_key": "pending-hold-1",
+            "effective_at": "2026-08-28T00:00:00Z",
+            "status": "pending",
+            "postings": [{
+                "source": revenue, "destination": receivable,
+                "amount_minor": 500, "currency": "USD"
+            }],
+        }))
+        .await?;
+    assert_eq!(held.status(), 201, "booking the pending hold");
 
     // The oracle agrees the book is healthy...
     book.assert_reconciled().await?;

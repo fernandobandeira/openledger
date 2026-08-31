@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use uuid::Uuid;
 
-use crate::domain::Posting;
+use crate::domain::{Posting, TransactionStatus};
 
 /// Which side of an account a leg lands on. Two variants and no catch-all
 /// anywhere: every match over a direction is exhaustive, so a third value is
@@ -128,11 +128,30 @@ pub struct Append {
     pub deltas: BTreeMap<(Uuid, String), Delta>,
 }
 
-/// Plan the append for these postings: expand to legs, coalesce, number.
-/// Refuses when coalescing overflows 64-bit minor units.
-pub(crate) fn plan_append(postings: &[Posting]) -> Result<Append, Overflow> {
+/// Plan the append for these postings: expand to legs, coalesce, number —
+/// and, for a pending transaction, withhold the balance movement. Refuses
+/// when coalescing overflows 64-bit minor units (checked before the
+/// withholding on purpose: a pending set that cannot post should be refused
+/// now, not at resolution).
+pub(crate) fn plan_append(
+    postings: &[Posting],
+    status: TransactionStatus,
+) -> Result<Append, Overflow> {
     let legs = expand_postings(postings);
-    let deltas = coalesce(&legs)?;
+    let mut deltas = coalesce(&legs)?;
+    // THE CACHE MEANS POSTED (ADR-0010's ruling, restated on
+    // `ledger_account_balances` in the baseline): `input`/`output`
+    // accumulate posted transactions only, while `last_seq` advances on
+    // EVERY entry because a pending entry still needs its `account_seq`
+    // issued under the same lock. A delta is what the cache accumulates, so
+    // a pending transaction's deltas carry the leg count and zero movement —
+    // decided here, where it is pure and testable, not in the statement.
+    if status == TransactionStatus::Pending {
+        for delta in deltas.values_mut() {
+            delta.input = 0;
+            delta.output = 0;
+        }
+    }
     let seq_offsets = offsets_back_from_last_seq(&legs);
     Ok(Append {
         legs,
@@ -237,6 +256,37 @@ mod tests {
             })
             .collect();
         assert_eq!(seqs, vec![1, 4, 2, 5]);
+    }
+
+    /// The cache means posted (ADR-0010): a pending plan carries every leg —
+    /// each still needs its `account_seq` issued, so `legs` counts stand and
+    /// the offsets are the posted plan's — while the balance movement is
+    /// withheld: zero `input`, zero `output`, for every account. Break the
+    /// withholding and this fails on the movement; break the counter and it
+    /// fails on the leg count.
+    #[test]
+    fn a_pending_plan_issues_seqs_and_withholds_the_balance_movement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let postings = vec![
+            Posting::new(account(1), account(2), 500, "USD".to_owned())
+                .map_err(|invalid| invalid.detail())?,
+        ];
+
+        let pending =
+            plan_append(&postings, TransactionStatus::Pending).map_err(|Overflow| "overflowed")?;
+
+        let planned: Vec<(Uuid, i64, i64, i64)> = pending
+            .deltas
+            .iter()
+            .map(|((id, _), d)| (*id, d.input, d.output, d.legs))
+            .collect();
+        assert_eq!(
+            planned,
+            vec![(account(1), 0, 0, 1), (account(2), 0, 0, 1)],
+            "a pending delta must carry its legs and no balance movement"
+        );
+        assert_eq!(pending.seq_offsets, vec![0, 0]);
+        Ok(())
     }
 
     /// The overflow refusal: two legs on one side of one account summing past

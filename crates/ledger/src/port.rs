@@ -39,6 +39,16 @@ pub enum WriteError {
     /// arithmetic overflow, nothing else wears this name. Nothing was
     /// written.
     Overflow,
+    /// `resolves_id` names a transaction that does not exist on this
+    /// tenant's book. Nothing was written.
+    UnknownResolveTarget { resolves_id: Uuid },
+    /// `resolves_id` names a transaction that is not pending — resolving
+    /// posted history is the −49,223 counterexample ADR-0004 recorded, and
+    /// the writer is the layer that refuses it. Nothing was written.
+    ResolveTargetNotPending { resolves_id: Uuid },
+    /// The pending transaction `resolves_id` names already has its one
+    /// resolution — pending → posted happens once. Nothing was written.
+    AlreadyResolved { resolves_id: Uuid },
     /// The writer reached a state its own derivations promise cannot happen
     /// — a leg without a counter in maps derived from those same legs, a
     /// rendering that failed after `PostTransaction::new` validated it.

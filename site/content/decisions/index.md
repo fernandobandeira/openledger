@@ -31,7 +31,7 @@ the ADRs don't each stop to re-explain them.
 
 ## The decisions
 
-Fifteen, each one file, each stating the decision first and then its evidence, its alternatives and
+Seventeen, each one file, each stating the decision first and then its evidence, its alternatives and
 what it costs. Each decision shows its `Status` — the decision itself — and, where useful, an
 `Artifact:` line for what is actually in the tree, with build status tracked on the [roadmap](/roadmap).
 The card rail's own two live under [the card decisions](/card). There is no separate
@@ -55,6 +55,8 @@ decision accepted lives in that ADR's own *"What it costs"*.
 | [0013](/decisions/0013-write-path-contract) | **`READ COMMITTED` on the write path, a two-statement replay contract, `event_id NOT NULL`, and the stripe below the account** | A retry loop rescues 0 of 25,074 serialization failures because the snapshot never moves; the one-statement replay returns zero rows under its own race; `NOT NULL` is free today and needs `DISABLE TRIGGER` tomorrow; and `uq_accounts__house` was never what blocked striping | accepted |
 | [0014](/decisions/0014-http-api) | **The HTTP API is the adoption surface — tokio + axum, `utoipa` core only, the spec a committed snapshot-tested artifact** — reversing the roadmap's original "no API in v0.1" | A writer only Rust code can call is not a deliverable, and the HTTP boundary is what makes the e2e tests caller-shaped. `utoipa-axum` is 19 months stale and ships RUSTSEC-2024-0436; `aide`'s naive failure mode is an endpoint with no `responses` at all, silently | accepted |
 | [0015](/decisions/0015-workspace-enforcement) | **Five crates plus a test-only crate, hexagonal by dependency direction — and the boundary machine-enforced** by deny.toml's capability ratchet, strict advisories, and the clock lint | An in-crate module cannot be forbidden a dependency; a crate can. The domain crate holds zero sqlx and `cargo deny check` fails the build if that ever changes — the boundary is a refusal, not a review habit | accepted |
+| [0016](/decisions/0016-pending-to-posted) | **Pending → posted is a new posted transaction carrying `resolves_id`, surfaced as two optional fields on `POST /v1/transactions`** — the target must be pending and unresolved, and the writer is what holds that. A reversals-and-void section (ratified 2026-08-31, unbuilt) adds `reverses_id`: server-derived contra mirror, the void as a zero-posting marker, one supersession index | The schema carried the whole shape since the baseline; what it cannot hold is the semantic linkage — ADR-0004 reproduced a posted transaction "resolved" by another posted one at revenue −49,223 with every check green. A `/resolve` route would restate the body schema to add one field | proposed — the API shape awaits ratification |
+| [0017](/decisions/0017-no-authentication) | **No authentication: the ledger deploys internally only, and `tenant_id` in the body is data scoping, not an auth claim** — authenticating callers is the deployer's layer (mesh, gateway, mTLS) | A second, ledger-shaped copy of the perimeter's identity machinery is security every deployment would have to configure correctly twice; the binary cannot verify its own network position either way, so the honest form of the requirement is a stated one | accepted (ruled 2026-08-31) |
 
 ## Non-negotiable
 

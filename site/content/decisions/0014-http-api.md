@@ -91,10 +91,13 @@ changing it costs nothing: responses are declared per endpoint, and the three 42
 
 ## What it costs
 
-- **No authentication, and the tenant is named in the request body.** The trust boundary is the
-  deployment perimeter's until an auth ADR exists — stated in `crates/api/src/lib.rs` rather than
-  implied. This is the largest honest gap in the surface, and it is why the endpoint count is being
-  held down while the structure is under review.
+- **No authentication, and the tenant is named in the request body — decided since, no longer
+  pending.** This bullet used to read "until an auth ADR exists";
+  [0017](/decisions/0017-no-authentication) is that ADR (ruled 2026-08-31): the ledger deploys
+  internally only, the trust boundary is the deployer's perimeter by design, and `tenant_id` is
+  data scoping, not an identity claim. What this cost list keeps is the honest residue — an
+  exposed deployment has no protection at all, and the requirement is stated, not enforceable
+  from inside the binary.
 - **`utoipa` annotations can drift from handler behaviour, and only the test layers catch it.** The
   spike measured the exposed class precisely: a status code or header set in `IntoResponse` moves
   and the spec stays byte-identical (D3, D6) — **and that class is uncovered by BOTH candidate

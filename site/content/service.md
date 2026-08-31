@@ -3,15 +3,17 @@
 **One binary, `openledger`, with three subcommands and one endpoint.** `openledger migrate` applies
 the schema the [database page](/database) explains, and exits. `openledger serve` refuses to start
 against a database that schema never reached, then answers `POST /v1/transactions`: post a balanced
-transaction, or replay the stored answer for an idempotency key it has already seen.
+transaction — posted, or pending and later resolved by a new posted transaction naming it
+([ADR-0016](/decisions/0016-pending-to-posted)) — or replay the stored answer for an idempotency
+key it has already seen.
 `openledger reconcile` runs the schema's ten reconciliation checks in one snapshot and turns them
 into an exit code — the daily sweep as a command. The rest of
 this page walks that code — the startup gate, the write path and what it guarantees, the wire
 contract, the crate boundaries that enforce the design, what the e2e suite proves, and
 [what is not built yet](#still-open--what-is-not-there).
 
-The census, counted 2026-08-28 against the workspace: **6 crates · 3 subcommands · 1 endpoint ·
-4 exit codes · 38 end-to-end tests · 10 reconciliation checks asserted at zero after every
+The census, counted 2026-08-31 against the workspace: **6 crates · 3 subcommands · 1 endpoint ·
+4 exit codes · 49 end-to-end tests · 10 reconciliation checks asserted at zero after every
 endpoint test.**
 
 The API itself is browsable as rendered documentation: **[the API reference](/api-reference/)**,
@@ -165,6 +167,17 @@ Step by step, with the reasoning each one carries:
    batch size tried, the composite foreign keys dominating
    ([ADR-0013 §5](/decisions/0013-write-path-contract)) — inside the same statement as everything
    they depend on.
+8. **Pending → posted rides the same statement**
+   ([ADR-0016](/decisions/0016-pending-to-posted)). A `status: pending` post is planned with its
+   balance movement withheld — the cache means POSTED
+   ([ADR-0010](/decisions/0010-reconciliation)), while `last_seq` still advances because a pending
+   entry draws its `account_seq` under the same lock — so the statement needs no branch. A
+   resolution is a new POSTED transaction carrying `resolves_id`, and the statement gates its
+   insert on the one thing no foreign key holds ([ADR-0004](/decisions/0004-where-logic-lives)'s
+   −49,223 counterexample): the target must exist on the caller's tenant, be pending, and be
+   unresolved — a failed gate comes back as a diagnosis the writer refuses by name, and two
+   resolutions racing one target fall to `uq_txn__one_resolution`, mapped to the same refusal.
+   Still three round trips either way.
 
 ## The contract on the wire
 
@@ -179,6 +192,9 @@ refusals are 422 rather than 400 or 409:
 | **422** `invalid_request` | A precondition on the body failed (unbalanced is unconstructible, so this is a malformed leg, currency, date or overflow) — nothing was written | Fix the body |
 | **422** `idempotency_key_reused` | Same key, different body — nothing was written | Send a new key, or resend the original request unchanged |
 | **422** `unknown_account` | A posting names an account that does not exist or does not hold that currency — nothing was written | Fix the account or currency |
+| **422** `unknown_resolve_target` | `resolves_id` names no transaction on this tenant's book — nothing was written | Fix the target id |
+| **422** `resolve_target_not_pending` | Only a pending transaction can be resolved, and status never mutates — nothing was written | Point at the pending transaction, not its history |
+| **422** `already_resolved` | The named pending transaction already has its one resolution — nothing was written | Stop; the resolution already posted |
 | **500** `internal` | The write failed; nothing was committed. The caller gets no internals; the operator's log has the error | Retry is safe — the key makes it harmless |
 
 Two things are deliberately absent. There is **no 409**: a concurrent duplicate blocks on the key
@@ -186,6 +202,12 @@ claim and finds a durable result, so there is no in-flight state to name. And `t
 **nullable by contract** even though this endpoint always writes one — most accepted operations
 write no transaction at all ([ADR-0005](/decisions/0005-event-log-and-write-path)), and a replay
 re-renders whatever was stored.
+
+A third absence is a decision, not a gap — **no authentication**, settled 2026-08-31
+([ADR-0017](/decisions/0017-no-authentication)): the ledger deploys internally only, behind the
+deployer's perimeter, and `tenant_id` in the body is data scoping — which book — never an identity
+claim. Authenticating callers is the deployer's layer (mesh, gateway, mTLS); a deployment that
+exposes this endpoint publicly is out of contract.
 
 The full rendered contract — schemas, examples, the header on both success responses — is
 **[the API reference](/api-reference/)**. Its source is `crates/api/openapi.json`, generated from
@@ -253,10 +275,11 @@ binary, named `openledger-e2e-pg` and reused across runs (testcontainers 0.27 sh
 an anonymous container would leak one per run; a named, reused one caps the population at exactly
 one).
 
-The thirty-eight tests, by what each holds:
+The forty-nine tests, by what each holds:
 
-- **Nine endpoint tests** (`endpoints/transactions/post.rs`) — the whole `POST /v1/transactions`
-  contract in one file: a posting lands on both accounts' balance rows; two postings over one pair
+- **Nine endpoint tests** (`endpoints/transactions/post.rs`) — the posting-and-idempotency half of
+  the `POST /v1/transactions` contract in one file: a posting lands on both accounts' balance rows;
+  two postings over one pair
   coalesce with gapless seqs; an unknown account — or a currency the account does not hold — is
   refused *and the three write tables did not move*; an invalid body never reaches the database; a
   replay returns 200, the stored ids and the header; a reused key with a different body is refused;
@@ -264,6 +287,23 @@ The thirty-eight tests, by what each holds:
   ([ADR-0013](/decisions/0013-write-path-contract) §2's race, held against the one-statement
   refactor it forbids); a storage failure is a 500 that commits nothing and names no internals; and
   a second tenant reusing the first's idempotency key gets its own fresh write.
+- **Eleven pending → posted tests** (`endpoints/transactions/pending.rs`) — the
+  [ADR-0016](/decisions/0016-pending-to-posted) half of the same endpoint: a pending post issues
+  sequence numbers and moves no balance, with the bridge footing available = posted + pending; a
+  resolution is a new posted transaction naming its target, the original standing unmutated, and
+  only then the cache moves; a partial capture resolves with less and the cache moves by what
+  posted; a pending key and a resolving key each replay their own stored result — and a key reused
+  with a body differing **only** in `status` or `resolves_id` is refused as
+  `idempotency_key_reused`, the red path that pins both fields into the canonical hash; and the
+  refusals, every one red against a specific guard — a target that does not exist (including one
+  on another tenant's book), a POSTED target (ADR-0004's −49,223 counterexample, refused as
+  `resolve_target_not_pending`), a second resolution, **eight concurrent resolutions of one
+  pending producing exactly one** with every loser named `already_resolved` (the gate under
+  concurrency), **a resolution racing a genuinely uncommitted rival** — held open on a second
+  connection until the API call is provably blocked, then committed — refused as
+  `already_resolved` and never a 500 (the `uq_txn__one_resolution` backstop and its
+  constraint-name mapping, staged deterministically), and a pending resolution refused before any
+  SQL.
 - **Conformance** (`conformance.rs`) — the committed `openapi.json` against the running router:
   every documented (path, method) must answer neither 404 nor 405 on the wire, an undocumented
   method on the same path must answer exactly 405, and the spec's path set must *equal* the
@@ -286,9 +326,9 @@ The thirty-eight tests, by what each holds:
   like everything else here, with a red-path injection for **every one of the summary's ten
   checks**: a check that cannot fail this suite through the command is a safety net nobody has
   load-tested. Two controls at exit 0: a clean, non-empty book (which also pins the suite's own
-  copy of the ten check names against the live view), and a correctly-booked **pending**
-  transaction — the population that must be *named* (the bridge derives available = posted +
-  pending) and never read as a break. [Spike 011](/spikes/011-reconciliation)'s five drift
+  copy of the ten check names against the live view), and a **pending** transaction posted through
+  the endpoint itself ([ADR-0016](/decisions/0016-pending-to-posted)) — the population that must
+  be *named* (the bridge derives available = posted + pending) and never read as a break. [Spike 011](/spikes/011-reconciliation)'s five drift
   classes, each at exit 1 with the right check — and only it — named on stderr: a forged cache
   (`balance_cache`), a forged sequence counter with the balance exact (same check, the `seq_ahead`
   class — ADR-0004's 48-wide gap), an entry with no transaction via the replica-role path
@@ -317,15 +357,13 @@ The thirty-eight tests, by what each holds:
 
 Stated the way the database page states its gaps: each of these is a hole today, not a design.
 
-> **STILL OPEN — no authentication.** The tenant is named in the request body, and the trust story
-> is the deployment perimeter's until an auth decision exists. Nothing about the write path assumed
-> otherwise — but nothing enforces a caller's claim to a tenant either.
-
 > **STILL OPEN — the writer is the lean single-stripe one.** Every write touches stripe 0 only:
 > the schema's balance striping ([ADR-0013 §4](/decisions/0013-write-path-contract)) is applied
 > but no selection policy is built, and the throughput numbers on this site are the spikes'
 > measurements of the SQL shape, not a load test of *this* binary — batching under load has no
-> proof yet. Pending→posted resolution (`resolves_id` is in the schema) has no endpoint.
+> proof yet. And a pending transaction that will never resolve has no exit: voiding is unbuilt
+> (`reverses_id` has no writer surface, hold expiry is M8's), so the bridge's
+> `oldest_pending_effective_at` is the only alarm ([ADR-0016](/decisions/0016-pending-to-posted)).
 
 > **STILL OPEN — one endpoint.** There is no read over HTTP: balances, entries and reports are
 > reachable only through SQL and the report functions the schema ships. The write path came first

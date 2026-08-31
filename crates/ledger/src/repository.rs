@@ -39,6 +39,32 @@ pub struct Appended {
     pub balance_upserts: Vec<BalanceUpsert>,
 }
 
+/// Why the single call refused to write a RESOLVING transaction — the
+/// semantic linkage the schema deliberately does not hold (ADR-0004's
+/// counterexample: a posted transaction "resolved" by another posted one
+/// took revenue to −49,223 with every declarative check green). The
+/// statement diagnoses; the service names the refusal; nothing is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolveRefusal {
+    /// `resolves_id` names no transaction on this tenant's book.
+    TargetMissing,
+    /// The target exists and is not pending — there is nothing to resolve.
+    TargetNotPending,
+    /// The target already has its one resolution (`uq_txn__one_resolution`
+    /// is the backstop; the sequential case is diagnosed before the index
+    /// has to speak).
+    AlreadyResolved,
+}
+
+/// What the single call answered after claiming the key: the append, or —
+/// for a resolving transaction whose target failed the pending-and-
+/// unresolved gate — the diagnosis. Either way the key WAS claimed in the
+/// open transaction; a refusal is made true by the service's rollback.
+pub enum Claimed {
+    Appended(Appended),
+    ResolutionRefused(ResolveRefusal),
+}
+
 /// The opaque storage failure. The port names no backend error type — the
 /// Postgres error stays inside the adapter crate, boxed at exactly one
 /// function — and the service forwards it unread into
@@ -75,11 +101,18 @@ pub trait Repository: Send + Sync {
     /// leg, deltas iterating in account-id order — and the statement must
     /// preserve that order when it takes the balance row locks.
     ///
-    /// `Some` means this caller is the first writer and the append already
-    /// happened (uncommitted); `None` means an earlier caller claimed the
-    /// key and NOTHING here ran — the claim's replay half stays the
-    /// separate [`stored_result`](Repository::stored_result), because
-    /// folding the two is the one-statement hole ADR-0013 §2 reproduced.
+    /// `Some` means this caller is the first writer: either the append
+    /// already happened (uncommitted), or — for a resolving transaction —
+    /// the statement's gate found the target unresolvable and diagnosed it
+    /// ([`Claimed::ResolutionRefused`]). On that refused path the gate
+    /// withholds only the transaction row and the entries hanging off it:
+    /// the key claim and the balance upserts DID run, uncommitted, because
+    /// they depend on the claim and not the transaction — which is exactly
+    /// why the service answers the refusal only after rolling the bracket
+    /// back. `None` means an earlier caller claimed the key and NOTHING
+    /// here ran — the claim's replay half stays the separate
+    /// [`stored_result`](Repository::stored_result), because folding the
+    /// two is the one-statement hole ADR-0013 §2 reproduced.
     fn claim_and_append(
         &self,
         tx: &mut Self::Tx,
@@ -87,7 +120,7 @@ pub trait Repository: Send + Sync {
         hash: &[u8],
         payload: &serde_json::Value,
         append: &Append,
-    ) -> impl Future<Output = Result<Option<Appended>, StorageError>> + Send;
+    ) -> impl Future<Output = Result<Option<Claimed>, StorageError>> + Send;
 
     /// Statement B: the stored `(event_id, transaction_id)` of the already
     /// claimed key — with the hash in the lookup's WHERE, never compared by

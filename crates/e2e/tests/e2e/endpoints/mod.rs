@@ -1,4 +1,5 @@
-//! One file per (resource, verb): a test file here is an endpoint's contract,
-//! whole — see the layout rule in main.rs.
+//! One file per (resource, verb), split only when one verb's contract
+//! outgrows a single read: a test file here is one half of an endpoint's
+//! contract at most — see the layout rule in main.rs.
 
 pub mod transactions;

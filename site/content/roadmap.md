@@ -10,9 +10,10 @@ product matters.
 `migrations/00001_baseline.sql` and `openledger migrate` are built and run in CI — and since
 2026-08-27 so are M3's lean writer, the one HTTP endpoint in front of it
 ([ADR-0014](/decisions/0014-http-api)), and the e2e suite that spawns the binary and posts over the
-wire; since 2026-08-28 the writer posts in a **single server-side call**
-([M3](#m3--the-posting-engine)). What is missing is the rest of the load-bearing half — batching
-under load, stripe selection, pending → posted, the concurrency proof — and the read path. That
+wire; since 2026-08-28 the writer posts in a **single server-side call**, and since 2026-08-31 it
+holds pending → posted too ([M3](#m3--the-posting-engine),
+[ADR-0016](/decisions/0016-pending-to-posted)). What is missing is the rest of the load-bearing
+half — batching under load, stripe selection, the concurrency proof — and the read path. That
 gap — not a deployment — is the story now. Phase 1 is the ordered list of code to build to close it.
 
 ---
@@ -24,8 +25,9 @@ gap — not a deployment — is the story now. Phase 1 is the ordered list of co
 1. **The writer** ([M3](#m3--the-posting-engine)) — the posting API that is balanced by
    construction, the two-statement idempotency replay, the posted-only cache update and the
    transaction seal. **The lean core of this landed on 2026-08-27**, behind one HTTP endpoint
-   ([ADR-0014](/decisions/0014-http-api)), and **single-call posting followed on 2026-08-28**;
-   what remains of M3 is batching under load, stripe selection, and pending → posted.
+   ([ADR-0014](/decisions/0014-http-api)), **single-call posting followed on 2026-08-28**, and
+   **pending → posted on 2026-08-31** ([ADR-0016](/decisions/0016-pending-to-posted));
+   what remains of M3 is batching under load and stripe selection.
 2. **`openledger reconcile`** ([M2](#m2--openledger-reconcile-and-the-concurrency-proof)) — wire the
    ten reconciliation views to an exit code so the daily sweep is a real command. **Built
    2026-08-28**: the subcommand runs the views in one snapshot as `openledger_recon`; what remains
@@ -116,7 +118,11 @@ must dump `pg_class.relrowsecurity`/`relforcerowsecurity`, `pg_get_viewdef` for 
 balanced set of entries and an idempotency key, post atomically or return the stored result — built,
 behind `POST /v1/transactions`, and verified by the caller-shaped e2e suite with
 `SELECT * FROM reconciliation` as its oracle. What remains here is the load-bearing half.
-Pending → posted is a **new** transaction with `resolves_id`, never an UPDATE — not yet built. Three
+Pending → posted is a **new** transaction with `resolves_id`, never an UPDATE — **built 2026-08-31**
+([ADR-0016](/decisions/0016-pending-to-posted)): the same endpoint takes an optional `status` and
+`resolves_id`, a pending post issues sequence numbers without moving the posted cache, and the
+writer refuses a resolution whose target is missing, not pending, or already resolved — the
+semantic linkage [ADR-0004](/decisions/0004-where-logic-lives) proved no foreign key holds. Three
 design constraints, not later optimizations — the second landed on 2026-08-28, the other two are
 not in the lean core yet:
 

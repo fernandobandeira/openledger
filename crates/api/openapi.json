@@ -96,7 +96,7 @@
             }
           },
           "422": {
-            "description": "Refused, and nothing was written. The caller must CHANGE the request to escape — which is why this is 422, not 400 or 409 (ADR-0013 §2). `type` is one of: `invalid_request` (a precondition on the body failed, or a field failed to deserialize into its documented type), `idempotency_key_reused` (same key, different body — send a new key or resend the original request unchanged), `unknown_account` (a posting names an account that does not exist or does not hold that currency).",
+            "description": "Refused, and nothing was written. The caller must CHANGE the request to escape — which is why this is 422, not 400 or 409 (ADR-0013 §2). `type` is one of: `invalid_request` (a precondition on the body failed, or a field failed to deserialize into its documented type), `idempotency_key_reused` (same key, different body — send a new key or resend the original request unchanged), `unknown_account` (a posting names an account that does not exist or does not hold that currency), `unknown_resolve_target` (`resolves_id` names no transaction on this tenant's book), `resolve_target_not_pending` (only a pending transaction can be resolved — its status never mutates), `already_resolved` (the named pending transaction already has its one resolution).",
             "content": {
               "application/json": {
                 "schema": {
@@ -176,6 +176,14 @@
           }
         }
       },
+      "StatusBody": {
+        "type": "string",
+        "description": "Whether the transaction lands on the books or records money that MAY\nmove. Status never mutates: a pending transaction becomes posted by a NEW\ntransaction naming it in `resolves_id`, never by an update (ADR-0016).",
+        "enum": [
+          "pending",
+          "posted"
+        ]
+      },
       "TransactionBody": {
         "type": "object",
         "description": "The body of `POST /v1/transactions`.",
@@ -205,9 +213,28 @@
             "description": "At least one posting.",
             "minItems": 1
           },
+          "resolves_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The PENDING transaction this one resolves — pending → posted is this\nnew, posted transaction, never an update to the original (ADR-0016).\nThe resolution's postings need not mirror the pending amounts (a\npartial capture resolves with less); a resolving transaction cannot\nitself be pending."
+          },
+          "status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StatusBody",
+                "description": "Omitted means `posted`."
+              }
+            ]
+          },
           "tenant_id": {
             "type": "string",
-            "description": "The book this transaction belongs to. Named in the body for now: the\ntrust story is the deployment perimeter's until an auth decision exists.",
+            "description": "The book this transaction belongs to. Named in the body by decision\n(ADR-0017): data scoping, never an identity claim — the trust story is\nthe deployment perimeter's, and authenticating callers is the\ndeployer's layer.",
             "example": "t1"
           }
         }

@@ -37,8 +37,8 @@ mod service;
 // `Repository` port's signatures name them; the functions are `pub(crate)`,
 // called by the writer service alone, so the math's order of operations
 // cannot be re-orchestrated outside this crate.
-pub use domain::{Invalid, PostTransaction, Posted, Posting};
+pub use domain::{Invalid, PostTransaction, Posted, Posting, TransactionStatus};
 pub use port::{Ledger, WriteError};
 pub use postings::{Append, Delta, Direction, Leg};
-pub use repository::{Appended, BalanceUpsert, Repository, StorageError};
+pub use repository::{Appended, BalanceUpsert, Claimed, Repository, ResolveRefusal, StorageError};
 pub use service::LedgerService;

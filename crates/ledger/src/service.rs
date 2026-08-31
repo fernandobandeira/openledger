@@ -14,7 +14,11 @@
 //!   are locked in id order, batch-wide;
 //! - `account_seq` is issued by the balance row's counter under its own lock
 //!   and each entry's seq walks back from the returned total — the offsets
-//!   are counted here in Rust, the one subtraction runs beside the counter.
+//!   are counted here in Rust, the one subtraction runs beside the counter;
+//! - pending → posted (roadmap M3, ADR-0016) rides the same claim: a pending
+//!   plan withholds the balance movement (the cache means POSTED, ADR-0010),
+//!   and a resolution whose target the statement's gate found unresolvable
+//!   is refused by name after rollback.
 //!
 //! The fourth clause of that contract — the transaction opens by SETTING
 //! `READ COMMITTED` rather than inheriting it — is stated on
@@ -27,7 +31,7 @@ use uuid::Uuid;
 use crate::domain::{PostTransaction, Posted};
 use crate::port::{Ledger, WriteError};
 use crate::postings::{self, Delta};
-use crate::repository::{Appended, Repository};
+use crate::repository::{Appended, Claimed, Repository, ResolveRefusal};
 
 /// The writer behind the [`Ledger`] port, generic over the repository. One
 /// adapter exists and no second is promised — the generic is the seam's
@@ -85,7 +89,11 @@ async fn post<R: Repository>(
     // can call is a pair (ADR-0005) — coalesce per (account, currency) so N
     // legs cost one balance upsert, and count each leg's offset back from
     // its account's counter so the statement can number the entries.
-    let append = postings::plan_append(command.postings())
+    // ...and, for a pending transaction, the plan withholds the balance
+    // movement while keeping every leg's seq: the cache means POSTED
+    // (ADR-0010), and that ruling is applied here in the pure math, never
+    // by a branch in the statement.
+    let append = postings::plan_append(command.postings(), command.status())
         .map_err(|postings::Overflow| WriteError::Overflow)?;
 
     let mut tx = repository.begin().await.map_err(storage)?;
@@ -104,8 +112,14 @@ async fn post<R: Repository>(
     {
         // This caller is the first writer: the work is already done in this
         // open transaction — check it landed whole, then close the bracket.
-        Some(appended) => {
+        Some(Claimed::Appended(appended)) => {
             commit_or_refuse_unknown_account(repository, tx, appended, &append.deltas).await
+        }
+        // This caller is the first writer AND named a resolves_id whose
+        // target the statement's gate found unresolvable: refuse it by name,
+        // after the rollback that makes "nothing was written" true.
+        Some(Claimed::ResolutionRefused(refusal)) => {
+            refuse_unresolvable_target(repository, tx, command, refusal).await
         }
         // The key belongs to an earlier post: replay its stored result —
         // never redo the work — or refuse the key if the body differs.
@@ -160,6 +174,35 @@ async fn commit_or_refuse_unknown_account<R: Repository>(
     })
 }
 
+/// The resolving transaction's target failed the statement's gate — it does
+/// not exist, is not pending, or is already resolved (ADR-0004's list: the
+/// foreign key holds existence eventually, but the SEMANTIC linkage is the
+/// writer's to hold, and this is where it holds it). Roll back first, so the
+/// claimed key and the balance locks the gated statement took are released
+/// and the refusal's "nothing was written" is true, then name the target.
+async fn refuse_unresolvable_target<R: Repository>(
+    repository: &R,
+    tx: R::Tx,
+    command: &PostTransaction,
+    refusal: ResolveRefusal,
+) -> Result<Posted, WriteError> {
+    repository.rollback(tx).await.map_err(storage)?;
+    // The statement only diagnoses a resolution the command asked for, so a
+    // refusal without a resolves_id means the adapter and this service
+    // disagree about the statement — answered as the can't-happen state it
+    // is, never dressed as a caller error.
+    let Some(resolves_id) = command.resolves_id() else {
+        return Err(WriteError::Internal(
+            "the single call refused a resolution the command never asked for".to_owned(),
+        ));
+    };
+    Err(match refusal {
+        ResolveRefusal::TargetMissing => WriteError::UnknownResolveTarget { resolves_id },
+        ResolveRefusal::TargetNotPending => WriteError::ResolveTargetNotPending { resolves_id },
+        ResolveRefusal::AlreadyResolved => WriteError::AlreadyResolved { resolves_id },
+    })
+}
+
 /// The key was already claimed: answer the replay, or refuse the reuse.
 /// Statement B is a SEPARATE statement, so it takes a new snapshot and can
 /// see the row a concurrent writer committed while A blocked on it
@@ -206,7 +249,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::domain::{Invalid, Posting};
+    use crate::domain::{Invalid, Posting, TransactionStatus};
     use crate::postings::Append;
     use crate::repository::{BalanceUpsert, StorageError};
 
@@ -224,6 +267,23 @@ mod tests {
             "acme".to_owned(),
             "key-1".to_owned(),
             OffsetDateTime::UNIX_EPOCH,
+            TransactionStatus::Posted,
+            None,
+            vec![Posting::new(SOURCE, DESTINATION, 100, "USD".to_owned())?],
+        )
+    }
+
+    /// The same shape, resolving a pending target — for the refusal path,
+    /// whose named answer must carry this id back.
+    const TARGET: Uuid = Uuid::from_u128(0xA0);
+
+    fn a_resolving_command() -> Result<PostTransaction, Invalid> {
+        PostTransaction::new(
+            "acme".to_owned(),
+            "key-2".to_owned(),
+            OffsetDateTime::UNIX_EPOCH,
+            TransactionStatus::Posted,
+            Some(TARGET),
             vec![Posting::new(SOURCE, DESTINATION, 100, "USD".to_owned())?],
         )
     }
@@ -258,6 +318,7 @@ mod tests {
         stored: Option<(Uuid, Option<Uuid>)>,
         accounts_exist: bool,
         claim_and_append_fails: bool,
+        resolution_refused: Option<ResolveRefusal>,
         calls: Calls,
     }
 
@@ -268,6 +329,7 @@ mod tests {
                 stored,
                 accounts_exist: true,
                 claim_and_append_fails: false,
+                resolution_refused: None,
                 calls: Calls::default(),
             }
         }
@@ -308,6 +370,14 @@ mod tests {
             fake
         }
 
+        /// The claim succeeds but the resolving target fails the gate: the
+        /// single call answers the diagnosis instead of the append.
+        fn refusing_the_resolution(refusal: ResolveRefusal) -> Self {
+            let mut fake = Self::first_writer();
+            fake.resolution_refused = Some(refusal);
+            fake
+        }
+
         fn calls(&self) -> Calls {
             Arc::clone(&self.calls)
         }
@@ -337,7 +407,7 @@ mod tests {
             _hash: &[u8],
             _payload: &serde_json::Value,
             append: &Append,
-        ) -> Result<Option<Appended>, StorageError> {
+        ) -> Result<Option<Claimed>, StorageError> {
             self.record("claim_and_append");
             // The statement's own precondition, held on every path: one
             // offset per leg, in the same order.
@@ -347,6 +417,9 @@ mod tests {
             }
             if !self.claims {
                 return Ok(None);
+            }
+            if let Some(refusal) = self.resolution_refused {
+                return Ok(Some(Claimed::ResolutionRefused(refusal)));
             }
             // One answer per delta, in the map's own account order — the
             // real statement's LEFT JOIN back onto the deltas it was handed.
@@ -361,11 +434,11 @@ mod tests {
                     last_seq: self.accounts_exist.then_some(delta.legs),
                 })
                 .collect();
-            Ok(Some(Appended {
+            Ok(Some(Claimed::Appended(Appended {
                 event_id: EVENT,
                 transaction_id: TRANSACTION,
                 balance_upserts,
-            }))
+            })))
         }
 
         async fn stored_result(
@@ -473,6 +546,51 @@ mod tests {
             Err(WriteError::UnknownAccount { account_id, .. }) if account_id == SOURCE
         ));
         assert_eq!(taken(&calls), ["begin", "claim_and_append", "rollback"]);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unresolvable_target_is_refused_by_name_after_rollback() -> Result<(), Invalid> {
+        // The three diagnoses, each mapped to its own named refusal — a
+        // match arm dropped or crossed here hands the caller the wrong
+        // instruction (ADR-0013's framing: the error names what to change).
+        let cases = [
+            (ResolveRefusal::TargetMissing, "unknown"),
+            (ResolveRefusal::TargetNotPending, "not_pending"),
+            (ResolveRefusal::AlreadyResolved, "already_resolved"),
+        ];
+        for (refusal, expected) in cases {
+            let repository = FakeRepository::refusing_the_resolution(refusal);
+            let calls = repository.calls();
+            let service = LedgerService::new(repository);
+            let command = a_resolving_command()?;
+
+            let posted = run(service.post(&command));
+
+            let named = match posted {
+                Err(WriteError::UnknownResolveTarget { resolves_id }) if resolves_id == TARGET => {
+                    "unknown"
+                }
+                Err(WriteError::ResolveTargetNotPending { resolves_id })
+                    if resolves_id == TARGET =>
+                {
+                    "not_pending"
+                }
+                Err(WriteError::AlreadyResolved { resolves_id }) if resolves_id == TARGET => {
+                    "already_resolved"
+                }
+                _ => "something else",
+            };
+            assert_eq!(named, expected, "for {refusal:?}");
+            // The bracket closes by rollback BEFORE the refusal leaves —
+            // that ordering is what makes "nothing was written" true — and
+            // statement B never runs: a refused resolution is not a replay.
+            assert_eq!(
+                taken(&calls),
+                ["begin", "claim_and_append", "rollback"],
+                "for {refusal:?}"
+            );
+        }
         Ok(())
     }
 

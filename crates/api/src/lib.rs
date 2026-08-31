@@ -7,8 +7,9 @@
 //! claim and finds a durable result, so there is no in-flight state to name.
 //!
 //! One endpoint while the core structure is under review. No authentication
-//! yet, and the tenant is named in the body: the trust story is the deployment
-//! perimeter's until an auth decision exists.
+//! by decision, not omission (ADR-0017): the ledger deploys internally only,
+//! the trust story is the deployment perimeter's, and the tenant named in the
+//! body is data scoping — which book — never an identity claim.
 //!
 //! This crate sees the ledger through its port, [`ledger::Ledger`], not
 //! through the Postgres writer — the composition root (crates/openledger)

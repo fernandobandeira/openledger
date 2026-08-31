@@ -31,11 +31,27 @@ pub(crate) struct PostingBody {
     currency: String,
 }
 
+/// Whether the transaction lands on the books or records money that MAY
+/// move. Status never mutates: a pending transaction becomes posted by a NEW
+/// transaction naming it in `resolves_id`, never by an update (ADR-0016).
+#[derive(Clone, Copy, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum StatusBody {
+    /// A claim about what may happen: entries are written and sequenced, but
+    /// no report and no balance counts them until a resolution posts. The
+    /// pending population is enumerated by `recon_pending_bridge`.
+    Pending,
+    /// Money that moved. The default.
+    Posted,
+}
+
 /// The body of `POST /v1/transactions`.
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct TransactionBody {
-    /// The book this transaction belongs to. Named in the body for now: the
-    /// trust story is the deployment perimeter's until an auth decision exists.
+    /// The book this transaction belongs to. Named in the body by decision
+    /// (ADR-0017): data scoping, never an identity claim — the trust story is
+    /// the deployment perimeter's, and authenticating callers is the
+    /// deployer's layer.
     #[schema(example = "t1")]
     tenant_id: String,
     /// Caller-supplied replay key, unique per tenant. Sending the same key
@@ -46,6 +62,16 @@ pub(crate) struct TransactionBody {
     /// When the movement is deemed to have happened, RFC 3339.
     #[serde(with = "time::serde::rfc3339")]
     effective_at: OffsetDateTime,
+    /// Omitted means `posted`.
+    #[serde(default)]
+    status: Option<StatusBody>,
+    /// The PENDING transaction this one resolves — pending → posted is this
+    /// new, posted transaction, never an update to the original (ADR-0016).
+    /// The resolution's postings need not mirror the pending amounts (a
+    /// partial capture resolves with less); a resolving transaction cannot
+    /// itself be pending.
+    #[serde(default)]
+    resolves_id: Option<Uuid>,
     /// At least one posting.
     #[schema(min_items = 1)]
     postings: Vec<PostingBody>,
@@ -153,7 +179,11 @@ where
                            `idempotency_key_reused` (same key, different body — send a \
                            new key or resend the original request unchanged), `unknown_account` \
                            (a posting names an account that does not exist or does not hold \
-                           that currency).",
+                           that currency), `unknown_resolve_target` (`resolves_id` names no \
+                           transaction on this tenant's book), `resolve_target_not_pending` \
+                           (only a pending transaction can be resolved — its status never \
+                           mutates), `already_resolved` (the named pending transaction already \
+                           has its one resolution).",
             body = ErrorBody
         ),
         (
@@ -241,6 +271,27 @@ where
             "invalid_request",
             "the posting amounts overflow 64-bit minor units".to_owned(),
         ),
+        Err(ledger::WriteError::UnknownResolveTarget { resolves_id }) => refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unknown_resolve_target",
+            format!("resolves_id {resolves_id} names no transaction on this tenant's book"),
+        ),
+        Err(ledger::WriteError::ResolveTargetNotPending { resolves_id }) => refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "resolve_target_not_pending",
+            format!(
+                "transaction {resolves_id} is not pending — only a pending transaction can be \
+                 resolved, and its status never mutates"
+            ),
+        ),
+        Err(ledger::WriteError::AlreadyResolved { resolves_id }) => refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "already_resolved",
+            format!(
+                "transaction {resolves_id} already has its resolution — pending → posted \
+                 happens once"
+            ),
+        ),
         // Same wire shape for both 500 classes: the caller gets no
         // internals, the operator's log gets the difference — a storage
         // failure reads as the backend's error, an Internal as the writer
@@ -270,10 +321,18 @@ fn to_command(body: TransactionBody) -> Result<ledger::PostTransaction, ledger::
         .into_iter()
         .map(|p| ledger::Posting::new(p.source, p.destination, p.amount_minor, p.currency))
         .collect::<Result<Vec<_>, _>>()?;
+    // Omitted means posted — the wire's default is decided here, at the
+    // boundary, so the domain constructor never sees an absence.
+    let status = match body.status.unwrap_or(StatusBody::Posted) {
+        StatusBody::Pending => ledger::TransactionStatus::Pending,
+        StatusBody::Posted => ledger::TransactionStatus::Posted,
+    };
     ledger::PostTransaction::new(
         body.tenant_id,
         body.idempotency_key,
         body.effective_at,
+        status,
+        body.resolves_id,
         postings,
     )
 }

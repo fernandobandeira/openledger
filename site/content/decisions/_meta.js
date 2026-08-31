@@ -16,4 +16,6 @@ export default {
   '0013-write-path-contract': '0013 · The write path contract',
   '0014-http-api': '0014 · The API is the adoption surface',
   '0015-workspace-enforcement': '0015 · The workspace, machine-enforced',
+  '0016-pending-to-posted': '0016 · Pending → posted is a new transaction',
+  '0017-no-authentication': '0017 · No auth; the perimeter is the boundary',
 }
