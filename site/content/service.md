@@ -3,9 +3,9 @@
 **One binary, `openledger`, with three subcommands and one endpoint.** `openledger migrate` applies
 the schema the [database page](/database) explains, and exits. `openledger serve` refuses to start
 against a database that schema never reached, then answers `POST /v1/transactions`: post a balanced
-transaction — posted, or pending and later resolved by a new posted transaction naming it
-([ADR-0016](/decisions/0016-pending-to-posted)) — or replay the stored answer for an idempotency
-key it has already seen.
+transaction — posted; pending, later resolved or voided by a new posted transaction naming it;
+or reversed in full by a server-derived mirror ([ADR-0016](/decisions/0016-pending-to-posted)) —
+or replay the stored answer for an idempotency key it has already seen.
 `openledger reconcile` runs the schema's ten reconciliation checks in one snapshot and turns them
 into an exit code — the daily sweep as a command. The rest of
 this page walks that code — the startup gate, the write path and what it guarantees, the wire
@@ -13,7 +13,7 @@ contract, the crate boundaries that enforce the design, what the e2e suite prove
 [what is not built yet](#still-open--what-is-not-there).
 
 The census, counted 2026-08-31 against the workspace: **6 crates · 3 subcommands · 1 endpoint ·
-4 exit codes · 50 end-to-end tests · 10 reconciliation checks asserted at zero after every
+4 exit codes · 63 end-to-end tests · 10 reconciliation checks asserted at zero after every
 endpoint test.**
 
 The API itself is browsable as rendered documentation: **[the API reference](/api-reference/)**,
@@ -157,7 +157,7 @@ Step by step, with the reasoning each one carries:
    the long version), and its `INSERT` arm selects the account's frozen identity columns from
    `ledger_accounts` itself — which doubles as the existence check: an unknown account or a wrong
    currency joins to nothing and comes back as a `NULL` counter, and the writer rolls back with
-   `unknown_account`.
+   `account_unknown`.
 6. **Sequence numbers walk back from the totals.** The domain counts each leg's offset back from
    its account's counter (`offsets_back_from_last_seq`, crate-internal to `ledger` — the pure half
    of the walk-back), and the statement numbers each entry `last_seq − offset` beside the counter
@@ -175,9 +175,21 @@ Step by step, with the reasoning each one carries:
    resolution is a new POSTED transaction carrying `resolves_id`, and the statement gates its
    insert on the one thing no foreign key holds ([ADR-0004](/decisions/0004-where-logic-lives)'s
    −49,223 counterexample): the target must exist on the caller's tenant, be pending, and be
-   unresolved — a failed gate comes back as a diagnosis the writer refuses by name, and two
-   resolutions racing one target fall to `uq_txn__one_resolution`, mapped to the same refusal.
+   unsuperseded — a failed gate comes back as a diagnosis the writer refuses by name, and two
+   supersessions racing one target fall to `uq_txn__one_supersession`, mapped to the same refusal.
    Still three round trips either way.
+9. **Reversals ride it too, and the statement derives them**
+   ([ADR-0016](/decisions/0016-pending-to-posted), Reversals and the void). A reversal request
+   carries `reverses_id` and NO postings; the statement reads the target and derives the outcome
+   in place: a POSTED target gets the full mirror — its own legs, directions flipped (contra,
+   never storno: amounts stay positive, so gross turnover inflates, the recorded cost), sequenced
+   and cached like any posting — and a PENDING target gets the void, a posted zero-entry marker
+   that retires the hold from the bridge while touching neither cache nor counters
+   (`recon_transaction_breaks` carves out exactly that marker — migration 00003). `effective_at`
+   may be omitted on a reversal and defaults to the target's; the gate refuses a target that is
+   missing, not an ordinary posting, itself a supersession, or already superseded. The single
+   call's answer anchors on the claimed row, so the zero-delta void is its own creation and never
+   mistaken for a replay. Still three round trips.
 
 ## The contract on the wire
 
@@ -191,10 +203,12 @@ refusals are 422 rather than 400 or 409:
 | **200** + `Idempotency-Replayed: true` | This key was already accepted with this same body; the stored `(event_id, transaction_id)` is **re-rendered, never a cached response body** | Nothing — done; treat it as the same success |
 | **422** `invalid_request` | A precondition on the body failed (unbalanced is unconstructible, so this is a malformed leg, currency, date or overflow) — nothing was written | Fix the body |
 | **422** `idempotency_key_reused` | Same key, different body — nothing was written | Send a new key, or resend the original request unchanged |
-| **422** `unknown_account` | A posting names an account that does not exist or does not hold that currency — nothing was written | Fix the account or currency |
-| **422** `unknown_resolve_target` | `resolves_id` names no transaction on this tenant's book — nothing was written | Fix the target id |
+| **422** `account_unknown` | A posting names an account that does not exist or does not hold that currency — nothing was written | Fix the account or currency |
+| **422** `resolve_target_unknown` | `resolves_id` names no transaction on this tenant's book — nothing was written | Fix the target id |
 | **422** `resolve_target_not_pending` | Only a pending transaction can be resolved, and status never mutates — nothing was written | Point at the pending transaction, not its history |
-| **422** `already_resolved` | The named pending transaction already has its one resolution — nothing was written | Stop; the resolution already posted |
+| **422** `reverse_target_unknown` | `reverses_id` names no transaction on this tenant's book — nothing was written | Fix the target id |
+| **422** `reverse_target_not_reversible` | Only an ordinary posting that is itself neither a resolution nor a reversal can be reversed — nothing was written | Correct with a fresh posting instead |
+| **422** `target_already_superseded` | The named target already has its one supersession — resolved or reversed, either fate is final — nothing was written | Stop; the supersession already posted |
 | **500** `internal` | The write failed; nothing was committed. The caller gets no internals; the operator's log has the error | Retry is safe — the key makes it harmless |
 
 Two things are deliberately absent. There is **no 409**: a concurrent duplicate blocks on the key
@@ -275,7 +289,7 @@ binary, named `openledger-e2e-pg` and reused across runs (testcontainers 0.27 sh
 an anonymous container would leak one per run; a named, reused one caps the population at exactly
 one).
 
-The fifty tests, by what each holds:
+The sixty-three tests, by what each holds:
 
 - **Nine endpoint tests** (`endpoints/transactions/post.rs`) — the posting-and-idempotency half of
   the `POST /v1/transactions` contract in one file: a posting lands on both accounts' balance rows;
@@ -298,12 +312,29 @@ The fifty tests, by what each holds:
   refusals, every one red against a specific guard — a target that does not exist (including one
   on another tenant's book), a POSTED target (ADR-0004's −49,223 counterexample, refused as
   `resolve_target_not_pending`), a second resolution, **eight concurrent resolutions of one
-  pending producing exactly one** with every loser named `already_resolved` (the gate under
+  pending producing exactly one** with every loser named `target_already_superseded` (the gate under
   concurrency), **a resolution racing a genuinely uncommitted rival** — held open on a second
   connection until the API call is provably blocked, then committed — refused as
-  `already_resolved` and never a 500 (the `uq_txn__one_resolution` backstop and its
+  `target_already_superseded` and never a 500 (the `uq_txn__one_supersession` backstop and its
   constraint-name mapping, staged deterministically), and a pending resolution refused before any
   SQL.
+- **Thirteen reversal-and-void tests** (`endpoints/transactions/reverse.rs`) — the
+  [ADR-0016](/decisions/0016-pending-to-posted) reversal half: a mirror reversal moves the cache
+  back (directions flipped, the face netting to zero, gross turnover carrying the recorded contra
+  noise) and replays its stored result; the void retires the pending with cache, counters and
+  trial balance untouched — the migration-00003 carve-out proven green by the oracle — and **the
+  void is its own creation, never a replay of itself** (the return-shape pin: regressed, the
+  marker is answered as a replay and silently rolled back); an omitted `effective_at` defaults to
+  the target's and a below-target date is accepted while absence outside a reversal stays
+  refused; and the refusals, each red against a specific guard — a reversal carrying postings (or
+  posted as pending), a missing or foreign target, a resolution or a reversal as target (the
+  neither-pointer arm: reversing a resolution strands its pending forever), a `period_close`
+  target (un-closing refused), a second reversal, the sequential resolve-vs-reverse twin in both
+  orders, **both uncommitted-rival races** (a void racing an uncommitted resolution and a
+  resolution racing an uncommitted void, each provably blocked then refused as
+  `target_already_superseded`, never a 500 — the supersession index refereeing the twin the two
+  per-pointer indexes never could), and a key reused with a different target or the defaulted
+  date spelled out.
 - **Conformance** (`conformance.rs`) — the committed `openapi.json` against the running router:
   every documented (path, method) must answer neither 404 nor 405 on the wire, an undocumented
   method on the same path must answer exactly 405, and the spec's path set must *equal* the
@@ -369,9 +400,10 @@ Stated the way the database page states its gaps: each of these is a hole today,
 > the schema's balance striping ([ADR-0013 §4](/decisions/0013-write-path-contract)) is applied
 > but no selection policy is built, and the throughput numbers on this site are the spikes'
 > measurements of the SQL shape, not a load test of *this* binary — batching under load has no
-> proof yet. And a pending transaction that will never resolve has no exit: voiding is unbuilt
-> (`reverses_id` has no writer surface, hold expiry is M8's), so the bridge's
-> `oldest_pending_effective_at` is the only alarm ([ADR-0016](/decisions/0016-pending-to-posted)).
+> proof yet. And hold EXPIRY — the timer
+> that fires a void unprompted — is M8's, so an abandoned pending waits on a caller-invoked void
+> and the bridge's `oldest_pending_effective_at` stays the aging alarm
+> ([ADR-0016](/decisions/0016-pending-to-posted)).
 
 > **STILL OPEN — one endpoint.** There is no read over HTTP: balances, entries and reports are
 > reachable only through SQL and the report functions the schema ships. The write path came first

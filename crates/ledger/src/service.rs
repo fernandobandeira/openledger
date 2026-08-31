@@ -17,8 +17,15 @@
 //!   are counted here in Rust, the one subtraction runs beside the counter;
 //! - pending → posted (roadmap M3, ADR-0016) rides the same claim: a pending
 //!   plan withholds the balance movement (the cache means POSTED, ADR-0010),
-//!   and a resolution whose target the statement's gate found unresolvable
-//!   is refused by name after rollback.
+//!   and a superseding transaction — a resolution or a reversal — whose
+//!   target the statement's gate found unsupersedable is refused by name
+//!   after rollback;
+//! - a reversal (ADR-0016, Reversals and the void) plans an EMPTY append —
+//!   the caller sends no postings — and the statement derives the outcome
+//!   from the target: the full mirror for a posted target, the zero-posting
+//!   void marker for a pending one. The derived append is the statement's,
+//!   so this service commits it without reconciling it against a plan it
+//!   never made.
 //!
 //! The fourth clause of that contract — the transaction opens by SETTING
 //! `READ COMMITTED` rather than inheriting it — is stated on
@@ -31,7 +38,7 @@ use uuid::Uuid;
 use crate::domain::{PostTransaction, Posted};
 use crate::port::{Ledger, WriteError};
 use crate::postings::{self, Delta};
-use crate::repository::{Appended, Claimed, Repository, ResolveRefusal};
+use crate::repository::{Appended, Claimed, Repository, SupersedeRefusal};
 
 /// The writer behind the [`Ledger`] port, generic over the repository. One
 /// adapter exists and no second is promised — the generic is the seam's
@@ -110,16 +117,24 @@ async fn post<R: Repository>(
         .await
         .map_err(storage)?
     {
+        // This caller is the first writer AND the command reverses: the
+        // append the statement ran is the one IT derived from the target —
+        // the mirror, or the void's nothing — so there is no plan to
+        // reconcile it against; commit the derivation as it stands.
+        Some(Claimed::Appended(appended)) if command.reverses_id().is_some() => {
+            commit_derived_reversal(repository, tx, appended).await
+        }
         // This caller is the first writer: the work is already done in this
         // open transaction — check it landed whole, then close the bracket.
         Some(Claimed::Appended(appended)) => {
             commit_or_refuse_unknown_account(repository, tx, appended, &append.deltas).await
         }
-        // This caller is the first writer AND named a resolves_id whose
-        // target the statement's gate found unresolvable: refuse it by name,
-        // after the rollback that makes "nothing was written" true.
-        Some(Claimed::ResolutionRefused(refusal)) => {
-            refuse_unresolvable_target(repository, tx, command, refusal).await
+        // This caller is the first writer AND named a target the statement's
+        // gate found unsupersedable — unresolvable, or unreversible: refuse
+        // it by name, after the rollback that makes "nothing was written"
+        // true.
+        Some(Claimed::SupersessionRefused(refusal)) => {
+            refuse_unsupersedable_target(repository, tx, command, refusal).await
         }
         // The key belongs to an earlier post: replay its stored result —
         // never redo the work — or refuse the key if the body differs.
@@ -159,7 +174,7 @@ async fn commit_or_refuse_unknown_account<R: Repository>(
         .iter()
         .find(|upsert| upsert.last_seq.is_none())
     {
-        let refusal = WriteError::UnknownAccount {
+        let refusal = WriteError::AccountUnknown {
             account_id: missing.account_id,
             currency: missing.currency.clone(),
         };
@@ -174,32 +189,72 @@ async fn commit_or_refuse_unknown_account<R: Repository>(
     })
 }
 
-/// The resolving transaction's target failed the statement's gate — it does
-/// not exist, is not pending, or is already resolved (ADR-0004's list: the
-/// foreign key holds existence eventually, but the SEMANTIC linkage is the
-/// writer's to hold, and this is where it holds it). Roll back first, so the
-/// claimed key and the balance locks the gated statement took are released
-/// and the refusal's "nothing was written" is true, then name the target.
-async fn refuse_unresolvable_target<R: Repository>(
+/// The reversal's second half: the statement derived the whole outcome from
+/// the target — the mirror's upserts, or none at all for the void — so
+/// there is no planned delta set to reconcile against and no unknown-account
+/// arm to keep: the mirror's accounts exist by construction (the target's
+/// entries reference them under composite foreign keys, so the upsert's
+/// existence join always matches), and the void upserts nothing. Commit the
+/// bracket and answer with what the statement wrote.
+async fn commit_derived_reversal<R: Repository>(
+    repository: &R,
+    tx: R::Tx,
+    appended: Appended,
+) -> Result<Posted, WriteError> {
+    repository.commit(tx).await.map_err(storage)?;
+    Ok(Posted {
+        event_id: appended.event_id,
+        transaction_id: Some(appended.transaction_id),
+        replayed: false,
+    })
+}
+
+/// The superseding transaction's target failed the statement's gate — it
+/// does not exist, cannot be resolved or reversed, or already met its one
+/// supersession (ADR-0004's list: the foreign key holds existence
+/// eventually, but the SEMANTIC linkage is the writer's to hold, and this is
+/// where it holds it). Roll back first, so the claimed key and the balance
+/// locks the gated statement took are released and the refusal's "nothing
+/// was written" is true, then name the target.
+async fn refuse_unsupersedable_target<R: Repository>(
     repository: &R,
     tx: R::Tx,
     command: &PostTransaction,
-    refusal: ResolveRefusal,
+    refusal: SupersedeRefusal,
 ) -> Result<Posted, WriteError> {
     repository.rollback(tx).await.map_err(storage)?;
-    // The statement only diagnoses a resolution the command asked for, so a
-    // refusal without a resolves_id means the adapter and this service
-    // disagree about the statement — answered as the can't-happen state it
-    // is, never dressed as a caller error.
-    let Some(resolves_id) = command.resolves_id() else {
-        return Err(WriteError::Internal(
-            "the single call refused a resolution the command never asked for".to_owned(),
-        ));
+    // The statement only diagnoses a supersession the command asked for, so
+    // a refusal without the matching pointer means the adapter and this
+    // service disagree about the statement — answered as the can't-happen
+    // state it is, never dressed as a caller error.
+    let disagreement = || {
+        WriteError::Internal(
+            "the single call refused a supersession the command never asked for".to_owned(),
+        )
     };
     Err(match refusal {
-        ResolveRefusal::TargetMissing => WriteError::UnknownResolveTarget { resolves_id },
-        ResolveRefusal::TargetNotPending => WriteError::ResolveTargetNotPending { resolves_id },
-        ResolveRefusal::AlreadyResolved => WriteError::AlreadyResolved { resolves_id },
+        SupersedeRefusal::ResolveTargetUnknown => match command.resolves_id() {
+            Some(resolves_id) => WriteError::ResolveTargetUnknown { resolves_id },
+            None => disagreement(),
+        },
+        SupersedeRefusal::ResolveTargetNotPending => match command.resolves_id() {
+            Some(resolves_id) => WriteError::ResolveTargetNotPending { resolves_id },
+            None => disagreement(),
+        },
+        SupersedeRefusal::ReverseTargetUnknown => match command.reverses_id() {
+            Some(reverses_id) => WriteError::ReverseTargetUnknown { reverses_id },
+            None => disagreement(),
+        },
+        SupersedeRefusal::ReverseTargetNotReversible => match command.reverses_id() {
+            Some(reverses_id) => WriteError::ReverseTargetNotReversible { reverses_id },
+            None => disagreement(),
+        },
+        SupersedeRefusal::TargetAlreadySuperseded => {
+            match command.resolves_id().or(command.reverses_id()) {
+                Some(transaction_id) => WriteError::TargetAlreadySuperseded { transaction_id },
+                None => disagreement(),
+            }
+        }
     })
 }
 
@@ -266,8 +321,9 @@ mod tests {
         PostTransaction::new(
             "acme".to_owned(),
             "key-1".to_owned(),
-            OffsetDateTime::UNIX_EPOCH,
+            Some(OffsetDateTime::UNIX_EPOCH),
             TransactionStatus::Posted,
+            None,
             None,
             vec![Posting::new(SOURCE, DESTINATION, 100, "USD".to_owned())?],
         )
@@ -281,10 +337,25 @@ mod tests {
         PostTransaction::new(
             "acme".to_owned(),
             "key-2".to_owned(),
-            OffsetDateTime::UNIX_EPOCH,
+            Some(OffsetDateTime::UNIX_EPOCH),
             TransactionStatus::Posted,
             Some(TARGET),
+            None,
             vec![Posting::new(SOURCE, DESTINATION, 100, "USD".to_owned())?],
+        )
+    }
+
+    /// The reversal shape: a pointer, no postings, the date deferred to the
+    /// target's — the command whose append the STATEMENT derives.
+    fn a_reversing_command() -> Result<PostTransaction, Invalid> {
+        PostTransaction::new(
+            "acme".to_owned(),
+            "key-3".to_owned(),
+            None,
+            TransactionStatus::Posted,
+            None,
+            Some(TARGET),
+            vec![],
         )
     }
 
@@ -318,7 +389,8 @@ mod tests {
         stored: Option<(Uuid, Option<Uuid>)>,
         accounts_exist: bool,
         claim_and_append_fails: bool,
-        resolution_refused: Option<ResolveRefusal>,
+        supersession_refused: Option<SupersedeRefusal>,
+        derived_upserts: Option<Vec<BalanceUpsert>>,
         calls: Calls,
     }
 
@@ -329,7 +401,8 @@ mod tests {
                 stored,
                 accounts_exist: true,
                 claim_and_append_fails: false,
-                resolution_refused: None,
+                supersession_refused: None,
+                derived_upserts: None,
                 calls: Calls::default(),
             }
         }
@@ -370,11 +443,20 @@ mod tests {
             fake
         }
 
-        /// The claim succeeds but the resolving target fails the gate: the
-        /// single call answers the diagnosis instead of the append.
-        fn refusing_the_resolution(refusal: ResolveRefusal) -> Self {
+        /// The claim succeeds but the superseding target fails the gate:
+        /// the single call answers the diagnosis instead of the append.
+        fn refusing_the_supersession(refusal: SupersedeRefusal) -> Self {
             let mut fake = Self::first_writer();
-            fake.resolution_refused = Some(refusal);
+            fake.supersession_refused = Some(refusal);
+            fake
+        }
+
+        /// The claim succeeds and the statement DERIVED the append from a
+        /// reversal's target — upserts the plan never predicted (the
+        /// mirror's), or none at all (the void's).
+        fn deriving_the_reversal(upserts: Vec<BalanceUpsert>) -> Self {
+            let mut fake = Self::first_writer();
+            fake.derived_upserts = Some(upserts);
             fake
         }
 
@@ -418,8 +500,24 @@ mod tests {
             if !self.claims {
                 return Ok(None);
             }
-            if let Some(refusal) = self.resolution_refused {
-                return Ok(Some(Claimed::ResolutionRefused(refusal)));
+            if let Some(refusal) = self.supersession_refused {
+                return Ok(Some(Claimed::SupersessionRefused(refusal)));
+            }
+            // A reversal's answer is the statement's own derivation, not an
+            // echo of the (empty) plan.
+            if let Some(derived) = &self.derived_upserts {
+                return Ok(Some(Claimed::Appended(Appended {
+                    event_id: EVENT,
+                    transaction_id: TRANSACTION,
+                    balance_upserts: derived
+                        .iter()
+                        .map(|upsert| BalanceUpsert {
+                            account_id: upsert.account_id,
+                            currency: upsert.currency.clone(),
+                            last_seq: upsert.last_seq,
+                        })
+                        .collect(),
+                })));
             }
             // One answer per delta, in the map's own account order — the
             // real statement's LEFT JOIN back onto the deltas it was handed.
@@ -543,53 +641,144 @@ mod tests {
         // first in account order, since the scan stops there.
         assert!(matches!(
             posted,
-            Err(WriteError::UnknownAccount { account_id, .. }) if account_id == SOURCE
+            Err(WriteError::AccountUnknown { account_id, .. }) if account_id == SOURCE
         ));
         assert_eq!(taken(&calls), ["begin", "claim_and_append", "rollback"]);
         Ok(())
     }
 
     #[test]
-    fn an_unresolvable_target_is_refused_by_name_after_rollback() -> Result<(), Invalid> {
-        // The three diagnoses, each mapped to its own named refusal — a
-        // match arm dropped or crossed here hands the caller the wrong
-        // instruction (ADR-0013's framing: the error names what to change).
+    fn an_unsupersedable_target_is_refused_by_name_after_rollback() -> Result<(), Invalid> {
+        // Every diagnosis, mapped to its own named refusal under the verb
+        // that asked — a match arm dropped or crossed here hands the caller
+        // the wrong instruction (ADR-0013's framing: the error names what to
+        // change). Resolve diagnoses ride a resolving command, reverse
+        // diagnoses a reversing one, and the shared already-superseded fate
+        // is held under both verbs.
+        let resolve = a_resolving_command as fn() -> Result<PostTransaction, Invalid>;
+        let reverse = a_reversing_command as fn() -> Result<PostTransaction, Invalid>;
         let cases = [
-            (ResolveRefusal::TargetMissing, "unknown"),
-            (ResolveRefusal::TargetNotPending, "not_pending"),
-            (ResolveRefusal::AlreadyResolved, "already_resolved"),
+            (
+                SupersedeRefusal::ResolveTargetUnknown,
+                resolve,
+                "unknown_resolve",
+            ),
+            (
+                SupersedeRefusal::ResolveTargetNotPending,
+                resolve,
+                "not_pending",
+            ),
+            (
+                SupersedeRefusal::ReverseTargetUnknown,
+                reverse,
+                "unknown_reverse",
+            ),
+            (
+                SupersedeRefusal::ReverseTargetNotReversible,
+                reverse,
+                "not_reversible",
+            ),
+            (
+                SupersedeRefusal::TargetAlreadySuperseded,
+                resolve,
+                "target_already_superseded",
+            ),
+            (
+                SupersedeRefusal::TargetAlreadySuperseded,
+                reverse,
+                "target_already_superseded",
+            ),
         ];
-        for (refusal, expected) in cases {
-            let repository = FakeRepository::refusing_the_resolution(refusal);
+        for (refusal, command, expected) in cases {
+            let repository = FakeRepository::refusing_the_supersession(refusal);
             let calls = repository.calls();
             let service = LedgerService::new(repository);
-            let command = a_resolving_command()?;
+            let command = command()?;
 
             let posted = run(service.post(&command));
 
             let named = match posted {
-                Err(WriteError::UnknownResolveTarget { resolves_id }) if resolves_id == TARGET => {
-                    "unknown"
+                Err(WriteError::ResolveTargetUnknown { resolves_id }) if resolves_id == TARGET => {
+                    "unknown_resolve"
                 }
                 Err(WriteError::ResolveTargetNotPending { resolves_id })
                     if resolves_id == TARGET =>
                 {
                     "not_pending"
                 }
-                Err(WriteError::AlreadyResolved { resolves_id }) if resolves_id == TARGET => {
-                    "already_resolved"
+                Err(WriteError::ReverseTargetUnknown { reverses_id }) if reverses_id == TARGET => {
+                    "unknown_reverse"
+                }
+                Err(WriteError::ReverseTargetNotReversible { reverses_id })
+                    if reverses_id == TARGET =>
+                {
+                    "not_reversible"
+                }
+                Err(WriteError::TargetAlreadySuperseded { transaction_id })
+                    if transaction_id == TARGET =>
+                {
+                    "target_already_superseded"
                 }
                 _ => "something else",
             };
             assert_eq!(named, expected, "for {refusal:?}");
             // The bracket closes by rollback BEFORE the refusal leaves —
             // that ordering is what makes "nothing was written" true — and
-            // statement B never runs: a refused resolution is not a replay.
+            // statement B never runs: a refused supersession is not a replay.
             assert_eq!(
                 taken(&calls),
                 ["begin", "claim_and_append", "rollback"],
                 "for {refusal:?}"
             );
+        }
+        Ok(())
+    }
+
+    /// The reversal branch, held against the plan-reconciliation arm: the
+    /// statement derives the mirror's upserts, so the plan (empty — a
+    /// reversal sends no postings) can NEVER be reconciled against the
+    /// answer, and a service that routes a reversal through the ordinary
+    /// commit path refuses its own success as an internal error. The void's
+    /// case — zero derived upserts — commits the same way.
+    #[test]
+    fn a_derived_reversal_commits_without_reconciling_a_plan_it_never_made() -> Result<(), Invalid>
+    {
+        for derived in [
+            // the mirror: two upserts the empty plan never predicted...
+            vec![
+                BalanceUpsert {
+                    account_id: SOURCE,
+                    currency: "USD".to_owned(),
+                    last_seq: Some(2),
+                },
+                BalanceUpsert {
+                    account_id: DESTINATION,
+                    currency: "USD".to_owned(),
+                    last_seq: Some(2),
+                },
+            ],
+            // ...and the void: none at all.
+            vec![],
+        ] {
+            let repository = FakeRepository::deriving_the_reversal(derived);
+            let calls = repository.calls();
+            let service = LedgerService::new(repository);
+            let command = a_reversing_command()?;
+
+            let posted = run(service.post(&command));
+
+            assert!(
+                matches!(
+                    posted,
+                    Ok(Posted {
+                        event_id: e,
+                        transaction_id: Some(t),
+                        replayed: false,
+                    }) if e == EVENT && t == TRANSACTION
+                ),
+                "a derived reversal must commit as its own creation"
+            );
+            assert_eq!(taken(&calls), ["begin", "claim_and_append", "commit"]);
         }
         Ok(())
     }

@@ -15,7 +15,7 @@
 //! −49,223 counterexample — the semantic linkage the foreign key never
 //! held), a second resolution, N resolutions racing one target (the gate
 //! under concurrency), a resolution racing a genuinely UNCOMMITTED rival
-//! (the `uq_txn__one_resolution` backstop, staged deterministically), and
+//! (the `uq_txn__one_supersession` backstop, staged deterministically), and
 //! a pending resolution (refused before any SQL).
 
 use uuid::Uuid;
@@ -370,7 +370,7 @@ async fn resolving_a_transaction_that_does_not_exist_is_refused() -> TestResult 
 
     assert_eq!(refused.status(), 422);
     let error: serde_json::Value = refused.json().await?;
-    assert_eq!(error.get("type"), Some(&"unknown_resolve_target".into()));
+    assert_eq!(error.get("type"), Some(&"resolve_target_unknown".into()));
     assert_eq!(
         book.write_counts().await?,
         (0, 0, 0),
@@ -410,7 +410,7 @@ async fn resolving_a_transaction_that_does_not_exist_is_refused() -> TestResult 
 
     assert_eq!(cross.status(), 422);
     let error: serde_json::Value = cross.json().await?;
-    assert_eq!(error.get("type"), Some(&"unknown_resolve_target".into()));
+    assert_eq!(error.get("type"), Some(&"resolve_target_unknown".into()));
     // Only t2's hold on the book; t1's attempts wrote nothing.
     assert_eq!(book.write_counts().await?, (1, 1, 2));
     book.assert_reconciled().await
@@ -499,7 +499,7 @@ async fn a_second_resolution_of_one_pending_is_refused() -> TestResult {
 
     assert_eq!(second.status(), 422);
     let error: serde_json::Value = second.json().await?;
-    assert_eq!(error.get("type"), Some(&"already_resolved".into()));
+    assert_eq!(error.get("type"), Some(&"target_already_superseded".into()));
     // The hold and its one capture; the cache moved once.
     assert_eq!(book.write_counts().await?, (2, 2, 4));
     assert_eq!(book.balance(receivable).await?, (500, 0, 2));
@@ -513,7 +513,7 @@ async fn a_second_resolution_of_one_pending_is_refused() -> TestResult {
 /// what this holds is the GATE under concurrency — losers diagnosed on
 /// committed state — plus the invariant that no interleave yields a second
 /// resolution or a 500. The genuinely-blocked window (a loser waiting on an
-/// UNCOMMITTED winner's `uq_txn__one_resolution` tuple) is not reliably
+/// UNCOMMITTED winner's `uq_txn__one_supersession` tuple) is not reliably
 /// reached here; the deterministic uncommitted-rival test below is what
 /// pins that path and the adapter's constraint-name mapping.
 #[tokio::test]
@@ -550,7 +550,7 @@ async fn concurrent_resolutions_of_one_pending_produce_exactly_one() -> TestResu
     let refused = responses
         .iter()
         .filter(|(status, _, body)| {
-            *status == 422 && body.get("type") == Some(&"already_resolved".into())
+            *status == 422 && body.get("type") == Some(&"target_already_superseded".into())
         })
         .count();
     assert_eq!(
@@ -572,48 +572,23 @@ async fn concurrent_resolutions_of_one_pending_produce_exactly_one() -> TestResu
 /// of the same target is begun on a second connection and HELD uncommitted
 /// while the API resolves. The gate reads committed state, so the API call
 /// passes it and then blocks on the rival's uncommitted claim; when the
-/// rival commits, `uq_txn__one_resolution` fires INSIDE the single call —
+/// rival commits, `uq_txn__one_supersession` fires INSIDE the single call —
 /// the one window the gate cannot see — and the adapter's constraint-name
 /// mapping must answer the same named 422 the sequential case gets, never
 /// a 500. Rename the index, or the match string in
-/// `refusal_from_resolution_race`, and THIS is the test that fails.
+/// `refusal_from_supersession_race`, and THIS is the test that fails.
 #[tokio::test]
 async fn a_resolution_racing_an_uncommitted_rival_is_refused_not_a_500() -> TestResult {
-    use sqlx::Connection;
-
     let book = TestBook::new("resolve_rival").await?;
     let (receivable, revenue) = book.fixture_accounts().await?;
     let pending = post_a_pending_hold(&book, revenue, receivable).await?;
-    // The rival: a full, balanced, correctly-cached resolution — event,
-    // transaction naming the target, both legs, cache advanced — on its own
-    // connection, begun and NOT committed. The book it leaves behind after
-    // the commit below is an ordinarily resolved hold, so the oracle's ten
-    // zeros still bind at the end.
-    let mut rival = sqlx::postgres::PgConnection::connect(&book.db_url).await?;
-    let mut held_open = rival.begin().await?;
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "INSERT INTO ledger_events (tenant_id, id, kind, source, idempotency_key,
-                                    idempotency_hash, payload, effective_at)
-         VALUES ('t1', '0e2e0000-0000-7000-8000-000000000070', 'posting', 'internal',
-                 'rival-capture', decode('00', 'hex'), '{{}}'::jsonb, '2026-08-29T00:00:00Z');
-         INSERT INTO ledger_transactions (tenant_id, id, event_id, kind, status,
-                                          effective_at, resolves_id)
-         VALUES ('t1', '0e2e0000-0000-7000-8000-000000000071',
-                 '0e2e0000-0000-7000-8000-000000000070', 'posting', 'posted',
-                 '2026-08-29T00:00:00Z', '{pending}');
-         INSERT INTO ledger_entries (tenant_id, transaction_id, account_id, direction,
-                                     amount_minor, currency, account_seq, effective_at)
-         VALUES ('t1', '0e2e0000-0000-7000-8000-000000000071', '{receivable}',
-                 'debit', 500, 'USD', 2, '2026-08-29T00:00:00Z'),
-                ('t1', '0e2e0000-0000-7000-8000-000000000071', '{revenue}',
-                 'credit', 500, 'USD', 2, '2026-08-29T00:00:00Z');
-         UPDATE ledger_account_balances SET input = input + 500, last_seq = 2
-         WHERE tenant_id = 't1' AND account_id = '{receivable}';
-         UPDATE ledger_account_balances SET output = output + 500, last_seq = 2
-         WHERE tenant_id = 't1' AND account_id = '{revenue}'"
-    )))
-    .execute(&mut *held_open)
-    .await?;
+    // The rival: a full, balanced, correctly-cached resolution, begun and
+    // NOT committed (support/book.rs — the staging every supersession race
+    // shares). The book it leaves behind after the commit below is an
+    // ordinarily resolved hold, so the oracle's ten zeros still bind.
+    let held_open = book
+        .begin_a_rival_resolution(pending, receivable, revenue)
+        .await?;
 
     // The API resolution, fired while the rival stands uncommitted...
     let racer = book.spawn_post(&serde_json::json!({
@@ -626,24 +601,9 @@ async fn a_resolution_racing_an_uncommitted_rival_is_refused_not_a_500() -> Test
             "amount_minor": 500, "currency": "USD"
         }],
     }));
-    // ...and waited for AT THE LOCK, never with a bare sleep: the blocked
-    // backend shows up in pg_stat_activity waiting on the rival, scoped to
-    // this book's database so a sibling test cannot satisfy the poll. The
-    // bound is book.rs's 15s horizon bound, for the same reasons.
-    let mut blocked = false;
-    for _ in 0..600 {
-        let (waiting,): (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM pg_stat_activity
-             WHERE datname = current_database() AND wait_event_type = 'Lock'",
-        )
-        .fetch_one(&book.pool)
-        .await?;
-        if waiting > 0 {
-            blocked = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
+    // ...and waited for AT THE LOCK, never with a bare sleep (the shared
+    // db-scoped poll in support/book.rs).
+    let blocked = book.wait_until_a_backend_blocks_on_a_lock().await?;
     assert!(
         blocked,
         "the API resolution never blocked on the rival's uncommitted claim within 15s"
@@ -656,7 +616,7 @@ async fn a_resolution_racing_an_uncommitted_rival_is_refused_not_a_500() -> Test
         status, 422,
         "the blocked loser must be refused by name, never a 500; body was {body}"
     );
-    assert_eq!(body.get("type"), Some(&"already_resolved".into()));
+    assert_eq!(body.get("type"), Some(&"target_already_superseded".into()));
     // The rival's resolution stands alone; the API attempt wrote nothing.
     assert_eq!(book.write_counts().await?, (2, 2, 4));
     assert_eq!(book.balance(receivable).await?, (500, 0, 2));

@@ -34,21 +34,31 @@ pub enum WriteError {
     KeyReused,
     /// A posting names an account that does not exist, or a currency its
     /// account does not hold. Nothing was written.
-    UnknownAccount { account_id: Uuid, currency: String },
+    AccountUnknown { account_id: Uuid, currency: String },
     /// Coalescing the legs overflowed 64-bit minor units — exactly
     /// arithmetic overflow, nothing else wears this name. Nothing was
     /// written.
     Overflow,
     /// `resolves_id` names a transaction that does not exist on this
     /// tenant's book. Nothing was written.
-    UnknownResolveTarget { resolves_id: Uuid },
+    ResolveTargetUnknown { resolves_id: Uuid },
     /// `resolves_id` names a transaction that is not pending — resolving
     /// posted history is the −49,223 counterexample ADR-0004 recorded, and
     /// the writer is the layer that refuses it. Nothing was written.
     ResolveTargetNotPending { resolves_id: Uuid },
-    /// The pending transaction `resolves_id` names already has its one
-    /// resolution — pending → posted happens once. Nothing was written.
-    AlreadyResolved { resolves_id: Uuid },
+    /// `reverses_id` names a transaction that does not exist on this
+    /// tenant's book. Nothing was written.
+    ReverseTargetUnknown { reverses_id: Uuid },
+    /// `reverses_id` names a transaction that cannot be reversed: a
+    /// `period_close` (un-closing would contradict its standing
+    /// checkpoint), or a transaction that is itself a resolution or a
+    /// reversal — reversing a resolution strands its pending forever
+    /// (ADR-0016's worked failure). Nothing was written.
+    ReverseTargetNotReversible { reverses_id: Uuid },
+    /// The named target already has its one supersession — it was resolved
+    /// or reversed, and either fate is final: pending → posted happens
+    /// once, and so does the void. Nothing was written.
+    TargetAlreadySuperseded { transaction_id: Uuid },
     /// The writer reached a state its own derivations promise cannot happen
     /// — a leg without a counter in maps derived from those same legs, a
     /// rendering that failed after `PostTransaction::new` validated it.

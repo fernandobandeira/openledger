@@ -406,8 +406,11 @@ transaction may do one or the other but not both.
 This is why the table can be append-only at all. The usual design updates a status column in place,
 and then the answer to "what did this look like last Tuesday" is gone.
 
-The keys that carry a rule: `uq_txn__one_resolution` and `uq_txn__one_reversal` (once each — because
-we refuse to mutate, the usual `UPDATE … WHERE resolved_at IS NULL` guard is not available here);
+The keys that carry a rule: `uq_txn__one_supersession` (one resolution OR one reversal per target,
+over `COALESCE(resolves_id, reverses_id)` — because we refuse to mutate, the usual
+`UPDATE … WHERE resolved_at IS NULL` guard is not available here; migration 00003 folded the
+baseline's two per-pointer indexes into this one, which is what makes resolve-vs-reverse a race
+one index can referee — [ADR-0016](/decisions/0016-pending-to-posted));
 `ck_txn__not_both` and `ck_txn__no_self_reference` beside them; `uq_txn__one_per_event`, below; and
 `uq_txn__id_effective`, which adds no uniqueness the primary key did not already give. `(tenant_id,
 id)` is `pk_txn`; the third column is there so a composite foreign key can carry the business date

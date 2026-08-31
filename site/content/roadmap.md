@@ -11,8 +11,9 @@ product matters.
 2026-08-27 so are M3's lean writer, the one HTTP endpoint in front of it
 ([ADR-0014](/decisions/0014-http-api)), and the e2e suite that spawns the binary and posts over the
 wire; since 2026-08-28 the writer posts in a **single server-side call**, and since 2026-08-31 it
-holds pending → posted too ([M3](#m3--the-posting-engine),
-[ADR-0016](/decisions/0016-pending-to-posted)). What is missing is the rest of the load-bearing
+holds pending → posted — and its undo: reversals, and the void — too
+([M3](#m3--the-posting-engine), [ADR-0016](/decisions/0016-pending-to-posted)). What is missing is
+the rest of the load-bearing
 half — batching under load, stripe selection, the concurrency proof — and the read path. That
 gap — not a deployment — is the story now. Phase 1 is the ordered list of code to build to close it.
 
@@ -132,8 +133,12 @@ behind `POST /v1/transactions`, and verified by the caller-shaped e2e suite with
 Pending → posted is a **new** transaction with `resolves_id`, never an UPDATE — **built 2026-08-31**
 ([ADR-0016](/decisions/0016-pending-to-posted)): the same endpoint takes an optional `status` and
 `resolves_id`, a pending post issues sequence numbers without moving the posted cache, and the
-writer refuses a resolution whose target is missing, not pending, or already resolved — the
-semantic linkage [ADR-0004](/decisions/0004-where-logic-lives) proved no foreign key holds. Three
+writer refuses a resolution whose target is missing, not pending, or already superseded — the
+semantic linkage [ADR-0004](/decisions/0004-where-logic-lives) proved no foreign key holds.
+**Reversals and the void followed the same day** (ADR-0016's reversal section, migration 00003):
+`reverses_id` on the same endpoint, the mirror derived server-side from a posted target, a pending
+target voided by a zero-entry marker, and one supersession index refereeing the resolve-vs-reverse
+race. Hold *expiry* — the timer that fires a void unprompted — stays M8's. Three
 design constraints, not later optimizations — the second landed on 2026-08-28, the other two are
 not in the lean core yet:
 
@@ -210,7 +215,13 @@ leads the primary key; without it the statement does not run at all. Three traps
 **Done when:** the reconcile command runs the views to an exit code (**done**, above), and — once the writer and
 batching exist — N writers against overlapping account sets, half posting their legs in reverse
 order, produce zero deadlocks, gapless per-account sequences and balanced transactions **with
-batching enabled**. Batch-wide ordering is the harder half and is untested. The acceptance test is
+batching enabled**. Batch-wide ordering is the harder half and is untested — measured on the
+shipped writer: removing or inverting the statement's `ORDER BY` survives the entire suite today,
+exactly as this section predicts with two-account fixtures. The proof must cover **both order
+sources**: the planned path takes its delta order from the bound arrays (the coalesced `BTreeMap`),
+while the mirror path ([ADR-0016](/decisions/0016-pending-to-posted)'s server-derived reversal)
+takes its order from a `GROUP BY` over the target's entries — two different producers feeding one
+`ORDER BY`, and a regression in either is invisible until this test exists. The acceptance test is
 `SELECT * FROM reconciliation` returning ten zeros under concurrent load, with batching on.
 
 ## M5 · Bitemporal reads

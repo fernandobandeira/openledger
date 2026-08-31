@@ -11,8 +11,9 @@
 //! **The layout rule:** `support/` holds helpers and contains no `#[test]`;
 //! `endpoints/` holds one file per (resource, verb) — split only when one
 //! verb's contract outgrows a single read (transactions POST holds `post`
-//! for posting-and-idempotency and `pending` for pending → posted,
-//! ADR-0016); suite-wide checks live at the top level.
+//! for posting-and-idempotency, `pending` for pending → posted, and
+//! `reverse` for reversals and the void, ADR-0016); suite-wide checks live
+//! at the top level.
 //! Today those are `conformance` (whether the committed OpenAPI document and
 //! the running router still describe the same surface), `startup` (whether
 //! `serve` refuses a database its migrate job never reached, is behind, or

@@ -75,8 +75,18 @@ under the wrong verb.
 shared error enum across every endpoint that names it — the spike's surface documented a 404 one
 endpoint cannot return and a 422 the other cannot — and **neither library can attach a subset of an
 error type's responses to one operation**. So the rule is set now, while there is one endpoint and
-changing it costs nothing: responses are declared per endpoint, and the three 422 `type`s on
-`POST /v1/transactions` are the three the writer can produce there, not an enum's worth.
+changing it costs nothing: responses are declared per endpoint, and the 422 `type`s on
+`POST /v1/transactions` are exactly the ones the writer can produce there — eight as of the
+reversal slice — not an enum's worth.
+
+**Error `type`s name their subject first and their condition second** (ruled 2026-08-31, when the
+family grew past a grammar's worth of ad-hoc names): `account_unknown`, `resolve_target_unknown`,
+`resolve_target_not_pending`, `reverse_target_not_reversible`, `target_already_superseded`,
+`idempotency_key_reused` — the caller reads *what* was wrong, then *how*. Two are grandfathered as
+conventions rather than exceptions: `invalid_request` is the generic body refusal the ecosystem
+expects under that exact name, and `internal` has no subject to lead with. A future `type` that
+does not fit the grammar is a naming bug, not a precedent ([ADR-0016](/decisions/0016-pending-to-posted)
+enumerates the current family).
 
 ## What we considered
 

@@ -98,7 +98,7 @@ async fn two_postings_over_one_pair_coalesce_into_one_balance_row() -> TestResul
 
 #[tokio::test]
 async fn an_unknown_account_is_refused_and_nothing_is_written() -> TestResult {
-    let book = TestBook::new("unknown_account").await?;
+    let book = TestBook::new("account_unknown").await?;
     let (receivable, revenue) = book.fixture_accounts().await?;
 
     // An account that does not exist: 422, and the whole write — the event row
@@ -118,7 +118,7 @@ async fn an_unknown_account_is_refused_and_nothing_is_written() -> TestResult {
 
     assert_eq!(refused.status(), 422);
     let error: serde_json::Value = refused.json().await?;
-    assert_eq!(error.get("type"), Some(&"unknown_account".into()));
+    assert_eq!(error.get("type"), Some(&"account_unknown".into()));
 
     // A currency the account does not hold, on accounts that DO exist: the
     // same refusal, because the balance upsert's WHERE matches on (account,
@@ -140,7 +140,7 @@ async fn an_unknown_account_is_refused_and_nothing_is_written() -> TestResult {
 
     assert_eq!(mismatched.status(), 422);
     let error: serde_json::Value = mismatched.json().await?;
-    assert_eq!(error.get("type"), Some(&"unknown_account".into()));
+    assert_eq!(error.get("type"), Some(&"account_unknown".into()));
     let detail = error.get("detail").and_then(serde_json::Value::as_str);
     assert!(
         detail.is_some_and(|detail| detail.contains("EUR")),

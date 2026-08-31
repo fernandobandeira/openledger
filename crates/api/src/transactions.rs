@@ -59,9 +59,13 @@ pub(crate) struct TransactionBody {
     /// is refused as `idempotency_key_reused` (ADR-0013 §2).
     #[schema(min_length = 1, example = "charge-1")]
     idempotency_key: String,
-    /// When the movement is deemed to have happened, RFC 3339.
-    #[serde(with = "time::serde::rfc3339")]
-    effective_at: OffsetDateTime,
+    /// When the movement is deemed to have happened, RFC 3339. Required —
+    /// the writer will not invent a date — EXCEPT on a reversal, where
+    /// omission means "the target's own effective_at" (ADR-0016's soft
+    /// convention). A supplied date is taken as given, including one below
+    /// the target's; the cost of that window is recorded in ADR-0016.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    effective_at: Option<OffsetDateTime>,
     /// Omitted means `posted`.
     #[serde(default)]
     status: Option<StatusBody>,
@@ -72,8 +76,18 @@ pub(crate) struct TransactionBody {
     /// itself be pending.
     #[serde(default)]
     resolves_id: Option<Uuid>,
-    /// At least one posting.
-    #[schema(min_items = 1)]
+    /// The transaction this one reverses — operational undo, as a NEW
+    /// posted transaction (ADR-0016): a posted target is mirrored in full
+    /// (same legs, directions flipped, derived by the server — send NO
+    /// postings), and a pending target is voided by a zero-posting marker.
+    /// The target must be an ordinary posting on this tenant's book,
+    /// itself neither a resolution nor a reversal, and not already
+    /// superseded.
+    #[serde(default)]
+    reverses_id: Option<Uuid>,
+    /// At least one posting — except on a reversal, which must carry NONE:
+    /// the server derives the mirror from the target.
+    #[serde(default)]
     postings: Vec<PostingBody>,
 }
 
@@ -138,10 +152,11 @@ where
 /// Post a transaction.
 ///
 /// The response set below is this endpoint's real one, not a shared error
-/// enum's: the three 422 `type`s named are the three the writer can produce
-/// here, and nothing else is documented (spike 021 found both candidate
-/// libraries fanning shared enums across statuses their endpoints cannot
-/// return — the fix is to declare per endpoint, so this project does).
+/// enum's: the eight 422 `type`s named are exactly the ones the writer can
+/// produce here, and nothing else is documented (spike 021 found both
+/// candidate libraries fanning shared enums across statuses their endpoints
+/// cannot return — the fix is to declare per endpoint, so this project
+/// does).
 #[utoipa::path(
     post,
     path = "/v1/transactions",
@@ -177,13 +192,17 @@ where
                            `type` is one of: `invalid_request` (a precondition on the body \
                            failed, or a field failed to deserialize into its documented type), \
                            `idempotency_key_reused` (same key, different body — send a \
-                           new key or resend the original request unchanged), `unknown_account` \
+                           new key or resend the original request unchanged), `account_unknown` \
                            (a posting names an account that does not exist or does not hold \
-                           that currency), `unknown_resolve_target` (`resolves_id` names no \
+                           that currency), `resolve_target_unknown` (`resolves_id` names no \
                            transaction on this tenant's book), `resolve_target_not_pending` \
                            (only a pending transaction can be resolved — its status never \
-                           mutates), `already_resolved` (the named pending transaction already \
-                           has its one resolution).",
+                           mutates), `reverse_target_unknown` (`reverses_id` names no \
+                           transaction on this tenant's book), `reverse_target_not_reversible` \
+                           (only an ordinary posting that is itself neither a resolution nor a \
+                           reversal can be reversed), `target_already_superseded` (the named target \
+                           already has its one supersession — resolved or reversed, either \
+                           fate is final).",
             body = ErrorBody
         ),
         (
@@ -258,12 +277,12 @@ where
              nothing was written — send a new key, or resend the original request unchanged"
                 .to_owned(),
         ),
-        Err(ledger::WriteError::UnknownAccount {
+        Err(ledger::WriteError::AccountUnknown {
             account_id,
             currency,
         }) => refuse(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "unknown_account",
+            "account_unknown",
             format!("account {account_id} does not exist, or does not hold {currency}"),
         ),
         Err(ledger::WriteError::Overflow) => refuse(
@@ -271,9 +290,9 @@ where
             "invalid_request",
             "the posting amounts overflow 64-bit minor units".to_owned(),
         ),
-        Err(ledger::WriteError::UnknownResolveTarget { resolves_id }) => refuse(
+        Err(ledger::WriteError::ResolveTargetUnknown { resolves_id }) => refuse(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "unknown_resolve_target",
+            "resolve_target_unknown",
             format!("resolves_id {resolves_id} names no transaction on this tenant's book"),
         ),
         Err(ledger::WriteError::ResolveTargetNotPending { resolves_id }) => refuse(
@@ -284,12 +303,26 @@ where
                  resolved, and its status never mutates"
             ),
         ),
-        Err(ledger::WriteError::AlreadyResolved { resolves_id }) => refuse(
+        Err(ledger::WriteError::ReverseTargetUnknown { reverses_id }) => refuse(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "already_resolved",
+            "reverse_target_unknown",
+            format!("reverses_id {reverses_id} names no transaction on this tenant's book"),
+        ),
+        Err(ledger::WriteError::ReverseTargetNotReversible { reverses_id }) => refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "reverse_target_not_reversible",
             format!(
-                "transaction {resolves_id} already has its resolution — pending → posted \
-                 happens once"
+                "transaction {reverses_id} cannot be reversed — only an ordinary posting that \
+                 is itself neither a resolution nor a reversal can be; recovery from a \
+                 mistaken correction is a fresh posting"
+            ),
+        ),
+        Err(ledger::WriteError::TargetAlreadySuperseded { transaction_id }) => refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "target_already_superseded",
+            format!(
+                "transaction {transaction_id} already has its one supersession — it was \
+                 resolved or reversed, and either fate is final"
             ),
         ),
         // Same wire shape for both 500 classes: the caller gets no
@@ -333,6 +366,7 @@ fn to_command(body: TransactionBody) -> Result<ledger::PostTransaction, ledger::
         body.effective_at,
         status,
         body.resolves_id,
+        body.reverses_id,
         postings,
     )
 }

@@ -39,30 +39,40 @@ pub struct Appended {
     pub balance_upserts: Vec<BalanceUpsert>,
 }
 
-/// Why the single call refused to write a RESOLVING transaction — the
-/// semantic linkage the schema deliberately does not hold (ADR-0004's
-/// counterexample: a posted transaction "resolved" by another posted one
-/// took revenue to −49,223 with every declarative check green). The
-/// statement diagnoses; the service names the refusal; nothing is written.
+/// Why the single call refused to write a SUPERSEDING transaction — a
+/// resolution or a reversal — over its named target: the semantic linkage
+/// the schema deliberately does not hold (ADR-0004's counterexample: a
+/// posted transaction "resolved" by another posted one took revenue to
+/// −49,223 with every declarative check green; ADR-0016's reversal twin: a
+/// reversed resolution strands its pending forever). The statement
+/// diagnoses; the service names the refusal; nothing is written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResolveRefusal {
+pub enum SupersedeRefusal {
     /// `resolves_id` names no transaction on this tenant's book.
-    TargetMissing,
-    /// The target exists and is not pending — there is nothing to resolve.
-    TargetNotPending,
-    /// The target already has its one resolution (`uq_txn__one_resolution`
-    /// is the backstop; the sequential case is diagnosed before the index
-    /// has to speak).
-    AlreadyResolved,
+    ResolveTargetUnknown,
+    /// The resolve target exists and is not pending — nothing to resolve.
+    ResolveTargetNotPending,
+    /// `reverses_id` names no transaction on this tenant's book.
+    ReverseTargetUnknown,
+    /// The reverse target is not an ordinary posting: it is a `period_close`
+    /// (un-closing would contradict the standing checkpoint), or it is
+    /// itself a resolution or reversal (reversing a resolution strands its
+    /// pending forever — ADR-0016's worked failure).
+    ReverseTargetNotReversible,
+    /// The target already has its one supersession — a resolution or a
+    /// reversal, whichever won (`uq_txn__one_supersession` is the backstop
+    /// for the race; the sequential case is diagnosed before the index has
+    /// to speak).
+    TargetAlreadySuperseded,
 }
 
 /// What the single call answered after claiming the key: the append, or —
-/// for a resolving transaction whose target failed the pending-and-
-/// unresolved gate — the diagnosis. Either way the key WAS claimed in the
-/// open transaction; a refusal is made true by the service's rollback.
+/// for a superseding transaction whose target failed the gate — the
+/// diagnosis. Either way the key WAS claimed in the open transaction; a
+/// refusal is made true by the service's rollback.
 pub enum Claimed {
     Appended(Appended),
-    ResolutionRefused(ResolveRefusal),
+    SupersessionRefused(SupersedeRefusal),
 }
 
 /// The opaque storage failure. The port names no backend error type — the
@@ -101,10 +111,19 @@ pub trait Repository: Send + Sync {
     /// leg, deltas iterating in account-id order — and the statement must
     /// preserve that order when it takes the balance row locks.
     ///
+    /// For a REVERSING command (`reverses_id` set, no postings), the
+    /// statement derives the append from the target itself: a posted target
+    /// yields the full mirror — same legs, directions flipped, cache moved
+    /// back — and a pending target yields the zero-posting void marker,
+    /// with no entries, no deltas and no balance movement (ADR-0016,
+    /// Reversals and the void). The returned [`Appended`] then carries the
+    /// upserts the STATEMENT ran, not upserts the plan predicted — empty
+    /// for a void.
+    ///
     /// `Some` means this caller is the first writer: either the append
-    /// already happened (uncommitted), or — for a resolving transaction —
-    /// the statement's gate found the target unresolvable and diagnosed it
-    /// ([`Claimed::ResolutionRefused`]). On that refused path the gate
+    /// already happened (uncommitted), or — for a superseding transaction —
+    /// the statement's gate found the target unsupersedable and diagnosed
+    /// it ([`Claimed::SupersessionRefused`]). On that refused path the gate
     /// withholds only the transaction row and the entries hanging off it:
     /// the key claim and the balance upserts DID run, uncommitted, because
     /// they depend on the claim and not the transaction — which is exactly
@@ -112,7 +131,10 @@ pub trait Repository: Send + Sync {
     /// back. `None` means an earlier caller claimed the key and NOTHING
     /// here ran — the claim's replay half stays the separate
     /// [`stored_result`](Repository::stored_result), because folding the
-    /// two is the one-statement hole ADR-0013 §2 reproduced.
+    /// two is the one-statement hole ADR-0013 §2 reproduced. A void answers
+    /// `Some` with zero upserts, never `None`: the statement's final SELECT
+    /// anchors on the claimed row, so zero rows means exactly "the key was
+    /// already held" and nothing else (ADR-0016's return-shape requirement).
     fn claim_and_append(
         &self,
         tx: &mut Self::Tx,

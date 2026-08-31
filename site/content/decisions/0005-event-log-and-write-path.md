@@ -61,6 +61,18 @@ account, an amount and a currency — so it cannot express one leg. A transactio
 postings. The writer expands each into two `ledger_entries` rows, one debit and one credit, and there
 is no code path that writes an entry on its own.
 
+**One stated exception (added 2026-08-31, with [ADR-0016](/decisions/0016-pending-to-posted)'s
+reversal slice): the void.** Reversing a *pending* transaction produces a posted transaction
+carrying `reverses_id` and **no entries at all** — the zero-posting marker. It is deliberately not
+a list of postings, because there is nothing to post: the pending never moved a balance, so the
+marker's whole job is to exist and retire the hold from the pending population by reference. The
+guarantee this section states is not weakened — a caller still cannot *express* an entryless
+transaction (a reversal request carries no postings and the server derives the outcome), and
+`recon_transaction_breaks` still flags every entryless transaction except exactly this marker (the
+carve-out is migration 00003's, scoped to zero entries + `reverses_id` + a pending target). This
+paragraph exists because "a transaction is a list of postings" is this ADR's load-bearing sentence,
+and the void is the one transaction that is deliberately not one.
+
 **An unbalanced transaction is therefore unconstructible, not refused** — a compiler guarantee, with
 no zero value and no implicit `Default` to fabricate one from
 ([0001](/decisions/0001-rust-and-postgres)).

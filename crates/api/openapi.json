@@ -16,7 +16,7 @@
           "transactions"
         ],
         "summary": "Post a transaction.",
-        "description": "The response set below is this endpoint's real one, not a shared error\nenum's: the three 422 `type`s named are the three the writer can produce\nhere, and nothing else is documented (spike 021 found both candidate\nlibraries fanning shared enums across statuses their endpoints cannot\nreturn — the fix is to declare per endpoint, so this project does).",
+        "description": "The response set below is this endpoint's real one, not a shared error\nenum's: the eight 422 `type`s named are exactly the ones the writer can\nproduce here, and nothing else is documented (spike 021 found both\ncandidate libraries fanning shared enums across statuses their endpoints\ncannot return — the fix is to declare per endpoint, so this project\ndoes).",
         "operationId": "postTransaction",
         "requestBody": {
           "content": {
@@ -96,7 +96,7 @@
             }
           },
           "422": {
-            "description": "Refused, and nothing was written. The caller must CHANGE the request to escape — which is why this is 422, not 400 or 409 (ADR-0013 §2). `type` is one of: `invalid_request` (a precondition on the body failed, or a field failed to deserialize into its documented type), `idempotency_key_reused` (same key, different body — send a new key or resend the original request unchanged), `unknown_account` (a posting names an account that does not exist or does not hold that currency), `unknown_resolve_target` (`resolves_id` names no transaction on this tenant's book), `resolve_target_not_pending` (only a pending transaction can be resolved — its status never mutates), `already_resolved` (the named pending transaction already has its one resolution).",
+            "description": "Refused, and nothing was written. The caller must CHANGE the request to escape — which is why this is 422, not 400 or 409 (ADR-0013 §2). `type` is one of: `invalid_request` (a precondition on the body failed, or a field failed to deserialize into its documented type), `idempotency_key_reused` (same key, different body — send a new key or resend the original request unchanged), `account_unknown` (a posting names an account that does not exist or does not hold that currency), `resolve_target_unknown` (`resolves_id` names no transaction on this tenant's book), `resolve_target_not_pending` (only a pending transaction can be resolved — its status never mutates), `reverse_target_unknown` (`reverses_id` names no transaction on this tenant's book), `reverse_target_not_reversible` (only an ordinary posting that is itself neither a resolution nor a reversal can be reversed), `target_already_superseded` (the named target already has its one supersession — resolved or reversed, either fate is final).",
             "content": {
               "application/json": {
                 "schema": {
@@ -189,15 +189,16 @@
         "description": "The body of `POST /v1/transactions`.",
         "required": [
           "tenant_id",
-          "idempotency_key",
-          "effective_at",
-          "postings"
+          "idempotency_key"
         ],
         "properties": {
           "effective_at": {
-            "type": "string",
+            "type": [
+              "string",
+              "null"
+            ],
             "format": "date-time",
-            "description": "When the movement is deemed to have happened, RFC 3339."
+            "description": "When the movement is deemed to have happened, RFC 3339. Required —\nthe writer will not invent a date — EXCEPT on a reversal, where\nomission means \"the target's own effective_at\" (ADR-0016's soft\nconvention). A supplied date is taken as given, including one below\nthe target's; the cost of that window is recorded in ADR-0016."
           },
           "idempotency_key": {
             "type": "string",
@@ -210,8 +211,7 @@
             "items": {
               "$ref": "#/components/schemas/PostingBody"
             },
-            "description": "At least one posting.",
-            "minItems": 1
+            "description": "At least one posting — except on a reversal, which must carry NONE:\nthe server derives the mirror from the target."
           },
           "resolves_id": {
             "type": [
@@ -220,6 +220,14 @@
             ],
             "format": "uuid",
             "description": "The PENDING transaction this one resolves — pending → posted is this\nnew, posted transaction, never an update to the original (ADR-0016).\nThe resolution's postings need not mirror the pending amounts (a\npartial capture resolves with less); a resolving transaction cannot\nitself be pending."
+          },
+          "reverses_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The transaction this one reverses — operational undo, as a NEW\nposted transaction (ADR-0016): a posted target is mirrored in full\n(same legs, directions flipped, derived by the server — send NO\npostings), and a pending target is voided by a zero-posting marker.\nThe target must be an ordinary posting on this tenant's book,\nitself neither a resolution nor a reversal, and not already\nsuperseded."
           },
           "status": {
             "oneOf": [

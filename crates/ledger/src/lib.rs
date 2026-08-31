@@ -40,5 +40,7 @@ mod service;
 pub use domain::{Invalid, PostTransaction, Posted, Posting, TransactionStatus};
 pub use port::{Ledger, WriteError};
 pub use postings::{Append, Delta, Direction, Leg};
-pub use repository::{Appended, BalanceUpsert, Claimed, Repository, ResolveRefusal, StorageError};
+pub use repository::{
+    Appended, BalanceUpsert, Claimed, Repository, StorageError, SupersedeRefusal,
+};
 pub use service::LedgerService;

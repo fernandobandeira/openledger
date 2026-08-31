@@ -5,8 +5,8 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Stdio};
 
-use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::{AssertSqlSafe, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use super::postgres;
@@ -293,6 +293,71 @@ impl TestBook {
              cursor forgery."
                 .into(),
         )
+    }
+
+    /// The blocked-loser wait every uncommitted-rival race shares: poll —
+    /// bounded exactly like the horizon wait above, never a bare sleep —
+    /// until a backend on THIS database is waiting on a lock, which is the
+    /// spawned API call blocked on a rival's uncommitted claim. Scoped by
+    /// `datname` so a sibling test's lock cannot satisfy the poll. `false`
+    /// means the bound expired with nothing blocked; the caller asserts,
+    /// with its own message naming which call never blocked.
+    pub async fn wait_until_a_backend_blocks_on_a_lock(&self) -> Result<bool, sqlx::Error> {
+        for _ in 0..600 {
+            let (waiting,): (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            if waiting > 0 {
+                return Ok(true);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        Ok(false)
+    }
+
+    /// A rival resolution of `pending`, begun and HELD uncommitted — the
+    /// staging both directions of the supersession race share (the
+    /// adversary's original setup). Full, balanced and correctly cached —
+    /// event, transaction naming the target, both legs, cache advanced —
+    /// so the book it leaves behind once the caller commits the returned
+    /// transaction is an ordinarily resolved hold, and the oracle's ten
+    /// zeros still bind. Dropping the transaction instead abandons the
+    /// rival, releasing whatever blocked on it.
+    pub async fn begin_a_rival_resolution(
+        &self,
+        pending: Uuid,
+        receivable: Uuid,
+        revenue: Uuid,
+    ) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
+        let mut held_open = self.pool.begin().await?;
+        sqlx::raw_sql(AssertSqlSafe(format!(
+            "INSERT INTO ledger_events (tenant_id, id, kind, source, idempotency_key,
+                                        idempotency_hash, payload, effective_at)
+             VALUES ('t1', '0e2e0000-0000-7000-8000-000000000070', 'posting', 'internal',
+                     'rival-capture', decode('00', 'hex'), '{{}}'::jsonb,
+                     '2026-08-29T00:00:00Z');
+             INSERT INTO ledger_transactions (tenant_id, id, event_id, kind, status,
+                                              effective_at, resolves_id)
+             VALUES ('t1', '0e2e0000-0000-7000-8000-000000000071',
+                     '0e2e0000-0000-7000-8000-000000000070', 'posting', 'posted',
+                     '2026-08-29T00:00:00Z', '{pending}');
+             INSERT INTO ledger_entries (tenant_id, transaction_id, account_id, direction,
+                                         amount_minor, currency, account_seq, effective_at)
+             VALUES ('t1', '0e2e0000-0000-7000-8000-000000000071', '{receivable}',
+                     'debit', 500, 'USD', 2, '2026-08-29T00:00:00Z'),
+                    ('t1', '0e2e0000-0000-7000-8000-000000000071', '{revenue}',
+                     'credit', 500, 'USD', 2, '2026-08-29T00:00:00Z');
+             UPDATE ledger_account_balances SET input = input + 500, last_seq = 2
+             WHERE tenant_id = 't1' AND account_id = '{receivable}';
+             UPDATE ledger_account_balances SET output = output + 500, last_seq = 2
+             WHERE tenant_id = 't1' AND account_id = '{revenue}'"
+        )))
+        .execute(&mut *held_open)
+        .await?;
+        Ok(held_open)
     }
 
     /// The oracle. Ten checks, and every one must report zero breaks.

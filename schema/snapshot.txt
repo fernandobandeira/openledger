@@ -589,8 +589,7 @@ CREATE UNIQUE INDEX pk_txn ON public.ledger_transactions USING btree (tenant_id,
 CREATE UNIQUE INDEX uq_txn__id_effective ON public.ledger_transactions USING btree (tenant_id, id, effective_at) valid=true ready=true
 CREATE UNIQUE INDEX uq_txn__id_kind ON public.ledger_transactions USING btree (tenant_id, id, kind) valid=true ready=true
 CREATE UNIQUE INDEX uq_txn__one_per_event ON public.ledger_transactions USING btree (tenant_id, event_id) valid=true ready=true
-CREATE UNIQUE INDEX uq_txn__one_resolution ON public.ledger_transactions USING btree (tenant_id, resolves_id) WHERE (resolves_id IS NOT NULL) valid=true ready=true
-CREATE UNIQUE INDEX uq_txn__one_reversal ON public.ledger_transactions USING btree (tenant_id, reverses_id) WHERE (reverses_id IS NOT NULL) valid=true ready=true
+CREATE UNIQUE INDEX uq_txn__one_supersession ON public.ledger_transactions USING btree (tenant_id, COALESCE(resolves_id, reverses_id)) WHERE ((resolves_id IS NOT NULL) OR (reverses_id IS NOT NULL)) valid=true ready=true
 CREATE UNIQUE INDEX pk_perimeter_attest ON public.perimeter_attestations USING btree (tenant_id, account_id, currency, as_of, source) valid=true ready=true
 
 == triggers (tgenabled: A always, O origin, R replica, D disabled) ==
@@ -1169,7 +1168,9 @@ recon_transaction_breaks:
         END AS reason
    FROM ledger_transactions x
      LEFT JOIN legs g ON g.tenant_id = x.tenant_id AND g.transaction_id = x.id
-  WHERE g.transaction_id IS NULL OR g.debits <> g.credits;
+  WHERE (g.transaction_id IS NULL OR g.debits <> g.credits) AND NOT (g.transaction_id IS NULL AND x.reverses_id IS NOT NULL AND (EXISTS ( SELECT 1
+           FROM ledger_transactions v
+          WHERE v.tenant_id = x.tenant_id AND v.id = x.reverses_id AND v.status = 'pending'::ledger_txn_status)));
 reconciliation:
  SELECT 'balance_cache'::text AS check_name,
     count(*) AS breaks
@@ -1802,6 +1803,6 @@ view recon_entry_breaks = Journal entries that fail one of the three joins every
 view recon_journal_to_reports = A reconciliation statement (one row per tenant/currency, always footing): journal debits minus the named reconciling items -- pending, superseded, out_of_window, orphan -- against what trial_balance actually shows; the unexplained remainder must be zero (ADR-0010).
 view recon_pending_bridge = The available balance derived, not stored: the posted cache plus the live pending population (retired holds excluded), per account. A reconciling population, not a break list (ADR-0010).
 view recon_scope_breaks = The two sides of a cross-scope obligation that fail to eliminate: for a mirrored account-type pair, the debit-positive sum over both types must be zero, per currency and per counterparty. The one check that aggregates across tenants (ADR-0010).
-view recon_transaction_breaks = Transactions whose entries do not balance per currency (debits_ne_credits), plus single-leg and entryless ones. The exception list for the balance invariant the writer's type will eventually make unrepresentable (ADR-0005, ADR-0007).
+view recon_transaction_breaks = Transactions whose entries do not balance per currency (debits_ne_credits), plus single-leg and entryless ones -- except the void: a zero-entry posted marker reversing a PENDING target is legitimate (ADR-0016), while every other entryless transaction stays a break. The exception list for the balance invariant the writer's type makes unrepresentable (ADR-0005, ADR-0007).
 view reconciliation = The daily sweep operators run (openledger reconcile, roadmap M2): one row per check -- cache-vs-journal, orphan entries, imbalance, cross-scope, journal-vs-reports, checkpoint, close typing, cursor forgery, the accounting equation, chart lint -- with its break count, all zero on a healthy book. SELECT * FROM reconciliation WHERE breaks <> 0 is the whole interface; the pending bridge and close disclosures are excluded as legitimate populations (ADR-0004, ADR-0010).
 view trial_balance = Per-account gross arithmetic at "now" and the reconciliation substrate half the recon views read. security_invoker, so RLS scopes it. Publishes both balance_minor (normal-balance-signed, for showing one account) and balance_debit_positive (roll up with THIS one). Enumerates INWARD from entries -- not the completeness surface (ADR-0011).

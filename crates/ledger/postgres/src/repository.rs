@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 
 use ledger::{
     Append, Appended, BalanceUpsert, Claimed, Delta, Direction, Leg, PostTransaction, Repository,
-    ResolveRefusal, StorageError, TransactionStatus,
+    StorageError, SupersedeRefusal, TransactionStatus,
 };
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -78,8 +78,9 @@ fn columns_for_entries(legs: &[Leg]) -> (Vec<Uuid>, Vec<String>, Vec<i64>, Vec<S
 /// The coalesced deltas, transposed into the parallel arrays the
 /// statement's delta `unnest` binds, in the map's account-id iteration
 /// order — the statement re-sorts anyway (its ORDER BY is what the lock
-/// order hangs on), but handing it ordered arrays keeps the wire form
-/// readable next to the plan.
+/// order hangs on; that property is unpinned until M2's concurrency proof —
+/// see the ORDER BY's own note in [`CLAIM_AND_APPEND`]'s doc), but handing
+/// it ordered arrays keeps the wire form readable next to the plan.
 struct DeltaColumns {
     account_ids: Vec<Uuid>,
     currencies: Vec<String>,
@@ -109,23 +110,53 @@ fn columns_for_deltas(deltas: &BTreeMap<(Uuid, String), Delta>) -> DeltaColumns 
 /// Statement A's SQL, whole — the CTE pipeline reads best as one literal,
 /// its CTE names narrating the append in order. What each stage holds:
 ///
+/// - `supersede_target` reads the one transaction a RESOLVING or REVERSING
+///   command names (`COALESCE` picks the sole pointer — the constructor
+///   holds ck_txn__not_both's rule, so at most one is bound) — the
+///   diagnosis the final `SELECT` carries back. Its `target_already_superseded`
+///   tests BOTH pointers, matching the schema's retirement rule
+///   (`recon_pending_bridge` retires a pending on resolved OR reversed), so
+///   a voided pending refuses a resolution and a resolved one refuses the
+///   void. Honestly stated: this both-pointer read is a deliberately
+///   redundant FAST PATH — narrow it to one pointer and the insert trips
+///   `uq_txn__one_supersession`, whose mapping produces the identical wire
+///   answer, so no test can hold this half red in isolation (ADR-0016's
+///   cost list records why it stays anyway: an ordinary refusal beats an
+///   aborted transaction on the common case);
+/// - `effective` is the transaction's date, decided once: the caller's when
+///   given, else the target's (ADR-0016's soft convention — a reversal may
+///   defer to the date it un-does; a caller-supplied date BELOW the
+///   target's is accepted, cost recorded in the ADR). The trailing `now()`
+///   arm is reachable only when a reversal names a missing target, a path
+///   the gate refuses and the service rolls back — it never commits;
 /// - `claimed` claims the idempotency key (`ON CONFLICT DO NOTHING`), and
 ///   every dependent insert selects `FROM` it — so when the key is already
 ///   held, zero rows come back and NONE of the append ran;
-/// - `resolve_target` reads the transaction a RESOLVING command names — the
-///   diagnosis the final `SELECT` carries back. Its `already_resolved`
-///   tests `resolves_id` only, while the schema retires a pending on
-///   resolved OR reversed (`recon_pending_bridge`): the day a `reverses_id`
-///   writer lands (voiding — M8's, not built), this gate must learn
-///   `reverses_id` too, or a reversed pending would still accept a
-///   resolution. ADR-0016's cost list names the coupling;
 /// - `txn` inserts the transaction — gated, for a resolution, on the
-///   target being pending and unresolved: the semantic linkage no foreign
-///   key holds (ADR-0004's −49,223 counterexample). The gate withholds
-///   only this insert and the entries hanging off it — `delta` and
-///   `balance` select `FROM claimed`, so a refused resolution still ran
-///   the balance upserts, uncommitted, which is why the service rolls back
+///   target being pending and unsuperseded, and, for a reversal, on it
+///   being an ordinary posting (`kind = 'posting'`: reversing a
+///   period_close would un-close earnings against its standing checkpoint)
+///   that neither carries a pointer itself (reversing a resolution strands
+///   its pending forever — ADR-0016's worked failure) nor is already
+///   superseded. The status arm a reader might expect is total: the enum
+///   holds exactly 'pending' and 'posted', and both are reversible (pending
+///   = the void). The semantic linkage no foreign key holds (ADR-0004's
+///   −49,223 counterexample) lives in this WHERE. The gate withholds only
+///   this insert and the entries hanging off it — `delta` and `balance`
+///   select `FROM claimed`, so a refused supersession still ran the
+///   balance upserts, uncommitted, which is why the service rolls back
 ///   BEFORE answering the refusal;
+/// - `mirror_leg` is the reversal's derivation (ADR-0016): the POSTED
+///   target's entries with directions flipped — contra, never storno:
+///   amounts stay positive and gross turnover inflates, the recorded cost —
+///   each leg's `seq_offset` counted back from its account's last position
+///   exactly as the Rust plan counts a caller's legs. A PENDING target
+///   derives nothing: the void is the marker transaction alone;
+/// - `mirror_delta` coalesces the mirror legs per (account, currency), the
+///   SQL twin of the plan's `coalesce`;
+/// - `delta` is whichever side exists: the caller-planned arrays (empty for
+///   a reversal) unioned with the derived mirror deltas (empty for
+///   everything else), both gated on the claim;
 /// - `balance` upserts each delta's row. Its `INSERT` arm copies the
 ///   account's frozen identity columns from `ledger_accounts` itself,
 ///   which doubles as the existence check — an unknown account, or a
@@ -133,41 +164,90 @@ fn columns_for_deltas(deltas: &BTreeMap<(Uuid, String), Delta>) -> DeltaColumns 
 ///   as a `NULL` counter for the service to refuse. The row locks are
 ///   taken in account-id order, held by the `ORDER BY` on the `SELECT`
 ///   feeding the upsert (deterministic lock ordering, batch-wide —
-///   ADR-0013, spike 003);
-/// - `entry` lands the entries through one `unnest` — measured within 2%
-///   of `COPY` on this table, the composite foreign keys dominating
-///   (ADR-0013 §5) — numbered `last_seq - seq_offset` beside the counter
-///   the upsert returned: the service's walk-back, with the one
-///   subtraction moved to where the counter lives;
-/// - the final `SELECT` answers one row per delta (`LEFT JOIN` back onto
-///   the deltas the statement was handed), so a missing account is a row
-///   with a `NULL` counter — and a gated resolution is rows with a `NULL`
-///   transaction id plus the target's diagnosis — never a silently shorter
-///   answer.
-const CLAIM_AND_APPEND: &str = "WITH claimed AS (
+///   ADR-0013, spike 003). That ordering is UNPINNED today — removing or
+///   inverting the ORDER BY survives the whole suite, because with two
+///   accounts the planner emits the legs in account order for free and no
+///   deadlock can be produced at all (the roadmap's M2 section, verbatim);
+///   its real test — many accounts, half the writers posting legs in
+///   reverse order, batching on — is M2's concurrency-proof deliverable,
+///   and "a test that does not fail when the sort is removed is not
+///   testing the sort";
+/// - `entry` lands the entries — planned and mirror alike — through one
+///   `unnest`-fed insert (within 2% of `COPY` on this table, ADR-0013 §5),
+///   numbered `last_seq - seq_offset` beside the counter the upsert
+///   returned;
+/// - the final `SELECT` anchors on the CLAIMED ROW, not the deltas
+///   (ADR-0016's return-shape requirement): a zero-delta void still answers
+///   one row, so zero rows means exactly "the key was already held" and
+///   never "nothing needed upserting". Each delta then rides one row
+///   (`LEFT JOIN`), so a missing account is a row with a `NULL` counter —
+///   and a gated supersession is rows with a `NULL` transaction id plus the
+///   target's diagnosis — never a silently shorter answer.
+const CLAIM_AND_APPEND: &str = "WITH supersede_target AS (
+         SELECT x.effective_at, x.status, x.kind,
+                (x.resolves_id IS NOT NULL OR x.reverses_id IS NOT NULL) AS is_superseding,
+                EXISTS (SELECT 1 FROM ledger_transactions rr
+                        WHERE rr.tenant_id = $1
+                          AND (rr.resolves_id = x.id OR rr.reverses_id = x.id))
+                    AS target_already_superseded
+         FROM ledger_transactions x
+         WHERE x.tenant_id = $1 AND x.id = COALESCE($17::uuid, $18::uuid)
+     ),
+     effective AS (
+         SELECT COALESCE($5::timestamptz,
+                         (SELECT effective_at FROM supersede_target),
+                         now()) AS at
+     ),
+     claimed AS (
          INSERT INTO ledger_events
                 (tenant_id, kind, source, idempotency_key, idempotency_hash,
                  payload, effective_at)
-         VALUES ($1, 'posting', 'api', $2, $3, $4, $5)
+         SELECT $1, 'posting', 'api', $2, $3, $4, e.at
+         FROM effective e
          ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
          RETURNING id
      ),
-     resolve_target AS (
-         SELECT x.status, EXISTS (SELECT 1 FROM ledger_transactions rr
-                                  WHERE rr.tenant_id = $1
-                                    AND rr.resolves_id = x.id) AS already_resolved
-         FROM ledger_transactions x
-         WHERE $17::uuid IS NOT NULL AND x.tenant_id = $1 AND x.id = $17
-     ),
      txn AS (
          INSERT INTO ledger_transactions
-                (tenant_id, event_id, kind, status, effective_at, resolves_id)
-         SELECT $1, c.id, 'posting', $16::ledger_txn_status, $5, $17
+                (tenant_id, event_id, kind, status, effective_at,
+                 resolves_id, reverses_id)
+         SELECT $1, c.id, 'posting', $16::ledger_txn_status,
+                (SELECT at FROM effective), $17, $18
          FROM claimed c
-         WHERE $17::uuid IS NULL
-            OR EXISTS (SELECT 1 FROM resolve_target g
-                       WHERE g.status = 'pending' AND NOT g.already_resolved)
+         WHERE ($17::uuid IS NULL AND $18::uuid IS NULL)
+            OR ($17::uuid IS NOT NULL
+                AND EXISTS (SELECT 1 FROM supersede_target g
+                            WHERE g.status = 'pending'
+                              AND NOT g.target_already_superseded))
+            OR ($18::uuid IS NOT NULL
+                AND EXISTS (SELECT 1 FROM supersede_target g
+                            WHERE g.kind = 'posting'
+                              AND NOT g.is_superseding
+                              AND NOT g.target_already_superseded))
          RETURNING id
+     ),
+     mirror_leg AS (
+         SELECT e.account_id,
+                CASE e.direction WHEN 'debit' THEN 'credit' ELSE 'debit' END
+                    AS direction,
+                e.amount_minor, e.currency::text AS currency,
+                (count(*) OVER (PARTITION BY e.account_id, e.currency)
+                 - row_number() OVER (PARTITION BY e.account_id, e.currency
+                                      ORDER BY e.account_seq)) AS seq_offset
+         FROM ledger_entries e
+         WHERE $18::uuid IS NOT NULL
+           AND e.tenant_id = $1 AND e.transaction_id = $18
+           AND (SELECT status FROM supersede_target) = 'posted'
+     ),
+     mirror_delta AS (
+         SELECT account_id, currency,
+                COALESCE(SUM(amount_minor) FILTER (WHERE direction = 'debit'),
+                         0)::bigint AS input,
+                COALESCE(SUM(amount_minor) FILTER (WHERE direction = 'credit'),
+                         0)::bigint AS output,
+                COUNT(*) AS legs
+         FROM mirror_leg
+         GROUP BY account_id, currency
      ),
      delta AS (
          SELECT d.account_id, d.currency, d.input, d.output, d.legs
@@ -175,6 +255,10 @@ const CLAIM_AND_APPEND: &str = "WITH claimed AS (
          CROSS JOIN unnest($6::uuid[], $7::text[], $8::bigint[], $9::bigint[],
                            $10::bigint[])
               AS d(account_id, currency, input, output, legs)
+         UNION ALL
+         SELECT m.account_id, m.currency, m.input, m.output, m.legs
+         FROM claimed c
+         CROSS JOIN mirror_delta m
      ),
      balance AS (
          INSERT INTO ledger_account_balances
@@ -200,37 +284,49 @@ const CLAIM_AND_APPEND: &str = "WITH claimed AS (
                 (tenant_id, transaction_id, account_id, direction, amount_minor,
                  currency, stripe, account_seq, effective_at)
          SELECT $1, t.id, l.account_id, l.direction::ledger_direction, l.amount_minor,
-                l.currency, 0, b.last_seq - l.seq_offset, $5
+                l.currency, 0, b.last_seq - l.seq_offset, (SELECT at FROM effective)
          FROM txn t
-         CROSS JOIN unnest($11::uuid[], $12::text[], $13::bigint[], $14::text[],
-                           $15::bigint[])
-              AS l(account_id, direction, amount_minor, currency, seq_offset)
+         CROSS JOIN (SELECT l.account_id, l.direction, l.amount_minor,
+                            l.currency, l.seq_offset
+                     FROM unnest($11::uuid[], $12::text[], $13::bigint[],
+                                 $14::text[], $15::bigint[])
+                          AS l(account_id, direction, amount_minor, currency,
+                               seq_offset)
+                     UNION ALL
+                     SELECT account_id, direction, amount_minor, currency,
+                            seq_offset
+                     FROM mirror_leg) l
          JOIN balance b ON b.account_id = l.account_id AND b.currency = l.currency
      )
      SELECT c.id AS event_id, t.id AS transaction_id,
             d.account_id, d.currency, b.last_seq,
-            g.status::text AS target_status, g.already_resolved AS target_resolved
+            g.status::text AS target_status, g.kind AS target_kind,
+            g.is_superseding AS target_is_superseding,
+            g.target_already_superseded
      FROM claimed c
      LEFT JOIN txn t ON true
-     CROSS JOIN delta d
+     LEFT JOIN delta d ON true
      LEFT JOIN balance b ON b.account_id = d.account_id AND b.currency = d.currency
-     LEFT JOIN resolve_target g ON true
+     LEFT JOIN supersede_target g ON true
      ORDER BY d.account_id, d.currency";
 
 /// One row of [`CLAIM_AND_APPEND`]'s answer, named so the matches downstream
-/// read: the claim, the transaction (`None` when the resolve gate withheld
-/// it), one delta's upsert counter (`None` when the account does not exist),
-/// and the resolve target's diagnosis — identical on every row, read off the
-/// first.
+/// read: the claim, the transaction (`None` when the supersede gate withheld
+/// it), one delta's upsert counter (`account_id`/`currency` are `None` on a
+/// zero-delta void's single anchored row; `last_seq` is `None` when the
+/// account does not exist), and the supersede target's diagnosis — identical
+/// on every row, read off the first.
 #[derive(sqlx::FromRow)]
 struct ClaimedRow {
     event_id: Uuid,
     transaction_id: Option<Uuid>,
-    account_id: Uuid,
-    currency: String,
+    account_id: Option<Uuid>,
+    currency: Option<String>,
     last_seq: Option<i64>,
     target_status: Option<String>,
-    target_resolved: Option<bool>,
+    target_kind: Option<String>,
+    target_is_superseding: Option<bool>,
+    target_already_superseded: Option<bool>,
 }
 
 /// The domain's status rendered into the dialect at the bind site,
@@ -242,45 +338,76 @@ fn column_for_status(status: TransactionStatus) -> &'static str {
     }
 }
 
-/// Two resolutions raced one pending target: the loser blocked on the
-/// winner's uncommitted `uq_txn__one_resolution` tuple and lost when it
-/// committed — the backstop for the one window the resolve gate cannot see
-/// at READ COMMITTED. The refusal is the same named answer the sequential
-/// case gets; the database transaction is aborted, and the service's
-/// rollback is what this path already promises. `None` for every other
-/// failure. The mapping hangs on the index's catalog name: rename it and
-/// this arm goes dead — the uncommitted-rival e2e test is what fails then.
-fn refusal_from_resolution_race(error: &sqlx::Error) -> Option<Claimed> {
+/// Two supersessions raced one target — resolve vs resolve, resolve vs
+/// reverse, or reverse vs reverse: the loser blocked on the winner's
+/// uncommitted `uq_txn__one_supersession` tuple and lost when it committed —
+/// the backstop for the one window the gate cannot see at READ COMMITTED.
+/// The refusal is the same named answer the sequential case gets; the
+/// database transaction is aborted, and the service's rollback is what this
+/// path already promises. `None` for every other failure. The mapping hangs
+/// on the index's catalog name: rename it and this arm goes dead — the
+/// uncommitted-rival e2e tests are what fail then.
+fn refusal_from_supersession_race(error: &sqlx::Error) -> Option<Claimed> {
     match error {
-        sqlx::Error::Database(db) if db.constraint() == Some("uq_txn__one_resolution") => {
-            Some(Claimed::ResolutionRefused(ResolveRefusal::AlreadyResolved))
-        }
+        sqlx::Error::Database(db) if db.constraint() == Some("uq_txn__one_supersession") => Some(
+            Claimed::SupersessionRefused(SupersedeRefusal::TargetAlreadySuperseded),
+        ),
         _ => None,
     }
 }
 
-/// A claimed key with no transaction row is the resolve gate speaking:
-/// diagnose the refusal from the target columns the statement carried back.
-/// A gated transaction with a resolvable target is a state the statement
-/// cannot produce — answered as the storage error it would have to be.
-fn diagnose_resolve_refusal(row: &ClaimedRow) -> Result<ResolveRefusal, StorageError> {
-    match (row.target_status.as_deref(), row.target_resolved) {
-        (None, _) => Ok(ResolveRefusal::TargetMissing),
-        (Some(status), _) if status != "pending" => Ok(ResolveRefusal::TargetNotPending),
-        (_, Some(true)) => Ok(ResolveRefusal::AlreadyResolved),
-        _ => Err("the single call gated the transaction for no reason it names".into()),
+/// A claimed key with no transaction row is the supersede gate speaking:
+/// diagnose the refusal from the target columns the statement carried back,
+/// under the verb the command asked — the same diagnosis columns mean
+/// different refusals to a resolution and a reversal. A gated transaction
+/// whose target passes its own gate is a state the statement cannot
+/// produce — answered as the storage error it would have to be.
+fn diagnose_supersede_refusal(
+    command: &PostTransaction,
+    row: &ClaimedRow,
+) -> Result<SupersedeRefusal, StorageError> {
+    if command.resolves_id().is_some() {
+        return match (row.target_status.as_deref(), row.target_already_superseded) {
+            (None, _) => Ok(SupersedeRefusal::ResolveTargetUnknown),
+            (Some(status), _) if status != "pending" => {
+                Ok(SupersedeRefusal::ResolveTargetNotPending)
+            }
+            (_, Some(true)) => Ok(SupersedeRefusal::TargetAlreadySuperseded),
+            _ => Err("the single call gated the resolution for no reason it names".into()),
+        };
     }
+    if command.reverses_id().is_some() {
+        return match (
+            row.target_kind.as_deref(),
+            row.target_is_superseding,
+            row.target_already_superseded,
+        ) {
+            (None, _, _) => Ok(SupersedeRefusal::ReverseTargetUnknown),
+            (Some(kind), _, _) if kind != "posting" => {
+                Ok(SupersedeRefusal::ReverseTargetNotReversible)
+            }
+            (_, Some(true), _) => Ok(SupersedeRefusal::ReverseTargetNotReversible),
+            (_, _, Some(true)) => Ok(SupersedeRefusal::TargetAlreadySuperseded),
+            _ => Err("the single call gated the reversal for no reason it names".into()),
+        };
+    }
+    Err("the single call gated a transaction that supersedes nothing".into())
 }
 
-/// Each delta's upsert answer, one per row in the statement's own account
-/// order — a `None` counter is the existence check failing, which the
-/// service turns into the refusal that names the account.
+/// Each delta's upsert answer, one per delta-carrying row in the statement's
+/// own account order — a `None` counter is the existence check failing,
+/// which the service turns into the refusal that names the account. The
+/// void's single anchored row carries no delta and yields none.
 fn collect_balance_upserts(rows: Vec<ClaimedRow>) -> Vec<BalanceUpsert> {
     rows.into_iter()
-        .map(|row| BalanceUpsert {
-            account_id: row.account_id,
-            currency: row.currency,
-            last_seq: row.last_seq,
+        .filter_map(|row| {
+            let account_id = row.account_id?;
+            let currency = row.currency?;
+            Some(BalanceUpsert {
+                account_id,
+                currency,
+                last_seq: row.last_seq,
+            })
         })
         .collect()
 }
@@ -301,15 +428,18 @@ impl Repository for PgRepository {
     }
 
     /// Statement A, carrying the whole append with it — single-call
-    /// posting (roadmap M3; pending → posted rides the same statement,
-    /// ADR-0016 — the plan already withheld a pending transaction's balance
-    /// movement, so no branch here): marshal the plan into the parallel
-    /// arrays [`CLAIM_AND_APPEND`] binds, run the one statement, read its
-    /// answer. Zero rows back means the key was already claimed and none of
-    /// the append ran; a `NULL` transaction id means the resolve gate
-    /// refused ([`diagnose_resolve_refusal`]); a unique violation on the
-    /// resolution index is the race's refusal
-    /// ([`refusal_from_resolution_race`]); otherwise the append happened,
+    /// posting (roadmap M3; pending → posted and reversals ride the same
+    /// statement, ADR-0016 — a pending plan already withheld its balance
+    /// movement, and a reversal's plan is EMPTY, the statement deriving the
+    /// mirror or the void from the target): marshal the plan into the
+    /// parallel arrays [`CLAIM_AND_APPEND`] binds, run the one statement,
+    /// read its answer. Zero rows back means the key was already claimed
+    /// and none of the append ran — the answer anchors on the claimed row,
+    /// so a zero-delta void is still rows back, never mistaken for a
+    /// replay; a `NULL` transaction id means the supersede gate refused
+    /// ([`diagnose_supersede_refusal`]); a unique violation on the
+    /// supersession index is the race's refusal
+    /// ([`refusal_from_supersession_race`]); otherwise the append happened,
     /// uncommitted, and the rows carry each delta's counter
     /// ([`collect_balance_upserts`]).
     async fn claim_and_append(
@@ -340,12 +470,13 @@ impl Repository for PgRepository {
             .bind(&append.seq_offsets)
             .bind(column_for_status(command.status()))
             .bind(command.resolves_id())
+            .bind(command.reverses_id())
             .fetch_all(&mut **tx)
             .await;
         let rows = match outcome {
             Ok(rows) => rows,
             Err(error) => {
-                return match refusal_from_resolution_race(&error) {
+                return match refusal_from_supersession_race(&error) {
                     Some(refused) => Ok(Some(refused)),
                     None => Err(storage(error)),
                 };
@@ -356,9 +487,9 @@ impl Repository for PgRepository {
         };
         let event_id = first.event_id;
         let Some(transaction_id) = first.transaction_id else {
-            return Ok(Some(Claimed::ResolutionRefused(diagnose_resolve_refusal(
-                first,
-            )?)));
+            return Ok(Some(Claimed::SupersessionRefused(
+                diagnose_supersede_refusal(command, first)?,
+            )));
         };
         Ok(Some(Claimed::Appended(Appended {
             event_id,

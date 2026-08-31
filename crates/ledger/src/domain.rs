@@ -104,9 +104,16 @@ const MAX_IDENTITY_BYTES: usize = 512;
 pub struct PostTransaction {
     pub(crate) tenant_id: String,
     pub(crate) idempotency_key: String,
-    pub(crate) effective_at: OffsetDateTime,
+    /// `None` only for a reversal, where omission means "the target's own
+    /// effective_at" — the writer's statement fills it from the target
+    /// (ADR-0016's soft convention). Every other shape requires it.
+    pub(crate) effective_at: Option<OffsetDateTime>,
     pub(crate) status: TransactionStatus,
     pub(crate) resolves_id: Option<Uuid>,
+    /// The transaction this one reverses. A reversing command carries NO
+    /// postings — the writer derives the mirror (posted target) or the
+    /// zero-posting void marker (pending target) from the target itself.
+    pub(crate) reverses_id: Option<Uuid>,
     pub(crate) postings: Vec<Posting>,
 }
 
@@ -134,9 +141,10 @@ impl PostTransaction {
     pub fn new(
         tenant_id: String,
         idempotency_key: String,
-        effective_at: OffsetDateTime,
+        effective_at: Option<OffsetDateTime>,
         status: TransactionStatus,
         resolves_id: Option<Uuid>,
+        reverses_id: Option<Uuid>,
         postings: Vec<Posting>,
     ) -> Result<Self, Invalid> {
         // A resolution IS the posted half of pending → posted (roadmap M3):
@@ -149,6 +157,31 @@ impl PostTransaction {
             return Err(Invalid::new(
                 "a resolving transaction cannot itself be pending",
             ));
+        }
+        // The reversal shape (ADR-0016, Reversals and the void), held whole
+        // at the door. One pointer per transaction — `ck_txn__not_both`'s
+        // rule, refused here with a name instead of a constraint error. A
+        // pending "reversal" would retire its target from the pending
+        // population while its own legs join it — one request moving the
+        // population twice. And a reversal derives its postings from the
+        // target (posted → the mirror, pending → the zero-posting void), so
+        // caller-restated legs are pure failure surface, refused outright.
+        if reverses_id.is_some() {
+            if resolves_id.is_some() {
+                return Err(Invalid::new(
+                    "a transaction cannot both resolve and reverse another",
+                ));
+            }
+            if status == TransactionStatus::Pending {
+                return Err(Invalid::new(
+                    "a reversing transaction cannot itself be pending",
+                ));
+            }
+            if !postings.is_empty() {
+                return Err(Invalid::new(
+                    "a reversal derives its postings from its target; the request must not carry postings",
+                ));
+            }
         }
         if tenant_id.trim().is_empty() {
             return Err(Invalid::new("tenant_id must not be blank"));
@@ -170,8 +203,18 @@ impl PostTransaction {
             "idempotency_key must not contain NUL bytes",
             "idempotency_key must be at most 512 bytes",
         )?;
-        if postings.is_empty() {
+        if reverses_id.is_none() && postings.is_empty() {
             return Err(Invalid::new("postings must not be empty"));
+        }
+        // Optional ONLY for a reversal, where omission means "the target's
+        // own effective_at" and the statement fills it in (ADR-0016's soft
+        // convention). Everywhere else, absence is a refusal, not a default:
+        // the effective date is the caller's claim about when money moved,
+        // and the writer will not invent one.
+        if reverses_id.is_none() && effective_at.is_none() {
+            return Err(Invalid::new(
+                "effective_at is required unless the request is a reversal",
+            ));
         }
         // Finite (ck_txn__effective_finite) and RFC 3339-renderable AFTER the
         // UTC normalization the canonical hash performs — the range check
@@ -181,13 +224,17 @@ impl PostTransaction {
         // time crate panics past its representable range). `checked_to_offset`
         // is the non-aborting form; `None` means the normalization itself
         // left the representable years.
-        let utc = effective_at
-            .checked_to_offset(time::UtcOffset::UTC)
-            .ok_or_else(|| Invalid::new("effective_at must fall between year 1 and 9999 UTC"))?;
-        if !(1..=9999).contains(&utc.year()) {
-            return Err(Invalid::new(
-                "effective_at must fall between year 1 and 9999 UTC",
-            ));
+        if let Some(effective_at) = effective_at {
+            let utc = effective_at
+                .checked_to_offset(time::UtcOffset::UTC)
+                .ok_or_else(|| {
+                    Invalid::new("effective_at must fall between year 1 and 9999 UTC")
+                })?;
+            if !(1..=9999).contains(&utc.year()) {
+                return Err(Invalid::new(
+                    "effective_at must fall between year 1 and 9999 UTC",
+                ));
+            }
         }
         Ok(Self {
             tenant_id,
@@ -195,6 +242,7 @@ impl PostTransaction {
             effective_at,
             status,
             resolves_id,
+            reverses_id,
             postings,
         })
     }
@@ -224,20 +272,35 @@ impl PostTransaction {
         // the same instant and must hash the same, or a genuine retry through a
         // client that re-renders its timestamps is refused as poisoned. `new`
         // already validated this exact normalization, so both failure arms are
-        // belt over that check, not a live path.
-        let effective = self
-            .effective_at
-            .checked_to_offset(time::UtcOffset::UTC)
-            .ok_or_else(|| Invalid::new("effective_at must fall between year 1 and 9999 UTC"))?
-            .format(&Rfc3339)
-            .map_err(|_| Invalid::new("effective_at is not representable"))?;
-        put(&mut buf, effective.as_bytes());
+        // belt over that check, not a live path. An OMITTED effective_at (a
+        // reversal deferring to its target's) hashes as zero bytes under the
+        // length prefix — so a retry that spells out the very date the default
+        // would have chosen is a DIFFERENT request, refused as key reuse: the
+        // hash covers what the caller said, never what the server derived.
+        match self.effective_at {
+            Some(effective_at) => {
+                let effective = effective_at
+                    .checked_to_offset(time::UtcOffset::UTC)
+                    .ok_or_else(|| {
+                        Invalid::new("effective_at must fall between year 1 and 9999 UTC")
+                    })?
+                    .format(&Rfc3339)
+                    .map_err(|_| Invalid::new("effective_at is not representable"))?;
+                put(&mut buf, effective.as_bytes());
+            }
+            None => put(&mut buf, b""),
+        }
         put(&mut buf, self.status.canonical().as_bytes());
         // A missing target is zero bytes under the length prefix — distinct
         // from every real uuid's sixteen, so absence cannot collide with a
-        // value.
+        // value. Both pointers are covered: a key reused with a different —
+        // or dropped — target is a different request.
         match self.resolves_id {
             Some(resolves_id) => put(&mut buf, resolves_id.as_bytes()),
+            None => put(&mut buf, b""),
+        }
+        match self.reverses_id {
+            Some(reverses_id) => put(&mut buf, reverses_id.as_bytes()),
             None => put(&mut buf, b""),
         }
         buf.extend_from_slice(&(self.postings.len() as u64).to_le_bytes());
@@ -274,10 +337,17 @@ impl PostTransaction {
     /// `effective_at` stays the caller's own offset rendering; the UTC
     /// normalization belongs to the hash, not the payload.
     pub(crate) fn payload(&self) -> Result<serde_json::Value, Invalid> {
+        // Null when the caller omitted it (a reversal deferring to its
+        // target's date): the payload records what the CALLER said, so a
+        // replay-from-payload re-derives the default rather than freezing it.
         let effective = self
             .effective_at
-            .format(&Rfc3339)
-            .map_err(|_| Invalid::new("effective_at is not representable"))?;
+            .map(|effective_at| {
+                effective_at
+                    .format(&Rfc3339)
+                    .map_err(|_| Invalid::new("effective_at is not representable"))
+            })
+            .transpose()?;
         let postings: Vec<serde_json::Value> = self
             .postings
             .iter()
@@ -295,11 +365,12 @@ impl PostTransaction {
             "tenant_id": self.tenant_id,
             "idempotency_key": self.idempotency_key,
             "effective_at": effective,
-            // Always present, `resolves_id` as an explicit null when there is
-            // no target: a reader never has to ask whether a missing key
-            // means "posted" or "not rendered".
+            // Always present, the pointers as explicit nulls when absent: a
+            // reader never has to ask whether a missing key means "posted"
+            // or "not rendered".
             "status": self.status.canonical(),
             "resolves_id": self.resolves_id,
+            "reverses_id": self.reverses_id,
             "postings": postings,
         }))
     }
@@ -313,7 +384,9 @@ impl PostTransaction {
     pub fn idempotency_key(&self) -> &str {
         &self.idempotency_key
     }
-    pub fn effective_at(&self) -> OffsetDateTime {
+    /// `None` only on a reversal that defers to its target's date — the
+    /// adapter binds it nullable and the statement COALESCEs from the target.
+    pub fn effective_at(&self) -> Option<OffsetDateTime> {
         self.effective_at
     }
     pub fn status(&self) -> TransactionStatus {
@@ -321,6 +394,9 @@ impl PostTransaction {
     }
     pub fn resolves_id(&self) -> Option<Uuid> {
         self.resolves_id
+    }
+    pub fn reverses_id(&self) -> Option<Uuid> {
+        self.reverses_id
     }
     pub fn postings(&self) -> &[Posting] {
         &self.postings
@@ -379,8 +455,9 @@ mod tests {
         PostTransaction::new(
             "acme".to_owned(),
             "key-1".to_owned(),
-            effective_at,
+            Some(effective_at),
             TransactionStatus::Posted,
+            None,
             None,
             vec![posting()?],
         )
@@ -432,16 +509,18 @@ mod tests {
         let nul_tenant = PostTransaction::new(
             "ac\0me".to_owned(),
             "key-1".to_owned(),
-            OffsetDateTime::UNIX_EPOCH,
+            Some(OffsetDateTime::UNIX_EPOCH),
             TransactionStatus::Posted,
+            None,
             None,
             vec![posting()?],
         );
         let nul_key = PostTransaction::new(
             "acme".to_owned(),
             "key\0".to_owned(),
-            OffsetDateTime::UNIX_EPOCH,
+            Some(OffsetDateTime::UNIX_EPOCH),
             TransactionStatus::Posted,
+            None,
             None,
             vec![posting()?],
         );
@@ -459,24 +538,27 @@ mod tests {
         let at_cap = PostTransaction::new(
             "acme".to_owned(),
             "k".repeat(512),
-            OffsetDateTime::UNIX_EPOCH,
+            Some(OffsetDateTime::UNIX_EPOCH),
             TransactionStatus::Posted,
+            None,
             None,
             vec![posting()?],
         );
         let past_cap_key = PostTransaction::new(
             "acme".to_owned(),
             "k".repeat(513),
-            OffsetDateTime::UNIX_EPOCH,
+            Some(OffsetDateTime::UNIX_EPOCH),
             TransactionStatus::Posted,
+            None,
             None,
             vec![posting()?],
         );
         let past_cap_tenant = PostTransaction::new(
             "t".repeat(513),
             "key-1".to_owned(),
-            OffsetDateTime::UNIX_EPOCH,
+            Some(OffsetDateTime::UNIX_EPOCH),
             TransactionStatus::Posted,
+            None,
             None,
             vec![posting()?],
         );
@@ -520,6 +602,7 @@ mod tests {
                 "effective_at": "2026-08-27T14:00:00+02:00",
                 "status": "posted",
                 "resolves_id": null,
+                "reverses_id": null,
                 "postings": [{
                     "source": Uuid::from_u128(1),
                     "destination": Uuid::from_u128(2),
@@ -540,9 +623,10 @@ mod tests {
         let refused = PostTransaction::new(
             "acme".to_owned(),
             "key-1".to_owned(),
-            OffsetDateTime::UNIX_EPOCH,
+            Some(OffsetDateTime::UNIX_EPOCH),
             TransactionStatus::Pending,
             Some(Uuid::from_u128(7)),
+            None,
             vec![posting()?],
         );
 
@@ -552,6 +636,122 @@ mod tests {
             detail,
             Some("a resolving transaction cannot itself be pending"),
             "pending + resolves_id must be refused before any SQL"
+        );
+        Ok(())
+    }
+
+    /// The reversal shape, held whole at the door (ADR-0016, Reversals and
+    /// the void): each illegal combination is a named constructor refusal —
+    /// and the two legal reversal forms construct, `effective_at` omitted
+    /// (deferring to the target's) or supplied.
+    #[test]
+    fn the_reversal_shape_is_held_at_the_constructor() -> Result<(), Invalid> {
+        let target = Some(Uuid::from_u128(7));
+        let refusals = [
+            (
+                // carries postings: the mirror is the server's to derive.
+                PostTransaction::new(
+                    "acme".to_owned(),
+                    "key-1".to_owned(),
+                    Some(OffsetDateTime::UNIX_EPOCH),
+                    TransactionStatus::Posted,
+                    None,
+                    target,
+                    vec![posting()?],
+                ),
+                "a reversal derives its postings from its target; the request must not carry postings",
+            ),
+            (
+                // both pointers: ck_txn__not_both's rule, named here.
+                PostTransaction::new(
+                    "acme".to_owned(),
+                    "key-1".to_owned(),
+                    Some(OffsetDateTime::UNIX_EPOCH),
+                    TransactionStatus::Posted,
+                    Some(Uuid::from_u128(8)),
+                    target,
+                    vec![],
+                ),
+                "a transaction cannot both resolve and reverse another",
+            ),
+            (
+                // a pending "reversal" moves the pending population twice.
+                PostTransaction::new(
+                    "acme".to_owned(),
+                    "key-1".to_owned(),
+                    Some(OffsetDateTime::UNIX_EPOCH),
+                    TransactionStatus::Pending,
+                    None,
+                    target,
+                    vec![],
+                ),
+                "a reversing transaction cannot itself be pending",
+            ),
+            (
+                // ...and absence of effective_at stays a refusal OUTSIDE the
+                // reversal shape: the writer will not invent a date.
+                PostTransaction::new(
+                    "acme".to_owned(),
+                    "key-1".to_owned(),
+                    None,
+                    TransactionStatus::Posted,
+                    None,
+                    None,
+                    vec![posting()?],
+                ),
+                "effective_at is required unless the request is a reversal",
+            ),
+        ];
+
+        for (refused, expected) in refusals {
+            let detail = refused.err().map(|invalid| invalid.detail());
+
+            assert_eq!(detail, Some(expected));
+        }
+        // Both legal forms: date omitted (defaults to the target's in the
+        // statement) and date supplied — each hashes, and the two hashes
+        // DIFFER, because the hash covers what the caller said, never what
+        // the server would derive.
+        let deferred = PostTransaction::new(
+            "acme".to_owned(),
+            "key-1".to_owned(),
+            None,
+            TransactionStatus::Posted,
+            None,
+            target,
+            vec![],
+        )?;
+        let dated = PostTransaction::new(
+            "acme".to_owned(),
+            "key-1".to_owned(),
+            Some(OffsetDateTime::UNIX_EPOCH),
+            TransactionStatus::Posted,
+            None,
+            target,
+            vec![],
+        )?;
+        assert_ne!(
+            deferred.idempotency_hash()?,
+            dated.idempotency_hash()?,
+            "an omitted and a spelled-out effective_at are different requests"
+        );
+        // ...and the hash covers the TARGET itself: the same key pointed at
+        // a different transaction is a different request. Strip reverses_id
+        // from `canonical_bytes` and these two hash identical — this assert
+        // is the unit-level pin (the e2e reuse test is the wire-level one).
+        let other_target = PostTransaction::new(
+            "acme".to_owned(),
+            "key-1".to_owned(),
+            None,
+            TransactionStatus::Posted,
+            None,
+            Some(Uuid::from_u128(8)),
+            vec![],
+        )?;
+        assert_ne!(
+            deferred.idempotency_hash()?,
+            other_target.idempotency_hash()?,
+            "reversals of different targets must hash differently"
         );
         Ok(())
     }

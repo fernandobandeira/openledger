@@ -42,7 +42,7 @@ from the six at this ADR's writing as the close, cursor, equation and chart-lint
 | --- | --- |
 | `recon_balance_breaks` | The balance cache against the journal, per tenant, account and currency — in **six** classes: `balance_drift`, `seq_ahead`, `seq_behind`, `seq_gap`, `no_cache_row`, `no_entries` |
 | `recon_entry_breaks` | Every entry no report can count, one row each, with the reason: `no_transaction`, `no_account`, `no_account_type` |
-| `recon_transaction_breaks` | Debits ≠ credits **per currency**, plus single-leg and entryless transactions |
+| `recon_transaction_breaks` | Debits ≠ credits **per currency**, plus single-leg and entryless transactions — except the void, a zero-entry posted marker reversing a PENDING target, carved out by migration 00003 ([ADR-0016](/decisions/0016-pending-to-posted)) |
 | `recon_scope_breaks` | The two sides of a cross-scope obligation, summed **per counterparty** (near = `tenant_id`, far = `owner_id`), per currency — so a third offsetting scope cannot cancel a real gap |
 | `recon_journal_to_reports` | Journal against the **chart-presented posted population** (the statement functions' own population, not `trial_balance`), with `pending`, `superseded`, `out_of_window` and `orphan` named as reconciling items — `unexplained` must be zero |
 | `recon_pending_bridge` | `available = posted + pending`, with the pending population named and aged, **excluding holds already resolved or reversed** |
