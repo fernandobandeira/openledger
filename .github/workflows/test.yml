@@ -10,7 +10,7 @@
 #
 # ADR-0008 is the reasoning for the parked-DDL steps in `schema`; ADR-0003 for `migrate`
 # being a subcommand rather than a shell script; ADR-0007 §2 for the schema
-# snapshot that is still missing.
+# snapshot test the e2e suite carries (schema_snapshot.rs — both jobs run it).
 
 name: test
 
@@ -167,8 +167,9 @@ jobs:
       # it on the container fallback; this run is NOT redundant — DATABASE_URL
       # is in the job env above, so it exercises the env-URL fast path that
       # `make test` and this job's own steps document. The suite creates its
-      # own scratch databases, so the `openledger` database the snapshot test
-      # will one day dump stays clean. (`-p e2e`: the suite is its own crate,
+      # own scratch databases — the ADR-0007 §2 schema-snapshot test among
+      # them migrates and dumps its own migrate-only scratch database, never
+      # this chart-seeded `openledger` one. (`-p e2e`: the suite is its own crate,
       # holding the test-only capability allowances; the binary it spawns was
       # built by the `cargo run -- migrate` steps above, and the explicit
       # build keeps that true if those steps ever move.)
@@ -185,20 +186,16 @@ jobs:
               (select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'i') as indexes"
 
       # ---------------------------------------------------------------
-      # ADR-0007 §2, the schema snapshot test, IS NOT HERE.
-      #
-      # It belongs immediately after the step above: dump every index,
-      # constraint and trigger, dump every NOT VALID constraint separately, and
-      # diff both against a committed snapshot. It is the highest-leverage
-      # untaken item in this repository, and what exists today is twenty-one
-      # lines containing one SELECT that emits a string -- no committed
-      # snapshot, no comparison, no failure path.
-      #
-      # There is deliberately NO placeholder step. A step that runs and passes
-      # without comparing anything is a green check that did not execute, and
-      # this project has a name for that. When the snapshot and its comparison
-      # land, they go here, and they go into the `openledger` database above --
-      # which is why the card DDL below is loaded into a database of its own.
+      # ADR-0007 §2, the schema snapshot test, is NOT a step here on purpose:
+      # it is a test in the e2e suite (schema_snapshot.rs), so the `cargo
+      # test` above just ran it — and the rust job ran it again on the
+      # container-fallback path. It migrates an empty scratch database with
+      # the compiled binary, dumps the catalog as deterministic text, and
+      # diffs it against the committed schema/snapshot.txt; regenerating the
+      # snapshot is an explicit opt-in (make schema-snapshot), so a run here
+      # can only ever FAIL on drift. It dumps its own scratch database, not
+      # the chart-seeded `openledger` one: the snapshot is of the migrated
+      # baseline alone, because the chart is seed data owned by no migration.
 
       # ---------------------------------------------------------------
       # The parked-DDL guard (ADR-0008). `parked/card/schema.sql` is applied by
@@ -208,9 +205,11 @@ jobs:
       # dependency to a machine, so the core could rename any of them and every
       # check in this repository would stay green.
       #
-      # Its own database, for two reasons: the snapshot test above must see the
-      # applied schema and nothing else, and this file is NOT idempotent -- a
-      # second load fails on `type "auth_event_kind" already exists`.
+      # Its own database, for two reasons: the `openledger` database above
+      # holds the documented baseline-plus-chart state and stays that way,
+      # and this file is NOT idempotent -- a second load fails on
+      # `type "auth_event_kind" already exists`. (The schema-snapshot test is
+      # unaffected either way: it dumps its own scratch database.)
       - name: The parked card DDL still loads on top of the core
         run: |
           set -euo pipefail

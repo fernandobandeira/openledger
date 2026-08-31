@@ -32,9 +32,10 @@ gap — not a deployment — is the story now. Phase 1 is the ordered list of co
    ten reconciliation views to an exit code so the daily sweep is a real command. **Built
    2026-08-28**: the subcommand runs the views in one snapshot as `openledger_recon`; what remains
    of M2 is the concurrency proof, which waits on M3's batching.
-3. **The stripe-picking writer** ([M3](#m3--the-posting-engine)) and **the CI schema-snapshot test**
-   (M1, below) — stripe selection on the write path, and [0007](/decisions/0007-schema-conventions-and-chart)'s
-   highest-leverage unbuilt guard against schema drift.
+3. **The stripe-picking writer** ([M3](#m3--the-posting-engine)) — stripe selection on the write
+   path. *(This step used to carry **the CI schema-snapshot test** too —
+   [0007](/decisions/0007-schema-conventions-and-chart)'s highest-leverage guard against schema
+   drift landed on 2026-08-31, closing [M1](#m1--schema-invariants-and-the-snapshot-test).)*
 4. **The as-of read path** ([M5](#m5--bitemporal-reads)) — a Rust read path over the report
    functions, correct on both time axes.
 
@@ -51,7 +52,7 @@ recorded in [ADR-0007](/decisions/0007-schema-conventions-and-chart),
 [ADR-0004](/decisions/0004-where-logic-lives) is why. **The same assertions come back as Rust
 tests, once the writer exists.**
 
-## M1 · Schema, invariants, and the snapshot test — **schema and migration runner landed**
+## M1 · Schema, invariants, and the snapshot test — **done: schema, migration runner, and the snapshot test**
 
 `migrations/00001_baseline.sql` is the core — `ledger_accounts`,
 `ledger_transactions`, `ledger_entries`, `ledger_account_balances`, `ledger_events` — plus the
@@ -103,14 +104,24 @@ and it is *striping* that removes contention, not per-tenant splitting: at 90/10
 accounts gave 1.07× while striping still gave 7.8× ([spike 003](/spikes/003-throughput-ceiling)).
 The writer that picks a stripe is M3's.
 
-**Done when:** the schema snapshot test is in CI, and striping exists. *(The migration runner is
-done; striping's schema is applied; the snapshot test [ADR-0007](/decisions/0007-schema-conventions-and-chart)
-calls the highest-leverage item here is still the gap.)* The snapshot's charge was widened for the
-[0009](/decisions/0009-append-only-perimeter) owner-accident DDL class it is the only backstop for:
-beyond `pg_trigger.tgenabled` / `pg_event_trigger.evtenabled`, `pg_policy` and view `reloptions`, it
-must dump `pg_class.relrowsecurity`/`relforcerowsecurity`, `pg_get_viewdef` for every view,
-`account_types.is_perimeter`/`mirror_type`, and the full `pg_constraint` set
-([ADR-0007](/decisions/0007-schema-conventions-and-chart) §2).
+**Done when:** the schema snapshot test is in CI, and striping exists. **Both hold as of
+2026-08-31.** The migration runner is done, striping's schema is applied, and the snapshot test —
+the item [ADR-0007](/decisions/0007-schema-conventions-and-chart) calls the highest-leverage one
+here — is built: the e2e suite migrates an empty scratch database with the compiled binary, dumps
+the catalog as deterministic text, and diffs it against the committed `schema/snapshot.txt`
+(`crates/e2e/tests/e2e/schema_snapshot.rs`; `make schema-snapshot-check`, with regeneration the
+explicit opt-in `make schema-snapshot` — the same write-under-env-var contract as the OpenAPI
+snapshot, so a normal run can only fail on drift, never rewrite the file it compares against).
+The charge that was widened for the [0009](/decisions/0009-append-only-perimeter) owner-accident
+DDL class is in the dump: `pg_trigger.tgenabled` / `pg_event_trigger.evtenabled`, full `pg_policy`
+definitions, view `reloptions`, `pg_class.relrowsecurity`/`relforcerowsecurity`, `pg_get_viewdef`
+for every view, `account_types.is_perimeter`/`mirror_type`, the full `pg_constraint` set, every
+catalog comment (`pg_description`), and `NOT VALID` constraints as their own must-stay-empty
+section ([ADR-0007](/decisions/0007-schema-conventions-and-chart) §2) — plus function bodies,
+grants and role attributes, which sit in the same accident class. Proved red before trusted green:
+a disabled append-only trigger, a disabled event trigger, a dropped RLS policy plus
+`DISABLE ROW LEVEL SECURITY`, and a `CREATE OR REPLACE VIEW` body swap plus a `security_invoker`
+reset were each injected by hand, and each failed the test naming exactly the drifted lines.
 
 ## M3 · The posting engine
 

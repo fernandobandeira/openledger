@@ -1,0 +1,1807 @@
+OpenLedger schema snapshot — the catalog state `openledger migrate` produces on an
+empty PostgreSQL 18 database, dumped as deterministic text and diffed in CI against
+this committed copy (ADR-0007 §2; the charge ADR-0009 widened for the owner-accident
+DDL class). Regenerate with `make schema-snapshot`; a normal test run only compares.
+
+Deliberately NOT in this dump, so the diff stays meaningful:
+- OIDs, and anything derived from them: the internal foreign-key trigger names
+  (RI_ConstraintTrigger_<oid>) differ per database, so those triggers appear
+  aggregated per constraint, as a count and enablement states (ADR-0009 §A).
+- Owner and grantor names: the migrating role differs per environment (compose,
+  CI's service container, the e2e testcontainer). ACL entries are filtered to
+  the migration-created openledger_* roles and PUBLIC.
+- Table data, with one charged exception: account_types.is_perimeter/mirror_type
+  (ADR-0007 §2). The section is empty on the baseline because the example chart
+  is seed data owned by no migration (ADR-0007 §9) — a deployment can run the
+  same dump against its seeded database.
+- _sqlx_migrations rows (timestamps, execution times); its catalog shape IS here.
+- Extension versions and extension-owned objects (btree_gist's ~200 support
+  functions), which track the server image, not the migrations.
+- Statistics, sizes, vacuum state — runtime, not schema.
+Formatting note: pg_get_*def output is PostgreSQL-major-version text (18, the
+pinned image everywhere this runs); every ORDER BY collates in "C".
+
+== extensions ==
+btree_gist
+plpgsql
+
+== enum types ==
+account_owner_type: company, platform, bank_account, house
+ledger_category: asset, liability, equity, revenue, expense
+ledger_direction: debit, credit
+ledger_normal_balance: debit, credit
+ledger_txn_status: pending, posted
+
+== relations (kind, persistence, row security, reloptions) ==
+r _sqlx_migrations persistence=p rowsecurity=false forcerowsecurity=false options=[]
+r account_types persistence=p rowsecurity=false forcerowsecurity=false options=[]
+v chart_lint persistence=p rowsecurity=false forcerowsecurity=false options=[]
+r chart_presentation persistence=p rowsecurity=false forcerowsecurity=false options=[]
+v chart_version_current persistence=p rowsecurity=false forcerowsecurity=false options=[]
+r chart_versions persistence=p rowsecurity=false forcerowsecurity=false options=[]
+v close_disclosures persistence=p rowsecurity=false forcerowsecurity=false options=[]
+r fs_lines persistence=p rowsecurity=false forcerowsecurity=false options=[]
+r ledger_account_balances persistence=p rowsecurity=true forcerowsecurity=false options=[]
+r ledger_accounts persistence=p rowsecurity=true forcerowsecurity=false options=[]
+r ledger_entries persistence=p rowsecurity=true forcerowsecurity=false options=[]
+r ledger_events persistence=p rowsecurity=true forcerowsecurity=false options=[]
+r ledger_period_balances persistence=p rowsecurity=true forcerowsecurity=false options=[]
+r ledger_period_closes persistence=p rowsecurity=true forcerowsecurity=false options=[]
+r ledger_periods persistence=p rowsecurity=true forcerowsecurity=false options=[]
+r ledger_transactions persistence=p rowsecurity=true forcerowsecurity=false options=[]
+r perimeter_attestations persistence=p rowsecurity=true forcerowsecurity=false options=[]
+v perimeter_drift persistence=p rowsecurity=false forcerowsecurity=false options=[]
+v recon_balance_breaks persistence=p rowsecurity=false forcerowsecurity=false options=[]
+v recon_checkpoint_breaks persistence=p rowsecurity=false forcerowsecurity=false options=[]
+v recon_close_breaks persistence=p rowsecurity=false forcerowsecurity=false options=[]
+v recon_cursor_breaks persistence=p rowsecurity=false forcerowsecurity=false options=[]
+v recon_entry_breaks persistence=p rowsecurity=false forcerowsecurity=false options=[]
+v recon_journal_to_reports persistence=p rowsecurity=false forcerowsecurity=false options=[]
+v recon_pending_bridge persistence=p rowsecurity=false forcerowsecurity=false options=[]
+v recon_scope_breaks persistence=p rowsecurity=false forcerowsecurity=false options=[]
+v recon_transaction_breaks persistence=p rowsecurity=false forcerowsecurity=false options=[]
+v reconciliation persistence=p rowsecurity=false forcerowsecurity=false options=[]
+v trial_balance persistence=p rowsecurity=false forcerowsecurity=false options=[security_invoker=true]
+
+== columns ==
+_sqlx_migrations.version: bigint NOT NULL
+_sqlx_migrations.description: text NOT NULL
+_sqlx_migrations.installed_on: timestamp with time zone NOT NULL DEFAULT now()
+_sqlx_migrations.success: boolean NOT NULL
+_sqlx_migrations.checksum: bytea NOT NULL
+_sqlx_migrations.execution_time: bigint NOT NULL
+account_types.code: text NOT NULL
+account_types.category: ledger_category NOT NULL
+account_types.normal_balance: ledger_normal_balance NOT NULL
+account_types.description: text NOT NULL
+account_types.is_perimeter: boolean NOT NULL DEFAULT false
+account_types.counterparty_scope: text NOT NULL DEFAULT 'none'::text
+account_types.mirror_type: text
+chart_lint.rule: text
+chart_lint.severity: text
+chart_lint.subject: text
+chart_lint.detail: text
+chart_presentation.chart_version: integer NOT NULL
+chart_presentation.type_code: text NOT NULL
+chart_presentation.category: ledger_category NOT NULL
+chart_presentation.counterparty_scope: text NOT NULL
+chart_presentation.fs_line: text NOT NULL
+chart_presentation.fs_line_contra: text
+chart_presentation.fs_statement: text GENERATED ALWAYS AS 
+CASE
+    WHEN (category = ANY (ARRAY['revenue'::ledger_category, 'expense'::ledger_category])) THEN 'income_statement'::text
+    ELSE 'balance_sheet'::text
+END STORED
+chart_presentation.fs_side: text GENERATED ALWAYS AS 
+CASE
+    WHEN (category = 'revenue'::ledger_category) THEN 'credit'::text
+    WHEN (category = 'expense'::ledger_category) THEN 'debit'::text
+    WHEN (category = 'asset'::ledger_category) THEN 'asset'::text
+    WHEN (category = 'liability'::ledger_category) THEN 'liability'::text
+    ELSE 'equity'::text
+END STORED
+chart_presentation.fs_side_contra: text GENERATED ALWAYS AS 
+CASE
+    WHEN (fs_line_contra IS NULL) THEN NULL::text
+    WHEN (category = 'asset'::ledger_category) THEN 'liability'::text
+    WHEN (category = 'liability'::ledger_category) THEN 'asset'::text
+    ELSE NULL::text
+END STORED
+chart_version_current.chart_version: integer
+chart_versions.version: integer NOT NULL
+chart_versions.created_at: timestamp with time zone NOT NULL DEFAULT now()
+chart_versions.note: text NOT NULL
+close_disclosures.tenant_id: text
+close_disclosures.period_code: text
+close_disclosures.currency: character(3)
+close_disclosures.computed_at_xid: xid8
+close_disclosures.entry_id: uuid
+close_disclosures.transaction_id: uuid
+close_disclosures.account_id: uuid
+close_disclosures.direction: ledger_direction
+close_disclosures.amount_minor: bigint
+close_disclosures.effective_at: timestamp with time zone
+close_disclosures.xact_id: xid8
+close_disclosures.recorded_at: timestamp with time zone
+fs_lines.chart_version: integer NOT NULL
+fs_lines.code: text NOT NULL
+fs_lines.caption: text NOT NULL
+fs_lines.statement: text NOT NULL
+fs_lines.side: text NOT NULL
+fs_lines.sort_order: integer NOT NULL DEFAULT 1000
+ledger_account_balances.tenant_id: text NOT NULL
+ledger_account_balances.account_id: uuid NOT NULL
+ledger_account_balances.currency: character(3) NOT NULL
+ledger_account_balances.stripe: smallint NOT NULL DEFAULT 0
+ledger_account_balances.owner_type: account_owner_type NOT NULL
+ledger_account_balances.owner_id_key: text NOT NULL
+ledger_account_balances.purpose: text NOT NULL
+ledger_account_balances.category: ledger_category NOT NULL
+ledger_account_balances.normal_balance: ledger_normal_balance NOT NULL
+ledger_account_balances.input: bigint NOT NULL DEFAULT 0
+ledger_account_balances.output: bigint NOT NULL DEFAULT 0
+ledger_account_balances.last_seq: bigint NOT NULL DEFAULT 0
+ledger_account_balances.updated_at: timestamp with time zone NOT NULL DEFAULT now()
+ledger_accounts.tenant_id: text NOT NULL
+ledger_accounts.id: uuid NOT NULL DEFAULT uuidv7()
+ledger_accounts.owner_type: account_owner_type NOT NULL
+ledger_accounts.owner_id: text
+ledger_accounts.owner_id_key: text GENERATED ALWAYS AS COALESCE(owner_id, ''::text) STORED
+ledger_accounts.purpose: text NOT NULL
+ledger_accounts.category: ledger_category NOT NULL
+ledger_accounts.normal_balance: ledger_normal_balance NOT NULL
+ledger_accounts.counterparty_scope: text NOT NULL
+ledger_accounts.currency: character(3) NOT NULL
+ledger_accounts.stripe_count: smallint NOT NULL DEFAULT 1
+ledger_accounts.metadata: jsonb NOT NULL DEFAULT '{}'::jsonb
+ledger_accounts.created_at: timestamp with time zone NOT NULL DEFAULT now()
+ledger_entries.tenant_id: text NOT NULL
+ledger_entries.id: uuid NOT NULL DEFAULT uuidv7()
+ledger_entries.transaction_id: uuid NOT NULL
+ledger_entries.account_id: uuid NOT NULL
+ledger_entries.direction: ledger_direction NOT NULL
+ledger_entries.amount_minor: bigint NOT NULL
+ledger_entries.currency: character(3) NOT NULL
+ledger_entries.stripe: smallint NOT NULL DEFAULT 0
+ledger_entries.account_seq: bigint NOT NULL
+ledger_entries.recorded_at: timestamp with time zone NOT NULL DEFAULT now()
+ledger_entries.effective_at: timestamp with time zone NOT NULL
+ledger_entries.xact_id: xid8 NOT NULL DEFAULT pg_current_xact_id()
+ledger_events.tenant_id: text NOT NULL
+ledger_events.id: uuid NOT NULL DEFAULT uuidv7()
+ledger_events.kind: text NOT NULL
+ledger_events.source: text NOT NULL
+ledger_events.idempotency_key: text NOT NULL
+ledger_events.idempotency_hash: bytea NOT NULL
+ledger_events.payload: jsonb NOT NULL
+ledger_events.effective_at: timestamp with time zone NOT NULL
+ledger_events.recorded_at: timestamp with time zone NOT NULL DEFAULT now()
+ledger_events.xact_id: xid8 NOT NULL DEFAULT pg_current_xact_id()
+ledger_period_balances.tenant_id: text NOT NULL
+ledger_period_balances.period_code: text NOT NULL
+ledger_period_balances.currency: character(3) NOT NULL
+ledger_period_balances.account_id: uuid NOT NULL
+ledger_period_balances.input: bigint NOT NULL
+ledger_period_balances.output: bigint NOT NULL
+ledger_period_closes.tenant_id: text NOT NULL
+ledger_period_closes.period_code: text NOT NULL
+ledger_period_closes.currency: character(3) NOT NULL
+ledger_period_closes.starts_at: timestamp with time zone NOT NULL
+ledger_period_closes.ends_at: timestamp with time zone NOT NULL
+ledger_period_closes.transaction_id: uuid NOT NULL
+ledger_period_closes.txn_effective_at: timestamp with time zone NOT NULL
+ledger_period_closes.closing_kind: text GENERATED ALWAYS AS 'period_close'::text STORED
+ledger_period_closes.computed_at_xid: xid8 NOT NULL
+ledger_period_closes.closed_at: timestamp with time zone NOT NULL DEFAULT now()
+ledger_periods.tenant_id: text NOT NULL
+ledger_periods.code: text NOT NULL
+ledger_periods.starts_at: timestamp with time zone NOT NULL
+ledger_periods.ends_at: timestamp with time zone NOT NULL
+ledger_periods.tz: text NOT NULL
+ledger_transactions.tenant_id: text NOT NULL
+ledger_transactions.id: uuid NOT NULL DEFAULT uuidv7()
+ledger_transactions.event_id: uuid NOT NULL
+ledger_transactions.kind: text NOT NULL
+ledger_transactions.status: ledger_txn_status NOT NULL
+ledger_transactions.effective_at: timestamp with time zone NOT NULL
+ledger_transactions.recorded_at: timestamp with time zone NOT NULL DEFAULT now()
+ledger_transactions.resolves_id: uuid
+ledger_transactions.reverses_id: uuid
+ledger_transactions.external_ref: jsonb NOT NULL DEFAULT '{}'::jsonb
+ledger_transactions.metadata: jsonb NOT NULL DEFAULT '{}'::jsonb
+ledger_transactions.xact_id: xid8 NOT NULL DEFAULT pg_current_xact_id()
+perimeter_attestations.tenant_id: text NOT NULL
+perimeter_attestations.account_id: uuid NOT NULL
+perimeter_attestations.currency: character(3) NOT NULL
+perimeter_attestations.as_of: date NOT NULL
+perimeter_attestations.tz: text NOT NULL
+perimeter_attestations.source: text NOT NULL
+perimeter_attestations.external_balance_minor: bigint NOT NULL
+perimeter_attestations.as_of_end: timestamp with time zone GENERATED ALWAYS AS (((as_of + 1))::timestamp without time zone AT TIME ZONE tz) STORED
+perimeter_attestations.recorded_at: timestamp with time zone NOT NULL DEFAULT now()
+perimeter_drift.tenant_id: text
+perimeter_drift.account_id: uuid
+perimeter_drift.purpose: text
+perimeter_drift.currency: character(3)
+perimeter_drift.as_of: date
+perimeter_drift.source: text
+perimeter_drift.is_perimeter: boolean
+perimeter_drift.external_balance_minor: bigint
+perimeter_drift.ledger_balance_minor: bigint
+perimeter_drift.drift_minor: bigint
+recon_balance_breaks.tenant_id: text
+recon_balance_breaks.account_id: uuid
+recon_balance_breaks.currency: character(3)
+recon_balance_breaks.stripe: smallint
+recon_balance_breaks.cache_input: bigint
+recon_balance_breaks.cache_output: bigint
+recon_balance_breaks.cache_balance_minor: bigint
+recon_balance_breaks.posted_input: numeric
+recon_balance_breaks.posted_output: numeric
+recon_balance_breaks.posted_balance_minor: numeric
+recon_balance_breaks.pending_input: numeric
+recon_balance_breaks.pending_output: numeric
+recon_balance_breaks.cache_last_seq: bigint
+recon_balance_breaks.max_seq: bigint
+recon_balance_breaks.entry_count: bigint
+recon_balance_breaks.drift_minor: numeric
+recon_balance_breaks.drift_turnover_minor: numeric
+recon_balance_breaks.reasons: text[]
+recon_checkpoint_breaks.tenant_id: text
+recon_checkpoint_breaks.period_code: text
+recon_checkpoint_breaks.currency: character(3)
+recon_checkpoint_breaks.account_id: uuid
+recon_checkpoint_breaks.stored_input: bigint
+recon_checkpoint_breaks.stored_output: bigint
+recon_checkpoint_breaks.recomputed_input: numeric
+recon_checkpoint_breaks.recomputed_output: numeric
+recon_checkpoint_breaks.reason: text
+recon_close_breaks.tenant_id: text
+recon_close_breaks.period_code: text
+recon_close_breaks.currency: character(3)
+recon_close_breaks.transaction_id: uuid
+recon_close_breaks.computed_at_xid: xid8
+recon_close_breaks.txn_xact_id: xid8
+recon_close_breaks.reason: text
+recon_cursor_breaks.tenant_id: text
+recon_cursor_breaks.entry_id: uuid
+recon_cursor_breaks.transaction_id: uuid
+recon_cursor_breaks.xact_id: xid8
+recon_cursor_breaks.txn_xact_id: xid8
+recon_cursor_breaks.reason: text
+recon_entry_breaks.tenant_id: text
+recon_entry_breaks.entry_id: uuid
+recon_entry_breaks.transaction_id: uuid
+recon_entry_breaks.account_id: uuid
+recon_entry_breaks.currency: character(3)
+recon_entry_breaks.direction: ledger_direction
+recon_entry_breaks.amount_minor: bigint
+recon_entry_breaks.stripe: smallint
+recon_entry_breaks.account_seq: bigint
+recon_entry_breaks.effective_at: timestamp with time zone
+recon_entry_breaks.recorded_at: timestamp with time zone
+recon_entry_breaks.reason: text
+recon_journal_to_reports.tenant_id: text
+recon_journal_to_reports.currency: character(3)
+recon_journal_to_reports.journal_debits: numeric
+recon_journal_to_reports.journal_credits: numeric
+recon_journal_to_reports.pending_debits: numeric
+recon_journal_to_reports.pending_credits: numeric
+recon_journal_to_reports.superseded_debits: numeric
+recon_journal_to_reports.superseded_credits: numeric
+recon_journal_to_reports.out_of_window_debits: numeric
+recon_journal_to_reports.out_of_window_credits: numeric
+recon_journal_to_reports.orphan_debits: numeric
+recon_journal_to_reports.orphan_credits: numeric
+recon_journal_to_reports.reported_debits: numeric
+recon_journal_to_reports.reported_credits: numeric
+recon_journal_to_reports.tb_debits: numeric
+recon_journal_to_reports.tb_credits: numeric
+recon_journal_to_reports.unexplained_debits: numeric
+recon_journal_to_reports.unexplained_credits: numeric
+recon_journal_to_reports.journal_minus_report_debits: numeric
+recon_pending_bridge.tenant_id: text
+recon_pending_bridge.account_id: uuid
+recon_pending_bridge.purpose: text
+recon_pending_bridge.currency: character(3)
+recon_pending_bridge.posted_balance_minor: numeric
+recon_pending_bridge.pending_balance_minor: numeric
+recon_pending_bridge.available_balance_minor: numeric
+recon_pending_bridge.pending_debits: numeric
+recon_pending_bridge.pending_credits: numeric
+recon_pending_bridge.pending_txns: bigint
+recon_pending_bridge.oldest_pending_effective_at: timestamp with time zone
+recon_scope_breaks.near_type: text
+recon_scope_breaks.far_type: text
+recon_scope_breaks.currency: character(3)
+recon_scope_breaks.counterparty: text
+recon_scope_breaks.near_minor: numeric
+recon_scope_breaks.far_minor: numeric
+recon_scope_breaks.gap_minor: numeric
+recon_transaction_breaks.tenant_id: text
+recon_transaction_breaks.transaction_id: uuid
+recon_transaction_breaks.status: ledger_txn_status
+recon_transaction_breaks.kind: text
+recon_transaction_breaks.effective_at: timestamp with time zone
+recon_transaction_breaks.recorded_at: timestamp with time zone
+recon_transaction_breaks.currency: character(3)
+recon_transaction_breaks.debits: numeric
+recon_transaction_breaks.credits: numeric
+recon_transaction_breaks.imbalance_minor: numeric
+recon_transaction_breaks.leg_count: bigint
+recon_transaction_breaks.reason: text
+reconciliation.check_name: text
+reconciliation.breaks: bigint
+trial_balance.tenant_id: text
+trial_balance.account_id: uuid
+trial_balance.owner_id: text
+trial_balance.purpose: text
+trial_balance.category: ledger_category
+trial_balance.normal_balance: ledger_normal_balance
+trial_balance.currency: character(3)
+trial_balance.debits: numeric
+trial_balance.credits: numeric
+trial_balance.balance_minor: numeric
+trial_balance.balance_debit_positive: numeric
+
+== constraints (the full pg_constraint set) ==
+_sqlx_migrations _sqlx_migrations_checksum_not_null: NOT NULL checksum
+_sqlx_migrations _sqlx_migrations_description_not_null: NOT NULL description
+_sqlx_migrations _sqlx_migrations_execution_time_not_null: NOT NULL execution_time
+_sqlx_migrations _sqlx_migrations_installed_on_not_null: NOT NULL installed_on
+_sqlx_migrations _sqlx_migrations_pkey: PRIMARY KEY (version)
+_sqlx_migrations _sqlx_migrations_success_not_null: NOT NULL success
+_sqlx_migrations _sqlx_migrations_version_not_null: NOT NULL version
+account_types account_types_category_not_null: NOT NULL category
+account_types account_types_code_not_null: NOT NULL code
+account_types account_types_counterparty_scope_not_null: NOT NULL counterparty_scope
+account_types account_types_description_not_null: NOT NULL description
+account_types account_types_is_perimeter_not_null: NOT NULL is_perimeter
+account_types account_types_normal_balance_not_null: NOT NULL normal_balance
+account_types ck_types__counterparty_scope: CHECK ((counterparty_scope = ANY (ARRAY['none'::text, 'shared'::text, 'per_shard'::text])))
+account_types ck_types__mirror_not_self: CHECK ((mirror_type <> code))
+account_types fk_types__mirror: FOREIGN KEY (mirror_type) REFERENCES account_types(code)
+account_types pk_account_types: PRIMARY KEY (code)
+account_types uq_types__identity: UNIQUE (code, category, normal_balance)
+account_types uq_types__presentable: UNIQUE (code, category, counterparty_scope)
+chart_presentation chart_presentation_category_not_null: NOT NULL category
+chart_presentation chart_presentation_chart_version_not_null: NOT NULL chart_version
+chart_presentation chart_presentation_counterparty_scope_not_null: NOT NULL counterparty_scope
+chart_presentation chart_presentation_fs_line_not_null: NOT NULL fs_line
+chart_presentation chart_presentation_type_code_not_null: NOT NULL type_code
+chart_presentation ck_presentation__contra_is_balance_sheet: CHECK (((fs_line_contra IS NULL) OR (category = ANY (ARRAY['asset'::ledger_category, 'liability'::ledger_category]))))
+chart_presentation ck_presentation__contra_required_for_per_shard: CHECK (((counterparty_scope <> 'per_shard'::text) OR (fs_line_contra IS NOT NULL)))
+chart_presentation ck_presentation__per_shard_is_balance_sheet: CHECK (((counterparty_scope <> 'per_shard'::text) OR (category = ANY (ARRAY['asset'::ledger_category, 'liability'::ledger_category]))))
+chart_presentation fk_presentation__fs_line: FOREIGN KEY (chart_version, fs_line, fs_statement, fs_side) REFERENCES fs_lines(chart_version, code, statement, side)
+chart_presentation fk_presentation__fs_line_contra: FOREIGN KEY (chart_version, fs_line_contra, fs_statement, fs_side_contra) REFERENCES fs_lines(chart_version, code, statement, side)
+chart_presentation fk_presentation__type: FOREIGN KEY (type_code, category, counterparty_scope) REFERENCES account_types(code, category, counterparty_scope)
+chart_presentation fk_presentation__version: FOREIGN KEY (chart_version) REFERENCES chart_versions(version)
+chart_presentation pk_presentation: PRIMARY KEY (chart_version, type_code)
+chart_versions chart_versions_created_at_not_null: NOT NULL created_at
+chart_versions chart_versions_note_not_null: NOT NULL note
+chart_versions chart_versions_version_not_null: NOT NULL version
+chart_versions ck_chart_versions__note: CHECK ((btrim(note) <> ''::text))
+chart_versions ck_chart_versions__positive: CHECK ((version > 0))
+chart_versions pk_chart_versions: PRIMARY KEY (version)
+fs_lines ck_fs_lines__caption_clean: CHECK (((caption = btrim(caption, ' 	
+ ​  '::text)) AND (caption <> ''::text) AND (caption !~ '[\u0000-\u001f\u00a0\u200b-\u200f\u2028\u2029\u202f\ufeff]'::text)))
+fs_lines ck_fs_lines__caption_reserved: CHECK ((lower(btrim(caption, ' 	
+ ​  '::text)) <> 'undistributed earnings (since inception)'::text))
+fs_lines ck_fs_lines__code_reserved: CHECK ((code <> 'current_year_earnings'::text))
+fs_lines ck_fs_lines__side_matches_statement: CHECK ((((statement = 'balance_sheet'::text) AND (side = ANY (ARRAY['asset'::text, 'liability'::text, 'equity'::text]))) OR ((statement = 'income_statement'::text) AND (side = ANY (ARRAY['credit'::text, 'debit'::text])))))
+fs_lines ck_fs_lines__statement: CHECK ((statement = ANY (ARRAY['balance_sheet'::text, 'income_statement'::text])))
+fs_lines fk_fs_lines__version: FOREIGN KEY (chart_version) REFERENCES chart_versions(version)
+fs_lines fs_lines_caption_not_null: NOT NULL caption
+fs_lines fs_lines_chart_version_not_null: NOT NULL chart_version
+fs_lines fs_lines_code_not_null: NOT NULL code
+fs_lines fs_lines_side_not_null: NOT NULL side
+fs_lines fs_lines_sort_order_not_null: NOT NULL sort_order
+fs_lines fs_lines_statement_not_null: NOT NULL statement
+fs_lines pk_fs_lines: PRIMARY KEY (chart_version, code)
+fs_lines uq_fs_lines__code_statement_side: UNIQUE (chart_version, code, statement, side)
+ledger_account_balances ck_balances__currency_iso: CHECK ((currency ~ '^[A-Z]{3}$'::text))
+ledger_account_balances ck_balances__non_negative: CHECK (((input >= 0) AND (output >= 0)))
+ledger_account_balances ck_balances__stripe_non_negative: CHECK ((stripe >= 0))
+ledger_account_balances ck_balances__tenant_non_empty: CHECK ((btrim(tenant_id) <> ''::text))
+ledger_account_balances fk_balances__account: FOREIGN KEY (tenant_id, account_id, currency) REFERENCES ledger_accounts(tenant_id, id, currency)
+ledger_account_balances fk_balances__account_owner: FOREIGN KEY (tenant_id, account_id, owner_type, owner_id_key) REFERENCES ledger_accounts(tenant_id, id, owner_type, owner_id_key)
+ledger_account_balances fk_balances__account_purpose: FOREIGN KEY (tenant_id, account_id, purpose, category, normal_balance) REFERENCES ledger_accounts(tenant_id, id, purpose, category, normal_balance)
+ledger_account_balances ledger_account_balances_account_id_not_null: NOT NULL account_id
+ledger_account_balances ledger_account_balances_category_not_null: NOT NULL category
+ledger_account_balances ledger_account_balances_currency_not_null: NOT NULL currency
+ledger_account_balances ledger_account_balances_input_not_null: NOT NULL input
+ledger_account_balances ledger_account_balances_last_seq_not_null: NOT NULL last_seq
+ledger_account_balances ledger_account_balances_normal_balance_not_null: NOT NULL normal_balance
+ledger_account_balances ledger_account_balances_output_not_null: NOT NULL output
+ledger_account_balances ledger_account_balances_owner_id_key_not_null: NOT NULL owner_id_key
+ledger_account_balances ledger_account_balances_owner_type_not_null: NOT NULL owner_type
+ledger_account_balances ledger_account_balances_purpose_not_null: NOT NULL purpose
+ledger_account_balances ledger_account_balances_stripe_not_null: NOT NULL stripe
+ledger_account_balances ledger_account_balances_tenant_id_not_null: NOT NULL tenant_id
+ledger_account_balances ledger_account_balances_updated_at_not_null: NOT NULL updated_at
+ledger_account_balances pk_balances: PRIMARY KEY (tenant_id, account_id, currency, stripe)
+ledger_accounts ck_accounts__currency_iso: CHECK ((currency ~ '^[A-Z]{3}$'::text))
+ledger_accounts ck_accounts__house_has_no_owner: CHECK (((owner_type = 'house'::account_owner_type) = (owner_id IS NULL)))
+ledger_accounts ck_accounts__per_shard_is_owned: CHECK (((counterparty_scope <> 'per_shard'::text) OR (owner_type <> 'house'::account_owner_type)))
+ledger_accounts ck_accounts__stripe_count: CHECK (((stripe_count >= 1) AND (stripe_count <= 1024)))
+ledger_accounts ck_accounts__tenant_non_empty: CHECK ((btrim(tenant_id) <> ''::text))
+ledger_accounts fk_accounts__scope: FOREIGN KEY (purpose, category, counterparty_scope) REFERENCES account_types(code, category, counterparty_scope)
+ledger_accounts fk_accounts__type: FOREIGN KEY (purpose, category, normal_balance) REFERENCES account_types(code, category, normal_balance)
+ledger_accounts ledger_accounts_category_not_null: NOT NULL category
+ledger_accounts ledger_accounts_counterparty_scope_not_null: NOT NULL counterparty_scope
+ledger_accounts ledger_accounts_created_at_not_null: NOT NULL created_at
+ledger_accounts ledger_accounts_currency_not_null: NOT NULL currency
+ledger_accounts ledger_accounts_id_not_null: NOT NULL id
+ledger_accounts ledger_accounts_metadata_not_null: NOT NULL metadata
+ledger_accounts ledger_accounts_normal_balance_not_null: NOT NULL normal_balance
+ledger_accounts ledger_accounts_owner_type_not_null: NOT NULL owner_type
+ledger_accounts ledger_accounts_purpose_not_null: NOT NULL purpose
+ledger_accounts ledger_accounts_stripe_count_not_null: NOT NULL stripe_count
+ledger_accounts ledger_accounts_tenant_id_not_null: NOT NULL tenant_id
+ledger_accounts pk_accounts: PRIMARY KEY (tenant_id, id)
+ledger_accounts uq_accounts__id_purpose: UNIQUE (tenant_id, id, purpose, category, normal_balance)
+ledger_entries ck_entries__amount_positive: CHECK ((amount_minor > 0))
+ledger_entries ck_entries__currency_iso: CHECK ((currency ~ '^[A-Z]{3}$'::text))
+ledger_entries ck_entries__effective_finite: CHECK (((effective_at > '-infinity'::timestamp with time zone) AND (effective_at < 'infinity'::timestamp with time zone)))
+ledger_entries ck_entries__seq_positive: CHECK ((account_seq > 0))
+ledger_entries ck_entries__stripe_non_negative: CHECK ((stripe >= 0))
+ledger_entries ck_entries__tenant_non_empty: CHECK ((btrim(tenant_id) <> ''::text))
+ledger_entries fk_entries__account: FOREIGN KEY (tenant_id, account_id, currency) REFERENCES ledger_accounts(tenant_id, id, currency)
+ledger_entries fk_entries__stripe: FOREIGN KEY (tenant_id, account_id, currency, stripe) REFERENCES ledger_account_balances(tenant_id, account_id, currency, stripe)
+ledger_entries fk_entries__txn: FOREIGN KEY (tenant_id, transaction_id) REFERENCES ledger_transactions(tenant_id, id)
+ledger_entries fk_entries__txn_effective: FOREIGN KEY (tenant_id, transaction_id, effective_at) REFERENCES ledger_transactions(tenant_id, id, effective_at)
+ledger_entries ledger_entries_account_id_not_null: NOT NULL account_id
+ledger_entries ledger_entries_account_seq_not_null: NOT NULL account_seq
+ledger_entries ledger_entries_amount_minor_not_null: NOT NULL amount_minor
+ledger_entries ledger_entries_currency_not_null: NOT NULL currency
+ledger_entries ledger_entries_direction_not_null: NOT NULL direction
+ledger_entries ledger_entries_effective_at_not_null: NOT NULL effective_at
+ledger_entries ledger_entries_id_not_null: NOT NULL id
+ledger_entries ledger_entries_recorded_at_not_null: NOT NULL recorded_at
+ledger_entries ledger_entries_stripe_not_null: NOT NULL stripe
+ledger_entries ledger_entries_tenant_id_not_null: NOT NULL tenant_id
+ledger_entries ledger_entries_transaction_id_not_null: NOT NULL transaction_id
+ledger_entries ledger_entries_xact_id_not_null: NOT NULL xact_id
+ledger_entries pk_entries: PRIMARY KEY (tenant_id, id)
+ledger_entries uq_entries__account_seq: UNIQUE (tenant_id, account_id, stripe, account_seq)
+ledger_events ck_events__tenant_non_empty: CHECK ((btrim(tenant_id) <> ''::text))
+ledger_events ledger_events_effective_at_not_null: NOT NULL effective_at
+ledger_events ledger_events_id_not_null: NOT NULL id
+ledger_events ledger_events_idempotency_hash_not_null: NOT NULL idempotency_hash
+ledger_events ledger_events_idempotency_key_not_null: NOT NULL idempotency_key
+ledger_events ledger_events_kind_not_null: NOT NULL kind
+ledger_events ledger_events_payload_not_null: NOT NULL payload
+ledger_events ledger_events_recorded_at_not_null: NOT NULL recorded_at
+ledger_events ledger_events_source_not_null: NOT NULL source
+ledger_events ledger_events_tenant_id_not_null: NOT NULL tenant_id
+ledger_events ledger_events_xact_id_not_null: NOT NULL xact_id
+ledger_events pk_events: PRIMARY KEY (tenant_id, id)
+ledger_period_balances ck_period_balances__non_negative: CHECK (((input >= 0) AND (output >= 0)))
+ledger_period_balances ck_period_balances__tenant_non_empty: CHECK ((btrim(tenant_id) <> ''::text))
+ledger_period_balances fk_period_balances__account: FOREIGN KEY (tenant_id, account_id, currency) REFERENCES ledger_accounts(tenant_id, id, currency)
+ledger_period_balances fk_period_balances__close: FOREIGN KEY (tenant_id, period_code, currency) REFERENCES ledger_period_closes(tenant_id, period_code, currency)
+ledger_period_balances ledger_period_balances_account_id_not_null: NOT NULL account_id
+ledger_period_balances ledger_period_balances_currency_not_null: NOT NULL currency
+ledger_period_balances ledger_period_balances_input_not_null: NOT NULL input
+ledger_period_balances ledger_period_balances_output_not_null: NOT NULL output
+ledger_period_balances ledger_period_balances_period_code_not_null: NOT NULL period_code
+ledger_period_balances ledger_period_balances_tenant_id_not_null: NOT NULL tenant_id
+ledger_period_balances pk_period_balances: PRIMARY KEY (tenant_id, period_code, currency, account_id)
+ledger_period_closes ck_closes__currency_iso: CHECK ((currency ~ '^[A-Z]{3}$'::text))
+ledger_period_closes ck_closes__tenant_non_empty: CHECK ((btrim(tenant_id) <> ''::text))
+ledger_period_closes ck_closes__txn_in_period: CHECK (((txn_effective_at >= starts_at) AND (txn_effective_at < ends_at)))
+ledger_period_closes fk_closes__period: FOREIGN KEY (tenant_id, period_code, starts_at, ends_at) REFERENCES ledger_periods(tenant_id, code, starts_at, ends_at)
+ledger_period_closes fk_closes__txn: FOREIGN KEY (tenant_id, transaction_id) REFERENCES ledger_transactions(tenant_id, id)
+ledger_period_closes fk_closes__txn_effective: FOREIGN KEY (tenant_id, transaction_id, txn_effective_at) REFERENCES ledger_transactions(tenant_id, id, effective_at)
+ledger_period_closes fk_closes__txn_kind: FOREIGN KEY (tenant_id, transaction_id, closing_kind) REFERENCES ledger_transactions(tenant_id, id, kind)
+ledger_period_closes ledger_period_closes_closed_at_not_null: NOT NULL closed_at
+ledger_period_closes ledger_period_closes_computed_at_xid_not_null: NOT NULL computed_at_xid
+ledger_period_closes ledger_period_closes_currency_not_null: NOT NULL currency
+ledger_period_closes ledger_period_closes_ends_at_not_null: NOT NULL ends_at
+ledger_period_closes ledger_period_closes_period_code_not_null: NOT NULL period_code
+ledger_period_closes ledger_period_closes_starts_at_not_null: NOT NULL starts_at
+ledger_period_closes ledger_period_closes_tenant_id_not_null: NOT NULL tenant_id
+ledger_period_closes ledger_period_closes_transaction_id_not_null: NOT NULL transaction_id
+ledger_period_closes ledger_period_closes_txn_effective_at_not_null: NOT NULL txn_effective_at
+ledger_period_closes pk_closes: PRIMARY KEY (tenant_id, period_code, currency)
+ledger_period_closes uq_closes__txn: UNIQUE (tenant_id, transaction_id)
+ledger_periods ck_periods__non_empty: CHECK ((ends_at > starts_at))
+ledger_periods ck_periods__tenant_non_empty: CHECK ((btrim(tenant_id) <> ''::text))
+ledger_periods ck_periods__tz_known: CHECK ((('2000-01-01 00:00:00'::timestamp without time zone AT TIME ZONE tz) IS NOT NULL))
+ledger_periods ex_periods__no_overlap: EXCLUDE USING gist (tenant_id WITH =, tstzrange(starts_at, ends_at, '[)'::text) WITH &&)
+ledger_periods ledger_periods_code_not_null: NOT NULL code
+ledger_periods ledger_periods_ends_at_not_null: NOT NULL ends_at
+ledger_periods ledger_periods_starts_at_not_null: NOT NULL starts_at
+ledger_periods ledger_periods_tenant_id_not_null: NOT NULL tenant_id
+ledger_periods ledger_periods_tz_not_null: NOT NULL tz
+ledger_periods pk_periods: PRIMARY KEY (tenant_id, code)
+ledger_periods uq_periods__bounds: UNIQUE (tenant_id, code, starts_at, ends_at)
+ledger_transactions ck_txn__effective_finite: CHECK (((effective_at > '-infinity'::timestamp with time zone) AND (effective_at < 'infinity'::timestamp with time zone)))
+ledger_transactions ck_txn__no_self_reference: CHECK (((id IS DISTINCT FROM reverses_id) AND (id IS DISTINCT FROM resolves_id)))
+ledger_transactions ck_txn__not_both: CHECK ((NOT ((reverses_id IS NOT NULL) AND (resolves_id IS NOT NULL))))
+ledger_transactions ck_txn__tenant_non_empty: CHECK ((btrim(tenant_id) <> ''::text))
+ledger_transactions fk_txn__event: FOREIGN KEY (tenant_id, event_id) REFERENCES ledger_events(tenant_id, id)
+ledger_transactions fk_txn__resolves: FOREIGN KEY (tenant_id, resolves_id) REFERENCES ledger_transactions(tenant_id, id)
+ledger_transactions fk_txn__reverses: FOREIGN KEY (tenant_id, reverses_id) REFERENCES ledger_transactions(tenant_id, id)
+ledger_transactions ledger_transactions_effective_at_not_null: NOT NULL effective_at
+ledger_transactions ledger_transactions_event_id_not_null: NOT NULL event_id
+ledger_transactions ledger_transactions_external_ref_not_null: NOT NULL external_ref
+ledger_transactions ledger_transactions_id_not_null: NOT NULL id
+ledger_transactions ledger_transactions_kind_not_null: NOT NULL kind
+ledger_transactions ledger_transactions_metadata_not_null: NOT NULL metadata
+ledger_transactions ledger_transactions_recorded_at_not_null: NOT NULL recorded_at
+ledger_transactions ledger_transactions_status_not_null: NOT NULL status
+ledger_transactions ledger_transactions_tenant_id_not_null: NOT NULL tenant_id
+ledger_transactions ledger_transactions_xact_id_not_null: NOT NULL xact_id
+ledger_transactions pk_txn: PRIMARY KEY (tenant_id, id)
+ledger_transactions uq_txn__id_effective: UNIQUE (tenant_id, id, effective_at)
+ledger_transactions uq_txn__id_kind: UNIQUE (tenant_id, id, kind)
+perimeter_attestations ck_perimeter_attest__currency_iso: CHECK ((currency ~ '^[A-Z]{3}$'::text))
+perimeter_attestations ck_perimeter_attest__source: CHECK ((btrim(source) <> ''::text))
+perimeter_attestations ck_perimeter_attest__tenant_non_empty: CHECK ((btrim(tenant_id) <> ''::text))
+perimeter_attestations ck_perimeter_attest__tz_known: CHECK ((('2000-01-01 00:00:00'::timestamp without time zone AT TIME ZONE tz) IS NOT NULL))
+perimeter_attestations fk_perimeter_attest__account: FOREIGN KEY (tenant_id, account_id, currency) REFERENCES ledger_accounts(tenant_id, id, currency)
+perimeter_attestations perimeter_attestations_account_id_not_null: NOT NULL account_id
+perimeter_attestations perimeter_attestations_as_of_not_null: NOT NULL as_of
+perimeter_attestations perimeter_attestations_currency_not_null: NOT NULL currency
+perimeter_attestations perimeter_attestations_external_balance_minor_not_null: NOT NULL external_balance_minor
+perimeter_attestations perimeter_attestations_recorded_at_not_null: NOT NULL recorded_at
+perimeter_attestations perimeter_attestations_source_not_null: NOT NULL source
+perimeter_attestations perimeter_attestations_tenant_id_not_null: NOT NULL tenant_id
+perimeter_attestations perimeter_attestations_tz_not_null: NOT NULL tz
+perimeter_attestations pk_perimeter_attest: PRIMARY KEY (tenant_id, account_id, currency, as_of, source)
+
+== constraints marked NOT VALID (must stay empty, ADR-0007 §5) ==
+(none)
+
+== indexes ==
+CREATE UNIQUE INDEX _sqlx_migrations_pkey ON public._sqlx_migrations USING btree (version) valid=true ready=true
+CREATE UNIQUE INDEX pk_account_types ON public.account_types USING btree (code) valid=true ready=true
+CREATE UNIQUE INDEX uq_types__identity ON public.account_types USING btree (code, category, normal_balance) valid=true ready=true
+CREATE UNIQUE INDEX uq_types__presentable ON public.account_types USING btree (code, category, counterparty_scope) valid=true ready=true
+CREATE UNIQUE INDEX pk_presentation ON public.chart_presentation USING btree (chart_version, type_code) valid=true ready=true
+CREATE UNIQUE INDEX pk_chart_versions ON public.chart_versions USING btree (version) valid=true ready=true
+CREATE UNIQUE INDEX pk_fs_lines ON public.fs_lines USING btree (chart_version, code) valid=true ready=true
+CREATE UNIQUE INDEX uq_fs_lines__caption ON public.fs_lines USING btree (chart_version, lower(btrim(caption, ' 	
+ ​  '::text))) valid=true ready=true
+CREATE UNIQUE INDEX uq_fs_lines__code_statement_side ON public.fs_lines USING btree (chart_version, code, statement, side) valid=true ready=true
+CREATE UNIQUE INDEX pk_balances ON public.ledger_account_balances USING btree (tenant_id, account_id, currency, stripe) valid=true ready=true
+CREATE UNIQUE INDEX pk_accounts ON public.ledger_accounts USING btree (tenant_id, id) valid=true ready=true
+CREATE UNIQUE INDEX uq_accounts__house ON public.ledger_accounts USING btree (tenant_id, purpose, currency) WHERE (owner_type = 'house'::account_owner_type) valid=true ready=true
+CREATE UNIQUE INDEX uq_accounts__id_currency ON public.ledger_accounts USING btree (tenant_id, id, currency) valid=true ready=true
+CREATE UNIQUE INDEX uq_accounts__id_owner ON public.ledger_accounts USING btree (tenant_id, id, owner_type, owner_id_key) valid=true ready=true
+CREATE UNIQUE INDEX uq_accounts__id_purpose ON public.ledger_accounts USING btree (tenant_id, id, purpose, category, normal_balance) valid=true ready=true
+CREATE UNIQUE INDEX uq_accounts__owned ON public.ledger_accounts USING btree (tenant_id, owner_type, owner_id, purpose, currency) WHERE (owner_type <> 'house'::account_owner_type) valid=true ready=true
+CREATE INDEX ix_entries__asof_commit ON public.ledger_entries USING btree (tenant_id, account_id, xact_id) valid=true ready=true
+CREATE INDEX ix_entries__effective ON public.ledger_entries USING btree (tenant_id, account_id, effective_at, xact_id) valid=true ready=true
+CREATE INDEX ix_entries__txn ON public.ledger_entries USING btree (tenant_id, transaction_id) valid=true ready=true
+CREATE UNIQUE INDEX pk_entries ON public.ledger_entries USING btree (tenant_id, id) valid=true ready=true
+CREATE UNIQUE INDEX uq_entries__account_seq ON public.ledger_entries USING btree (tenant_id, account_id, stripe, account_seq) valid=true ready=true
+CREATE UNIQUE INDEX pk_events ON public.ledger_events USING btree (tenant_id, id) valid=true ready=true
+CREATE UNIQUE INDEX uq_events__idempotency ON public.ledger_events USING btree (tenant_id, idempotency_key) NULLS NOT DISTINCT valid=true ready=true
+CREATE UNIQUE INDEX pk_period_balances ON public.ledger_period_balances USING btree (tenant_id, period_code, currency, account_id) valid=true ready=true
+CREATE UNIQUE INDEX pk_closes ON public.ledger_period_closes USING btree (tenant_id, period_code, currency) valid=true ready=true
+CREATE UNIQUE INDEX uq_closes__txn ON public.ledger_period_closes USING btree (tenant_id, transaction_id) valid=true ready=true
+CREATE INDEX ex_periods__no_overlap ON public.ledger_periods USING gist (tenant_id, tstzrange(starts_at, ends_at, '[)'::text)) valid=true ready=true
+CREATE UNIQUE INDEX pk_periods ON public.ledger_periods USING btree (tenant_id, code) valid=true ready=true
+CREATE UNIQUE INDEX uq_periods__bounds ON public.ledger_periods USING btree (tenant_id, code, starts_at, ends_at) valid=true ready=true
+CREATE UNIQUE INDEX pk_txn ON public.ledger_transactions USING btree (tenant_id, id) valid=true ready=true
+CREATE UNIQUE INDEX uq_txn__id_effective ON public.ledger_transactions USING btree (tenant_id, id, effective_at) valid=true ready=true
+CREATE UNIQUE INDEX uq_txn__id_kind ON public.ledger_transactions USING btree (tenant_id, id, kind) valid=true ready=true
+CREATE UNIQUE INDEX uq_txn__one_per_event ON public.ledger_transactions USING btree (tenant_id, event_id) valid=true ready=true
+CREATE UNIQUE INDEX uq_txn__one_resolution ON public.ledger_transactions USING btree (tenant_id, resolves_id) WHERE (resolves_id IS NOT NULL) valid=true ready=true
+CREATE UNIQUE INDEX uq_txn__one_reversal ON public.ledger_transactions USING btree (tenant_id, reverses_id) WHERE (reverses_id IS NOT NULL) valid=true ready=true
+CREATE UNIQUE INDEX pk_perimeter_attest ON public.perimeter_attestations USING btree (tenant_id, account_id, currency, as_of, source) valid=true ready=true
+
+== triggers (tgenabled: A always, O origin, R replica, D disabled) ==
+chart_presentation ck_presentation__append_only enabled=A: CREATE TRIGGER ck_presentation__append_only BEFORE DELETE OR UPDATE ON public.chart_presentation FOR EACH ROW EXECUTE FUNCTION refuse_mutation()
+chart_presentation ck_presentation__no_stale_version enabled=A: CREATE TRIGGER ck_presentation__no_stale_version BEFORE INSERT ON public.chart_presentation FOR EACH ROW EXECUTE FUNCTION refuse_stale_chart_version()
+chart_presentation ck_presentation__no_truncate enabled=A: CREATE TRIGGER ck_presentation__no_truncate BEFORE TRUNCATE ON public.chart_presentation FOR EACH STATEMENT EXECUTE FUNCTION refuse_truncate()
+chart_versions ck_chart_versions__append_only enabled=A: CREATE TRIGGER ck_chart_versions__append_only BEFORE DELETE OR UPDATE ON public.chart_versions FOR EACH ROW EXECUTE FUNCTION refuse_mutation()
+chart_versions ck_chart_versions__no_truncate enabled=A: CREATE TRIGGER ck_chart_versions__no_truncate BEFORE TRUNCATE ON public.chart_versions FOR EACH STATEMENT EXECUTE FUNCTION refuse_truncate()
+fs_lines ck_fs_lines__append_only enabled=A: CREATE TRIGGER ck_fs_lines__append_only BEFORE DELETE OR UPDATE ON public.fs_lines FOR EACH ROW EXECUTE FUNCTION refuse_mutation()
+fs_lines ck_fs_lines__no_stale_version enabled=A: CREATE TRIGGER ck_fs_lines__no_stale_version BEFORE INSERT ON public.fs_lines FOR EACH ROW EXECUTE FUNCTION refuse_stale_chart_version()
+fs_lines ck_fs_lines__no_truncate enabled=A: CREATE TRIGGER ck_fs_lines__no_truncate BEFORE TRUNCATE ON public.fs_lines FOR EACH STATEMENT EXECUTE FUNCTION refuse_truncate()
+ledger_entries ck_entries__append_only enabled=A: CREATE TRIGGER ck_entries__append_only BEFORE DELETE OR UPDATE ON public.ledger_entries FOR EACH ROW EXECUTE FUNCTION refuse_mutation()
+ledger_entries ck_entries__no_truncate enabled=A: CREATE TRIGGER ck_entries__no_truncate BEFORE TRUNCATE ON public.ledger_entries FOR EACH STATEMENT EXECUTE FUNCTION refuse_truncate()
+ledger_events ck_events__append_only enabled=A: CREATE TRIGGER ck_events__append_only BEFORE DELETE OR UPDATE ON public.ledger_events FOR EACH ROW EXECUTE FUNCTION refuse_mutation()
+ledger_events ck_events__no_truncate enabled=A: CREATE TRIGGER ck_events__no_truncate BEFORE TRUNCATE ON public.ledger_events FOR EACH STATEMENT EXECUTE FUNCTION refuse_truncate()
+ledger_period_closes ck_closes__append_only enabled=A: CREATE TRIGGER ck_closes__append_only BEFORE DELETE OR UPDATE ON public.ledger_period_closes FOR EACH ROW EXECUTE FUNCTION refuse_mutation()
+ledger_period_closes ck_closes__no_truncate enabled=A: CREATE TRIGGER ck_closes__no_truncate BEFORE TRUNCATE ON public.ledger_period_closes FOR EACH STATEMENT EXECUTE FUNCTION refuse_truncate()
+ledger_periods ck_periods__append_only enabled=A: CREATE TRIGGER ck_periods__append_only BEFORE DELETE OR UPDATE ON public.ledger_periods FOR EACH ROW EXECUTE FUNCTION refuse_mutation()
+ledger_periods ck_periods__no_truncate enabled=A: CREATE TRIGGER ck_periods__no_truncate BEFORE TRUNCATE ON public.ledger_periods FOR EACH STATEMENT EXECUTE FUNCTION refuse_truncate()
+ledger_transactions ck_txn__append_only enabled=A: CREATE TRIGGER ck_txn__append_only BEFORE DELETE OR UPDATE ON public.ledger_transactions FOR EACH ROW EXECUTE FUNCTION refuse_mutation()
+ledger_transactions ck_txn__no_truncate enabled=A: CREATE TRIGGER ck_txn__no_truncate BEFORE TRUNCATE ON public.ledger_transactions FOR EACH STATEMENT EXECUTE FUNCTION refuse_truncate()
+perimeter_attestations ck_perimeter_attest__append_only enabled=A: CREATE TRIGGER ck_perimeter_attest__append_only BEFORE DELETE OR UPDATE ON public.perimeter_attestations FOR EACH ROW EXECUTE FUNCTION refuse_mutation()
+perimeter_attestations ck_perimeter_attest__no_truncate enabled=A: CREATE TRIGGER ck_perimeter_attest__no_truncate BEFORE TRUNCATE ON public.perimeter_attestations FOR EACH STATEMENT EXECUTE FUNCTION refuse_truncate()
+
+== foreign-key internal triggers (per constraint: count and enablement) ==
+account_types fk_accounts__scope: 2 enabled=OO
+account_types fk_accounts__type: 2 enabled=OO
+account_types fk_presentation__type: 2 enabled=OO
+account_types fk_types__mirror: 4 enabled=OOOO
+chart_presentation fk_presentation__fs_line: 2 enabled=OO
+chart_presentation fk_presentation__fs_line_contra: 2 enabled=OO
+chart_presentation fk_presentation__type: 2 enabled=OO
+chart_presentation fk_presentation__version: 2 enabled=OO
+chart_versions fk_fs_lines__version: 2 enabled=OO
+chart_versions fk_presentation__version: 2 enabled=OO
+fs_lines fk_fs_lines__version: 2 enabled=OO
+fs_lines fk_presentation__fs_line: 2 enabled=OO
+fs_lines fk_presentation__fs_line_contra: 2 enabled=OO
+ledger_account_balances fk_balances__account: 2 enabled=OO
+ledger_account_balances fk_balances__account_owner: 2 enabled=OO
+ledger_account_balances fk_balances__account_purpose: 2 enabled=OO
+ledger_account_balances fk_entries__stripe: 2 enabled=OO
+ledger_accounts fk_accounts__scope: 2 enabled=OO
+ledger_accounts fk_accounts__type: 2 enabled=OO
+ledger_accounts fk_balances__account: 2 enabled=OO
+ledger_accounts fk_balances__account_owner: 2 enabled=OO
+ledger_accounts fk_balances__account_purpose: 2 enabled=OO
+ledger_accounts fk_entries__account: 2 enabled=OO
+ledger_accounts fk_perimeter_attest__account: 2 enabled=OO
+ledger_accounts fk_period_balances__account: 2 enabled=OO
+ledger_entries fk_entries__account: 2 enabled=OO
+ledger_entries fk_entries__stripe: 2 enabled=OO
+ledger_entries fk_entries__txn: 2 enabled=OO
+ledger_entries fk_entries__txn_effective: 2 enabled=OO
+ledger_events fk_txn__event: 2 enabled=OO
+ledger_period_balances fk_period_balances__account: 2 enabled=OO
+ledger_period_balances fk_period_balances__close: 2 enabled=OO
+ledger_period_closes fk_closes__period: 2 enabled=OO
+ledger_period_closes fk_closes__txn: 2 enabled=OO
+ledger_period_closes fk_closes__txn_effective: 2 enabled=OO
+ledger_period_closes fk_closes__txn_kind: 2 enabled=OO
+ledger_period_closes fk_period_balances__close: 2 enabled=OO
+ledger_periods fk_closes__period: 2 enabled=OO
+ledger_transactions fk_closes__txn: 2 enabled=OO
+ledger_transactions fk_closes__txn_effective: 2 enabled=OO
+ledger_transactions fk_closes__txn_kind: 2 enabled=OO
+ledger_transactions fk_entries__txn: 2 enabled=OO
+ledger_transactions fk_entries__txn_effective: 2 enabled=OO
+ledger_transactions fk_txn__event: 2 enabled=OO
+ledger_transactions fk_txn__resolves: 4 enabled=OOOO
+ledger_transactions fk_txn__reverses: 4 enabled=OOOO
+perimeter_attestations fk_perimeter_attest__account: 2 enabled=OO
+
+== event triggers (evtenabled: A always, O origin, R replica, D disabled) ==
+ck_journal__no_drop on sql_drop enabled=A function=refuse_journal_ddl tags=[]
+ck_journal__no_inherit on ddl_command_end enabled=A function=refuse_journal_ddl tags=[CREATE TABLE, ALTER TABLE]
+ck_journal__no_rewrite on table_rewrite enabled=A function=refuse_journal_ddl tags=[]
+
+== row-level security policies ==
+ledger_account_balances rls_balances__recon permissive cmd=r roles=[openledger_recon] using=(true) check=()
+ledger_account_balances rls_balances__tenant permissive cmd=r roles=[openledger_read] using=((tenant_id = ( SELECT current_setting('app.tenant_id'::text, true) AS current_setting))) check=()
+ledger_account_balances rls_balances__writer permissive cmd=* roles=[openledger_app] using=(true) check=(true)
+ledger_accounts rls_accounts__recon permissive cmd=r roles=[openledger_recon] using=(true) check=()
+ledger_accounts rls_accounts__tenant permissive cmd=r roles=[openledger_read] using=((tenant_id = ( SELECT current_setting('app.tenant_id'::text, true) AS current_setting))) check=()
+ledger_accounts rls_accounts__writer permissive cmd=* roles=[openledger_app] using=(true) check=(true)
+ledger_entries rls_entries__recon permissive cmd=r roles=[openledger_recon] using=(true) check=()
+ledger_entries rls_entries__tenant permissive cmd=r roles=[openledger_read] using=((tenant_id = ( SELECT current_setting('app.tenant_id'::text, true) AS current_setting))) check=()
+ledger_entries rls_entries__writer permissive cmd=* roles=[openledger_app] using=(true) check=(true)
+ledger_events rls_events__recon permissive cmd=r roles=[openledger_recon] using=(true) check=()
+ledger_events rls_events__tenant permissive cmd=r roles=[openledger_read] using=((tenant_id = ( SELECT current_setting('app.tenant_id'::text, true) AS current_setting))) check=()
+ledger_events rls_events__writer permissive cmd=* roles=[openledger_app] using=(true) check=(true)
+ledger_period_balances rls_period_balances__recon permissive cmd=r roles=[openledger_recon] using=(true) check=()
+ledger_period_balances rls_period_balances__tenant permissive cmd=r roles=[openledger_read] using=((tenant_id = ( SELECT current_setting('app.tenant_id'::text, true) AS current_setting))) check=()
+ledger_period_balances rls_period_balances__writer permissive cmd=* roles=[openledger_app] using=(true) check=(true)
+ledger_period_closes rls_closes__recon permissive cmd=r roles=[openledger_recon] using=(true) check=()
+ledger_period_closes rls_closes__tenant permissive cmd=r roles=[openledger_read] using=((tenant_id = ( SELECT current_setting('app.tenant_id'::text, true) AS current_setting))) check=()
+ledger_period_closes rls_closes__writer permissive cmd=* roles=[openledger_app] using=(true) check=(true)
+ledger_periods rls_periods__recon permissive cmd=r roles=[openledger_recon] using=(true) check=()
+ledger_periods rls_periods__tenant permissive cmd=r roles=[openledger_read] using=((tenant_id = ( SELECT current_setting('app.tenant_id'::text, true) AS current_setting))) check=()
+ledger_periods rls_periods__writer permissive cmd=* roles=[openledger_app] using=(true) check=(true)
+ledger_transactions rls_txn__recon permissive cmd=r roles=[openledger_recon] using=(true) check=()
+ledger_transactions rls_txn__tenant permissive cmd=r roles=[openledger_read] using=((tenant_id = ( SELECT current_setting('app.tenant_id'::text, true) AS current_setting))) check=()
+ledger_transactions rls_txn__writer permissive cmd=* roles=[openledger_app] using=(true) check=(true)
+perimeter_attestations rls_perimeter_attest__recon permissive cmd=r roles=[openledger_recon] using=(true) check=()
+perimeter_attestations rls_perimeter_attest__tenant permissive cmd=r roles=[openledger_read] using=((tenant_id = ( SELECT current_setting('app.tenant_id'::text, true) AS current_setting))) check=()
+perimeter_attestations rls_perimeter_attest__writer permissive cmd=* roles=[openledger_app] using=(true) check=(true)
+
+== view definitions (pg_get_viewdef, every view) ==
+chart_lint:
+ SELECT 'type_unpresented'::text AS rule,
+    'error'::text AS severity,
+    (t.code || ' @ v'::text) || cv.version AS subject,
+    'account type has no chart_presentation row in chart version '::text || cv.version AS detail
+   FROM account_types t
+     CROSS JOIN chart_versions cv
+  WHERE NOT (EXISTS ( SELECT 1
+           FROM chart_presentation p
+          WHERE p.chart_version = cv.version AND p.type_code = t.code))
+UNION ALL
+ SELECT 'line_unreachable'::text AS rule,
+    'info'::text AS severity,
+    f.code AS subject,
+    'fs_line has no account type mapped to it in this chart version'::text AS detail
+   FROM fs_lines f,
+    chart_version_current cv
+  WHERE f.chart_version = cv.chart_version AND NOT (EXISTS ( SELECT 1
+           FROM chart_presentation p
+          WHERE p.chart_version = f.chart_version AND (p.fs_line = f.code OR p.fs_line_contra = f.code)))
+UNION ALL
+ SELECT 'per_shard_in_house_account'::text AS rule,
+    'error'::text AS severity,
+    t.code AS subject,
+    ('per_shard type held in '::text || count(*)) || ' house account(s): opposite-sign positions against different counterparties are already netted at write time'::text AS detail
+   FROM account_types t
+     JOIN ledger_accounts a ON a.purpose = t.code AND a.owner_type = 'house'::account_owner_type
+  WHERE t.counterparty_scope = 'per_shard'::text
+  GROUP BY t.code
+UNION ALL
+ SELECT 'shared_but_split_by_owner'::text AS rule,
+    'error'::text AS severity,
+    t.code AS subject,
+    ('counterparty_scope=shared but accounts are keyed to '::text || count(DISTINCT a.owner_id)) || ' distinct owners'::text AS detail
+   FROM account_types t
+     JOIN ledger_accounts a ON a.purpose = t.code AND a.owner_type <> 'house'::account_owner_type
+  WHERE t.counterparty_scope = 'shared'::text
+  GROUP BY t.code
+ HAVING count(DISTINCT a.owner_id) > 1
+UNION ALL
+ SELECT 'none_but_owner_keyed'::text AS rule,
+    'warn'::text AS severity,
+    t.code AS subject,
+    ('counterparty_scope=none but '::text || count(*)) || ' account(s) are owner-keyed'::text AS detail
+   FROM account_types t
+     JOIN ledger_accounts a ON a.purpose = t.code AND a.owner_type <> 'house'::account_owner_type
+  WHERE t.counterparty_scope = 'none'::text
+  GROUP BY t.code
+UNION ALL
+ SELECT 'perimeter_unattested'::text AS rule,
+    'error'::text AS severity,
+    (((t.code || ' / '::text) || a.tenant_id) || ' / '::text) || a.id::text AS subject,
+    'is_perimeter account carries posted entries and has no attestation'::text AS detail
+   FROM account_types t
+     JOIN ledger_accounts a ON a.purpose = t.code
+  WHERE t.is_perimeter AND (EXISTS ( SELECT 1
+           FROM ledger_entries e
+             JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id AND x.status = 'posted'::ledger_txn_status
+          WHERE e.tenant_id = a.tenant_id AND e.account_id = a.id)) AND NOT (EXISTS ( SELECT 1
+           FROM perimeter_attestations at
+          WHERE at.tenant_id = a.tenant_id AND at.account_id = a.id))
+UNION ALL
+ SELECT 'attested_but_not_perimeter'::text AS rule,
+    'warn'::text AS severity,
+    (a.purpose || ' / '::text) || at.source AS subject,
+    'attestation exists for an account whose type declares is_perimeter = false'::text AS detail
+   FROM perimeter_attestations at
+     JOIN ledger_accounts a ON a.tenant_id = at.tenant_id AND a.id = at.account_id AND a.currency = at.currency
+     JOIN account_types t ON t.code = a.purpose
+  WHERE NOT t.is_perimeter
+  GROUP BY a.purpose, at.source
+UNION ALL
+ SELECT 'perimeter_drift'::text AS rule,
+    'error'::text AS severity,
+    (((d.purpose || ' / '::text) || d.tenant_id) || ' / '::text) || d.source AS subject,
+    (((('ledger '::text || d.ledger_balance_minor) || ' against attested '::text) || d.external_balance_minor) || ' as of '::text) || d.as_of AS detail
+   FROM perimeter_drift d
+  WHERE d.drift_minor <> 0 AND d.as_of = (( SELECT max(d2.as_of) AS max
+           FROM perimeter_drift d2
+          WHERE d2.tenant_id = d.tenant_id AND d2.account_id = d.account_id AND d2.currency = d.currency AND d2.source = d.source))
+UNION ALL
+ SELECT 'mirror_same_side'::text AS rule,
+    'error'::text AS severity,
+    (t.code || ' / '::text) || t.mirror_type AS subject,
+    ((((('mirror pair '::text || t.code) || ' <-> '::text) || t.mirror_type) || ' share normal_balance '::text) || t.normal_balance::text) || '; a mirror must be opposite-signed to eliminate to zero'::text AS detail
+   FROM account_types t
+     JOIN account_types m ON m.code = t.mirror_type
+  WHERE t.mirror_type IS NOT NULL AND t.normal_balance = m.normal_balance
+UNION ALL
+ SELECT 'mirror_undeclared'::text AS rule,
+    'warn'::text AS severity,
+    t.code AS subject,
+    (('counterparty_scope='::text || t.counterparty_scope) || ' but no mirror_type declared, not a mirror target, and not a perimeter '::text) || 'account: a cross-scope position of this type is reconciled by nothing'::text AS detail
+   FROM account_types t
+  WHERE t.counterparty_scope <> 'none'::text AND (t.category = ANY (ARRAY['asset'::ledger_category, 'liability'::ledger_category])) AND NOT t.is_perimeter AND t.mirror_type IS NULL AND NOT (EXISTS ( SELECT 1
+           FROM account_types m
+          WHERE m.mirror_type = t.code)) AND (EXISTS ( SELECT 1
+           FROM ledger_accounts a
+          WHERE a.purpose = t.code AND a.owner_type <> 'house'::account_owner_type));
+chart_version_current:
+ SELECT max(version) AS chart_version
+   FROM chart_versions;
+close_disclosures:
+ SELECT c.tenant_id,
+    c.period_code,
+    c.currency,
+    c.computed_at_xid,
+    e.id AS entry_id,
+    e.transaction_id,
+    e.account_id,
+    e.direction,
+    e.amount_minor,
+    e.effective_at,
+    e.xact_id,
+    e.recorded_at
+   FROM ledger_period_closes c
+     JOIN ledger_entries e ON e.tenant_id = c.tenant_id AND e.currency = c.currency AND e.effective_at < c.ends_at AND e.xact_id >= c.computed_at_xid
+     JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id AND x.status = 'posted'::ledger_txn_status
+  WHERE NOT (EXISTS ( SELECT 1
+           FROM ledger_period_closes c2
+          WHERE c2.tenant_id = x.tenant_id AND c2.transaction_id = x.id));
+perimeter_drift:
+ SELECT at.tenant_id,
+    at.account_id,
+    a.purpose,
+    at.currency,
+    at.as_of,
+    at.source,
+    t.is_perimeter,
+    at.external_balance_minor,
+    COALESCE(ours.v, 0::bigint) AS ledger_balance_minor,
+    COALESCE(ours.v, 0::bigint) - at.external_balance_minor AS drift_minor
+   FROM perimeter_attestations at
+     JOIN ledger_accounts a ON a.tenant_id = at.tenant_id AND a.id = at.account_id AND a.currency = at.currency
+     JOIN account_types t ON t.code = a.purpose
+     LEFT JOIN LATERAL ( SELECT sum(
+                CASE
+                    WHEN e.direction = 'debit'::ledger_direction THEN e.amount_minor::numeric
+                    ELSE - e.amount_minor::numeric
+                END)::bigint AS v
+           FROM ledger_entries e
+             JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id AND x.status = 'posted'::ledger_txn_status
+          WHERE e.tenant_id = at.tenant_id AND e.account_id = at.account_id AND e.currency = at.currency AND e.effective_at < at.as_of_end) ours ON true;
+recon_balance_breaks:
+ WITH j AS (
+         SELECT e.tenant_id,
+            e.account_id,
+            e.currency,
+            e.stripe,
+            COALESCE(sum(e.amount_minor) FILTER (WHERE e.direction = 'debit'::ledger_direction AND x.status = 'posted'::ledger_txn_status), 0::numeric) AS posted_input,
+            COALESCE(sum(e.amount_minor) FILTER (WHERE e.direction = 'credit'::ledger_direction AND x.status = 'posted'::ledger_txn_status), 0::numeric) AS posted_output,
+            COALESCE(sum(e.amount_minor) FILTER (WHERE e.direction = 'debit'::ledger_direction AND x.status <> 'posted'::ledger_txn_status), 0::numeric) AS pending_input,
+            COALESCE(sum(e.amount_minor) FILTER (WHERE e.direction = 'credit'::ledger_direction AND x.status <> 'posted'::ledger_txn_status), 0::numeric) AS pending_output,
+            count(*) AS entry_count,
+            max(e.account_seq) AS max_seq
+           FROM ledger_entries e
+             JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+          GROUP BY e.tenant_id, e.account_id, e.currency, e.stripe
+        ), joined AS (
+         SELECT COALESCE(b.tenant_id, j.tenant_id) AS tenant_id,
+            COALESCE(b.account_id, j.account_id) AS account_id,
+            COALESCE(b.currency, j.currency) AS currency,
+            COALESCE(b.stripe, j.stripe) AS stripe,
+            b.tenant_id IS NULL AS cache_missing,
+            j.tenant_id IS NULL AS journal_empty,
+            COALESCE(b.input, 0::bigint) AS cache_input,
+            COALESCE(b.output, 0::bigint) AS cache_output,
+            COALESCE(b.last_seq, 0::bigint) AS cache_last_seq,
+            COALESCE(j.posted_input, 0::numeric) AS posted_input,
+            COALESCE(j.posted_output, 0::numeric) AS posted_output,
+            COALESCE(j.pending_input, 0::numeric) AS pending_input,
+            COALESCE(j.pending_output, 0::numeric) AS pending_output,
+            COALESCE(j.entry_count, 0::bigint) AS entry_count,
+            COALESCE(j.max_seq, 0::bigint) AS max_seq
+           FROM ledger_account_balances b
+             FULL JOIN j ON j.tenant_id = b.tenant_id AND j.account_id = b.account_id AND j.currency = b.currency AND j.stripe = b.stripe
+        )
+ SELECT tenant_id,
+    account_id,
+    currency,
+    stripe,
+    cache_input,
+    cache_output,
+    cache_input - cache_output AS cache_balance_minor,
+    posted_input,
+    posted_output,
+    posted_input - posted_output AS posted_balance_minor,
+    pending_input,
+    pending_output,
+    cache_last_seq,
+    max_seq,
+    entry_count,
+    cache_input::numeric - cache_output::numeric - (posted_input - posted_output) AS drift_minor,
+    cache_input::numeric + cache_output::numeric - (posted_input + posted_output) AS drift_turnover_minor,
+    array_remove(ARRAY[
+        CASE
+            WHEN cache_input::numeric <> posted_input OR cache_output::numeric <> posted_output THEN 'balance_drift'::text
+            ELSE NULL::text
+        END,
+        CASE
+            WHEN NOT cache_missing AND cache_last_seq < max_seq THEN 'seq_behind'::text
+            ELSE NULL::text
+        END,
+        CASE
+            WHEN NOT cache_missing AND cache_last_seq > max_seq THEN 'seq_ahead'::text
+            ELSE NULL::text
+        END,
+        CASE
+            WHEN entry_count <> max_seq THEN 'seq_gap'::text
+            ELSE NULL::text
+        END,
+        CASE
+            WHEN cache_missing THEN 'no_cache_row'::text
+            ELSE NULL::text
+        END,
+        CASE
+            WHEN journal_empty AND (cache_input <> 0 OR cache_output <> 0 OR cache_last_seq <> 0) THEN 'no_entries'::text
+            ELSE NULL::text
+        END], NULL::text) AS reasons
+   FROM joined
+  WHERE cache_input::numeric <> posted_input OR cache_output::numeric <> posted_output OR cache_missing OR NOT cache_missing AND cache_last_seq <> max_seq OR entry_count <> max_seq OR journal_empty AND (cache_input <> 0 OR cache_output <> 0 OR cache_last_seq <> 0);
+recon_checkpoint_breaks:
+ WITH recomputed AS (
+         SELECT c.tenant_id,
+            c.period_code,
+            c.currency,
+            e.account_id,
+            COALESCE(sum(e.amount_minor) FILTER (WHERE e.direction = 'debit'::ledger_direction), 0::numeric) AS input,
+            COALESCE(sum(e.amount_minor) FILTER (WHERE e.direction = 'credit'::ledger_direction), 0::numeric) AS output
+           FROM ledger_period_closes c
+             JOIN ledger_entries e ON e.tenant_id = c.tenant_id AND e.currency = c.currency AND e.effective_at < c.ends_at AND e.xact_id < c.computed_at_xid
+             JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id AND x.status = 'posted'::ledger_txn_status
+          GROUP BY c.tenant_id, c.period_code, c.currency, e.account_id
+        )
+ SELECT COALESCE(s.tenant_id, r.tenant_id) AS tenant_id,
+    COALESCE(s.period_code, r.period_code) AS period_code,
+    COALESCE(s.currency, r.currency) AS currency,
+    COALESCE(s.account_id, r.account_id) AS account_id,
+    COALESCE(s.input, 0::bigint) AS stored_input,
+    COALESCE(s.output, 0::bigint) AS stored_output,
+    COALESCE(r.input, 0::numeric) AS recomputed_input,
+    COALESCE(r.output, 0::numeric) AS recomputed_output,
+        CASE
+            WHEN s.account_id IS NULL THEN 'missing_row'::text
+            WHEN r.account_id IS NULL THEN 'spurious_row'::text
+            ELSE 'value_drift'::text
+        END AS reason
+   FROM ledger_period_balances s
+     FULL JOIN recomputed r ON r.tenant_id = s.tenant_id AND r.period_code = s.period_code AND r.currency = s.currency AND r.account_id = s.account_id
+  WHERE COALESCE(s.input, 0::bigint)::numeric <> COALESCE(r.input, 0::numeric) OR COALESCE(s.output, 0::bigint)::numeric <> COALESCE(r.output, 0::numeric);
+recon_close_breaks:
+ SELECT c.tenant_id,
+    c.period_code,
+    c.currency,
+    c.transaction_id,
+    c.computed_at_xid,
+    x.xact_id AS txn_xact_id,
+    'cursor_precedes_close'::text AS reason
+   FROM ledger_period_closes c
+     JOIN ledger_transactions x ON x.tenant_id = c.tenant_id AND x.id = c.transaction_id
+  WHERE c.computed_at_xid < x.xact_id;
+recon_cursor_breaks:
+ SELECT e.tenant_id,
+    e.id AS entry_id,
+    e.transaction_id,
+    e.xact_id,
+    x.xact_id AS txn_xact_id,
+        CASE
+            WHEN e.xact_id > pg_snapshot_xmin(pg_current_snapshot()) THEN 'above_horizon'::text
+            WHEN e.xact_id < x.xact_id THEN 'predates_txn'::text
+            ELSE NULL::text
+        END AS reason
+   FROM ledger_entries e
+     JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+  WHERE e.xact_id > pg_snapshot_xmin(pg_current_snapshot()) OR e.xact_id < x.xact_id;
+recon_entry_breaks:
+ SELECT e.tenant_id,
+    e.id AS entry_id,
+    e.transaction_id,
+    e.account_id,
+    e.currency,
+    e.direction,
+    e.amount_minor,
+    e.stripe,
+    e.account_seq,
+    e.effective_at,
+    e.recorded_at,
+        CASE
+            WHEN x.id IS NULL THEN 'no_transaction'::text
+            WHEN a.id IS NULL THEN 'no_account'::text
+            WHEN t.code IS NULL THEN 'no_account_type'::text
+            ELSE NULL::text
+        END AS reason
+   FROM ledger_entries e
+     LEFT JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+     LEFT JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id AND a.currency = e.currency
+     LEFT JOIN account_types t ON t.code = a.purpose
+  WHERE x.id IS NULL OR a.id IS NULL OR t.code IS NULL;
+recon_journal_to_reports:
+ WITH classified AS (
+         SELECT e.tenant_id,
+            e.currency,
+            e.direction,
+            e.amount_minor,
+                CASE
+                    WHEN x.id IS NULL OR a.id IS NULL OR t.code IS NULL THEN 'orphan'::text
+                    WHEN x.status <> 'posted'::ledger_txn_status AND (EXISTS ( SELECT 1
+                       FROM ledger_transactions rr
+                      WHERE rr.tenant_id = x.tenant_id AND (rr.resolves_id = x.id OR rr.reverses_id = x.id))) THEN 'superseded'::text
+                    WHEN x.status <> 'posted'::ledger_txn_status THEN 'pending'::text
+                    WHEN e.effective_at < '1900-01-01 00:00:00+00'::timestamp with time zone OR e.effective_at >= (now() + '1 year'::interval) THEN 'out_of_window'::text
+                    ELSE 'reported'::text
+                END AS bucket
+           FROM ledger_entries e
+             LEFT JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+             LEFT JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id AND a.currency = e.currency
+             LEFT JOIN account_types t ON t.code = a.purpose
+        ), j AS (
+         SELECT classified.tenant_id,
+            classified.currency,
+            COALESCE(sum(classified.amount_minor::numeric) FILTER (WHERE classified.direction = 'debit'::ledger_direction), 0::numeric) AS journal_debits,
+            COALESCE(sum(classified.amount_minor::numeric) FILTER (WHERE classified.direction = 'credit'::ledger_direction), 0::numeric) AS journal_credits,
+            COALESCE(sum(classified.amount_minor::numeric) FILTER (WHERE classified.direction = 'debit'::ledger_direction AND classified.bucket = 'pending'::text), 0::numeric) AS pending_debits,
+            COALESCE(sum(classified.amount_minor::numeric) FILTER (WHERE classified.direction = 'credit'::ledger_direction AND classified.bucket = 'pending'::text), 0::numeric) AS pending_credits,
+            COALESCE(sum(classified.amount_minor::numeric) FILTER (WHERE classified.direction = 'debit'::ledger_direction AND classified.bucket = 'superseded'::text), 0::numeric) AS superseded_debits,
+            COALESCE(sum(classified.amount_minor::numeric) FILTER (WHERE classified.direction = 'credit'::ledger_direction AND classified.bucket = 'superseded'::text), 0::numeric) AS superseded_credits,
+            COALESCE(sum(classified.amount_minor::numeric) FILTER (WHERE classified.direction = 'debit'::ledger_direction AND classified.bucket = 'out_of_window'::text), 0::numeric) AS out_of_window_debits,
+            COALESCE(sum(classified.amount_minor::numeric) FILTER (WHERE classified.direction = 'credit'::ledger_direction AND classified.bucket = 'out_of_window'::text), 0::numeric) AS out_of_window_credits,
+            COALESCE(sum(classified.amount_minor::numeric) FILTER (WHERE classified.direction = 'debit'::ledger_direction AND classified.bucket = 'orphan'::text), 0::numeric) AS orphan_debits,
+            COALESCE(sum(classified.amount_minor::numeric) FILTER (WHERE classified.direction = 'credit'::ledger_direction AND classified.bucket = 'orphan'::text), 0::numeric) AS orphan_credits,
+            COALESCE(sum(classified.amount_minor::numeric) FILTER (WHERE classified.direction = 'debit'::ledger_direction AND classified.bucket = 'reported'::text), 0::numeric) AS reported_debits,
+            COALESCE(sum(classified.amount_minor::numeric) FILTER (WHERE classified.direction = 'credit'::ledger_direction AND classified.bucket = 'reported'::text), 0::numeric) AS reported_credits
+           FROM classified
+          GROUP BY classified.tenant_id, classified.currency
+        ), r AS (
+         SELECT e.tenant_id,
+            e.currency,
+            COALESCE(sum(e.amount_minor::numeric) FILTER (WHERE e.direction = 'debit'::ledger_direction), 0::numeric) AS tb_debits,
+            COALESCE(sum(e.amount_minor::numeric) FILTER (WHERE e.direction = 'credit'::ledger_direction), 0::numeric) AS tb_credits
+           FROM ledger_entries e
+             JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id AND x.status = 'posted'::ledger_txn_status
+             JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id AND a.currency = e.currency
+             JOIN account_types ty ON ty.code = a.purpose
+             CROSS JOIN chart_version_current cv
+             JOIN chart_presentation p ON p.chart_version = cv.chart_version AND p.type_code = a.purpose
+          GROUP BY e.tenant_id, e.currency
+        )
+ SELECT COALESCE(j.tenant_id, r.tenant_id) AS tenant_id,
+    COALESCE(j.currency, r.currency) AS currency,
+    COALESCE(j.journal_debits, 0::numeric) AS journal_debits,
+    COALESCE(j.journal_credits, 0::numeric) AS journal_credits,
+    COALESCE(j.pending_debits, 0::numeric) AS pending_debits,
+    COALESCE(j.pending_credits, 0::numeric) AS pending_credits,
+    COALESCE(j.superseded_debits, 0::numeric) AS superseded_debits,
+    COALESCE(j.superseded_credits, 0::numeric) AS superseded_credits,
+    COALESCE(j.out_of_window_debits, 0::numeric) AS out_of_window_debits,
+    COALESCE(j.out_of_window_credits, 0::numeric) AS out_of_window_credits,
+    COALESCE(j.orphan_debits, 0::numeric) AS orphan_debits,
+    COALESCE(j.orphan_credits, 0::numeric) AS orphan_credits,
+    COALESCE(j.reported_debits, 0::numeric) AS reported_debits,
+    COALESCE(j.reported_credits, 0::numeric) AS reported_credits,
+    COALESCE(r.tb_debits, 0::numeric) AS tb_debits,
+    COALESCE(r.tb_credits, 0::numeric) AS tb_credits,
+    COALESCE(j.reported_debits, 0::numeric) - COALESCE(r.tb_debits, 0::numeric) AS unexplained_debits,
+    COALESCE(j.reported_credits, 0::numeric) - COALESCE(r.tb_credits, 0::numeric) AS unexplained_credits,
+    COALESCE(j.journal_debits, 0::numeric) - COALESCE(r.tb_debits, 0::numeric) AS journal_minus_report_debits
+   FROM j
+     FULL JOIN r ON r.tenant_id = j.tenant_id AND r.currency = j.currency;
+recon_pending_bridge:
+ WITH pend AS (
+         SELECT e.tenant_id,
+            e.account_id,
+            e.currency,
+            COALESCE(sum(e.amount_minor) FILTER (WHERE e.direction = 'debit'::ledger_direction), 0::numeric) AS pending_debits,
+            COALESCE(sum(e.amount_minor) FILTER (WHERE e.direction = 'credit'::ledger_direction), 0::numeric) AS pending_credits,
+            count(DISTINCT e.transaction_id) AS pending_txns,
+            min(x.effective_at) AS oldest_pending_effective_at
+           FROM ledger_entries e
+             JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+          WHERE x.status <> 'posted'::ledger_txn_status AND NOT (EXISTS ( SELECT 1
+                   FROM ledger_transactions rr
+                  WHERE rr.tenant_id = x.tenant_id AND (rr.resolves_id = x.id OR rr.reverses_id = x.id)))
+          GROUP BY e.tenant_id, e.account_id, e.currency
+        ), cache AS (
+         SELECT b.tenant_id,
+            b.account_id,
+            b.currency,
+            sum(b.input - b.output) AS posted_balance_minor
+           FROM ledger_account_balances b
+          GROUP BY b.tenant_id, b.account_id, b.currency
+        )
+ SELECT p.tenant_id,
+    p.account_id,
+    a.purpose,
+    p.currency,
+    COALESCE(c.posted_balance_minor, 0::numeric) AS posted_balance_minor,
+    p.pending_debits - p.pending_credits AS pending_balance_minor,
+    COALESCE(c.posted_balance_minor, 0::numeric) + (p.pending_debits - p.pending_credits) AS available_balance_minor,
+    p.pending_debits,
+    p.pending_credits,
+    p.pending_txns,
+    p.oldest_pending_effective_at
+   FROM pend p
+     JOIN ledger_accounts a ON a.tenant_id = p.tenant_id AND a.id = p.account_id AND a.currency = p.currency
+     LEFT JOIN cache c ON c.tenant_id = p.tenant_id AND c.account_id = p.account_id AND c.currency = p.currency;
+recon_scope_breaks:
+ WITH pairs AS (
+         SELECT t.code AS near_type,
+            t.mirror_type AS far_type
+           FROM account_types t
+             JOIN account_types m ON m.code = t.mirror_type
+          WHERE t.mirror_type IS NOT NULL
+        ), near AS (
+         SELECT p.near_type,
+            p.far_type,
+            tb.currency,
+            tb.tenant_id AS counterparty,
+            sum(tb.balance_debit_positive) AS near_minor
+           FROM pairs p
+             JOIN trial_balance tb ON tb.purpose = p.near_type
+          GROUP BY p.near_type, p.far_type, tb.currency, tb.tenant_id
+        ), far AS (
+         SELECT p.near_type,
+            p.far_type,
+            tb.currency,
+            tb.owner_id AS counterparty,
+            sum(tb.balance_debit_positive) AS far_minor
+           FROM pairs p
+             JOIN trial_balance tb ON tb.purpose = p.far_type
+          GROUP BY p.near_type, p.far_type, tb.currency, tb.owner_id
+        )
+ SELECT COALESCE(n.near_type, f.near_type) AS near_type,
+    COALESCE(n.far_type, f.far_type) AS far_type,
+    COALESCE(n.currency, f.currency) AS currency,
+    COALESCE(n.counterparty, f.counterparty) AS counterparty,
+    COALESCE(n.near_minor, 0::numeric) AS near_minor,
+    COALESCE(f.far_minor, 0::numeric) AS far_minor,
+    COALESCE(n.near_minor, 0::numeric) + COALESCE(f.far_minor, 0::numeric) AS gap_minor
+   FROM near n
+     FULL JOIN far f ON f.near_type = n.near_type AND f.far_type = n.far_type AND f.currency = n.currency AND NOT f.counterparty IS DISTINCT FROM n.counterparty
+  WHERE (COALESCE(n.near_minor, 0::numeric) + COALESCE(f.far_minor, 0::numeric)) <> 0::numeric;
+recon_transaction_breaks:
+ WITH legs AS (
+         SELECT e.tenant_id,
+            e.transaction_id,
+            e.currency,
+            COALESCE(sum(e.amount_minor) FILTER (WHERE e.direction = 'debit'::ledger_direction), 0::numeric) AS debits,
+            COALESCE(sum(e.amount_minor) FILTER (WHERE e.direction = 'credit'::ledger_direction), 0::numeric) AS credits,
+            count(*) AS leg_count
+           FROM ledger_entries e
+          GROUP BY e.tenant_id, e.transaction_id, e.currency
+        )
+ SELECT x.tenant_id,
+    x.id AS transaction_id,
+    x.status,
+    x.kind,
+    x.effective_at,
+    x.recorded_at,
+    g.currency,
+    COALESCE(g.debits, 0::numeric) AS debits,
+    COALESCE(g.credits, 0::numeric) AS credits,
+    COALESCE(g.debits, 0::numeric) - COALESCE(g.credits, 0::numeric) AS imbalance_minor,
+    COALESCE(g.leg_count, 0::bigint) AS leg_count,
+        CASE
+            WHEN g.transaction_id IS NULL THEN 'no_entries'::text
+            WHEN g.leg_count = 1 THEN 'single_leg'::text
+            ELSE 'debits_ne_credits'::text
+        END AS reason
+   FROM ledger_transactions x
+     LEFT JOIN legs g ON g.tenant_id = x.tenant_id AND g.transaction_id = x.id
+  WHERE g.transaction_id IS NULL OR g.debits <> g.credits;
+reconciliation:
+ SELECT 'balance_cache'::text AS check_name,
+    count(*) AS breaks
+   FROM recon_balance_breaks
+UNION ALL
+ SELECT 'orphan_entries'::text AS check_name,
+    count(*) AS breaks
+   FROM recon_entry_breaks
+UNION ALL
+ SELECT 'unbalanced_transactions'::text AS check_name,
+    count(*) AS breaks
+   FROM recon_transaction_breaks
+UNION ALL
+ SELECT 'cross_scope_mirror'::text AS check_name,
+    count(*) AS breaks
+   FROM recon_scope_breaks
+UNION ALL
+ SELECT 'journal_to_reports'::text AS check_name,
+    count(*) AS breaks
+   FROM recon_journal_to_reports
+  WHERE recon_journal_to_reports.unexplained_debits <> 0::numeric OR recon_journal_to_reports.unexplained_credits <> 0::numeric
+UNION ALL
+ SELECT 'checkpoint_drift'::text AS check_name,
+    count(*) AS breaks
+   FROM recon_checkpoint_breaks
+UNION ALL
+ SELECT 'close_typing'::text AS check_name,
+    count(*) AS breaks
+   FROM recon_close_breaks
+UNION ALL
+ SELECT 'cursor_forgery'::text AS check_name,
+    count(*) AS breaks
+   FROM recon_cursor_breaks
+UNION ALL
+ SELECT 'accounting_equation'::text AS check_name,
+    count(*) AS breaks
+   FROM recon_equation_breaks(report_cursor(), 'infinity'::timestamp with time zone) recon_equation_breaks(tenant_id, currency, assets_minor, liab_equity_minor, gap_minor)
+UNION ALL
+ SELECT 'chart_lint'::text AS check_name,
+    count(*) AS breaks
+   FROM chart_lint
+  WHERE chart_lint.severity = 'error'::text;
+trial_balance:
+ SELECT a.tenant_id,
+    a.id AS account_id,
+    a.owner_id,
+    a.purpose,
+    t.category,
+    t.normal_balance,
+    e.currency,
+    COALESCE(sum(e.amount_minor) FILTER (WHERE e.direction = 'debit'::ledger_direction), 0::numeric) AS debits,
+    COALESCE(sum(e.amount_minor) FILTER (WHERE e.direction = 'credit'::ledger_direction), 0::numeric) AS credits,
+        CASE
+            WHEN t.normal_balance = 'debit'::ledger_normal_balance THEN sum(
+            CASE
+                WHEN e.direction = 'debit'::ledger_direction THEN e.amount_minor
+                ELSE - e.amount_minor
+            END)
+            ELSE sum(
+            CASE
+                WHEN e.direction = 'credit'::ledger_direction THEN e.amount_minor
+                ELSE - e.amount_minor
+            END)
+        END AS balance_minor,
+    sum(
+        CASE
+            WHEN e.direction = 'debit'::ledger_direction THEN e.amount_minor
+            ELSE - e.amount_minor
+        END) AS balance_debit_positive
+   FROM ledger_entries e
+     JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id AND x.status = 'posted'::ledger_txn_status
+     JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id AND a.currency = e.currency
+     JOIN account_types t ON t.code = a.purpose
+  GROUP BY a.tenant_id, a.id, a.owner_id, a.purpose, t.category, t.normal_balance, e.currency;
+
+== functions (pg_get_functiondef, migration-owned only) ==
+CREATE OR REPLACE FUNCTION public.balance_sheet_at(p_tenant text, p_asof timestamp with time zone, p_cursor xid8, p_chart_version integer DEFAULT NULL::integer)
+ RETURNS TABLE(tenant_id text, currency character, chart_version integer, fs_line text, caption text, sort_order integer, amount_minor bigint, side text, pinned_cursor xid8)
+ LANGUAGE plpgsql
+ STABLE
+AS $function$
+DECLARE
+    v_cv int;
+BEGIN
+    v_cv := COALESCE(p_chart_version, (SELECT max(cvx.version) FROM chart_versions cvx));
+    IF v_cv IS NULL THEN
+        RAISE EXCEPTION 'no chart version exists: seed a chart before running a statement'
+            USING ERRCODE = '23514';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM chart_versions cvx WHERE cvx.version = v_cv) THEN
+        RAISE EXCEPTION 'chart version % does not exist', v_cv USING ERRCODE = '23514';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM ledger_entries e
+        JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+                                  AND x.status = 'posted'
+        JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
+                              AND a.currency = e.currency
+        WHERE e.tenant_id = p_tenant
+          AND e.effective_at < p_asof
+          AND e.xact_id < p_cursor
+          AND NOT EXISTS (SELECT 1 FROM chart_presentation p
+                          WHERE p.chart_version = v_cv AND p.type_code = a.purpose)
+    ) THEN
+        RAISE EXCEPTION
+          'chart version % does not present every account type with posted entries as at this instant (chart_lint.type_unpresented)',
+          v_cv USING ERRCODE = '23514';
+    END IF;
+
+    RETURN QUERY
+    WITH scopes AS (
+        -- Enumerated from the ACCOUNTS, not from the entries. A scope that has been
+        -- opened but has not yet posted anything is still a scope, and a report that
+        -- cannot name it cannot claim completeness over it. HONEST LIMIT: this is
+        -- still enumeration from data, one level further out -- there is no tenant
+        -- registry, so a scope with no accounts at all remains invisible.
+        SELECT DISTINCT l.tenant_id, l.currency FROM ledger_accounts l
+        WHERE l.tenant_id = p_tenant
+    ), pos AS (
+        -- HALF-OPEN (effective_at < p_asof), to match the period model and the
+        -- income statement: a balance sheet "as at ends_at" is the period's closing
+        -- position, [starts_at, ends_at) (ADR-0011).
+        SELECT e.tenant_id, e.currency, e.account_id,
+               p.category, p.counterparty_scope, p.fs_line, p.fs_line_contra,
+               SUM(CASE WHEN e.direction='debit' THEN e.amount_minor::numeric
+                        ELSE -e.amount_minor::numeric END) AS v
+        FROM ledger_entries e
+        JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+                                  AND x.status = 'posted'
+        JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
+                              AND a.currency  = e.currency
+        JOIN chart_presentation p ON p.chart_version = v_cv AND p.type_code = a.purpose
+        WHERE e.tenant_id = p_tenant AND e.effective_at < p_asof AND e.xact_id < p_cursor
+        GROUP BY e.tenant_id, e.currency, e.account_id,
+                 p.category, p.counterparty_scope, p.fs_line, p.fs_line_contra
+    ), dp AS (
+        -- ROUTE ON POSITION SIGN (ADR-0012, amended by A10). A position that has
+        -- swung to the opposite side of its normal presents on its declared CONTRA
+        -- line -- for ANY balance-sheet type that declares one, not only per_shard.
+        -- Sign-swing is orthogonal to sharding: a `shared` payable that has gone
+        -- into a receivable position must present gross under its contra line, not
+        -- net to zero against another payable on the same line.
+        SELECT pos.tenant_id, pos.currency, pos.category,
+               CASE WHEN pos.fs_line_contra IS NOT NULL
+                         AND ((pos.category = 'asset'     AND pos.v < 0)
+                           OR (pos.category = 'liability' AND pos.v > 0))
+                    THEN pos.fs_line_contra ELSE pos.fs_line END AS fs_line,
+               pos.v
+        FROM pos
+    ), lines AS (
+        SELECT s.tenant_id, s.currency,
+               f.code AS fs_line, f.caption, f.sort_order, f.side,
+               COALESCE(SUM(CASE WHEN f.side = 'asset' THEN d.v ELSE -d.v END), 0)::bigint
+                   AS amount_minor
+        FROM scopes s
+        JOIN fs_lines f ON f.chart_version = v_cv
+        LEFT JOIN dp d ON d.tenant_id = s.tenant_id AND d.currency = s.currency
+                      AND d.fs_line = f.code
+        WHERE f.statement = 'balance_sheet'
+        GROUP BY s.tenant_id, s.currency, f.code, f.caption, f.sort_order, f.side
+    ), plug AS (
+        -- THE UN-CLOSED-EARNINGS PLUG (A3, replacing the max(ends_at) watermark).
+        -- The net of ALL temporary (revenue/expense) positions at the cursor,
+        -- INCLUDING closing entries. A closed period's operational entries and its
+        -- closing reversal cancel, so what remains is exactly earnings not yet
+        -- closed at this cursor: no watermark to walk, no ledger_period_closes read,
+        -- and a caption that cannot move under a fixed cursor (a caption that moves
+        -- under a fixed cursor is itself a reproducibility break). A backdated
+        -- arrival above a close cursor is un-closed until a later close sweeps it,
+        -- and shows here rather than dropping from equity forever.
+        SELECT s.tenant_id, s.currency,
+               (-COALESCE((
+                   SELECT SUM(CASE WHEN e.direction='debit' THEN e.amount_minor::numeric
+                                   ELSE -e.amount_minor::numeric END)
+                   FROM ledger_entries e
+                   JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+                                             AND x.status = 'posted'
+                   JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
+                                         AND a.currency = e.currency
+                   JOIN chart_presentation p ON p.chart_version = v_cv AND p.type_code = a.purpose
+                   WHERE e.tenant_id = s.tenant_id AND e.currency = s.currency
+                     AND e.effective_at < p_asof AND e.xact_id < p_cursor
+                     AND p.category IN ('revenue','expense')
+               ), 0))::bigint AS amount_minor
+        FROM scopes s
+    )
+    SELECT l.tenant_id, l.currency, v_cv, l.fs_line, l.caption, l.sort_order,
+           l.amount_minor, l.side, p_cursor
+    FROM lines l
+    UNION ALL
+    -- The synthesised un-closed-earnings plug. Its side is 'equity'. The caption is
+    -- CONSTANT (A3): the plug always means "earnings not yet closed to retained
+    -- earnings", so it does not change with whether a close has happened.
+    SELECT g.tenant_id, g.currency, v_cv, 'current_year_earnings',
+           'Undistributed earnings (since inception)', 9000,
+           g.amount_minor, 'equity', p_cursor
+    FROM plug g
+    ORDER BY 1, 2, 6;
+END $function$
+
+CREATE OR REPLACE FUNCTION public.income_statement_for(p_tenant text, p_from timestamp with time zone, p_to timestamp with time zone, p_cursor xid8, p_chart_version integer DEFAULT NULL::integer)
+ RETURNS TABLE(tenant_id text, currency character, chart_version integer, fs_line text, caption text, sort_order integer, amount_minor bigint, side text, pinned_cursor xid8)
+ LANGUAGE plpgsql
+ STABLE
+AS $function$
+DECLARE
+    v_cv int;
+BEGIN
+    -- A13: the chart version must EXIST. The old COALESCE never touched
+    -- chart_versions, so income_statement_for(..., 999) returned a fabricated,
+    -- all-zero, perfectly balanced statement citing a version nobody created.
+    v_cv := COALESCE(p_chart_version, (SELECT max(cvx.version) FROM chart_versions cvx));
+    IF v_cv IS NULL THEN
+        RAISE EXCEPTION 'no chart version exists: seed a chart before running a statement'
+            USING ERRCODE = '23514';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM chart_versions cvx WHERE cvx.version = v_cv) THEN
+        RAISE EXCEPTION 'chart version % does not exist', v_cv USING ERRCODE = '23514';
+    END IF;
+    -- A14: an in-scope account WITH posted entries in-window whose type has no
+    -- chart_presentation row at this version is silently DROPPED by the INNER JOIN
+    -- below -- a whole sub-book vanishing with the statement still balanced. Refuse.
+    IF EXISTS (
+        SELECT 1
+        FROM ledger_entries e
+        JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+                                  AND x.status = 'posted'
+        JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
+                              AND a.currency = e.currency
+        WHERE e.tenant_id = p_tenant
+          AND e.effective_at >= p_from AND e.effective_at < p_to
+          AND e.xact_id < p_cursor
+          AND NOT EXISTS (SELECT 1 FROM chart_presentation p
+                          WHERE p.chart_version = v_cv AND p.type_code = a.purpose)
+    ) THEN
+        RAISE EXCEPTION
+          'chart version % does not present every account type with posted entries in this window (chart_lint.type_unpresented)',
+          v_cv USING ERRCODE = '23514';
+    END IF;
+
+    RETURN QUERY
+    WITH dp AS (
+        SELECT e.tenant_id, e.currency, p.fs_line,
+               SUM(CASE WHEN e.direction='debit' THEN e.amount_minor::numeric
+                        ELSE -e.amount_minor::numeric END) AS v
+        FROM ledger_entries e
+        JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+                                  AND x.status = 'posted'
+        JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
+                              AND a.currency = e.currency
+        JOIN chart_presentation p ON p.chart_version = v_cv AND p.type_code = a.purpose
+        WHERE e.tenant_id = p_tenant
+          AND e.effective_at >= p_from AND e.effective_at < p_to
+          AND e.xact_id < p_cursor
+          AND NOT EXISTS (SELECT 1 FROM ledger_period_closes c
+                          WHERE c.tenant_id = x.tenant_id AND c.transaction_id = x.id)
+        GROUP BY e.tenant_id, e.currency, p.fs_line
+    ), scopes AS (SELECT DISTINCT l.tenant_id, l.currency FROM ledger_accounts l
+                  WHERE l.tenant_id = p_tenant)
+    SELECT s.tenant_id, s.currency, v_cv, f.code, f.caption, f.sort_order,
+           -- credit-normal lines (revenue) present positive; debit-normal (expense) too
+           (CASE WHEN f.side = 'credit' THEN -1 ELSE 1 END * COALESCE(SUM(d.v), 0))::bigint,
+           f.side, p_cursor
+    FROM scopes s
+    JOIN fs_lines f ON f.chart_version = v_cv
+    LEFT JOIN dp d ON d.tenant_id = s.tenant_id AND d.currency = s.currency AND d.fs_line = f.code
+    WHERE f.statement = 'income_statement'
+    GROUP BY s.tenant_id, s.currency, f.code, f.caption, f.sort_order, f.side
+    -- ORDERED BY THE CHART. sort_order was written by the seed and read by
+    -- nothing, so every value in it could be changed with the suite green -- and the
+    -- assertion that claimed to check the order was reading PHYSICAL ROW ORDER.
+    ORDER BY 1, 2, 6;
+END $function$
+
+CREATE OR REPLACE FUNCTION public.recon_equation_breaks(p_cursor xid8, p_asof timestamp with time zone)
+ RETURNS TABLE(tenant_id text, currency character, assets_minor numeric, liab_equity_minor numeric, gap_minor numeric)
+ LANGUAGE sql
+ STABLE
+AS $function$
+    WITH tenants AS (SELECT DISTINCT l.tenant_id FROM ledger_accounts l),
+    bs AS (
+        SELECT b.tenant_id, b.currency, b.side, b.amount_minor
+        FROM tenants tn
+        CROSS JOIN LATERAL balance_sheet_at(tn.tenant_id, p_asof, p_cursor) b
+    )
+    SELECT bs.tenant_id, bs.currency,
+           COALESCE(SUM(bs.amount_minor::numeric) FILTER (WHERE bs.side = 'asset'), 0) AS assets_minor,
+           COALESCE(SUM(bs.amount_minor::numeric) FILTER (WHERE bs.side IN ('liability','equity')), 0) AS liab_equity_minor,
+           COALESCE(SUM(bs.amount_minor::numeric) FILTER (WHERE bs.side = 'asset'), 0)
+             - COALESCE(SUM(bs.amount_minor::numeric) FILTER (WHERE bs.side IN ('liability','equity')), 0) AS gap_minor
+    FROM bs
+    GROUP BY bs.tenant_id, bs.currency
+    HAVING COALESCE(SUM(bs.amount_minor::numeric) FILTER (WHERE bs.side = 'asset'), 0)
+        <> COALESCE(SUM(bs.amount_minor::numeric) FILTER (WHERE bs.side IN ('liability','equity')), 0);
+$function$
+
+CREATE OR REPLACE FUNCTION public.refuse_journal_ddl()
+ RETURNS event_trigger
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    protected CONSTANT text[] := ARRAY['public.ledger_entries',
+                                       'public.ledger_transactions',
+                                       'public.ledger_events',
+                                       'public.chart_versions',
+                                       'public.fs_lines',
+                                       'public.chart_presentation',
+                                       'public.perimeter_attestations',
+                                       'public.ledger_periods',
+                                       'public.ledger_period_closes'];
+    victim  text;
+BEGIN
+    IF TG_EVENT = 'table_rewrite' THEN
+        victim := (SELECT format('%s.%s', n.nspname, c.relname)
+                   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                   WHERE c.oid = pg_event_trigger_table_rewrite_oid());
+        IF victim = ANY (protected) THEN
+            RAISE EXCEPTION
+              '% is posted history and may not be rewritten by DDL (rewrite reason %)',
+              victim, pg_event_trigger_table_rewrite_reason()
+              USING ERRCODE = '23514',
+                    HINT = 'Add a new column or a new table; posted rows are not editable, by DDL either.';
+        END IF;
+
+    ELSIF TG_EVENT = 'sql_drop' THEN
+        -- named as TEXT, not regclass: by the time sql_drop fires the relation is
+        -- gone, and 'ledger_entries'::regclass raises `relation does not exist`.
+        SELECT format('%s.%s', schema_name, object_name) INTO victim
+        FROM pg_event_trigger_dropped_objects()
+        WHERE object_type = 'table'
+          AND format('%s.%s', schema_name, object_name) = ANY (protected)
+        LIMIT 1;
+        IF victim IS NOT NULL THEN
+            RAISE EXCEPTION '% is posted history and may not be dropped', victim
+              USING ERRCODE = '23514';
+        END IF;
+
+    ELSE  -- ddl_command_end. A STATE assertion, not a command parse: it asks whether
+          -- a protected table has acquired a child, so CREATE TABLE ... INHERITS and
+          -- ALTER TABLE ... INHERIT are both caught without knowing either grammar.
+        SELECT format('%s.%s', cn.nspname, c.relname) INTO victim
+        FROM pg_inherits i
+        JOIN pg_class c      ON c.oid  = i.inhrelid
+        JOIN pg_namespace cn ON cn.oid = c.relnamespace
+        JOIN pg_class p      ON p.oid  = i.inhparent
+        JOIN pg_namespace pn ON pn.oid = p.relnamespace
+        WHERE format('%s.%s', pn.nspname, p.relname) = ANY (protected)
+        LIMIT 1;
+        IF victim IS NOT NULL THEN
+            RAISE EXCEPTION
+              '% inherits from posted history: a child carries none of the parent''s keys or triggers and is visible through it to every report',
+              victim USING ERRCODE = '23514';
+        END IF;
+    END IF;
+END $function$
+
+CREATE OR REPLACE FUNCTION public.refuse_mutation()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+    RAISE EXCEPTION '% is append-only: % on % refused. Correct it with a new row.',
+        TG_TABLE_NAME, TG_OP, COALESCE(to_jsonb(OLD)->>'id', '(row)')
+        USING ERRCODE = '23514';
+END $function$
+
+CREATE OR REPLACE FUNCTION public.refuse_stale_chart_version()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    current_max int;
+BEGIN
+    SELECT max(version) INTO current_max FROM chart_versions;
+    IF current_max IS NOT NULL AND NEW.chart_version < current_max THEN
+        RAISE EXCEPTION
+          '% names chart version %, below the current maximum % -- a superseded '
+          'chart version is frozen history; append a new version instead',
+          TG_TABLE_NAME, NEW.chart_version, current_max
+          USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END $function$
+
+CREATE OR REPLACE FUNCTION public.refuse_truncate()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+    RAISE EXCEPTION '% is history and cannot be truncated', TG_TABLE_NAME
+        USING ERRCODE = '23514';
+END $function$
+
+CREATE OR REPLACE FUNCTION public.report_cursor()
+ RETURNS xid8
+ LANGUAGE sql
+AS $function$
+    SELECT pg_snapshot_xmin(pg_current_snapshot())
+$function$
+
+CREATE OR REPLACE FUNCTION public.trial_balance_at(p_tenant text, p_from timestamp with time zone, p_to timestamp with time zone, p_cursor xid8)
+ RETURNS TABLE(tenant_id text, account_id uuid, purpose text, category ledger_category, currency character, debits bigint, credits bigint, balance_debit_positive bigint)
+ LANGUAGE sql
+ STABLE
+AS $function$
+-- amount_minor is summed as `numeric` and cast back at the end (ADR-0013): a
+-- single huge-but-legal row overflows a running bigint SUM and raises the whole
+-- SELECT, and a report that dies on one large row reports nothing.
+SELECT a.tenant_id, a.id, a.purpose, t.category, e.currency,
+       COALESCE(SUM(e.amount_minor::numeric) FILTER (WHERE e.direction='debit'), 0)::bigint,
+       COALESCE(SUM(e.amount_minor::numeric) FILTER (WHERE e.direction='credit'), 0)::bigint,
+       SUM(CASE WHEN e.direction='debit' THEN e.amount_minor::numeric ELSE -e.amount_minor::numeric END)::bigint
+FROM ledger_entries e
+JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+                          AND x.status = 'posted'
+JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
+                      AND a.currency = e.currency
+JOIN account_types   t ON t.code = a.purpose
+WHERE a.tenant_id = p_tenant
+  AND e.effective_at >= p_from AND e.effective_at < p_to
+  AND e.xact_id < p_cursor
+GROUP BY a.tenant_id, a.id, a.purpose, t.category, e.currency;
+$function$
+
+
+== roles (openledger_*) ==
+openledger_app login=false super=false inherit=true createrole=false createdb=false replication=false bypassrls=false
+openledger_read login=false super=false inherit=true createrole=false createdb=false replication=false bypassrls=false
+openledger_recon login=false super=false inherit=true createrole=false createdb=false replication=false bypassrls=false
+
+== schema acl (public) ==
+PUBLIC USAGE
+openledger_app USAGE
+openledger_read USAGE
+openledger_recon USAGE
+pg_database_owner CREATE
+pg_database_owner USAGE
+
+== relation grants (to openledger_* and PUBLIC) ==
+account_types: openledger_app SELECT
+account_types: openledger_read SELECT
+account_types: openledger_recon SELECT
+chart_lint: openledger_app SELECT
+chart_lint: openledger_recon SELECT
+chart_presentation: openledger_app SELECT
+chart_presentation: openledger_read SELECT
+chart_presentation: openledger_recon SELECT
+chart_version_current: openledger_app SELECT
+chart_version_current: openledger_read SELECT
+chart_version_current: openledger_recon SELECT
+chart_versions: openledger_app SELECT
+chart_versions: openledger_read SELECT
+chart_versions: openledger_recon SELECT
+close_disclosures: openledger_recon SELECT
+fs_lines: openledger_app SELECT
+fs_lines: openledger_read SELECT
+fs_lines: openledger_recon SELECT
+ledger_account_balances: openledger_app INSERT
+ledger_account_balances: openledger_app SELECT
+ledger_account_balances: openledger_read SELECT
+ledger_account_balances: openledger_recon SELECT
+ledger_accounts: openledger_app INSERT
+ledger_accounts: openledger_app SELECT
+ledger_accounts: openledger_read SELECT
+ledger_accounts: openledger_recon SELECT
+ledger_entries: openledger_app SELECT
+ledger_entries: openledger_read SELECT
+ledger_entries: openledger_recon SELECT
+ledger_events: openledger_app SELECT
+ledger_events: openledger_read SELECT
+ledger_events: openledger_recon SELECT
+ledger_period_balances: openledger_app INSERT
+ledger_period_balances: openledger_app SELECT
+ledger_period_balances: openledger_read SELECT
+ledger_period_balances: openledger_recon SELECT
+ledger_period_closes: openledger_app INSERT
+ledger_period_closes: openledger_app SELECT
+ledger_period_closes: openledger_read SELECT
+ledger_period_closes: openledger_recon SELECT
+ledger_periods: openledger_app INSERT
+ledger_periods: openledger_app SELECT
+ledger_periods: openledger_read SELECT
+ledger_periods: openledger_recon SELECT
+ledger_transactions: openledger_app SELECT
+ledger_transactions: openledger_read SELECT
+ledger_transactions: openledger_recon SELECT
+perimeter_attestations: openledger_app INSERT
+perimeter_attestations: openledger_app SELECT
+perimeter_attestations: openledger_read SELECT
+perimeter_attestations: openledger_recon SELECT
+perimeter_drift: openledger_app SELECT
+perimeter_drift: openledger_recon SELECT
+recon_balance_breaks: openledger_recon SELECT
+recon_checkpoint_breaks: openledger_recon SELECT
+recon_close_breaks: openledger_recon SELECT
+recon_cursor_breaks: openledger_recon SELECT
+recon_entry_breaks: openledger_recon SELECT
+recon_journal_to_reports: openledger_recon SELECT
+recon_pending_bridge: openledger_app SELECT
+recon_pending_bridge: openledger_recon SELECT
+recon_scope_breaks: openledger_recon SELECT
+recon_transaction_breaks: openledger_recon SELECT
+reconciliation: openledger_recon SELECT
+trial_balance: openledger_app SELECT
+trial_balance: openledger_read SELECT
+trial_balance: openledger_recon SELECT
+
+== column grants (to openledger_* and PUBLIC) ==
+ledger_account_balances.input: openledger_app UPDATE
+ledger_account_balances.last_seq: openledger_app UPDATE
+ledger_account_balances.output: openledger_app UPDATE
+ledger_account_balances.updated_at: openledger_app UPDATE
+ledger_entries.account_id: openledger_app INSERT
+ledger_entries.account_seq: openledger_app INSERT
+ledger_entries.amount_minor: openledger_app INSERT
+ledger_entries.currency: openledger_app INSERT
+ledger_entries.direction: openledger_app INSERT
+ledger_entries.effective_at: openledger_app INSERT
+ledger_entries.id: openledger_app INSERT
+ledger_entries.stripe: openledger_app INSERT
+ledger_entries.tenant_id: openledger_app INSERT
+ledger_entries.transaction_id: openledger_app INSERT
+ledger_events.effective_at: openledger_app INSERT
+ledger_events.id: openledger_app INSERT
+ledger_events.idempotency_hash: openledger_app INSERT
+ledger_events.idempotency_key: openledger_app INSERT
+ledger_events.kind: openledger_app INSERT
+ledger_events.payload: openledger_app INSERT
+ledger_events.source: openledger_app INSERT
+ledger_events.tenant_id: openledger_app INSERT
+ledger_transactions.effective_at: openledger_app INSERT
+ledger_transactions.event_id: openledger_app INSERT
+ledger_transactions.external_ref: openledger_app INSERT
+ledger_transactions.id: openledger_app INSERT
+ledger_transactions.kind: openledger_app INSERT
+ledger_transactions.metadata: openledger_app INSERT
+ledger_transactions.resolves_id: openledger_app INSERT
+ledger_transactions.reverses_id: openledger_app INSERT
+ledger_transactions.status: openledger_app INSERT
+ledger_transactions.tenant_id: openledger_app INSERT
+
+== account_types.is_perimeter / mirror_type (ADR-0007 §2's charged data) ==
+(none)
+
+== comments (pg_description) ==
+column account_seq of table ledger_entries = Monotonic, GAPLESS per account per stripe -- issued by the writer under the balance-row lock, not a Postgres sequence (an aborted nextval leaves a hole). The key a drift check walks and every as-of reconstruction depends on; gaplessness is asserted afterwards by recon_balance_breaks (ADR-0004, ADR-0013).
+column amount_minor of table ledger_entries = The leg amount in minor units, always POSITIVE (> 0). The sign lives in direction. Roll up as SUM(CASE WHEN direction='debit' THEN amount ELSE -amount END) for a debit-positive value (ADR-0007 rule 15).
+column as_of of table perimeter_attestations = The COUNTERPARTY's statement date -- a business date, so the comparison is on the effective axis (a bank statement is dated by the bank's book) (ADR-0006, ADR-0012).
+column as_of_end of table perimeter_attestations = GENERATED exclusive end instant of the as_of business day in tz, resolved once at write time so perimeter_drift compares a fixed instant rather than a session-resolved bare date (ADR-0011).
+column caption of table fs_lines = Display text a reader sees, NOT an identity: never key on it (Unicode confusables pass every CHECK and print identically). Whitespace/case-normalised as defence in depth against typos only (ADR-0007).
+column category of table chart_presentation = Copied from account_types under a composite FK (fk_presentation__type), because fs_statement/fs_side are GENERATED from it and a generated column may not read another table (ADR-0012).
+column category of table ledger_account_balances = Part of the frozen identity copy (fk_balances__account_purpose) (ADR-0012).
+column category of table ledger_accounts = Copied from the account's type and held honest by fk_accounts__type, so a report need not join the chart to know a balance's sign (ADR-0012).
+column chart_version of table chart_presentation = The chart version this mapping belongs to. A reclassification is a new version, so which line a type presented under is one key lookup (ADR-0012).
+column chart_version of table fs_lines = The chart version this line belongs to. A line's identity is (chart_version, code); the same caption may recur across versions -- that is what makes them comparable (ADR-0012).
+column closing_kind of table ledger_period_closes = A generated constant ('period_close') carried into fk_closes__txn_kind, turning "the named transaction is a close" into a key rather than a free-text match (ADR-0011).
+column code of table fs_lines = The STABLE identity of the line -- what consumers key on and what the balance sheet emits. The caption is display text and is Unicode-confusable, so it is never keyed on (ADR-0007).
+column computed_at_xid of table ledger_period_closes = The commit cursor the checkpoint was computed at: everything below it had committed, nothing below it can ever appear. A backdated arrival lands ABOVE it and is a tail term (close_disclosures enumerates them), never an invalidation (ADR-0011).
+column counterparty_scope of table account_types = none / shared / per_shard. Can a set of these accounts be summed for reporting? Only if all face ONE counterparty (IAS 32.42). Consumed by the balance sheet's gross routing and by chart_lint (ADR-0012).
+column counterparty_scope of table chart_presentation = Copied from account_types under fk_presentation__type; determines whether a contra line is required (per_shard) (ADR-0012).
+column counterparty_scope of table ledger_accounts = Copied from the type (fk_accounts__scope). Drives the balance sheet's gross routing; a CHECK may not read another table, so the copy is held honest by a composite FK (ADR-0012).
+column currency of table ledger_entries = ISO 4217, uppercase. Part of a composite FK to the account, so an entry cannot carry a currency its account does not hold.
+column direction of table ledger_entries = debit or credit -- direction carries the SIGN of the leg; amount_minor never does.
+column effective_at of table ledger_entries = The business date, DENORMALISED from the transaction and held honest by a composite FK (fk_entries__txn_effective) so it cannot disagree. The basis of ADR-0006 and every business-date report; the effective-axis aggregate is a single-table index scan on ix_entries__effective.
+column effective_at of table ledger_events = The business-date axis: the source's clock. Contrast recorded_at, the wall clock (ADR-0006).
+column effective_at of table ledger_transactions = The business date, copied from the SOURCE's clock (a clearing's network date), never now(). Finite (no +/-infinity). The axis every as-of report filters on (ADR-0006).
+column event_id of table ledger_transactions = The event that caused this transaction. NOT NULL: every transaction references its event, and one event causes at most one transaction (ADR-0013).
+column external_balance_minor of table perimeter_attestations = What the third party said the balance was, in OUR debit-positive sign convention, so the comparison needs no normal_balance flip (ADR-0007 rule 15).
+column fs_line of table chart_presentation = The financial-statement line this type reports under, in this chart version. Held to the type's statement and side by a composite FK (ADR-0012).
+column fs_line_contra of table chart_presentation = The line an OPPOSITE-SIGN position of this type presents under (a payable gone into a receivable). Required for per_shard, allowed for any balance-sheet type, meaningless on the income statement (IAS 32.42, ADR-0012).
+column fs_side of table chart_presentation = GENERATED from category ONLY (not normal_balance) and THREE-valued on the balance sheet. Derived so a contra-revenue type cannot be forced onto a cost line; carried into the fs_line FK (ADR-0012).
+column fs_statement of table chart_presentation = GENERATED from category (revenue/expense -> income_statement, else balance_sheet), so it cannot disagree with the category; carried into the fs_line FK (ADR-0012).
+column idempotency_hash of table ledger_events = sha256 of the canonical request body. Distinguishes a genuine replay (same body) from a same-key/different-body conflict (ADR-0013).
+column idempotency_key of table ledger_events = The retry key. Same key + same idempotency_hash replays the stored result; same key + DIFFERENT hash is rejected -- silently replaying the wrong result is worse than failing (ADR-0013).
+column input of table ledger_account_balances = Accumulates DEBIT legs of POSTED transactions. balance = input - output (the debit-positive value of ADR-0007 rule 15); a credit-normal account reads negative and the reader applies the presentation flip (ADR-0010).
+column is_perimeter of table account_types = This type mirrors exactly one EXTERNAL balance and must reconcile against it. Consumed by perimeter_attestations, perimeter_drift and chart_lint -- a claim about the world, falsifiable only by an attestation (ADR-0012).
+column last_seq of table ledger_account_balances = The account_seq counter for this stripe. Advances on EVERY entry, PENDING included (it issues the seq), whereas input/output move on posted entries only (ADR-0010).
+column mirror_type of table account_types = The account type holding the OTHER side of the same cross-scope obligation (e.g. due_from_treasury <-> due_to_tenants). Declared on one side, arbitrarily the asset side; read by recon_scope_breaks to eliminate the pair to zero (ADR-0010, ADR-0012).
+column normal_balance of table account_types = Which direction increases this type. NOT derivable from category: a loss allowance is an asset with a CREDIT normal balance -- storing both is the only correct option (ADR-0007 rule 10).
+column normal_balance of table ledger_account_balances = Part of the frozen identity copy (fk_balances__account_purpose) (ADR-0012).
+column normal_balance of table ledger_accounts = Copied from the type (fk_accounts__type). NOT derivable from category: a loss allowance is an asset with a CREDIT normal balance (ADR-0007 rule 10).
+column note of table chart_versions = The IAS 1.41 REASON for a reclassification. NOT NULL and non-empty -- the half of the disclosure a schema can hold; the amounts are derivable by presenting one period under both versions (ADR-0012).
+column output of table ledger_account_balances = Accumulates CREDIT legs of POSTED transactions. balance = input - output. Kept separate from input so the upsert stays commutative and gross turnover is free (ADR-0010).
+column owner_id_key of table ledger_account_balances = A frozen copy of the account's owner_id_key; with owner_type, the owner freeze (fk_balances__account_owner) (ADR-0009).
+column owner_id_key of table ledger_accounts = A NULL-free copy of owner_id (coalesce to '') so the owner-freeze composite key (MATCH SIMPLE) is not silently satisfied by a NULL on house accounts (ADR-0009).
+column owner_type of table ledger_account_balances = A frozen copy of the account's owner, held honest by fk_balances__account_owner (NO ACTION), so an account with any balance row cannot have its owner nulled or reassigned (ADR-0009).
+column purpose of table ledger_account_balances = A frozen copy of the account's identity; with category/normal_balance, held by fk_balances__account_purpose (NO ACTION) so a posted account cannot be reclassified (ADR-0009, ADR-0012).
+column purpose of table ledger_accounts = The account's type: a FK to account_types.code. Carried into composite keys that freeze identity while balance rows exist.
+column recorded_at of table ledger_entries = The wall clock. NOT the axis as-of questions are asked on -- that is effective_at (ADR-0006).
+column recorded_at of table ledger_events = The wall-clock axis: when we recorded the event. Contrast effective_at, the business date (ADR-0006).
+column recorded_at of table ledger_transactions = The wall clock: when this row was written. Contrast effective_at, the business date (ADR-0006).
+column side of table fs_lines = Which side of the statement the line sits on -- declared, not inferred. THREE-valued on the balance sheet (asset/liability/equity), two-valued on the income statement (credit/debit) (ADR-0012).
+column statement of table fs_lines = balance_sheet or income_statement. Carried into a composite FK with side so a type cannot report under a line that contradicts its category (ADR-0012).
+column status of table ledger_transactions = pending or posted, and it NEVER mutates. Reports read status='posted' only; a pending->posted transition is a NEW row (resolves_id), not an update (ADR-0009, ADR-0011).
+column stripe of table ledger_account_balances = Which physical stripe of one account's balance this row is -- a partition, not an account. Each stripe is a separate lock; a reader SUMs the stripes that exist. Unstriped accounts hold row 0 (ADR-0013).
+column stripe of table ledger_entries = Which of the account's physical balance stripes issued this entry's account_seq. A reader SUMs the stripes that exist; unstriped accounts write stripe 0 (ADR-0013).
+column stripe_count of table ledger_accounts = How many stripes the writer should spread this account's balance across. A HINT, not an invariant: a reader SUMs the stripe rows that exist, so lowering it strands nothing and raising it needs no backfill (ADR-0013).
+column transaction_id of table ledger_period_closes = The closing transaction, posted through the ordinary write primitive; this row only NAMES it. Typed to kind='period_close' and to a date inside the period by composite FKs (ADR-0011).
+column xact_id of table ledger_entries = The entry's OWN commit-ordering key (ADR-0011). Filter xact_id < :cursor for a reproducible as-of read. Deliberately NOT tied to the transaction's xact_id under an FK: a leg appended to an already-committed transaction carries a HIGHER id, so a report pinned before the append cannot see it.
+column xact_id of table ledger_events = The commit-ordering key (ADR-0011) for an operation that writes no transaction -- where it records its position on the commit axis.
+column xact_id of table ledger_transactions = The commit-ordering key the as-of cursor pins to. Filter xact_id < :cursor for a reproducible as-of read: a later arrival carries its own, HIGHER id and cannot rewrite an already-issued report (ADR-0011).
+function balance_sheet_at(text,timestamp with time zone,xid8,integer) = The balance sheet as at an instant p_asof (effective_at < p_asof, half-open), at a commit cursor, under a chart version (default: current). Enumerates FROM the chart; positions are per-account then routed to a contra line on sign-swing; synthesises the un-closed-earnings plug; RAISES on an unpresented type. Returns its pinned cursor (ADR-0011, ADR-0012).
+function income_statement_for(text,timestamp with time zone,timestamp with time zone,xid8,integer) = The income statement over an effective range [p_from, p_to), at a commit cursor, under a chart version (default: current). Enumerates FROM the chart; RAISES if the version does not exist or does not present every posted account type in-window; excludes the period's closing transaction. Returns its pinned cursor (ADR-0011).
+function recon_equation_breaks(xid8,timestamp with time zone) = The accounting equation on the FACE of the balance sheet: runs balance_sheet_at per tenant at (p_cursor, p_asof) and returns a row only where assets <> liabilities + equity + earnings, per currency. The highest-leverage check -- no journal-level test can falsify presentation (ADR-0011).
+function report_cursor() = The commit cursor a report pins itself to: pg_snapshot_xmin of the current snapshot. Everything strictly below it has committed or aborted and can never grow; a row invisible now carries a HIGHER id. Pass it as :cursor to the statement functions (ADR-0011).
+function trial_balance_at(text,timestamp with time zone,timestamp with time zone,xid8) = The trial balance pinned: per-account debits/credits/debit-positive balance for one tenant over an effective range [p_from, p_to) at a commit cursor (xact_id < p_cursor). Sums as numeric to survive a huge legal row (ADR-0011, ADR-0013).
+table account_types = The chart of accounts -- what an account MEANS. IDENTITY only (category, normal_balance, counterparty_scope, is_perimeter, mirror_type); which financial-statement line a type reports under is PRESENTATION and lives in chart_presentation, keyed by chart_version. Seed data, shipped by schema/chart.sql, not by this migration (ADR-0012).
+table chart_presentation = Which fs_line a type reports under, per chart_version. Append-only: so "which line was this presented under" is one key lookup, never a walk of overrides. category and counterparty_scope are copied from account_types under a composite FK; fs_statement/fs_side are GENERATED from category (ADR-0012).
+table chart_versions = The chart as append-only history. A reclassification is a NEW version carrying a complete chart, never an edit -- an issued statement names the version it was presented under. "Current" is DERIVED as max(version) (see chart_version_current), never stored (ADR-0012).
+table fs_lines = The financial-statement lines, one set PER chart_version. Reports enumerate FROM here outward (LEFT JOIN the numbers on), so an inactive line prints a zero instead of vanishing -- omission is structurally impossible. Consumers key on the code, NOT the caption (a caption is display text and Unicode-confusable) (ADR-0007, ADR-0012).
+table ledger_account_balances = The O(1) cached POSTED balance AND the write-side serialization point: one atomic upsert returns the new balance and the next account_seq together, so the row lock IS the serialization. balance = input - output. Physically striped -- a reader SUMs the stripe rows that exist for an account, never a range. Kept honest against the journal by recon_balance_breaks (ADR-0010, ADR-0013).
+table ledger_accounts = The account register: whose money, in what currency, of what type (purpose). NOT history -- metadata is editable -- but an account's identity (purpose/category/normal_balance) and owner are FROZEN while any balance row references them (NO ACTION on fk_balances__account_purpose / _owner) (ADR-0009, ADR-0012).
+table ledger_entries = The append-only journal: one leg of one movement (direction + amount_minor), the ground truth every report and drift check derives from. NO running balance (spike 009) -- 'balance now' is ledger_account_balances and 'as of a business date' aggregates over effective_at. For a reproducible as-of read, filter effective_at and xact_id < :cursor (ADR-0006, ADR-0009, ADR-0011).
+table ledger_events = The idempotency spine: every accepted operation, INCLUDING the ones that write no ledger transaction (an account opened, a limit changed, a posting rejected). Append-only. One event causes at most one transaction (uq_txn__one_per_event). Replay contract: same idempotency_key + same idempotency_hash replays the stored result, same key + different hash is rejected (ADR-0005, ADR-0013).
+table ledger_period_balances = The effective-axis checkpoint: the at-close balance per account per period. DERIVED and exactly recomputable from ledger_entries at (effective_at < ends_at, xact_id < computed_at_xid); reconciled by recon_checkpoint_breaks. Same input/output convention as ledger_account_balances, posted entries only (ADR-0011).
+table ledger_period_closes = One close per tenant/period/currency: names the transaction that closed the period (an ordinary posting, kind='period_close') and the commit cursor computed_at_xid it was computed at. Lets the income statement exclude closing entries declaratively instead of matching a free-text kind (ADR-0011).
+table ledger_periods = A resolved period boundary [starts_at, ends_at). HALF-OPEN, and the instants are resolved ONCE from (local date, tz) at creation and never re-resolved -- IANA rules change, so a stored (date, zone) pair is not a stable instant. A tenant's periods may not overlap (ex_periods__no_overlap) (ADR-0011).
+table ledger_transactions = The unit of atomicity and the event's bookkeeping. Append-only; status NEVER mutates -- a pending->posted change is a NEW row via resolves_id, not an UPDATE. Every transaction references the event that caused it (event_id NOT NULL). Reports read status='posted' only (ADR-0009, ADR-0011).
+table perimeter_attestations = What a third party (bank, network, trustee) said an is_perimeter account's balance was on their statement date. The only thing that can falsify is_perimeter's "must reconcile against an external balance" claim, since a CHECK cannot. Compared on the EFFECTIVE axis by perimeter_drift; append-only (ADR-0012).
+view chart_lint = Chart claims the account register contradicts: a type no version presents, a per_shard type in a house account, a same-side mirror pair, an unattested perimeter account, live drift, and more -- ten shape rules a CHECK or key cannot reach. Empty is passing; reconciliation counts the error-severity rows (ADR-0012).
+view chart_version_current = The current chart version, DERIVED as max(version) -- the default the statement functions read when no version is passed (ADR-0012).
+view close_disclosures = Entries legally backdated past a close (effective_at before ends_at, xact_id at/after computed_at_xid) -- not a break: the analogue of IAS 1.41's reclassification disclosure, so a row here means an already-issued report no longer matches a re-run at "now" (ADR-0011).
+view perimeter_drift = What a third party attested against what our book says on the same business date (effective axis, bounded by the stored as_of_end instant), per is_perimeter account -- the drift is the difference. Fed into chart_lint (ADR-0012).
+view recon_balance_breaks = The cached balance against the recomputed sum over the journal, per account/currency/stripe -- a nonzero row is drift the cache introduced. Six break classes (balance_drift, seq_behind/ahead/gap, no_cache_row, no_entries); input/output vs POSTED entries, last_seq vs ALL entries (ADR-0010).
+view recon_checkpoint_breaks = The stored period checkpoint against ledger_entries recomputed at the checkpoint's own cursor, per account -- missing, spurious or value-drifted rows. Compares values, so a dormant 0/0 row is not a break (ADR-0011).
+view recon_close_breaks = Closes whose computed_at_xid precedes their own closing transaction's xact_id -- a checkpoint computed at a cursor that could not have seen the close it records (ADR-0011).
+view recon_cursor_breaks = Entries whose commit key is impossible -- an xact_id above the current snapshot horizon, or below its own transaction's (a leg claiming to predate its transaction). Where a forged xact_id shows, since it silences no other check (ADR-0011).
+view recon_entry_breaks = Journal entries that fail one of the three joins every report makes -- no_transaction, no_account or no_account_type, one row each. Empty wherever the foreign keys are enforced; a pending entry is not an orphan (ADR-0009).
+view recon_journal_to_reports = A reconciliation statement (one row per tenant/currency, always footing): journal debits minus the named reconciling items -- pending, superseded, out_of_window, orphan -- against what trial_balance actually shows; the unexplained remainder must be zero (ADR-0010).
+view recon_pending_bridge = The available balance derived, not stored: the posted cache plus the live pending population (retired holds excluded), per account. A reconciling population, not a break list (ADR-0010).
+view recon_scope_breaks = The two sides of a cross-scope obligation that fail to eliminate: for a mirrored account-type pair, the debit-positive sum over both types must be zero, per currency and per counterparty. The one check that aggregates across tenants (ADR-0010).
+view recon_transaction_breaks = Transactions whose entries do not balance per currency (debits_ne_credits), plus single-leg and entryless ones. The exception list for the balance invariant the writer's type will eventually make unrepresentable (ADR-0005, ADR-0007).
+view reconciliation = The daily sweep operators run (openledger reconcile, roadmap M2): one row per check -- cache-vs-journal, orphan entries, imbalance, cross-scope, journal-vs-reports, checkpoint, close typing, cursor forgery, the accounting equation, chart lint -- with its break count, all zero on a healthy book. SELECT * FROM reconciliation WHERE breaks <> 0 is the whole interface; the pending bridge and close disclosures are excluded as legitimate populations (ADR-0004, ADR-0010).
+view trial_balance = Per-account gross arithmetic at "now" and the reconciliation substrate half the recon views read. security_invoker, so RLS scopes it. Publishes both balance_minor (normal-balance-signed, for showing one account) and balance_debit_positive (roll up with THIS one). Enumerates INWARD from entries -- not the completeness surface (ADR-0011).

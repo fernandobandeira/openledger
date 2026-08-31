@@ -29,7 +29,7 @@
 > every natural key*. And **migration 37 dropped four indexes and two unique constraints as a side
 > effect of dropping three columns**, two of which were never recreated — which is the strongest
 > argument anyone has made for [ADR-0007](/decisions/0007-schema-conventions-and-chart)'s
-> still-unbuilt schema snapshot test.
+> schema snapshot test — unbuilt when this spike ran; built 2026-08-31.
 
 # Spike 001 — Learn from Formance
 

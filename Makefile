@@ -59,6 +59,22 @@ openapi: ## Regenerate crates/api/openapi.json from the annotations
 openapi-check: ## Fail if crates/api/openapi.json drifted from the annotations
 	cargo test -p api --test spec
 
+.PHONY: schema-snapshot
+schema-snapshot: ## Regenerate schema/snapshot.txt from a freshly migrated database
+	@# Same contract as `openapi`: the committed snapshot is written by the
+	@# test itself, under an explicit opt-in — so a normal test run can only
+	@# ever FAIL on drift, never paper over it by rewriting the file it was
+	@# about to compare. No DATABASE_URL on purpose: the test migrates and
+	@# dumps a scratch database on the e2e suite's own testcontainer, so this
+	@# never depends on (or disturbs) the `make up` book.
+	cargo build -p openledger
+	OPENLEDGER_WRITE_SCHEMA_SNAPSHOT=1 cargo test -p e2e --test e2e schema_snapshot
+
+.PHONY: schema-snapshot-check
+schema-snapshot-check: ## Fail if schema/snapshot.txt drifted from the migrations
+	cargo build -p openledger
+	cargo test -p e2e --test e2e schema_snapshot
+
 .PHONY: build
 build: ## Build the binary
 	cargo build --release

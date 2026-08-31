@@ -13,7 +13,7 @@ contract, the crate boundaries that enforce the design, what the e2e suite prove
 [what is not built yet](#still-open--what-is-not-there).
 
 The census, counted 2026-08-31 against the workspace: **6 crates · 3 subcommands · 1 endpoint ·
-4 exit codes · 49 end-to-end tests · 10 reconciliation checks asserted at zero after every
+4 exit codes · 50 end-to-end tests · 10 reconciliation checks asserted at zero after every
 endpoint test.**
 
 The API itself is browsable as rendered documentation: **[the API reference](/api-reference/)**,
@@ -275,7 +275,7 @@ binary, named `openledger-e2e-pg` and reused across runs (testcontainers 0.27 sh
 an anonymous container would leak one per run; a named, reused one caps the population at exactly
 one).
 
-The forty-nine tests, by what each holds:
+The fifty tests, by what each holds:
 
 - **Nine endpoint tests** (`endpoints/transactions/post.rs`) — the posting-and-idempotency half of
   the `POST /v1/transactions` contract in one file: a posting lands on both accounts' balance rows;
@@ -310,6 +310,14 @@ The forty-nine tests, by what each holds:
   route table the router is built from, so a route the spec forgot fails as loudly as a route the
   router lost. This is the working replacement for the structural guarantee the refused
   `utoipa-axum` would have given.
+- **The schema snapshot** (`schema_snapshot.rs`) — [ADR-0007 §2](/decisions/0007-schema-conventions-and-chart),
+  the same committed-artifact contract as the OpenAPI spec, applied to the database: migrate an
+  empty scratch database with the compiled binary, dump the catalog as deterministic text —
+  trigger and event-trigger enablement, full policy and constraint sets, view bodies and
+  `reloptions`, row-security flags, function bodies, grants, catalog comments — and diff it
+  against the committed `schema/snapshot.txt`. Regeneration is an explicit opt-in
+  (`make schema-snapshot`), so a normal run can only fail on drift; this is the backstop for the
+  [ADR-0009](/decisions/0009-append-only-perimeter) owner-accident DDL class.
 - **Three startup tests** (`startup.rs`) — `serve` refuses, at exit 1 and naming
   `openledger migrate`, a database that was never migrated, one behind this binary (naming the
   missing version), and one whose applied checksum differs from the embedded baseline — all three
