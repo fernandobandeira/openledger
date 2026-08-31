@@ -179,8 +179,16 @@ file's. (`make chart` is a `psql -f` of a file no migration owns, and gets the s
   the comment beside the mutex (`crates/e2e/tests/e2e/support/postgres.rs`). No adopter runs two
   first-migrates into sibling databases of one cluster at once, which is why this is a known issue
   rather than an incident. The fix is an exception-handled `CREATE ROLE` — catch `duplicate_object`
-  and carry on — **as migration `00002`: scheduled work, not done.** It cannot be a baseline edit,
-  because the freeze above forbids exactly that, on its own reasoning.
+  (and `unique_violation`, which is what the loser of a *truly concurrent* pair gets from
+  `pg_authid`'s index) and carry on — **landed 2026-08-28 as
+  `migrations/00002_role_creation_survives_duplicates.sql`.** It could not be a baseline edit,
+  because the freeze above forbids exactly that, on its own reasoning — and that same freeze is
+  the honest limit of the fix: 00001's guarded `CREATE ROLE` still runs first on a fresh cluster,
+  so two first-migrates can still collide *inside the baseline*, where the loser fails whole
+  (sqlx's transaction-per-migration; nothing half-applied) and the re-run heals. The e2e suite
+  therefore keeps its migrate mutex. What 00002 guarantees is that role creation from it onward —
+  every re-run included — survives a role that already exists or a concurrent `CREATE`, and it is
+  the form every later role migration copies.
 - **A killed migrator leaves an INVALID index behind, and the retry does not heal it.** This is the
   failure a pre-deploy job makes *more* likely, because pods get evicted, `activeDeadlineSeconds`
   fires and nodes drain. Reproduced against PostgreSQL 18: kill the backend mid-build and
