@@ -1,11 +1,11 @@
-//! The posting math: what the writer computes between its SQL statements —
-//! legs, coalesced deltas, the per-account seq walk-back. Plain values in,
-//! plain values out; the zero-sqlx property of this CRATE is the point
-//! (deny.toml enforces it), which is why these live here and not beside the
-//! SQL that consumes them. The service (`service.rs`) owns the order they run
-//! in, and is their only caller — the functions are `pub(crate)`; the crate
-//! exports only the types the [`Repository`](crate::Repository) port's
-//! signatures name.
+//! The posting math: what the writer computes before its SQL runs — legs,
+//! coalesced deltas, each leg's offset back from its account's counter.
+//! Plain values in, plain values out; the zero-sqlx property of this CRATE
+//! is the point (deny.toml enforces it), which is why these live here and
+//! not beside the SQL that consumes them. The service (`service.rs`) owns
+//! the order they run in, and is their only caller — the functions are
+//! `pub(crate)`; the crate exports only the types the
+//! [`Repository`](crate::Repository) port's signatures name.
 
 use std::collections::BTreeMap;
 
@@ -90,37 +90,64 @@ pub(crate) fn coalesce(legs: &[Leg]) -> Result<BTreeMap<(Uuid, String), Delta>, 
     Ok(deltas)
 }
 
-/// Number each leg from its account's counter, in leg order, by walking back
-/// from the totals the balance upserts returned: an account whose counter now
-/// reads `last_seq` after `delta.legs` new legs starts numbering them at
-/// `last_seq - delta.legs + 1`. Returns one seq per leg, parallel to `legs`;
-/// `None` when a leg's account is missing from either map, which cannot
-/// happen when both were derived from these same legs.
-pub(crate) fn assign_account_seqs(
-    legs: &[Leg],
-    issued: &BTreeMap<(Uuid, String), i64>,
-    deltas: &BTreeMap<(Uuid, String), Delta>,
-) -> Option<Vec<i64>> {
-    let mut next_seq: BTreeMap<(Uuid, String), i64> = BTreeMap::new();
-    for ((account_id, currency), delta) in deltas {
-        let last_seq = issued.get(&(*account_id, currency.clone()))?;
-        next_seq.insert((*account_id, currency.clone()), last_seq - delta.legs);
-    }
-    let mut seqs = Vec::with_capacity(legs.len());
-    for leg in legs {
-        let seq = next_seq.get_mut(&(leg.account_id, leg.currency.clone()))?;
-        *seq += 1;
-        seqs.push(*seq);
-    }
-    Some(seqs)
+/// Each leg's distance back from its account's counter after this batch:
+/// leg i's offset is the number of LATER legs on the same (account,
+/// currency), so the account's final leg carries 0 and its first carries
+/// `delta.legs - 1`. The single call numbers each entry `last_seq - offset`
+/// right beside the counter the balance upsert returned — ADR-0013's
+/// walk-back, with the counting here where it is pure and the one
+/// subtraction in the statement where the counter lives. Returns one offset
+/// per leg, parallel to `legs`.
+pub(crate) fn offsets_back_from_last_seq(legs: &[Leg]) -> Vec<i64> {
+    let mut later_legs: BTreeMap<(Uuid, &str), i64> = BTreeMap::new();
+    let mut offsets: Vec<i64> = legs
+        .iter()
+        .rev()
+        .map(|leg| {
+            let count = later_legs
+                .entry((leg.account_id, leg.currency.as_str()))
+                .or_insert(0);
+            let offset = *count;
+            *count += 1;
+            offset
+        })
+        .collect();
+    offsets.reverse();
+    offsets
+}
+
+/// The append, planned: everything the single call writes for a first
+/// writer, computed here where it is pure — the legs in posting order, one
+/// seq offset per leg, and the coalesced per-account deltas in account-id
+/// order. One value, because the three travel together: the statement that
+/// consumes them binds all three, and an offset without its leg — or a leg
+/// without its delta — is not a state the writer can be in.
+pub struct Append {
+    pub legs: Vec<Leg>,
+    pub seq_offsets: Vec<i64>,
+    pub deltas: BTreeMap<(Uuid, String), Delta>,
+}
+
+/// Plan the append for these postings: expand to legs, coalesce, number.
+/// Refuses when coalescing overflows 64-bit minor units.
+pub(crate) fn plan_append(postings: &[Posting]) -> Result<Append, Overflow> {
+    let legs = expand_postings(postings);
+    let deltas = coalesce(&legs)?;
+    let seq_offsets = offsets_back_from_last_seq(&legs);
+    Ok(Append {
+        legs,
+        seq_offsets,
+        deltas,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     //! The posting math's contract, held without a database in the room:
     //! coalescing iterates in account-id order (the writer's deadlock
-    //! defense — spike 003), the seq walk-back numbers legs gaplessly from
-    //! the totals the upserts returned, and both refuse rather than guess.
+    //! defense — spike 003), the per-leg offsets number legs gaplessly once
+    //! the single call subtracts them from each returned counter, and
+    //! coalescing refuses overflow rather than wrapping a balance.
 
     use super::*;
 
@@ -180,42 +207,36 @@ mod tests {
         Ok(())
     }
 
-    /// The walk-back arithmetic: an account whose upsert returned `last_seq`
-    /// after `legs` new legs numbers them ending AT `last_seq`, gaplessly, in
-    /// leg order — interleaved across accounts.
+    /// The walk-back arithmetic, offsets half: each leg's offset counts the
+    /// LATER legs on its own account, interleaved across accounts — so once
+    /// the single call subtracts them from each account's returned counter,
+    /// the legs number gaplessly, ending AT `last_seq`, in leg order.
     #[test]
-    fn seqs_walk_back_from_the_returned_totals() -> Result<(), Overflow> {
+    fn offsets_count_the_later_legs_of_each_account() {
         let legs = [
             leg(account(2), Direction::Credit, 10),
             leg(account(1), Direction::Debit, 10),
             leg(account(2), Direction::Credit, 5),
             leg(account(1), Direction::Debit, 5),
         ];
-        let deltas = coalesce(&legs)?;
-        // Account 1 had 3 entries before this batch (counter now 5); account 2
-        // was fresh (counter now 2).
-        let issued = BTreeMap::from([
-            ((account(1), "USD".to_owned()), 5_i64),
-            ((account(2), "USD".to_owned()), 2_i64),
-        ]);
 
-        let seqs = assign_account_seqs(&legs, &issued, &deltas);
+        let offsets = offsets_back_from_last_seq(&legs);
 
-        assert_eq!(seqs, Some(vec![1, 4, 2, 5]));
-        Ok(())
-    }
+        assert_eq!(offsets, vec![1, 1, 0, 0]);
 
-    /// A leg pointing at an account the maps do not carry is refused, not
-    /// numbered from nothing.
-    #[test]
-    fn a_leg_without_a_counter_is_refused() -> Result<(), Overflow> {
-        let legs = [leg(account(1), Direction::Debit, 10)];
-        let deltas = coalesce(&legs)?;
-
-        let seqs = assign_account_seqs(&legs, &BTreeMap::new(), &deltas);
-
-        assert!(seqs.is_none());
-        Ok(())
+        // The subtraction the statement performs, replayed here: account 1
+        // had 3 entries before this batch (counter now 5); account 2 was
+        // fresh (counter now 2). `last_seq - offset` numbers the legs
+        // [1, 4, 2, 5] — gapless per account, in leg order.
+        let counters = BTreeMap::from([(account(1), 5_i64), (account(2), 2_i64)]);
+        let seqs: Vec<i64> = legs
+            .iter()
+            .zip(&offsets)
+            .map(|(leg, offset)| {
+                counters.get(&leg.account_id).copied().unwrap_or_default() - offset
+            })
+            .collect();
+        assert_eq!(seqs, vec![1, 4, 2, 5]);
     }
 
     /// The overflow refusal: two legs on one side of one account summing past

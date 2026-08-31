@@ -1,6 +1,8 @@
 //! The outbound repository port: what the writer service asks of storage —
 //! one method per statement the adapter runs, plus the transaction bracket
-//! around them.
+//! around them. Since single-call posting (roadmap M3, spike 003) the
+//! first-writer path IS one statement, so the port carries two: the claim
+//! with the whole append riding on it, and the replay lookup.
 //!
 //! This seam is NOT storage-agnosticism. There is one adapter
 //! (`crates/ledger/postgres`, a nested workspace member) and no swappability
@@ -15,7 +17,27 @@
 use uuid::Uuid;
 
 use crate::domain::PostTransaction;
-use crate::postings::{Delta, Leg};
+use crate::postings::Append;
+
+/// What the single call answered for one coalesced delta, in account order:
+/// the counter the balance upsert returned, or `None` when the upsert's
+/// existence check found no such account holding this currency — the
+/// service turns the first `None` into the refusal that names it.
+pub struct BalanceUpsert {
+    pub account_id: Uuid,
+    pub currency: String,
+    pub last_seq: Option<i64>,
+}
+
+/// The first writer's appended posting, as the single call reports it: the
+/// claimed event, the transaction it caused, and each delta's balance
+/// upsert. Everything it names is still uncommitted — the service closes
+/// the bracket.
+pub struct Appended {
+    pub event_id: Uuid,
+    pub transaction_id: Uuid,
+    pub balance_upserts: Vec<BalanceUpsert>,
+}
 
 /// The opaque storage failure. The port names no backend error type — the
 /// Postgres error stays inside the adapter crate, boxed at exactly one
@@ -43,16 +65,29 @@ pub trait Repository: Send + Sync {
     /// invariant is stated here; the SQL that honors it lives in the adapter.
     fn begin(&self) -> impl Future<Output = Result<Self::Tx, StorageError>> + Send;
 
-    /// Statement A: claim the idempotency key, storing the command's hash
-    /// and `payload` (its JSON rendering) beside it. A returned event id
-    /// means this caller is the first writer.
-    fn claim_event(
+    /// Statement A, carrying the whole append with it — single-call posting
+    /// (roadmap M3, measured by spike 003): claim the idempotency key,
+    /// storing the command's hash and `payload` (its JSON rendering) beside
+    /// it, and — only when the claim returns a row — insert the transaction,
+    /// upsert every delta's balance row in account order, and append the
+    /// entries numbered `last_seq - offset`, all in this ONE statement.
+    /// `append` is the planned append: legs in posting order, one offset per
+    /// leg, deltas iterating in account-id order — and the statement must
+    /// preserve that order when it takes the balance row locks.
+    ///
+    /// `Some` means this caller is the first writer and the append already
+    /// happened (uncommitted); `None` means an earlier caller claimed the
+    /// key and NOTHING here ran — the claim's replay half stays the
+    /// separate [`stored_result`](Repository::stored_result), because
+    /// folding the two is the one-statement hole ADR-0013 §2 reproduced.
+    fn claim_and_append(
         &self,
         tx: &mut Self::Tx,
         command: &PostTransaction,
         hash: &[u8],
         payload: &serde_json::Value,
-    ) -> impl Future<Output = Result<Option<Uuid>, StorageError>> + Send;
+        append: &Append,
+    ) -> impl Future<Output = Result<Option<Appended>, StorageError>> + Send;
 
     /// Statement B: the stored `(event_id, transaction_id)` of the already
     /// claimed key — with the hash in the lookup's WHERE, never compared by
@@ -65,39 +100,6 @@ pub trait Repository: Send + Sync {
         command: &PostTransaction,
         hash: &[u8],
     ) -> impl Future<Output = Result<Option<(Uuid, Option<Uuid>)>, StorageError>> + Send;
-
-    /// Insert the posted transaction row for the claimed event; returns its
-    /// id.
-    fn insert_transaction(
-        &self,
-        tx: &mut Self::Tx,
-        command: &PostTransaction,
-        event_id: Uuid,
-    ) -> impl Future<Output = Result<Uuid, StorageError>> + Send;
-
-    /// Apply one account's coalesced delta to its balance row — the row lock
-    /// IS the serialization point — returning the account's `last_seq` after
-    /// this batch, or `None` when the account does not exist or does not
-    /// hold this currency (the upsert doubles as the existence check).
-    fn upsert_balance(
-        &self,
-        tx: &mut Self::Tx,
-        tenant_id: &str,
-        account_id: &Uuid,
-        currency: &str,
-        delta: &Delta,
-    ) -> impl Future<Output = Result<Option<i64>, StorageError>> + Send;
-
-    /// Append all entries in one statement. `seqs` is parallel to `legs`,
-    /// one seq per row.
-    fn insert_entries(
-        &self,
-        tx: &mut Self::Tx,
-        command: &PostTransaction,
-        transaction_id: Uuid,
-        legs: &[Leg],
-        seqs: &[i64],
-    ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Commit the bracket: the event claim and everything it caused become
     /// durable together.

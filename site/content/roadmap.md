@@ -10,8 +10,9 @@ product matters.
 `migrations/00001_baseline.sql` and `openledger migrate` are built and run in CI — and since
 2026-08-27 so are M3's lean writer, the one HTTP endpoint in front of it
 ([ADR-0014](/decisions/0014-http-api)), and the e2e suite that spawns the binary and posts over the
-wire. What is missing is the load-bearing half of the writer — batching under load, stripe
-selection, single-call posting, pending → posted, the concurrency proof — and the read path. That
+wire; since 2026-08-28 the writer posts in a **single server-side call**
+([M3](#m3--the-posting-engine)). What is missing is the rest of the load-bearing half — batching
+under load, stripe selection, pending → posted, the concurrency proof — and the read path. That
 gap — not a deployment — is the story now. Phase 1 is the ordered list of code to build to close it.
 
 ---
@@ -23,8 +24,8 @@ gap — not a deployment — is the story now. Phase 1 is the ordered list of co
 1. **The writer** ([M3](#m3--the-posting-engine)) — the posting API that is balanced by
    construction, the two-statement idempotency replay, the posted-only cache update and the
    transaction seal. **The lean core of this landed on 2026-08-27**, behind one HTTP endpoint
-   ([ADR-0014](/decisions/0014-http-api)); what remains of M3 is batching under load, stripe
-   selection, single-call posting, and pending → posted.
+   ([ADR-0014](/decisions/0014-http-api)), and **single-call posting followed on 2026-08-28**;
+   what remains of M3 is batching under load, stripe selection, and pending → posted.
 2. **`openledger reconcile`** ([M2](#m2--openledger-reconcile-and-the-concurrency-proof)) — wire the
    ten reconciliation views to an exit code so the daily sweep is a real command. **Built
    2026-08-28**: the subcommand runs the views in one snapshot as `openledger_recon`; what remains
@@ -116,14 +117,25 @@ balanced set of entries and an idempotency key, post atomically or return the st
 behind `POST /v1/transactions`, and verified by the caller-shaped e2e suite with
 `SELECT * FROM reconciliation` as its oracle. What remains here is the load-bearing half.
 Pending → posted is a **new** transaction with `resolves_id`, never an UPDATE — not yet built. Three
-design constraints, not later optimizations, none of them in the lean core yet:
+design constraints, not later optimizations — the second landed on 2026-08-28, the other two are
+not in the lean core yet:
 
 - **Coalesced batching.** N postings to one account collapse into a single upsert advancing the
   balance by the total and `last_seq` by the count; each entry's running balance is derived by
   walking backwards from the returned totals. This is the only batching that does not deadlock.
-- **Single-call posting.** The whole operation in one server-side call rather than six round trips
-  — worth ~14% on localhost, and worth more the higher round-trip latency climbs, where five saved
-  round trips cost ~2.5 ms against ~1.3 ms of real work ([spike 003](/spikes/003-throughput-ceiling)).
+  What ships today coalesces *within* one posting request; coalescing *across* requests under load
+  is the unbuilt half.
+- **Single-call posting — built 2026-08-28.** The whole append — key claim, transaction row,
+  balance upserts in account order, entries — is one `unnest`-based CTE pipeline in one statement
+  ([the service page has the shape](/service#the-write-path-as-implemented)), so a posting costs
+  **three round trips** (`BEGIN ISOLATION LEVEL READ COMMITTED`, the statement, `COMMIT`) where
+  the lean writer spent **eight**. The replay lookup stays a *separate* statement B, because
+  folding it into the claim is the one-statement hole
+  [ADR-0013 §2](/decisions/0013-write-path-contract) reproduced. Why it is a constraint and not a
+  knob: worth ~14% on localhost, and worth more the higher round-trip latency climbs, where five
+  saved round trips cost ~2.5 ms against ~1.3 ms of real work
+  ([spike 003](/spikes/003-throughput-ceiling) — the spike's numbers; this binary's own throughput
+  is still unmeasured).
 - **Striping and batching must not both be applied blindly.** Random stripe selection makes them
   *cancel*, measured worse than either alone; tenant- or worker-affinity selection composes. The
   stripe-picking writer is the third build step above.

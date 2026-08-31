@@ -1,18 +1,20 @@
 //! The writer service: ADR-0005's posting primitive under ADR-0013's
-//! write-path contract. This is the use-case — hash, claim-or-replay,
-//! coalesce, upsert in delta order, number, append, commit — orchestrated in
-//! the core over the outbound [`Repository`] port, with no SQL in the room:
-//! the statements live in the adapter (`crates/ledger/postgres`), the pure
-//! computation between them in `domain`.
+//! write-path contract. This is the use-case — hash, coalesce, number,
+//! claim-and-append-or-replay, commit — orchestrated in the core over the
+//! outbound [`Repository`] port, with no SQL in the room: the statements
+//! live in the adapter (`crates/ledger/postgres`), the pure computation
+//! before them in `domain` and `postings`.
 //!
 //! What is deliberately here already, because ADR-0013 calls them contract
 //! and not optimization:
-//! - idempotency is the two-statement replay (claim, then a separate lookup
-//!   with the hash in the `WHERE`);
+//! - idempotency is the two-statement replay (the claim, then a separate
+//!   lookup with the hash in the `WHERE`) — single-call posting rides the
+//!   whole append on the CLAIM, never on the lookup;
 //! - legs are coalesced per account before the balance upsert, and accounts
 //!   are locked in id order, batch-wide;
 //! - `account_seq` is issued by the balance row's counter under its own lock
-//!   and each entry's seq is derived by walking back from the returned total.
+//!   and each entry's seq walks back from the returned total — the offsets
+//!   are counted here in Rust, the one subtraction runs beside the counter.
 //!
 //! The fourth clause of that contract — the transaction opens by SETTING
 //! `READ COMMITTED` rather than inheriting it — is stated on
@@ -24,8 +26,8 @@ use uuid::Uuid;
 
 use crate::domain::{PostTransaction, Posted};
 use crate::port::{Ledger, WriteError};
-use crate::postings::{self, Delta, Leg};
-use crate::repository::Repository;
+use crate::postings::{self, Delta};
+use crate::repository::{Appended, Repository};
 
 /// The writer behind the [`Ledger`] port, generic over the repository. One
 /// adapter exists and no second is promised — the generic is the seam's
@@ -78,58 +80,84 @@ async fn post<R: Repository>(
         ))
     })?;
 
+    // The posting math, all of it pure and all of it before any SQL: expand
+    // each posting into its two legs — the row is a leg; the primitive you
+    // can call is a pair (ADR-0005) — coalesce per (account, currency) so N
+    // legs cost one balance upsert, and count each leg's offset back from
+    // its account's counter so the statement can number the entries.
+    let append = postings::plan_append(command.postings())
+        .map_err(|postings::Overflow| WriteError::Overflow)?;
+
     let mut tx = repository.begin().await.map_err(storage)?;
 
-    // Statement A: claim the idempotency key by inserting the event row.
-    // An event id back means the insert happened — nobody held this key.
-    // Nothing back means an earlier caller already claimed it, and the
-    // answer they stored is what this caller gets (ADR-0013 §2).
+    // Statement A, carrying the whole append with it — single-call posting
+    // (roadmap M3): claim the idempotency key by inserting the event row,
+    // and from the claimed row, in the SAME statement, the transaction, the
+    // balance upserts in account order, the entries. Rows back mean the
+    // insert happened — nobody held this key. Nothing back means an earlier
+    // caller already claimed it, and the answer they stored is what this
+    // caller gets (ADR-0013 §2); none of the append ran.
     match repository
-        .claim_event(&mut tx, command, &hash, &payload)
+        .claim_and_append(&mut tx, command, &hash, &payload, &append)
         .await
         .map_err(storage)?
     {
-        // This caller is the first writer: it does the work in this same
-        // transaction and never looks at the store.
-        Some(event_id) => append_and_commit(repository, tx, command, event_id).await,
+        // This caller is the first writer: the work is already done in this
+        // open transaction — check it landed whole, then close the bracket.
+        Some(appended) => {
+            commit_or_refuse_unknown_account(repository, tx, appended, &append.deltas).await
+        }
         // The key belongs to an earlier post: replay its stored result —
         // never redo the work — or refuse the key if the body differs.
         None => replay_or_refuse(repository, tx, command, &hash).await,
     }
 }
 
-/// The first writer's path: append the claimed transaction to the ledger,
-/// then close the bracket — commit on success, so the event claim and
-/// everything it caused become durable together; on a refusal, rollback
-/// first, which is what makes the refusal's "nothing was written" promise
-/// true.
-async fn append_and_commit<R: Repository>(
+/// The first writer's second half: the append already ran inside the single
+/// call, so what is left is reading its answer and closing the bracket —
+/// commit on success, so the event claim and everything it caused become
+/// durable together; on a refusal, rollback first, which is what makes the
+/// refusal's "nothing was written" promise true. A balance upsert that
+/// returned no counter is the existence check failing: the refusal names
+/// that account — the first one in account order, as the per-statement
+/// upserts used to.
+async fn commit_or_refuse_unknown_account<R: Repository>(
     repository: &R,
-    mut tx: R::Tx,
-    command: &PostTransaction,
-    event_id: Uuid,
+    tx: R::Tx,
+    appended: Appended,
+    deltas: &BTreeMap<(Uuid, String), Delta>,
 ) -> Result<Posted, WriteError> {
-    match append_to_ledger(repository, &mut tx, command, event_id).await {
-        Ok(transaction_id) => {
-            repository.commit(tx).await.map_err(storage)?;
-            Ok(Posted {
-                event_id,
-                transaction_id: Some(transaction_id),
-                replayed: false,
-            })
-        }
-        // A storage error means the backend already failed mid-statement;
-        // no further statement is sent — the open database transaction dies
-        // with the connection, and that is what keeps "nothing was
-        // committed" true.
-        Err(error @ WriteError::Storage(_)) => Err(error),
-        // A refusal decided here still holds a healthy connection: close
-        // the bracket, then answer.
-        Err(refusal) => {
-            repository.rollback(tx).await.map_err(storage)?;
-            Err(refusal)
-        }
+    // One row per delta is the statement's own shape (it answers the deltas
+    // it was handed, found or not); anything else means the adapter and this
+    // service disagree about the statement — unreachable by construction,
+    // answered as Internal rather than dressed up as a caller error.
+    if appended.balance_upserts.len() != deltas.len() {
+        let refusal = WriteError::Internal(format!(
+            "the single call answered {} balance upserts for {} deltas",
+            appended.balance_upserts.len(),
+            deltas.len()
+        ));
+        repository.rollback(tx).await.map_err(storage)?;
+        return Err(refusal);
     }
+    if let Some(missing) = appended
+        .balance_upserts
+        .iter()
+        .find(|upsert| upsert.last_seq.is_none())
+    {
+        let refusal = WriteError::UnknownAccount {
+            account_id: missing.account_id,
+            currency: missing.currency.clone(),
+        };
+        repository.rollback(tx).await.map_err(storage)?;
+        return Err(refusal);
+    }
+    repository.commit(tx).await.map_err(storage)?;
+    Ok(Posted {
+        event_id: appended.event_id,
+        transaction_id: Some(appended.transaction_id),
+        replayed: false,
+    })
 }
 
 /// The key was already claimed: answer the replay, or refuse the reuse.
@@ -159,106 +187,18 @@ async fn replay_or_refuse<R: Repository>(
     }
 }
 
-/// Append the claimed transaction to the ledger, in ADR-0013's order:
-/// insert the transaction row, upsert the balances, append the entries.
-/// Returns the transaction id and never touches the bracket — `post` owns
-/// the commit, and on a refusal from here, the rollback.
-async fn append_to_ledger<R: Repository>(
-    repository: &R,
-    tx: &mut R::Tx,
-    command: &PostTransaction,
-    event_id: Uuid,
-) -> Result<Uuid, WriteError> {
-    let transaction_id = repository
-        .insert_transaction(tx, command, event_id)
-        .await
-        .map_err(storage)?;
-
-    // Expand each posting into its two legs — the row is a leg; the primitive
-    // you can call is a pair (ADR-0005) — and coalesce per (account,
-    // currency) before any balance is touched.
-    let legs = postings::expand_postings(command.postings());
-    let deltas = postings::coalesce(&legs).map_err(|postings::Overflow| WriteError::Overflow)?;
-
-    let issued = upsert_balances(repository, tx, command, &deltas).await?;
-    append_entries(
-        repository,
-        tx,
-        command,
-        transaction_id,
-        &legs,
-        &issued,
-        &deltas,
-    )
-    .await?;
-
-    Ok(transaction_id)
-}
-
-/// Apply each account's coalesced delta to its balance row and collect the
-/// `last_seq` each upsert returns. The coalesced map iterates in account-id
-/// order (the domain's BTreeMap choice), so the row locks are taken
-/// deterministically, batch-wide. An upsert that selects no row is the
-/// existence check failing: the refusal names that account.
-async fn upsert_balances<R: Repository>(
-    repository: &R,
-    tx: &mut R::Tx,
-    command: &PostTransaction,
-    deltas: &BTreeMap<(Uuid, String), Delta>,
-) -> Result<BTreeMap<(Uuid, String), i64>, WriteError> {
-    let mut issued: BTreeMap<(Uuid, String), i64> = BTreeMap::new();
-    for ((account_id, currency), delta) in deltas {
-        let last_seq = repository
-            .upsert_balance(tx, command.tenant_id(), account_id, currency, delta)
-            .await
-            .map_err(storage)?;
-        let Some(last_seq) = last_seq else {
-            return Err(WriteError::UnknownAccount {
-                account_id: *account_id,
-                currency: currency.clone(),
-            });
-        };
-        issued.insert((*account_id, currency.clone()), last_seq);
-    }
-    Ok(issued)
-}
-
-/// Number each leg from its account's counter — walking back from the
-/// `last_seq` the upserts returned — then append all entries in one
-/// multi-row statement. `None` from the numbering means a leg's account is
-/// missing from maps derived from these same legs — unreachable by
-/// construction, answered as Internal rather than dressed up as a caller
-/// error.
-async fn append_entries<R: Repository>(
-    repository: &R,
-    tx: &mut R::Tx,
-    command: &PostTransaction,
-    transaction_id: Uuid,
-    legs: &[Leg],
-    issued: &BTreeMap<(Uuid, String), i64>,
-    deltas: &BTreeMap<(Uuid, String), Delta>,
-) -> Result<(), WriteError> {
-    let Some(seqs) = postings::assign_account_seqs(legs, issued, deltas) else {
-        return Err(WriteError::Internal(
-            "a leg's account is missing from the seq maps derived from these same legs".to_owned(),
-        ));
-    };
-    repository
-        .insert_entries(tx, command, transaction_id, legs, &seqs)
-        .await
-        .map_err(storage)
-}
-
 #[cfg(test)]
 mod tests {
     //! Orchestration tests over a fake repository — read top to bottom, the
     //! test names are the service's contract. What they hold is the BRANCHING
-    //! and the ORDER: which methods a claim runs and in what sequence, what a
-    //! replay never touches, where each refusal rolls back. The SQL behavior
-    //! each method promises (the claim's ON CONFLICT, the hash-in-WHERE
-    //! lookup, the upsert's existence check) stays proven by the e2e suite
-    //! against real PostgreSQL; nothing here re-proves it, and nothing here
-    //! could.
+    //! and the ROUND-TRIP SHAPE: which repository calls a claim runs — each
+    //! one statement in the adapter — what a replay never touches, where each
+    //! refusal rolls back. The SQL behavior the single call promises (the
+    //! claim's ON CONFLICT gating the append, the ordered balance upserts,
+    //! the hash-in-WHERE lookup) stays proven by the e2e suite against real
+    //! PostgreSQL; nothing here re-proves it, and nothing here could. The
+    //! account-order property lives in the coalesced BTreeMap (held by the
+    //! postings tests) and the statement's ORDER BY (held by the e2e race).
 
     use std::sync::{Arc, Mutex, PoisonError};
 
@@ -267,11 +207,11 @@ mod tests {
 
     use super::*;
     use crate::domain::{Invalid, Posting};
-    use crate::postings::{Delta, Leg};
-    use crate::repository::StorageError;
+    use crate::postings::Append;
+    use crate::repository::{BalanceUpsert, StorageError};
 
-    // Fixed ids: SOURCE < DESTINATION, so SOURCE's upsert runs first (the
-    // service walks the coalesced BTreeMap in account-id order).
+    // Fixed ids: SOURCE < DESTINATION, so SOURCE leads the coalesced map —
+    // and is the account an all-unknown refusal must name.
     const EVENT: Uuid = Uuid::from_u128(0xE0);
     const TRANSACTION: Uuid = Uuid::from_u128(0xF0);
     const SOURCE: Uuid = Uuid::from_u128(1);
@@ -301,12 +241,12 @@ mod tests {
     }
 
     /// The call log, shared out of the fake before the service consumes it.
-    /// Each entry is `(method, account)`: the account is `Some` only for
-    /// `upsert_balance`, so the delta ORDER — which account's upsert ran
-    /// first — is asserted outright rather than inferred from the count.
-    type Calls = Arc<Mutex<Vec<(&'static str, Option<Uuid>)>>>;
+    /// One entry per repository call — and every repository call is one
+    /// statement in the adapter, so this log IS the round-trip count the
+    /// happy-path test asserts.
+    type Calls = Arc<Mutex<Vec<&'static str>>>;
 
-    fn taken(calls: &Calls) -> Vec<(&'static str, Option<Uuid>)> {
+    fn taken(calls: &Calls) -> Vec<&'static str> {
         calls.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
@@ -314,55 +254,57 @@ mod tests {
     /// the real SQL would produce, and every method records its name so the
     /// tests can hold the order.
     struct FakeRepository {
-        claim: Option<Uuid>,
+        claims: bool,
         stored: Option<(Uuid, Option<Uuid>)>,
         accounts_exist: bool,
-        insert_transaction_fails: bool,
+        claim_and_append_fails: bool,
         calls: Calls,
     }
 
     impl FakeRepository {
-        fn new(claim: Option<Uuid>, stored: Option<(Uuid, Option<Uuid>)>) -> Self {
+        fn new(claims: bool, stored: Option<(Uuid, Option<Uuid>)>) -> Self {
             Self {
-                claim,
+                claims,
                 stored,
                 accounts_exist: true,
-                insert_transaction_fails: false,
+                claim_and_append_fails: false,
                 calls: Calls::default(),
             }
         }
 
-        /// Statement A returns a row: this caller claimed the key.
+        /// The single call returns rows: this caller claimed the key and the
+        /// whole append already ran, uncommitted, in the open transaction.
         fn first_writer() -> Self {
-            Self::new(Some(EVENT), None)
+            Self::new(true, None)
         }
 
-        /// The key is already claimed and the body matches: statement B
-        /// finds the stored result.
+        /// The key is already claimed and the body matches: the single call
+        /// returns nothing and statement B finds the stored result.
         fn replaying() -> Self {
-            Self::new(None, Some((EVENT, Some(TRANSACTION))))
+            Self::new(false, Some((EVENT, Some(TRANSACTION))))
         }
 
         /// The key is already claimed with a DIFFERENT body: statement B's
         /// hash-in-WHERE finds nothing.
         fn poisoned_key() -> Self {
-            Self::new(None, None)
+            Self::new(false, None)
         }
 
         /// The claim succeeds but no posted account exists: every balance
-        /// upsert selects zero rows.
+        /// upsert inside the single call selects zero rows, so every
+        /// returned counter is `None`.
         fn without_accounts() -> Self {
             let mut fake = Self::first_writer();
             fake.accounts_exist = false;
             fake
         }
 
-        /// The claim succeeds and then the backend fails mid-flight: the
-        /// transaction insert returns the opaque storage error the adapter
-        /// would box up from a lost connection or a refused statement.
+        /// The backend fails mid-statement: the single call returns the
+        /// opaque storage error the adapter would box up from a lost
+        /// connection or a refused statement.
         fn failing_mid_flight() -> Self {
             let mut fake = Self::first_writer();
-            fake.insert_transaction_fails = true;
+            fake.claim_and_append_fails = true;
             fake
         }
 
@@ -371,14 +313,10 @@ mod tests {
         }
 
         fn record(&self, name: &'static str) {
-            self.push(name, None);
-        }
-
-        fn push(&self, name: &'static str, account: Option<Uuid>) {
             self.calls
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push((name, account));
+                .push(name);
         }
     }
 
@@ -392,15 +330,42 @@ mod tests {
             Ok(FakeTx)
         }
 
-        async fn claim_event(
+        async fn claim_and_append(
             &self,
             _tx: &mut FakeTx,
             _command: &PostTransaction,
             _hash: &[u8],
             _payload: &serde_json::Value,
-        ) -> Result<Option<Uuid>, StorageError> {
-            self.record("claim_event");
-            Ok(self.claim)
+            append: &Append,
+        ) -> Result<Option<Appended>, StorageError> {
+            self.record("claim_and_append");
+            // The statement's own precondition, held on every path: one
+            // offset per leg, in the same order.
+            assert_eq!(append.seq_offsets.len(), append.legs.len());
+            if self.claim_and_append_fails {
+                return Err("the backend refused the statement".into());
+            }
+            if !self.claims {
+                return Ok(None);
+            }
+            // One answer per delta, in the map's own account order — the
+            // real statement's LEFT JOIN back onto the deltas it was handed.
+            // A fresh account: after this batch its counter reads exactly
+            // this batch's leg count.
+            let balance_upserts = append
+                .deltas
+                .iter()
+                .map(|((account_id, currency), delta)| BalanceUpsert {
+                    account_id: *account_id,
+                    currency: currency.clone(),
+                    last_seq: self.accounts_exist.then_some(delta.legs),
+                })
+                .collect();
+            Ok(Some(Appended {
+                event_id: EVENT,
+                transaction_id: TRANSACTION,
+                balance_upserts,
+            }))
         }
 
         async fn stored_result(
@@ -411,45 +376,6 @@ mod tests {
         ) -> Result<Option<(Uuid, Option<Uuid>)>, StorageError> {
             self.record("stored_result");
             Ok(self.stored)
-        }
-
-        async fn insert_transaction(
-            &self,
-            _tx: &mut FakeTx,
-            _command: &PostTransaction,
-            _event_id: Uuid,
-        ) -> Result<Uuid, StorageError> {
-            self.record("insert_transaction");
-            if self.insert_transaction_fails {
-                return Err("the backend refused the statement".into());
-            }
-            Ok(TRANSACTION)
-        }
-
-        async fn upsert_balance(
-            &self,
-            _tx: &mut FakeTx,
-            _tenant_id: &str,
-            account_id: &Uuid,
-            _currency: &str,
-            delta: &Delta,
-        ) -> Result<Option<i64>, StorageError> {
-            self.push("upsert_balance", Some(*account_id));
-            // A fresh account: after this batch its counter reads exactly
-            // this batch's leg count, so the walk-back numbers from 1.
-            Ok(self.accounts_exist.then_some(delta.legs))
-        }
-
-        async fn insert_entries(
-            &self,
-            _tx: &mut FakeTx,
-            _command: &PostTransaction,
-            _transaction_id: Uuid,
-            _legs: &[Leg],
-            _seqs: &[i64],
-        ) -> Result<(), StorageError> {
-            self.record("insert_entries");
-            Ok(())
         }
 
         async fn commit(&self, _tx: FakeTx) -> Result<(), StorageError> {
@@ -464,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn a_claimed_key_does_the_work_in_delta_order_and_commits() -> Result<(), Invalid> {
+    fn a_claimed_key_posts_in_one_call_between_begin_and_commit() -> Result<(), Invalid> {
         let repository = FakeRepository::first_writer();
         let calls = repository.calls();
         let service = LedgerService::new(repository);
@@ -480,21 +406,11 @@ mod tests {
                 replayed: false,
             }) if e == EVENT && t == TRANSACTION
         ));
-        // One posting is two legs on two accounts: one upsert each, in
-        // account-id order — SOURCE's upsert before DESTINATION's, asserted
-        // by account and not just by count — and statement B never runs.
-        assert_eq!(
-            taken(&calls),
-            [
-                ("begin", None),
-                ("claim_event", None),
-                ("insert_transaction", None),
-                ("upsert_balance", Some(SOURCE)),
-                ("upsert_balance", Some(DESTINATION)),
-                ("insert_entries", None),
-                ("commit", None),
-            ]
-        );
+        // The round-trip shape single-call posting exists to buy (roadmap
+        // M3, spike 003): the whole append is the ONE call between the
+        // bracket's ends — three repository calls, each one statement in
+        // the adapter — and statement B never runs.
+        assert_eq!(taken(&calls), ["begin", "claim_and_append", "commit"]);
         Ok(())
     }
 
@@ -515,16 +431,11 @@ mod tests {
                 replayed: true,
             }) if e == EVENT && t == TRANSACTION
         ));
-        // Statement B, then out — no transaction row, no upsert, no entries,
-        // and the bracket closes by rollback: a replay writes nothing.
+        // Statement B, then out — the single call appended nothing, and the
+        // bracket closes by rollback: a replay writes nothing.
         assert_eq!(
             taken(&calls),
-            [
-                ("begin", None::<Uuid>),
-                ("claim_event", None),
-                ("stored_result", None),
-                ("rollback", None),
-            ]
+            ["begin", "claim_and_append", "stored_result", "rollback"]
         );
         Ok(())
     }
@@ -541,18 +452,13 @@ mod tests {
         assert!(matches!(posted, Err(WriteError::KeyReused)));
         assert_eq!(
             taken(&calls),
-            [
-                ("begin", None::<Uuid>),
-                ("claim_event", None),
-                ("stored_result", None),
-                ("rollback", None),
-            ]
+            ["begin", "claim_and_append", "stored_result", "rollback"]
         );
         Ok(())
     }
 
     #[test]
-    fn an_unknown_account_rolls_back_before_any_entry_is_written() -> Result<(), Invalid> {
+    fn an_unknown_account_rolls_back_before_anything_commits() -> Result<(), Invalid> {
         let repository = FakeRepository::without_accounts();
         let calls = repository.calls();
         let service = LedgerService::new(repository);
@@ -561,28 +467,19 @@ mod tests {
         let posted = run(service.post(&command));
 
         // The refusal names the account whose upsert found nothing — the
-        // first in id order, since the walk stops there.
+        // first in account order, since the scan stops there.
         assert!(matches!(
             posted,
             Err(WriteError::UnknownAccount { account_id, .. }) if account_id == SOURCE
         ));
-        assert_eq!(
-            taken(&calls),
-            [
-                ("begin", None),
-                ("claim_event", None),
-                ("insert_transaction", None),
-                ("upsert_balance", Some(SOURCE)),
-                ("rollback", None),
-            ]
-        );
+        assert_eq!(taken(&calls), ["begin", "claim_and_append", "rollback"]);
         Ok(())
     }
 
     #[test]
     fn a_storage_failure_mid_flight_propagates_and_nothing_commits() -> Result<(), Invalid> {
-        // The backend fails AFTER the claim — the adapter's boxed error for a
-        // lost connection or a refused statement, from the transaction insert.
+        // The backend fails INSIDE the single call — the adapter's boxed
+        // error for a lost connection or a refused statement.
         let repository = FakeRepository::failing_mid_flight();
         let calls = repository.calls();
         let service = LedgerService::new(repository);
@@ -595,14 +492,7 @@ mod tests {
         // the open database transaction dies with the connection, which is
         // what makes "nothing was committed" true without a rollback call.
         assert!(matches!(posted, Err(WriteError::Storage(_))));
-        assert_eq!(
-            taken(&calls),
-            [
-                ("begin", None::<Uuid>),
-                ("claim_event", None),
-                ("insert_transaction", None),
-            ]
-        );
+        assert_eq!(taken(&calls), ["begin", "claim_and_append"]);
         Ok(())
     }
 }

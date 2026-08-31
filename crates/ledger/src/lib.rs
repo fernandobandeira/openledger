@@ -20,7 +20,7 @@
 //! Inside the crate the layout is: `domain` is the pure core's types —
 //! entities, value objects, their validation, the canonical hash and the
 //! versioned payload rendering; `postings` is the posting math the writer
-//! runs between its SQL statements; `port` is the one trait a consumer sees;
+//! runs before its SQL does; `port` is the one trait a consumer sees;
 //! `repository` is the outbound port the adapter implements; and `service`
 //! is the writer — the claim-or-replay use-case, orchestrated over the
 //! repository.
@@ -33,12 +33,12 @@ mod service;
 
 // Consumers write `ledger::Posting`; the module layout is this crate's own
 // business. Of the posting math only the TYPES are exported — the adapter
-// needs `Leg`, `Delta` and `Direction` because the `Repository` port's
-// signatures name them; the functions are `pub(crate)`, called by the writer
-// service alone, so the math's order of operations cannot be re-orchestrated
-// outside this crate.
+// needs `Append` (and the `Leg`, `Delta`, `Direction` inside it) because the
+// `Repository` port's signatures name them; the functions are `pub(crate)`,
+// called by the writer service alone, so the math's order of operations
+// cannot be re-orchestrated outside this crate.
 pub use domain::{Invalid, PostTransaction, Posted, Posting};
 pub use port::{Ledger, WriteError};
-pub use postings::{Delta, Direction, Leg};
-pub use repository::{Repository, StorageError};
+pub use postings::{Append, Delta, Direction, Leg};
+pub use repository::{Appended, BalanceUpsert, Repository, StorageError};
 pub use service::LedgerService;

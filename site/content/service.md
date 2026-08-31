@@ -83,9 +83,17 @@ failed sweep and a red one differ.
 
 The database page ends where the writer begins: ADR-0013 specified this path before it existed,
 and this is the path as it now runs — `crates/api` (the handler), `crates/ledger` (the writer
-service and the pure math between statements), `crates/ledger/postgres` (the SQL, a nested
+service and the pure math before the SQL), `crates/ledger/postgres` (the SQL, a nested
 workspace member). One database transaction; the event claim and everything it causes commit
-together:
+together — and since 2026-08-28 the whole append is **one server-side statement** (roadmap M3's
+single-call posting): a posting costs **three round trips** — the explicit `BEGIN`, the statement,
+`COMMIT` — where the lean writer of 2026-08-27 spent **eight** on the same two-account posting
+(`BEGIN`, `SET`, claim, transaction, one balance upsert per account, entries, `COMMIT`; counted
+from the adapter, one statement per repository method). [Spike
+003](/spikes/003-throughput-ceiling) is the motivation: collapsing the per-clearing round trips
+into one call measured ~14% on localhost, where a round trip costs ~0.05 ms — and the same five
+saved round trips are ~2.5 ms against ~1.3 ms of real work at RDS-like latency, which is the
+number that made this a design constraint rather than a tuning knob.
 
 ```mermaid
 sequenceDiagram
@@ -97,20 +105,13 @@ sequenceDiagram
     C->>H: POST /v1/transactions
     Note over H: construct the command — an unbalanced<br/>body is unconstructible (ADR-0005)
     H->>W: post(command)
-    Note over W: canonical bytes → SHA-256<br/>idempotency hash (ADR-0013)
-    W->>P: BEGIN, SET READ COMMITTED
-    W->>P: statement A — claim the key<br/>(INSERT event … ON CONFLICT DO NOTHING RETURNING)
-    alt claimed — this caller is the first writer
-        W->>P: INSERT ledger_transactions (status 'posted')
-        Note over W: expand postings to legs, coalesce<br/>per (account, currency), account-id order
-        loop one upsert per account, in id order
-            W->>P: balance upsert (+input, +output, +legs)<br/>RETURNING last_seq
-        end
-        Note over W: number every leg by walking back<br/>from the returned totals
-        W->>P: INSERT ledger_entries — one unnest statement
+    Note over W: canonical bytes → SHA-256 idempotency hash (ADR-0013);<br/>expand postings to legs, coalesce per (account, currency)<br/>in account-id order, count each leg's offset<br/>back from its account's counter
+    W->>P: BEGIN ISOLATION LEVEL READ COMMITTED
+    W->>P: statement A, carrying the whole append — one CTE pipeline:<br/>claim the key (INSERT event … ON CONFLICT DO NOTHING),<br/>and from the claimed row: the transaction, the balance<br/>upserts in account order RETURNING last_seq, the entries<br/>numbered last_seq − offset through one unnest
+    alt rows back — this caller is the first writer, the append already ran
         W->>P: COMMIT
         H-->>C: 201 · Idempotency-Replayed: false
-    else no row — the key already exists
+    else zero rows — the key already exists, none of the append ran
         W->>P: statement B — the stored result,<br/>hash in the WHERE
         W->>P: ROLLBACK
         H-->>C: 200 · Idempotency-Replayed: true — or 422
@@ -131,29 +132,39 @@ Step by step, with the reasoning each one carries:
    are normalized to UTC first, so a client that re-renders `12:00+02:00` as `10:00Z` is a replay,
    not a poisoned key.
 3. **The writer SETS `READ COMMITTED`, never inherits it**
-   ([ADR-0013 §1](/decisions/0013-write-path-contract)). Measured there: under a deployment default
-   of `REPEATABLE READ`, contended writes fail with `could not serialize access` at 64–82%, and an
-   in-transaction retry rescues **0 of 25,074** — so the isolation level is the writer's to state.
-4. **The replay is two statements** ([ADR-0013 §2](/decisions/0013-write-path-contract)). Statement
-   A claims the key; when it returns nothing, a *separate* statement B takes a new snapshot — the
-   elegant single-CTE form returns zero rows under exactly the race it exists to handle. B carries
-   the body hash **in the `WHERE`, not as a returned column**: a same-key/different-body call gets
-   no row, so a caller that forgets to compare gets nothing instead of the wrong stored result.
+   ([ADR-0013 §1](/decisions/0013-write-path-contract)) — now literally the ADR's own sentence:
+   the transaction opens with `BEGIN ISOLATION LEVEL READ COMMITTED`, one round trip, no second
+   `SET` statement. Measured there: under a deployment default of `REPEATABLE READ`, contended
+   writes fail with `could not serialize access` at 64–82%, and an in-transaction retry rescues
+   **0 of 25,074** — so the isolation level is the writer's to state.
+4. **The replay is still two statements** ([ADR-0013 §2](/decisions/0013-write-path-contract)),
+   and single-call posting rides the append on the CLAIM, never on the lookup. Statement A claims
+   the key, and every dependent insert in its CTE pipeline selects `FROM` the claimed row — so
+   when the key is already held, zero rows come back and *none of the append ran*. Then a
+   *separate* statement B takes a new snapshot — folding B into A is the one-statement form that
+   returns zero rows under exactly the race it exists to handle, which is why it stays out. B
+   carries the body hash **in the `WHERE`, not as a returned column**: a same-key/different-body
+   call gets no row, so a caller that forgets to compare gets nothing instead of the wrong stored
+   result.
 5. **Coalesce, then lock in account order** ([spike 003](/spikes/003-throughput-ceiling)). Legs are
    summed per (account, currency) so N legs cost one balance upsert, and the coalesced map is a
-   `BTreeMap` so the upserts run in account-id order batch-wide — the spike measured the unordered
-   alternative collapsing 10× into deadlocks. The upsert's row lock *is* the serialization point
-   (the database page's `ledger_account_balances` section is the long version), and its `INSERT`
-   arm selects the account's frozen identity columns from `ledger_accounts` itself — which doubles
-   as the existence check: an unknown account or a wrong currency upserts nothing, and the writer
-   rolls back with `unknown_account`.
-6. **Sequence numbers walk back from the totals.** Each upsert returns the account's `last_seq`
-   after this batch; the domain numbers each leg by walking backwards
-   (`assign_account_seqs`, crate-internal to `ledger`), so gapless per-account numbering costs no second lock and no
+   `BTreeMap` so the deltas arrive in account-id order — inside the statement, the `ORDER BY` on
+   the `SELECT` feeding the upsert is what holds that order batch-wide when the row locks are
+   taken; the spike measured the unordered alternative collapsing 10× into deadlocks. The upsert's
+   row lock *is* the serialization point (the database page's `ledger_account_balances` section is
+   the long version), and its `INSERT` arm selects the account's frozen identity columns from
+   `ledger_accounts` itself — which doubles as the existence check: an unknown account or a wrong
+   currency joins to nothing and comes back as a `NULL` counter, and the writer rolls back with
+   `unknown_account`.
+6. **Sequence numbers walk back from the totals.** The domain counts each leg's offset back from
+   its account's counter (`offsets_back_from_last_seq`, crate-internal to `ledger` — the pure half
+   of the walk-back), and the statement numbers each entry `last_seq − offset` beside the counter
+   the upsert just returned — gapless per-account numbering with no second lock and no
    `SELECT max()`.
-7. **Entries land in one statement.** All legs insert through a single `unnest` — measured within
-   2% of `COPY` on this table at every batch size tried, the composite foreign keys dominating
-   ([ADR-0013 §5](/decisions/0013-write-path-contract)).
+7. **Entries land through one `unnest`** — measured within 2% of `COPY` on this table at every
+   batch size tried, the composite foreign keys dominating
+   ([ADR-0013 §5](/decisions/0013-write-path-contract)) — inside the same statement as everything
+   they depend on.
 
 ## The contract on the wire
 

@@ -5,12 +5,12 @@
 //!
 //! What lives here is exactly the [`ledger::Repository`] implementation: the
 //! SQL, and nothing that decides when to run it. The use-case — hash,
-//! claim-or-replay, coalesce, upsert in delta order, number, append, commit
-//! — is the writer service in the `ledger` crate, orchestrating over the
-//! repository port; the pure computation between the statements is that
-//! crate's domain. The one piece of ADR-0013's contract that is this crate's
-//! to honor is §1: `begin` opens every transaction by SETTING
-//! `READ COMMITTED` rather than inheriting it.
+//! coalesce, number, claim-and-append-or-replay, commit — is the writer
+//! service in the `ledger` crate, orchestrating over the repository port;
+//! the pure computation before the statements is that crate's domain. The
+//! one piece of ADR-0013's contract that is this crate's to honor is §1:
+//! `begin` opens every transaction WITH `READ COMMITTED` rather than
+//! inheriting it.
 //!
 //! `repository` is the whole of it: [`PgRepository`] and its trait impl,
 //! implemented where the SQL lives — one statement per method, all of this
