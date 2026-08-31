@@ -5,7 +5,7 @@ built on top of it afterwards. This ADR records the model and the evidence behin
 not re-derived — it is *not* a specification of something being built now, and its open defects below
 are recorded rather than closed deliberately. Where a sentence here is in the present tense about an
 adapter, a writer or a sweep, **that code does not exist**, and neither do the tables: the built
-binary (`crates/openledger`) carries the core ledger's `migrate` and `serve` and nothing
+binary (`crates/openledger`) carries the core ledger's `migrate`, `serve` and `reconcile` and nothing
 card-shaped, and this module's DDL is parked in
 [`parked/card/`](/card/parked), applied by no migration.
 **Artifact:** the DDL is **parked** — `parked/card/schema.sql`, applied by no migration and loaded

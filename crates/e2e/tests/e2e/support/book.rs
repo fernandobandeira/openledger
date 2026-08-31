@@ -249,20 +249,28 @@ impl TestBook {
         .await
     }
 
-    /// The oracle. Ten checks, and every one must report zero breaks.
-    pub async fn assert_reconciled(&self) -> TestResult {
-        // The sweep's quiescence assumption, made explicit. recon_cursor_breaks
-        // reads the snapshot horizon, and report_cursor()'s comment names the
-        // honest cost: the horizon is the CLUSTER's, so one in-flight
-        // transaction anywhere on the server — another database included —
-        // holds it back. The operator sweep runs on a quiet book; this binary
-        // runs sibling tests concurrently on one cluster, so an entry this
-        // book has committed can sit above a horizon a sibling still pins —
-        // 'above_horizon', transiently, on a healthy book. Wait, bounded, for
-        // the horizon to retire this book's newest entry. A forged far-future
-        // xact_id outlives the bound and still fails below.
-        let mut retired = false;
-        for _ in 0..200 {
+    /// The sweep's quiescence assumption, made explicit and waitable-for.
+    /// recon_cursor_breaks reads the snapshot horizon, and report_cursor()'s
+    /// comment names the honest cost: the horizon is the CLUSTER's, so one
+    /// in-flight transaction anywhere on the server — another database
+    /// included — holds it back. The operator sweep runs on a quiet book;
+    /// this binary runs sibling tests concurrently on one cluster, so an
+    /// entry this book has committed can sit above a horizon a sibling still
+    /// pins — 'above_horizon', transiently, on a healthy book. Wait,
+    /// bounded, for the horizon to retire this book's newest entry; once
+    /// retired it STAYS retired (xids only grow), so anything read or
+    /// spawned after this cannot trip over a neighbor. A forged far-future
+    /// xact_id outlives the bound and still fails in the oracle.
+    ///
+    /// The bound is 15s because the longest honest pin measured here is
+    /// not a query: it is a sibling's setup `DROP DATABASE ... WITH
+    /// (FORCE)`, which holds its xid through a forced checkpoint and the
+    /// file unlinking — over five seconds on a loaded Docker volume, and
+    /// every run OPENS with a wave of them (each test's create_scratch_db
+    /// drops the previous run's database). 200 polls flaked exactly there
+    /// when the suite grew past seventeen tests.
+    pub async fn wait_for_the_horizon_to_retire_this_book(&self) -> TestResult {
+        for _ in 0..600 {
             let (now_retired,): (bool,) = sqlx::query_as(
                 "SELECT coalesce(max(xact_id) <= pg_snapshot_xmin(pg_current_snapshot()), true)
                  FROM ledger_entries",
@@ -270,8 +278,7 @@ impl TestBook {
             .fetch_one(&self.pool)
             .await?;
             if now_retired {
-                retired = true;
-                break;
+                return Ok(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
@@ -279,15 +286,18 @@ impl TestBook {
         // oracle, where a held-back horizon reads as `cursor_forgery` and
         // sends whoever is debugging into the forgery check instead of at
         // the neighbor holding the horizon.
-        if !retired {
-            return Err(
-                "the cluster's xmin horizon never retired this book's entries after 5s — \
-                 another database on this cluster likely has an open transaction holding it \
-                 back; see ADR-0010's cluster-horizon note. This is a stalled horizon, not a \
-                 cursor forgery."
-                    .into(),
-            );
-        }
+        Err(
+            "the cluster's xmin horizon never retired this book's entries after 15s — \
+             another database on this cluster likely has an open transaction holding it \
+             back; see ADR-0010's cluster-horizon note. This is a stalled horizon, not a \
+             cursor forgery."
+                .into(),
+        )
+    }
+
+    /// The oracle. Ten checks, and every one must report zero breaks.
+    pub async fn assert_reconciled(&self) -> TestResult {
+        self.wait_for_the_horizon_to_retire_this_book().await?;
         let checks: Vec<(String, i64)> =
             sqlx::query_as("SELECT check_name, breaks FROM reconciliation")
                 .fetch_all(&self.pool)

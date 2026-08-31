@@ -53,6 +53,16 @@ that the schema is current before it listens, and an unmigrated
 or behind database is exit 1 naming that command. The check
 takes no locks — the serving process never migrates (ADR-0003).";
 
+const RECONCILE_ABOUT: &str = "\
+Run the ten reconciliation checks, then exit.
+
+One REPEATABLE READ READ ONLY transaction as openledger_recon —
+the role the views grant to, assumed with SET ROLE, so the login
+behind DATABASE_URL needs membership in it. Every check clean is
+exit 0; breaks are exit 1 with each breaking check named on
+stderr. The sweep takes ACCESS SHARE only and cannot block a
+posting. Schedule it once a day at a cut-off (ADR-0010).";
+
 const LOCK_SECS_HELP: &str = "\
 Seconds to wait for another migrator to finish before
 giving up.
@@ -65,9 +75,9 @@ someone chose the number.";
 /// mean, and how to connect. Shown under `--help`, not the shorter `-h`.
 const OPERATING_NOTES: &str = "\
 EXIT CODES
-    0   nothing left to apply
-    1   the migration failed, or the database could not be reached
-        — do not retry blindly; look at the error
+    0   nothing left to apply, or every reconciliation check is clean
+    1   the migration failed, the database could not be reached, or
+        the sweep found breaks — do not retry blindly; look at the error
     2   the command line or the environment is wrong
     3   another migrator held the lock for the whole budget
         — safe to re-run
@@ -130,6 +140,23 @@ pub enum Command {
         lock_secs: u64,
     },
 
+    /// Run the reconciliation sweep, then exit
+    #[command(long_about = RECONCILE_ABOUT)]
+    Reconcile {
+        /// PostgreSQL connection string
+        ///
+        // `Option` for the same message-quality reason as `migrate`'s:
+        // `dispatch` refuses its absence naming both spellings.
+        #[arg(
+            long,
+            env = "DATABASE_URL",
+            hide_env_values = true,
+            value_name = "URL",
+            long_help = DATABASE_URL_HELP
+        )]
+        database_url: Option<String>,
+    },
+
     /// Serve the ledger API
     #[command(long_about = SERVE_ABOUT)]
     Serve {
@@ -170,7 +197,8 @@ mod tests {
     //! migrate-then-serve split) is held by the e2e suite against the
     //! compiled binary: `startup.rs` holds exit 1's serve refusals,
     //! `exit_codes.rs` holds 2 (a malformed flag) and 3 (the lock budget
-    //! spent, safe to re-run).
+    //! spent, safe to re-run), and `reconcile.rs` holds the sweep's 0 and
+    //! its breaks-on-stderr exit 1.
 
     use clap::CommandFactory;
 

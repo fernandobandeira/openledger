@@ -1,9 +1,11 @@
 //! openledger — an open-source double-entry ledger.
 //!
-//! Two subcommands: `migrate` applies the schema, `serve` is the ledger API.
-//! One binary on purpose: ADR-0003 makes `migrate` a *subcommand of the same
-//! binary*, so a deployment runs the same image with a different command, and
-//! the ledger process never migrates.
+//! Three subcommands: `migrate` applies the schema, `serve` is the ledger
+//! API, `reconcile` is the daily sweep. One binary on purpose: ADR-0003 makes
+//! `migrate` a *subcommand of the same binary*, so a deployment runs the same
+//! image with a different command, and the ledger process never migrates —
+//! and ADR-0010 gives the sweep the same shape, a command an operator runs
+//! and schedules rather than a step that happens invisibly.
 //!
 //! The command line is `clap`'s derive, so the *shape* of the interface — flag
 //! forms, environment fallbacks, the range on the lock budget, the help text —
@@ -86,6 +88,14 @@ fn dispatch(cli: Cli) -> Result<(), Failure> {
             let database_url = require_database_url(database_url)?;
             block_on(async {
                 db::migrate::run(&database_url, Duration::from_secs(lock_secs))
+                    .await
+                    .map_err(Failure::from)
+            })
+        }
+        Some(Command::Reconcile { database_url }) => {
+            let database_url = require_database_url(database_url)?;
+            block_on(async {
+                db::reconcile::run(&database_url)
                     .await
                     .map_err(Failure::from)
             })

@@ -1,6 +1,8 @@
 //! How a process reaches PostgreSQL: the pool a serving process runs on, the
-//! startup gate that refuses to serve an unmigrated database (`verify`), and
-//! `migrate` — the pre-deploy job that puts the schema there first (ADR-0003).
+//! startup gate that refuses to serve an unmigrated database (`verify`),
+//! `migrate` — the pre-deploy job that puts the schema there first (ADR-0003)
+//! — and `reconcile`, the scheduled sweep that turns the ten reconciliation
+//! checks into an exit code (ADR-0010).
 //! The migration files themselves stay at the repository root; they are
 //! adopter-facing, and this crate only compiles them in.
 //!
@@ -16,6 +18,7 @@ use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 pub mod migrate;
+pub mod reconcile;
 mod verify;
 
 pub use verify::verify_schema_is_current;
@@ -41,7 +44,7 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
 /// this pool — it opens its own `PgConnection` (migrate.rs) with its own 5s
 /// `lock_timeout`, so a future long `CREATE INDEX` is not killed by the 30s
 /// here. The e2e suite's bounded reconciliation wait polls 25ms SELECTs for
-/// 5s max, nowhere near any of these.
+/// 15s max, each nowhere near any of these.
 const SESSION_TIMEOUTS: &str = "\
     SET statement_timeout = '30s'; \
     SET lock_timeout = '10s'; \
@@ -98,6 +101,21 @@ pub enum MigrateError {
     Locked(String),
     /// The migration or the connection failed. Read the error first.
     Failed(String),
+}
+
+/// What the sweep can report, split the way the binary's exit codes need it:
+/// `Usage` is exit 2, and both `Failed` and `Drift` are exit 1 — "read the
+/// error first" is exactly what a drifted book demands, and ADR-0010 assigns
+/// no code of its own, so the sweep stays inside the contract `Failure`
+/// already prints under `--help`. `Drift` is still its own variant because
+/// it is not a malfunction: the command worked, and the book is wrong.
+pub enum ReconcileError {
+    /// The invocation is wrong. Retrying changes nothing.
+    Usage(String),
+    /// The sweep could not run or could not be trusted. Read the error first.
+    Failed(String),
+    /// The sweep ran and found breaks — the checks are named in the message.
+    Drift(String),
 }
 
 /// `println!` panics on a broken pipe, and this workspace denies `panic`. A

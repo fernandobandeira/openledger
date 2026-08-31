@@ -26,8 +26,9 @@ gap — not a deployment — is the story now. Phase 1 is the ordered list of co
    ([ADR-0014](/decisions/0014-http-api)); what remains of M3 is batching under load, stripe
    selection, single-call posting, and pending → posted.
 2. **`openledger reconcile`** ([M2](#m2--openledger-reconcile-and-the-concurrency-proof)) — wire the
-   ten reconciliation views to an exit code so the daily sweep is a real command. The views already
-   ship in the baseline; the command does not.
+   ten reconciliation views to an exit code so the daily sweep is a real command. **Built
+   2026-08-28**: the subcommand runs the views in one snapshot as `openledger_recon`; what remains
+   of M2 is the concurrency proof, which waits on M3's batching.
 3. **The stripe-picking writer** ([M3](#m3--the-posting-engine)) and **the CI schema-snapshot test**
    (M1, below) — stripe selection on the write path, and [0007](/decisions/0007-schema-conventions-and-chart)'s
    highest-leverage unbuilt guard against schema drift.
@@ -139,17 +140,20 @@ without batching, and with striping on and off.
 
 ## M2 · `openledger reconcile` and the concurrency proof
 
-Two things live here: a command that is buildable now, and a proof that waits on the writer above.
+Two things live here: a command that is built, and a proof that waits on the writer above.
 
-**Buildable now — the `openledger reconcile` subcommand.** The ten reconciliation views ship in
-`migrations/00001_baseline.sql`, but nothing runs them on a schedule: the binary carries `migrate`
-and `serve` today, and the e2e suite reads `reconciliation` per test rather than as a sweep.
-The command is the same binary and shape as `openledger migrate` ([ADR-0010](/decisions/0010-reconciliation)),
-running the reconciliation views once a day in one `REPEATABLE READ READ ONLY` transaction as
-`openledger_recon` and turning `SELECT * FROM reconciliation` into an exit code. The views exist; the
-command that schedules them does not. [ADR-0010](/decisions/0010-reconciliation) specifies the layer,
-every drift class was reproduced and caught with a clean-book negative control
-([spike 011](/spikes/011-reconciliation)).
+**Built 2026-08-28 — the `openledger reconcile` subcommand.** The ten reconciliation views ship in
+`migrations/00001_baseline.sql`, and the command that runs them as a sweep now exists: the same
+binary and shape as `openledger migrate` ([ADR-0010](/decisions/0010-reconciliation)), running the
+views in one `REPEATABLE READ READ ONLY` transaction as `openledger_recon` (`SET ROLE` after
+connecting — the role is `NOLOGIN`) and turning `SELECT * FROM reconciliation` into an exit code:
+ten checks at zero breaks is exit 0, drift is exit 1 with each breaking check named on stderr
+(`crates/db/src/reconcile.rs`; the [service page](/service) has the operator contract). Scheduling
+the daily run stays the operator's — a cron entry or a Kubernetes CronJob, the same way `migrate`
+is a pre-deploy job. [ADR-0010](/decisions/0010-reconciliation) specifies the layer, every drift
+class was reproduced and caught with a clean-book negative control
+([spike 011](/spikes/011-reconciliation)) — and the e2e suite now holds both halves against the
+compiled binary: a clean book to exit 0, a forged cache to exit 1.
 
 **The concurrency proof — waits on M3's writer and batching.** The mechanism is settled: a
 per-(account, currency) balance row, updated by [one atomic upsert](/database) returning **both** the
@@ -174,7 +178,7 @@ leads the primary key; without it the statement does not run at all. Three traps
   `SELECT … FOR UPDATE` — you cannot lock a row that does not exist — but
   `INSERT … ON CONFLICT DO UPDATE` *is* the insert-and-lock, so there is no gap to race through.
 
-**Done when:** the reconcile command runs the views to an exit code, and — once the writer and
+**Done when:** the reconcile command runs the views to an exit code (**done**, above), and — once the writer and
 batching exist — N writers against overlapping account sets, half posting their legs in reverse
 order, produce zero deadlocks, gapless per-account sequences and balanced transactions **with
 batching enabled**. Batch-wide ordering is the harder half and is untested. The acceptance test is
@@ -232,7 +236,9 @@ re-evaluating against a limit that may have moved, and STIP.
 
 **Also here, moved from the decision log** ([0008](/decisions/0008-module-boundaries)): the card
 schema is *parked*, not *separated* —
-un-parking it is **migration 00002 creating a `card` schema** (leaving the core in `public`), and the
+un-parking it is **a new numbered migration creating a `card` schema** (leaving the core in `public` —
+the next free number when that day comes, not a reserved one: 00002 went to
+[ADR-0003](/decisions/0003-migrations)'s role-race fix), and the
 collision test [0008](/decisions/0008-module-boundaries) requires still does not exist. And the
 **perimeter-attestation feed** — importing bank statements, network settlement reports and trustee
 statements into `perimeter_attestations` so `perimeter_drift` has something to compare — is unowned and

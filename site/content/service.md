@@ -1,22 +1,24 @@
 # The service, built and running
 
-**One binary, `openledger`, with two subcommands and one endpoint.** `openledger migrate` applies
+**One binary, `openledger`, with three subcommands and one endpoint.** `openledger migrate` applies
 the schema the [database page](/database) explains, and exits. `openledger serve` refuses to start
 against a database that schema never reached, then answers `POST /v1/transactions`: post a balanced
-transaction, or replay the stored answer for an idempotency key it has already seen. The rest of
+transaction, or replay the stored answer for an idempotency key it has already seen.
+`openledger reconcile` runs the schema's ten reconciliation checks in one snapshot and turns them
+into an exit code — the daily sweep as a command. The rest of
 this page walks that code — the startup gate, the write path and what it guarantees, the wire
 contract, the crate boundaries that enforce the design, what the e2e suite proves, and
 [what is not built yet](#still-open--what-is-not-there).
 
-The census, counted 2026-08-27 against the workspace: **6 crates · 2 subcommands · 1 endpoint ·
-4 exit codes · 17 end-to-end tests · 10 reconciliation checks asserted at zero after every
+The census, counted 2026-08-28 against the workspace: **6 crates · 3 subcommands · 1 endpoint ·
+4 exit codes · 38 end-to-end tests · 10 reconciliation checks asserted at zero after every
 endpoint test.**
 
 The API itself is browsable as rendered documentation: **[the API reference](/api-reference/)**,
 generated on every site build from the committed `crates/api/openapi.json` — never a second
 hand-maintained copy.
 
-## The shape: one binary, two commands, one refusal
+## The shape: one binary, three commands, one refusal
 
 [ADR-0003](/decisions/0003-migrations) split deployment in two — migrations are a pre-deploy job,
 and **the ledger process never migrates** — and made both halves the *same image*: `migrate` is a
@@ -53,11 +55,29 @@ starting server never blocks a migrator and a migrator never blocks a starting s
 ADR-0003's split is what makes a lock-free read sufficient. The refusal is exit 1 with the remedy
 in the message: *"Run `openledger migrate` first — the serving process never migrates."*
 
+**`reconcile`** (`crates/db/src/reconcile.rs`) is the daily sweep as a command, the shape
+[ADR-0010](/decisions/0010-reconciliation) decided for it: something an operator runs and
+schedules, never a step that happens invisibly. It reads
+`SELECT check_name, breaks FROM reconciliation` — the ten checks the schema ships — in **one
+`REPEATABLE READ READ ONLY` transaction**, because the family of views is many statements and one
+snapshot is what keeps the summary and the break lists describing the same book; the transaction
+writes nothing and takes `ACCESS SHARE` only, so it cannot block a posting. It runs **as
+`openledger_recon`**, the role the views grant to and the one that cannot write the cache it
+checks; the role is `NOLOGIN` (the baseline names roles for what they may do, never for who logs
+in), so the command assumes it with `SET ROLE` and the login behind `DATABASE_URL` needs only
+membership. Ten checks at zero breaks is exit 0 and one summary line; anything else is exit 1 with
+every breaking check named on stderr — and a summary returning fewer than ten rows is *also* a
+failure, because a check that never ran is indistinguishable from one that passed, and this
+project has already paid for reading that silence as assent (ADR-0010).
+
 **The exit codes are an operator contract**, defined once (`crates/openledger/src/failure.rs`) and
-printed under `--help`: **0** nothing left to do, **1** it failed — read the error before retrying,
-**2** the invocation is wrong — retrying changes nothing, **3** another migrator held the lock for
-the whole budget — safe to re-run. The distinction exists so a deploy pipeline can retry exit 3
-blindly and must not retry exit 1 blindly.
+printed under `--help`: **0** nothing left to do, or every reconciliation check clean, **1** it
+failed or the sweep found breaks — read the error before retrying, **2** the invocation is wrong —
+retrying changes nothing, **3** another migrator held the lock for the whole budget — safe to
+re-run. The distinction exists so a deploy pipeline can retry exit 3 blindly and must not retry
+exit 1 blindly. Drift shares exit 1 deliberately: ADR-0010 assigns the sweep no code of its own,
+and a drifted book is exactly "read the error first" — the message, not the number, is where a
+failed sweep and a red one differ.
 
 ## The write path, as implemented
 
@@ -176,7 +196,7 @@ Six crates, split along the hexagon's seams
 | --- | --- | --- |
 | `ledger` | The domain, the ports and the writer service: posting types, validation, the canonical hash, the pure posting math, and the orchestration behind the `Ledger` port | — **sqlx is forbidden here**, and that is the boundary |
 | `ledger-postgres` | The adapter, a nested member at `crates/ledger/postgres`: the `Repository` port's Postgres implementation; all of its SQL in one repository file | `sqlx` |
-| `db` | The pool, `migrate`, the schema gate | `sqlx` |
+| `db` | The pool, `migrate`, `reconcile`, the schema gate | `sqlx` |
 | `api` | The HTTP surface and the OpenAPI annotations | `axum`, `utoipa` |
 | `openledger` | The binary: parse, dispatch, exit codes, and the composition root | `clap` |
 | `e2e` | The end-to-end suite and its instrumentation | `sqlx`, `reqwest`, `testcontainers` |
@@ -222,7 +242,7 @@ binary, named `openledger-e2e-pg` and reused across runs (testcontainers 0.27 sh
 an anonymous container would leak one per run; a named, reused one caps the population at exactly
 one).
 
-The seventeen tests, by what each holds:
+The thirty-eight tests, by what each holds:
 
 - **Nine endpoint tests** (`endpoints/transactions/post.rs`) — the whole `POST /v1/transactions`
   contract in one file: a posting lands on both accounts' balance rows; two postings over one pair
@@ -251,6 +271,36 @@ The seventeen tests, by what each holds:
 - **Two exit-code tests** (`exit_codes.rs`) — a malformed `--bind` is a usage error at exit 2, and
   a migrator that never gets the advisory lock exits 3 telling the operator it is safe to re-run —
   the two halves of the failure contract that exist to be retried differently.
+- **Twenty-one reconcile tests** (`reconcile.rs`) — the sweep subcommand, spawned as a process
+  like everything else here, with a red-path injection for **every one of the summary's ten
+  checks**: a check that cannot fail this suite through the command is a safety net nobody has
+  load-tested. Two controls at exit 0: a clean, non-empty book (which also pins the suite's own
+  copy of the ten check names against the live view), and a correctly-booked **pending**
+  transaction — the population that must be *named* (the bridge derives available = posted +
+  pending) and never read as a break. [Spike 011](/spikes/011-reconciliation)'s five drift
+  classes, each at exit 1 with the right check — and only it — named on stderr: a forged cache
+  (`balance_cache`), a forged sequence counter with the balance exact (same check, the `seq_ahead`
+  class — ADR-0004's 48-wide gap), an entry with no transaction via the replica-role path
+  (`orphan_entries`, kept a named reconciling item rather than an unexplained gap), an entryless
+  transaction — the ADR-0004 `TRUNCATE` scar (`unbalanced_transactions`), and a one-sided
+  cross-scope booking posted through the front door (`cross_scope_mirror`, grouped per
+  counterparty). The four checks that joined the family after the spike, same contract: a
+  fat-fingered year-2226 posting lands in the out-of-window bucket (`journal_to_reports`), a
+  single posted leg breaks the face and the rows together (`accounting_equation` +
+  `unbalanced_transactions` — the one injection that cannot break alone, and says so), a close
+  whose stored cursor precedes its own closing transaction (`close_typing`), a close whose
+  checkpoint rows never landed (`checkpoint_drift`, one `missing_row` per account), an entry
+  whose supplied commit key predates its transaction (`cursor_forgery`'s persistent class — the
+  one no horizon wait retires), and an `is_perimeter` account posted to and never attested
+  (`chart_lint`). Two simultaneous drifts are both named in one sweep. The contract edges: no URL
+  and a garbage URL at exit 2, an unreachable database at exit 1, a login outside
+  `openledger_recon` refused with the `GRANT` to run, a summary surgically shortened to nine
+  checks **failing rather than passing** — nine zeros are silence, not assent — and a write
+  smuggled into the summary's read path as `SECURITY DEFINER` refused by the sweep's READ ONLY
+  transaction itself, with nothing landed. And sweeps raced against a live wave of API posts: at
+  worst the documented horizon transient, never any other check, and the quiesced book sweeps
+  clean — [ADR-0010](/decisions/0010-reconciliation)'s command contract, with its negative
+  controls.
 
 ## STILL OPEN — what is not there
 

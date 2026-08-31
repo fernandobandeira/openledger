@@ -43,15 +43,15 @@ site/content/     THE DELIVERABLE — vision, glossary, the database page, the
                   service page, the decision log, the roadmap, the spike
                   write-ups.
 site/             the viewer over it: `make docs`.
-migrations/       the schema, as one numbered migration, with the reasoning
-                  in comments beside each object.
+migrations/       the schema, as numbered migrations — the 00001 baseline
+                  carries the reasoning in comments beside each object.
 schema/           chart.sql: an EXAMPLE chart of accounts, seeded separately
                   by `make chart`. No migration owns it.
 parked/card/      the card product's schema, written and not deployed.
 crates/           the workspace: `ledger` (the domain and the writer, no
                   sqlx), its `postgres` adapter, `db` (connections and
                   migrations), `api` (HTTP), `openledger` (the one binary:
-                  `migrate` and `serve`), and `e2e` (the suite that spawns
+                  `migrate`, `serve`, `reconcile`), and `e2e` (the suite that spawns
                   the binary and posts over the wire).
 scripts/          check-migrations-immutable.sh — the CI guard that keeps
                   committed migrations immutable.

@@ -7,7 +7,9 @@
 ///
 /// The exit codes are THIS binary's contract; the library crates return their
 /// own error types (`db::MigrateError` carries the same three-way
-/// distinction; `api::ServeError` is only ever exit 1 — serve's usage errors
+/// distinction; `db::ReconcileError` folds drift into 1 — ADR-0010 assigns
+/// the sweep no code of its own, and a drifted book is exactly "read the
+/// error first"; `api::ServeError` is only ever exit 1 — serve's usage errors
 /// are clap's now, refused before the crate is reached), and the `From`
 /// impls below are the one place the mapping to a number lives.
 pub enum Failure {
@@ -41,6 +43,18 @@ impl From<db::MigrateError> for Failure {
             db::MigrateError::Usage(m) => Self::Usage(m),
             db::MigrateError::Locked(m) => Self::Locked(m),
             db::MigrateError::Failed(m) => Self::Failed(m),
+        }
+    }
+}
+
+impl From<db::ReconcileError> for Failure {
+    fn from(error: db::ReconcileError) -> Self {
+        match error {
+            db::ReconcileError::Usage(m) => Self::Usage(m),
+            // Drift and a failed sweep are both exit 1: an operator reads the
+            // message either way, and the message is where they differ — the
+            // breaking checks are named, one per line.
+            db::ReconcileError::Failed(m) | db::ReconcileError::Drift(m) => Self::Failed(m),
         }
     }
 }

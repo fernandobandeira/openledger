@@ -137,7 +137,10 @@ errors as the tenth.
 
 **Once a day, at a cut-off, as an `openledger reconcile` subcommand — decided here, and the same shape
 as `openledger migrate` ([0003](/decisions/0003-migrations)): a command an operator runs and schedules,
-not a step that happens invisibly. It is an M2 work item on the [roadmap](/roadmap).** The cadence is not invented here. The Federal Reserve's
+not a step that happens invisibly. Built 2026-08-28** — `crates/db/src/reconcile.rs` behind the
+subcommand, one snapshot as the role below, ten zeros to exit 0 and the breaking checks named on
+stderr at exit 1; the [service page](/service) carries the operator contract, and the daily
+scheduling stays the operator's (a cron entry, a Kubernetes CronJob). The cadence is not invented here. The Federal Reserve's
 *Commercial Bank Examination Manual* asks it as an internal-control question — §2320.4: *"Are the
 above ledger or individual subsidiary accounts balanced to the general ledger on a **daily
 basis**?"* — and the OCC puts *"balancing subsidiary records to general ledger control totals"*

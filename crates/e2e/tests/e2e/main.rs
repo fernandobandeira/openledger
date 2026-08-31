@@ -15,12 +15,17 @@
 //! the running router still describe the same surface), `startup` (whether
 //! `serve` refuses a database its migrate job never reached, is behind, or
 //! mismatches), `exit_codes` (the binary's 2-and-3 half of the exit-code
-//! contract), and `roles` (the writer as a policy-admitted role, and the
-//! reader's RLS scoping).
+//! contract), `roles` (the writer as a policy-admitted role, and the
+//! reader's RLS scoping), and `reconcile` (the sweep subcommand: clean and
+//! pending controls to exit 0, a red-path injection for EVERY one of the
+//! summary's ten checks — spike 013's drift classes and the four checks
+//! that joined after the spike — each named on stderr at exit 1, the
+//! command's contract edges, and the sweep racing live writers).
 
 mod conformance;
 mod endpoints;
 mod exit_codes;
+mod reconcile;
 mod roles;
 mod startup;
 mod support;

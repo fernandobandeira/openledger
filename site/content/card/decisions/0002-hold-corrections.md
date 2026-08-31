@@ -3,7 +3,7 @@
 **Status:** accepted, and **scoped as future work** like the ADR it corrects. Every schema change
 below is **proposed DDL against [`parked/card/schema.sql`](/card/parked)**, which is applied by no
 migration; nothing here is deployed, and the built binary (`crates/openledger`) still carries the
-core ledger's `migrate` and `serve` and nothing card-shaped.
+core ledger's `migrate`, `serve` and `reconcile` and nothing card-shaped.
 This ADR closes the findings the card rail's [authorization-holds decision](/card/decisions/0001-authorization-holds) records and declines
 to fix, and closes the open question [spike 001](/card/spikes/001-append-only-holds) leaves about
 what `group_key` is.
