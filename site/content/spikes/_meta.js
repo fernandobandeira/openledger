@@ -18,5 +18,7 @@ export default {
   '015-managed-postgres-event-triggers': '015 · Event triggers on managed Postgres',
   '016-close-cost-at-scale': '016 · What a period close costs at scale',
   '017-openapi-tooling': '017 · aide or utoipa for the OpenAPI spec',
-  '018-batching-and-stripe-selection': '018 · Do batching and striping compose?'
+  '018-batching-and-stripe-selection': '018 · Do batching and striping compose?',
+  '019-read-path-contract': '019 · What a read path must honour',
+  '021-reporting-layer-defects': '021 · Which reporting defects are real?'
 }
