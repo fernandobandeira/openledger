@@ -1,0 +1,30 @@
+# Spike 023's harness. NOT a workspace member (see spikes/README and spike 022's
+# harness, which set the pattern): spike code is throwaway and its dependencies
+# never leak into the root manifest. sqlx is pinned to the workspace's 0.9 line
+# on purpose — the questions this answers are about what THAT pool does with
+# session state, so a different pool implementation would answer a different
+# question.
+#
+# The empty `[workspace]` table detaches this crate from the repo root's
+# workspace so its dependencies never reach the root manifest, the root
+# Cargo.lock, or deny.toml's capability map. It carries its own Cargo.lock.
+[workspace]
+
+[package]
+name = "spike023"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "uuid", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+uuid = { version = "1", features = ["v4"] }
+
+[[bin]]
+name = "guc"
+path = "src/guc.rs"
+
+[[bin]]
+name = "role"
+path = "src/role.rs"

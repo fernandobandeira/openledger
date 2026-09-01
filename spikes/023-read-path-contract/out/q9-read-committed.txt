@@ -1,0 +1,18 @@
+BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY;
+BEGIN
+SELECT 'statement 1: rows = ' || count(*)
+FROM balance_sheet_at('t1','infinity','16168'::xid8, 3);
+        ?column?        
+------------------------
+ statement 1: rows = 20
+(1 row)
+
+SELECT 'statement 2: rows = ' || count(*)
+FROM balance_sheet_at('t1','infinity','16168'::xid8, 3);
+        ?column?        
+------------------------
+ statement 2: rows = 30
+(1 row)
+
+COMMIT;
+COMMIT

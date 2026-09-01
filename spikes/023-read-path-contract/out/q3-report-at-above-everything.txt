@@ -1,0 +1,19 @@
+-- trial_balance_at('t1', -infinity, infinity, 15789)
+01a05d61-52a1-7f83-b40d-2da9d28abc8a|USD|442000|0|442000
+01a05d61-52a2-7ca2-b1e5-1c3adb3edf14|USD|0|442000|-442000
+-- balance_sheet_at('t1', infinity, 15789, 3)
+USD|3|borrowings|0|liability|15789
+USD|3|cash|0|asset|15789
+USD|3|current_year_earnings|442000|equity|15789
+USD|3|customer_funds|0|liability|15789
+USD|3|equity|0|equity|15789
+USD|3|other_assets|0|asset|15789
+USD|3|payables|0|liability|15789
+USD|3|receivables|442000|asset|15789
+USD|3|restricted_cash|0|asset|15789
+USD|3|retained_earnings|0|equity|15789
+-- income_statement_for('t1', -infinity, infinity, 15789, 3)
+USD|3|cost_of_revenue|0|debit|15789
+USD|3|credit_losses|0|debit|15789
+USD|3|interest|0|debit|15789
+USD|3|revenue|442000|credit|15789

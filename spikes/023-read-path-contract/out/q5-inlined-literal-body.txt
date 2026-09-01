@@ -1,0 +1,9 @@
+   Buffers: shared hit=2486971 read=51251 written=5, temp read=18709 written=18709
+           Buffers: shared hit=2481607 read=29451
+   Buffers: shared hit=2488097 read=50125, temp read=18709 written=18709
+           Buffers: shared hit=2481438 read=29620
+   Buffers: shared hit=2487791 read=50431, temp read=18709 written=18709
+           Buffers: shared hit=2481124 read=29934
+ Execution Time: 2756.951 ms
+ Execution Time: 2766.227 ms
+ Execution Time: 2731.270 ms

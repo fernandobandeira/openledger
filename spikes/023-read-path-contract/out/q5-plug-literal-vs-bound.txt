@@ -1,0 +1,42 @@
+=== plug with the cursor as a LITERAL (what my decomposition ran) ===
+   Buffers: shared hit=2481089 read=29974 written=978
+         Buffers: shared hit=4 read=1
+               Buffers: shared hit=4 read=1
+                     Buffers: shared hit=1 read=1
+     ->  Aggregate  (cost=21129.90..21129.91 rows=1 width=32) (actual rows=1.00 loops=1)
+           Buffers: shared hit=2481085 read=29973 written=978
+           ->  Nested Loop  (cost=4420.33..21043.18 rows=6937 width=12) (actual rows=500000.00 loops=1)
+                 Buffers: shared hit=2481085 read=29973 written=978
+                 ->  Nested Loop  (cost=4419.90..16997.68 rows=3469 width=86) (actual rows=500000.00 loops=1)
+                       Buffers: shared hit=3 read=11055 written=351
+                       ->  Nested Loop  (cost=0.15..10.13 rows=1 width=64) (actual rows=1.00 loops=1)
+                             Buffers: shared hit=3 read=1
+                                   Buffers: shared hit=1 read=1
+                             ->  Seq Scan on chart_presentation p  (cost=0.00..1.90 rows=5 width=19) (actual rows=3.50 loops=2)
+                                   Buffers: shared hit=2
+                             Buffers: shared read=11054 written=351
+                                   Buffers: shared read=2856 written=42
+                       Buffers: shared hit=2481082 read=18918 written=627
+   Buffers: shared hit=728 read=30
+ Execution Time: 1582.981 ms
+=== the same, as a PREPARED statement with the cursor BOUND (what plpgsql does) ===
+   Buffers: shared hit=2482784 read=28276
+         Buffers: shared hit=1 read=1
+               Buffers: shared hit=1 read=1
+                     Buffers: shared hit=1 read=1
+     ->  Aggregate  (cost=21129.90..21129.91 rows=1 width=32) (actual rows=1.00 loops=1)
+           Buffers: shared hit=2482783 read=28275
+           ->  Nested Loop  (cost=4420.33..21043.18 rows=6937 width=12) (actual rows=500000.00 loops=1)
+                 Buffers: shared hit=2482783 read=28275
+                 ->  Nested Loop  (cost=4419.90..16997.68 rows=3469 width=86) (actual rows=500000.00 loops=1)
+                       Buffers: shared hit=3 read=11055
+                       ->  Nested Loop  (cost=0.15..10.13 rows=1 width=64) (actual rows=1.00 loops=1)
+                             Buffers: shared hit=3 read=1
+                                   Buffers: shared hit=1 read=1
+                             ->  Seq Scan on chart_presentation p  (cost=0.00..1.90 rows=5 width=19) (actual rows=3.50 loops=2)
+                                   Buffers: shared hit=2
+                             Buffers: shared read=11054
+                                   Buffers: shared read=2856
+                       Buffers: shared hit=2482780 read=17220
+   Buffers: shared read=1
+ Execution Time: 1536.319 ms

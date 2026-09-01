@@ -1,0 +1,10 @@
+    reason     | count | entry_disagrees_with_its_txn 
+---------------+-------+------------------------------
+ above_horizon | 10016 |                            0
+(1 row)
+
+ horizon | min_entry_xid 
+---------+---------------
+   15760 |         15567
+(1 row)
+

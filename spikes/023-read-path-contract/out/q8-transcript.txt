@@ -1,0 +1,190 @@
+############ 1 · an unknown chart version RAISES (the only input that does)
+---- balance_sheet_at, chart version 999
+ERROR:  23514: chart version 999 does not exist
+CONTEXT:  PL/pgSQL function balance_sheet_at(text,timestamp with time zone,xid8,integer) line 11 at RAISE
+LOCATION:  exec_stmt_raise, pl_exec.c:3909
+
+---- income_statement_for, chart version 999
+ERROR:  23514: chart version 999 does not exist
+CONTEXT:  PL/pgSQL function income_statement_for(text,timestamp with time zone,timestamp with time zone,xid8,integer) line 14 at RAISE
+LOCATION:  exec_stmt_raise, pl_exec.c:3909
+
+---- trial_balance_at takes no chart version at all
+ count 
+-------
+     2
+(1 row)
+
+
+############ 2 · a type with posted entries that the version does not present
+ unpresented_type_at_v3 
+------------------------
+(0 rows)
+
+---- …is refused rather than silently dropped (A14)
+ count 
+-------
+    20
+(1 row)
+
+
+############ 3 · a malformed cursor
+---- cursor = 'not-a-cursor'
+ERROR:  22P02: invalid input syntax for type xid8: "not-a-cursor"
+LOCATION:  uint64in_subr, numutils.c:1001
+
+---- cursor = -1
+ count 
+-------
+    20
+(1 row)
+
+
+---- cursor = 0  (below every transaction id ever issued)
+ rows | total 
+------+-------
+   20 |     0
+(1 row)
+
+
+---- cursor = 18446744073709551615 (xid8 max — above every id)
+ rows | total  
+------+--------
+   20 | 884000
+(1 row)
+
+
+############ 4 · an absent cursor: NULL, and what it fabricates
+---- balance_sheet_at with a NULL cursor
+ rows | assets | liab_eq_earn | rows_with_null_pinned_cursor 
+------+--------+--------------+------------------------------
+   20 |      0 |            0 |                           20
+(1 row)
+
+
+---- …and the accounting-equation check on that fabrication
+ equation_breaks 
+-----------------
+               0
+(1 row)
+
+
+---- a NULL as-of instant
+ rows | total 
+------+-------
+   20 |     0
+(1 row)
+
+
+---- a NULL effective range on the income statement
+ rows | total 
+------+-------
+    8 |     0
+(1 row)
+
+
+############ 5 · an unknown tenant — silence, not a refusal
+---- a tenant that does not exist
+ bs_rows 
+---------
+       0
+(1 row)
+
+
+---- …on the trial balance too
+ tb_rows 
+---------
+       0
+(1 row)
+
+
+---- a tenant that exists but has been TYPO'd by one character
+ bs_rows 
+---------
+       0
+(1 row)
+
+
+############ 6 · the two shapes of an empty book
+---- a tenant with ACCOUNTS but no entries
+ bs_rows | total 
+---------+-------
+      10 |     0
+(1 row)
+
+
+---- a tenant with NO accounts at all
+ bs_rows 
+---------
+       0
+(1 row)
+
+
+############ 7 · scoped out by RLS — the same silence as case 5 and 6b
+---- reader scoped to t1, asking for t2
+BEGIN
+SET
+ set_config 
+------------
+ t1
+(1 row)
+
+          q           | rows 
+----------------------+------
+ balance_sheet_at(t2) |    0
+(1 row)
+
+
+---- reader with NO scope at all, asking for its own tenant
+BEGIN
+SET
+               q                | rows 
+--------------------------------+------
+ balance_sheet_at(t1), unscoped |    0
+(1 row)
+
+COMMIT
+
+############ 8 · an unknown ACCOUNT, on the balance read a caller would want
+---- a real account with activity (the SUM over its stripes)
+ stripe_rows | balance_minor 
+-------------+---------------
+           6 |        442000
+(1 row)
+
+
+---- an account id that does not exist
+ stripe_rows | balance_minor 
+-------------+---------------
+           0 |              
+(1 row)
+
+
+---- an account that EXISTS but has never been written (no balance row yet)
+ stripe_rows | balance_minor 
+-------------+---------------
+           0 |              
+(1 row)
+
+
+---- …and the account row itself, which is the only thing that can tell them apart
+ account_exists 
+----------------
+              1
+(1 row)
+
+
+############ 9 · a currency the account does not hold
+---- an existing account, currency EUR
+ stripe_rows 
+-------------
+           0
+(1 row)
+
+
+############ 10 · the seed cases: no chart at all
+              ?column?              
+------------------------------------
+ chart versions on this database: 3
+(the 'no chart version exists' RAISE at :1122 needs an unseeded database;
+ it is the same ERRCODE 23514 as case 1 and is not re-run here)

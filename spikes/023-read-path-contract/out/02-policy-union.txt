@@ -1,0 +1,112 @@
+################ login: spike023_reader
+Output format is aligned.
+=== who am I, and which policies apply to me ===
+  current_user   | is_read | is_app | is_recon 
+-----------------+---------+--------+----------
+ spike023_reader | t       | f      | f
+(1 row)
+
+=== A · no GUC at all: does the fence hold? ===
+ entries | tenants 
+---------+---------
+       0 | <none>
+(1 row)
+
+=== B · scoped to t1 through an inherited membership (no SET ROLE) ===
+BEGIN
+ applied 
+---------
+ t1
+(1 row)
+
+ entries | tenants 
+---------+---------
+       4 | t1
+(1 row)
+
+COMMIT
+=== C · the same read behind SET LOCAL ROLE openledger_read ===
+BEGIN
+SET
+ applied 
+---------
+ t1
+(1 row)
+
+ current_user_inside | entries | tenants 
+---------------------+---------+---------
+ openledger_read     |       4 | t1
+(1 row)
+
+COMMIT
+=== D · and through the report surfaces, which is what a caller reaches ===
+BEGIN
+SET
+ applied 
+---------
+ t1
+(1 row)
+
+       surface        | rows | tenants 
+----------------------+------+---------
+ trial_balance        |    2 | t1
+ trial_balance_at(t2) |    0 | <none>
+(2 rows)
+
+COMMIT
+################ login: spike023_dual
+Output format is aligned.
+=== who am I, and which policies apply to me ===
+ current_user  | is_read | is_app | is_recon 
+---------------+---------+--------+----------
+ spike023_dual | t       | t      | f
+(1 row)
+
+=== A · no GUC at all: does the fence hold? ===
+ entries | tenants 
+---------+---------
+       6 | t1,t2
+(1 row)
+
+=== B · scoped to t1 through an inherited membership (no SET ROLE) ===
+BEGIN
+ applied 
+---------
+ t1
+(1 row)
+
+ entries | tenants 
+---------+---------
+       6 | t1,t2
+(1 row)
+
+COMMIT
+=== C · the same read behind SET LOCAL ROLE openledger_read ===
+BEGIN
+SET
+ applied 
+---------
+ t1
+(1 row)
+
+ current_user_inside | entries | tenants 
+---------------------+---------+---------
+ openledger_read     |       4 | t1
+(1 row)
+
+COMMIT
+=== D · and through the report surfaces, which is what a caller reaches ===
+BEGIN
+SET
+ applied 
+---------
+ t1
+(1 row)
+
+       surface        | rows | tenants 
+----------------------+------+---------
+ trial_balance        |    2 | t1
+ trial_balance_at(t2) |    0 | <none>
+(2 rows)
+
+COMMIT

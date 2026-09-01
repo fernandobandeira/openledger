@@ -1,0 +1,36 @@
+== Q2 · assuming the read role ==
+
+-- A · session SET ROLE, returned to the pool, next caller writes --
+checkout 1: SET ROLE openledger_read                       current_user=openledger_read
+checkout 2: the WRITER's next posting                      current_user=openledger_read INSERT REFUSED: error returned from database: permission denied for table ledger_accounts at line 2793
+
+-- B · SET LOCAL ROLE inside the read's own transaction ------
+inside: SET LOCAL ROLE then set_config as that role        current_user=openledger_read set_config=Ok("t1") entries=22
+same connection, after COMMIT                              current_user=openledger
+next checkout                                              current_user=openledger
+
+-- C · an error inside the read transaction, then ROLLBACK ---
+the read raises                                            error returned from database: division by zero at line 870
+after ROLLBACK                                             current_user=openledger guc="<NULL>"
+
+-- D · a dedicated read pool, SET ROLE in after_connect ------
+fresh connection, nothing set per request                  current_user=openledger_read entries=0
+one request: transaction + set_config, no role statement   entries=2 tenants=t2
+RESET ROLE on a read-pool connection                       Ok("ok") current_user=openledger
+
+-- E · sqlx's prepared-statement cache across a role/GUC change --
+1st execution: OWNER, no GUC                               entries=1110024 tenants=big100k,big10k,big1m,t1,t2
+2nd execution: same text, reader scoped to t1              entries=22 tenants=t1
+3rd execution: same text, GUC moved to t2                  entries=2 tenants=t2
+4th execution: same text, back to the OWNER                entries=1110024 tenants=big100k,big10k,big1m,t1,t2
+
+-- F · what RESET leaves behind, and what then fails closed --
+fresh connection, never SET                                current_setting => None
+after SET then RESET                                       current_setting => Some("")
+can a tenant be named ''? (as the OWNER, no less)          REFUSED: error returned from database: new row for relation "ledger_accounts" violates check constraint "ck_accounts__tenant_non_empty" at line 2076
+
+-- G · a read pool with its own statement_timeout ------------
+read pool after_connect: 90s                               statement_timeout=90s current_user=openledger_read
+SET LOCAL statement_timeout as openledger_read             Ok("ok") => 2min
+
+done.

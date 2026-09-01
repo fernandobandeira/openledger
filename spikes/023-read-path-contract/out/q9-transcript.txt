@@ -1,0 +1,61 @@
+cursor for the whole experiment: 16168
+
+###### A · a MULTI-statement read under READ COMMITTED, with an account
+         created between the two statements
+SELECT 'statement 1: rows = ' || count(*)
+ statement 1: rows = 20
+SELECT 'statement 2: rows = ' || count(*)
+ statement 2: rows = 30
+
+###### B · the same two statements under REPEATABLE READ READ ONLY
+SELECT 'statement 1: rows = ' || count(*)
+ statement 1: rows = 30
+SELECT 'statement 2: rows = ' || count(*)
+ statement 2: rows = 30
+
+###### C · what a REPEATABLE READ report costs everyone else: it pins the
+         horizon that report_cursor() is defined off
+before the report opens:
+ cursor_now 
+------------
+      16170
+(1 row)
+
+while an 11-second REPEATABLE READ report on big1m is running:
+ cursor_now | backends_pinning_xmin 
+------------+-----------------------
+      16170 |                     4
+(1 row)
+
+  pid  | datname  | state  | backend_xmin |                      q                       
+-------+----------+--------+--------------+----------------------------------------------
+ 10525 | spike023 | active |        16170 | SELECT count(*) FROM balance_sheet_at('big1m
+ 10541 | spike023 | active |        16170 | WITH scopes AS (                            +
+       |          |        |              |         -- Enumerated from 
+ 10542 | spike023 | active |        16170 | WITH scopes AS (                            +
+       |          |        |              |         -- Enumerated from 
+ 10545 | spike023 | active |        16170 | SELECT pid, datname, state, backend_xmin, le
+(4 rows)
+
+
+###### D · a SINGLE call is one snapshot at every isolation level, so the
+         report function alone needs no transaction for consistency —
+         but it needs one for the tenant GUC (Q1), which is what settles it
+ERROR:  syntax error at or near ">"
+LINE 7:         WHERE l LIKE '%Function Scan%') > 0
+                                                ^
+                                                                                                                     QUERY PLAN                                                                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on "*SELECT*"
+   ->  HashAggregate
+         Group Key: a.id, t.category, e.currency
+         ->  Hash Join
+               Hash Cond: (x.id = e.transaction_id)
+               ->  Index Scan using uq_txn__id_kind on ledger_transactions x
+            QUERY PLAN             
+-----------------------------------
+ Function Scan on balance_sheet_at
+(1 row)
+
+
+== loadavg: 2.13 2.36 2.12 ==

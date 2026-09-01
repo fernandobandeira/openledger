@@ -1,0 +1,27 @@
+== Q1 · tenant scoping on a pooled connection ==
+pool: max_connections=1, sqlx 0.9, crates/db's after_connect
+
+-- A · fail closed when unset --------------------------------
+unset app.tenant_id, reader role                           entries=0 guc=<NULL> tenants=<none>
+unset GUC, through the report surfaces                     trial_balance=0 trial_balance_at=0 balance_sheet_at=0 income_statement_for=0
+
+-- B · session SET, returned to the pool ---------------------
+checkout 1: SET app.tenant_id = 't1', then read            entries=4 guc=t1 tenants=t1
+checkout 2: sets NOTHING, reads as if for t2               entries=4 guc=t1 tenants=t1
+
+-- C · SET LOCAL inside an explicit transaction --------------
+inside the transaction, SET LOCAL 't1'                     entries=4 tenants=t1
+same connection, after COMMIT                              entries=0 guc= tenants=<none>
+next checkout after a SET LOCAL request                    entries=0 guc= tenants=<none>
+
+-- D · set_config(..., is_local => true), parameterised ------
+SET app.tenant_id = $1                                     REFUSED: error returned from database: syntax error at or near "$1" at line 1236
+set_config($1, is_local => true) in a transaction          applied=t2 entries=2 tenants=t2
+…and with a hostile tenant_id as the bind                  applied="t2'; SET ROLE openledger_app; --" entries=0 current_user=openledger_read
+
+-- E · set_config(local) with NO explicit transaction --------
+set_config(local) then a separate statement                applied=t1 next statement sees guc=
+…and the read it was supposed to scope                     entries=0
+one statement: WITH set_config(...) SELECT …               entries=6 (as OWNER, unscoped by RLS)
+
+done.

@@ -1,0 +1,4 @@
+psql:spikes/023-read-path-contract/sql/01-login-roles.sql:21: NOTICE:  role "spike023_reader" does not exist, skipping
+psql:spikes/023-read-path-contract/sql/01-login-roles.sql:22: NOTICE:  role "spike023_dual" does not exist, skipping
+spike023_dual member_of=openledger_app,openledger_read
+spike023_reader member_of=openledger_read

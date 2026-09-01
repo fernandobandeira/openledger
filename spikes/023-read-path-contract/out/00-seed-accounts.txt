@@ -1,0 +1,4 @@
+t1 customer_receivable 01a05d61-52a1-7f83-b40d-2da9d28abc8a
+t1 fee_revenue 01a05d61-52a2-7ca2-b1e5-1c3adb3edf14
+t2 customer_receivable 01a05d61-52a2-7d6a-9b9f-fae92f1b5f7e
+t2 fee_revenue 01a05d61-52a2-7d9f-93f7-1a820602533f

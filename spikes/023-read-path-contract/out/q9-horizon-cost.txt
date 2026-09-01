@@ -1,0 +1,10 @@
+BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+BEGIN
+SELECT count(*) FROM balance_sheet_at('big1m','infinity','16168'::xid8, 3);
+ count 
+-------
+    10
+(1 row)
+
+COMMIT;
+COMMIT

@@ -1,0 +1,124 @@
+-- building big100k: 50000 transactions (loadavg 1.39)
+-- building big1m: 500000 transactions (loadavg 2.25)
+
+== the books ==
+ tenant_id | entries | transactions | balance_rows 
+-----------+---------+--------------+--------------
+ t2        |       2 |            1 |            2
+ t1        |      22 |           11 |           12
+ big10k    |   10000 |         5000 |           16
+ big100k   |  100000 |        50000 |           16
+ big1m     | 1000000 |       500000 |           16
+(5 rows)
+
+ entries_size | txn_size 
+--------------+----------
+ 454 MB       | 193 MB
+(1 row)
+
+
+== the inception scan, per book (loadavg at start: 2.44) ==
+---- big10k (10000 entries) ----
+trial_balance_at, since inception              median      9.858 ms   range 9.453–10.606   loadavg 2.44
+balance_sheet_at, as at infinity               median     64.760 ms   range 64.112–66.522   loadavg 2.32
+income_statement_for, since inception          median     37.624 ms   range 37.570–38.129   loadavg 2.32
+one account's CURRENT balance (SUM over stripes) median      0.100 ms   range 0.093–0.167   loadavg 2.32
+one account, as of a business date (mid-book)  median      6.886 ms   range 6.821–7.516   loadavg 2.32
+---- big100k (100000 entries) ----
+trial_balance_at, since inception              median     76.232 ms   range 72.000–77.781   loadavg 2.32
+balance_sheet_at, as at infinity               median   1207.944 ms   range 1198.184–1232.098   loadavg 2.46
+income_statement_for, since inception          median    472.953 ms   range 470.498–480.707   loadavg 2.46
+one account's CURRENT balance (SUM over stripes) median      0.094 ms   range 0.088–0.097   loadavg 2.46
+one account, as of a business date (mid-book)  median     61.629 ms   range 60.562–65.995   loadavg 2.50
+---- big1m (1000000 entries) ----
+trial_balance_at, since inception              median   1057.181 ms   range 1012.299–1081.043   loadavg 2.62
+balance_sheet_at, as at infinity               median  11428.071 ms   range 11296.349–12163.156   loadavg 4.22
+income_statement_for, since inception          median   4302.945 ms   range 4270.623–4328.310   loadavg 3.80
+one account's CURRENT balance (SUM over stripes) median      0.091 ms   range 0.084–0.133   loadavg 3.80
+one account, as of a business date (mid-book)  median    574.658 ms   range 558.407–581.624   loadavg 3.80
+
+== the row counts the three reports RETURN (the result is small; the scan is not) ==
+          f           | count 
+----------------------+-------
+ trial_balance_at     |     2
+ balance_sheet_at     |    10
+ income_statement_for |     4
+(3 rows)
+
+
+== the plan at 1M, to say WHAT is being scanned ==
+                                                                                    QUERY PLAN                                                                                     
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on "*SELECT*"  (cost=107365.97..107370.97 rows=200 width=140) (actual rows=2.00 loops=1)
+   Buffers: shared hit=6694 read=20457, temp read=11450 written=11450
+   ->  HashAggregate  (cost=107365.97..107370.97 rows=200 width=112) (actual rows=2.00 loops=1)
+         Group Key: a.id, t.category, e.currency
+         Batches: 1  Memory Usage: 40kB
+         Buffers: shared hit=6694 read=20457, temp read=11450 written=11450
+         ->  Hash Join  (cost=28643.02..83192.27 rows=690677 width=100) (actual rows=1000000.00 loops=1)
+               Hash Cond: (e.transaction_id = x.id)
+               Buffers: shared hit=6694 read=20457, temp read=11450 written=11450
+               ->  Nested Loop  (cost=2005.15..26168.37 rows=690676 width=122) (actual rows=1000000.00 loops=1)
+                     Buffers: shared hit=6592 read=11460
+                     ->  Nested Loop  (cost=0.29..16.36 rows=1 width=100) (actual rows=2.00 loops=1)
+                           Buffers: shared hit=4 read=2
+                           ->  Index Scan using uq_accounts__id_currency on ledger_accounts a  (cost=0.15..8.17 rows=1 width=96) (actual rows=2.00 loops=1)
+                                 Index Cond: (tenant_id = 'big1m'::text)
+                                 Index Searches: 1
+                                 Buffers: shared read=2
+                           ->  Index Only Scan using uq_types__presentable on account_types t  (cost=0.15..8.17 rows=1 width=36) (actual rows=1.00 loops=2)
+                                 Index Cond: (code = a.purpose)
+                                 Heap Fetches: 2
+                                 Index Searches: 2
+                                 Buffers: shared hit=4
+                     ->  Bitmap Heap Scan on ledger_entries e  (cost=2004.85..24900.15 rows=125185 width=54) (actual rows=500000.00 loops=2)
+                           Recheck Cond: ((tenant_id = 'big1m'::text) AND (account_id = a.id) AND (xact_id < pg_snapshot_xmin(pg_current_snapshot())))
+                           Filter: ((effective_at >= '-infinity'::timestamp with time zone) AND (effective_at < 'infinity'::timestamp with time zone) AND (currency = a.currency))
+                           Heap Blocks: exact=17244
+                           Buffers: shared hit=6588 read=11458
+                           ->  Bitmap Index Scan on ix_entries__asof_commit  (cost=0.00..1973.56 rows=125210 width=0) (actual rows=500000.00 loops=2)
+                                 Index Cond: ((tenant_id = 'big1m'::text) AND (account_id = a.id) AND (xact_id < pg_snapshot_xmin(pg_current_snapshot())))
+                                 Index Searches: 2
+                                 Buffers: shared read=802
+               ->  Hash  (cost=17424.12..17424.12 rows=501820 width=22) (actual rows=500000.00 loops=1)
+                     Buckets: 131072  Batches: 4  Memory Usage: 7608kB
+                     Buffers: shared hit=102 read=8997, temp written=1921
+                     ->  Seq Scan on ledger_transactions x  (cost=0.00..17424.12 rows=501820 width=22) (actual rows=500000.00 loops=1)
+                           Filter: ((tenant_id = 'big1m'::text) AND (status = 'posted'::ledger_txn_status))
+                           Rows Removed by Filter: 55012
+                           Buffers: shared hit=102 read=8997
+ Planning:
+   Buffers: shared hit=1428 read=189
+ Planning Time: 7.437 ms
+ JIT:
+   Functions: 31
+   Options: Inlining false, Optimization false, Expressions true, Deforming true
+ Execution Time: 989.344 ms
+(45 rows)
+
+                                              QUERY PLAN                                               
+-------------------------------------------------------------------------------------------------------
+ Function Scan on balance_sheet_at  (cost=0.26..10.26 rows=1000 width=184) (actual rows=10.00 loops=1)
+   Buffers: shared hit=47333537 read=262145
+ Planning:
+   Buffers: shared hit=12 read=3
+ Planning Time: 0.135 ms
+ Execution Time: 11218.265 ms
+(6 rows)
+
+
+== does the checkpoint exist to be read? (ADR-0011 §3, roadmap M5) ==
+ period_rows 
+-------------
+           0
+(1 row)
+
+ checkpoint_rows 
+-----------------
+               0
+(1 row)
+
+ledger_period_balances is referenced by: <no function>
+and by these views: recon_checkpoint_breaks
+
+== loadavg at end: 3.30 2.79 2.18 ==

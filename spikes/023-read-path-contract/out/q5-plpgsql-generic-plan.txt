@@ -1,0 +1,54 @@
+=== balance_sheet_at on big1m, seven consecutive calls on ONE connection ===
+--- call 1
+-----------------------------------------------------------------------------------------------------------
+   Buffers: shared hit=47330349 read=265332 written=3
+         Buffers: shared hit=47330349 read=265332 written=3
+   Buffers: shared hit=12 read=6
+ Execution Time: 11045.975 ms
+--- call 2
+-----------------------------------------------------------------------------------------------------------
+   Buffers: shared hit=47328496 read=265170 written=754
+         Buffers: shared hit=47328496 read=265170 written=754
+ Execution Time: 11065.362 ms
+--- call 3
+-----------------------------------------------------------------------------------------------------------
+   Buffers: shared hit=47330578 read=265333 written=81
+         Buffers: shared hit=47330578 read=265333 written=81
+   Buffers: shared hit=12 read=6
+ Execution Time: 11061.974 ms
+--- call 4
+-----------------------------------------------------------------------------------------------------------
+   Buffers: shared hit=47328494 read=265172
+         Buffers: shared hit=47328494 read=265172
+ Execution Time: 11079.233 ms
+--- call 5
+-----------------------------------------------------------------------------------------------------------
+   Buffers: shared hit=47328494 read=265172
+         Buffers: shared hit=47328494 read=265172
+ Execution Time: 11043.252 ms
+--- call 6
+-----------------------------------------------------------------------------------------------------------
+   Buffers: shared hit=7441845 read=72623
+         Buffers: shared hit=7441845 read=72623
+ Execution Time: 4200.411 ms
+--- call 7
+-----------------------------------------------------------------------------------------------------------
+   Buffers: shared hit=7453178 read=61267 written=6
+         Buffers: shared hit=7453178 read=61267 written=6
+ Execution Time: 4137.633 ms
+=== and with plan_cache_mode = force_custom_plan ===
+--- forced-custom call 1
+-----------------------------------------------------------------------------------------------------------
+   Buffers: shared hit=47323862 read=269804 written=6
+         Buffers: shared hit=47323862 read=269804 written=6
+ Execution Time: 11060.768 ms
+--- forced-custom call 2
+-----------------------------------------------------------------------------------------------------------
+   Buffers: shared hit=47328502 read=265164 written=98
+         Buffers: shared hit=47328502 read=265164 written=98
+ Execution Time: 11207.497 ms
+--- forced-custom call 3
+-----------------------------------------------------------------------------------------------------------
+   Buffers: shared hit=47328495 read=265171 written=2
+         Buffers: shared hit=47328495 read=265171 written=2
+ Execution Time: 11135.175 ms

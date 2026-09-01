@@ -1,0 +1,12 @@
+ pid  |   datname    |  usename   |        state        |          xact_start           | backend_xmin |                                   q                                    
+------+--------------+------------+---------------------+-------------------------------+--------------+------------------------------------------------------------------------
+ 6042 | spike024arms | openledger | idle in transaction | 2026-09-01 14:48:22.954045+00 |              | SELECT spike_post_raw('a','USD', md5('a:fee:USD')::uuid, md5('a:recv_1
+ 6045 | spike024arms | openledger | active              | 2026-09-01 14:48:22.98013+00  |        15760 | SELECT spike_close_mode('a','2026-01','USD','xmin_strict');
+ 6560 | spike023     | openledger | active              | 2026-09-01 14:50:00.93949+00  |        15760 | select pid, datname, usename, state, xact_start, backend_xmin, left(qu
+(3 rows)
+
+ cursor_now | entries_total | entries_a_report_would_see | entries_above_the_horizon 
+------------+---------------+----------------------------+---------------------------
+      15760 |            12 |                          8 |                         4
+(1 row)
+

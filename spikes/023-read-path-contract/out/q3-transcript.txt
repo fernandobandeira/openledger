@@ -1,0 +1,218 @@
+== loadavg at start: 1.59 2.05 1.78 ==
+
+########## 1 · the branch audit's two unpinned axes, named from the catalog
+tables carrying xact_id: ledger_entries, ledger_events, ledger_transactions
+tables the reports read that carry NO xact_id: account_types, chart_presentation, chart_versions, fs_lines, ledger_accounts, ledger_period_closes
+none of the five report functions is STRICT: balance_sheet_at=false, income_statement_for=false, recon_equation_breaks=false, report_cursor=false, trial_balance_at=false
+EXECUTE is the default (PUBLIC) on all five: balance_sheet_at=<default>, income_statement_for=<default>, recon_equation_breaks=<default>, report_cursor=<default>, trial_balance_at=<default>
+
+########## 2 · the adversary: a transaction that starts BEFORE the cursor and commits AFTER
+A's xact_id (uncommitted): 15787
+B's xact_id (committed, visible):        15788
+report_cursor() = pg_snapshot_xmin:      15760
+max(xact_id)+1  (the refuted watermark): 15789
+  A below the pg_snapshot_xmin cursor?   f
+  A below max(xact_id)+1?                t
+
+########## 3 · A commits, and the same two cursors are re-run
+--- pg_snapshot_xmin cursor 15760, before vs after A's commit ---
+IDENTICAL — the cursor holds under a transaction that spanned it
+--- the refuted watermark 15789, before vs after A's commit ---
+DIFFERENT — a row appeared below a watermark already issued:
+--- out/q3-report-at-W-before.txt	2026-09-01 11:51:01.073733934 -0300
++++ out/q3-report-at-W-after.txt	2026-09-01 11:51:03.202700507 -0300
+@@ -1,19 +1,19 @@
+ -- trial_balance_at('t1', -infinity, infinity, 15789)
+-01a05d61-52a1-7f83-b40d-2da9d28abc8a|USD|343000|0|343000
+-01a05d61-52a2-7ca2-b1e5-1c3adb3edf14|USD|0|343000|-343000
++01a05d61-52a1-7f83-b40d-2da9d28abc8a|USD|442000|0|442000
++01a05d61-52a2-7ca2-b1e5-1c3adb3edf14|USD|0|442000|-442000
+ -- balance_sheet_at('t1', infinity, 15789, 3)
+ USD|3|borrowings|0|liability|15789
+ USD|3|cash|0|asset|15789
+-USD|3|current_year_earnings|343000|equity|15789
++USD|3|current_year_earnings|442000|equity|15789
+ USD|3|customer_funds|0|liability|15789
+ USD|3|equity|0|equity|15789
+ USD|3|other_assets|0|asset|15789
+ USD|3|payables|0|liability|15789
+-USD|3|receivables|343000|asset|15789
++USD|3|receivables|442000|asset|15789
+ USD|3|restricted_cash|0|asset|15789
+ USD|3|retained_earnings|0|equity|15789
+ -- income_statement_for('t1', -infinity, infinity, 15789, 3)
+ USD|3|cost_of_revenue|0|debit|15789
+ USD|3|credit_losses|0|debit|15789
+ USD|3|interest|0|debit|15789
+-USD|3|revenue|343000|credit|15789
++USD|3|revenue|442000|credit|15789
+
+########## 4 · the negative control, and the cluster horizon
+ pid  |   datname    |        state        |          xact_start           | backend_xmin 
+------+--------------+---------------------+-------------------------------+--------------
+ 6042 | spike024arms | idle in transaction | 2026-09-01 14:48:22.954045+00 |             
+ 6045 | spike024arms | active              | 2026-09-01 14:48:22.98013+00  |        15760
+ 6995 | spike023     | active              | 2026-09-01 14:51:03.21719+00  |        15760
+ 6956 | spike023     | idle                |                               |             
+(4 rows)
+
+ cursor_now | entries_total | a_report_would_see | above_the_horizon 
+------------+---------------+--------------------+-------------------
+      15760 |            24 |                  8 |                16
+(1 row)
+
+a cursor above every committed write: 15789
+DIFFERENT, as it must be — the pinned cursor is WITHHOLDING the new writes
+--- out/q3-report-at-C-after.txt	2026-09-01 11:51:03.138701512 -0300
++++ out/q3-report-at-above-everything.txt	2026-09-01 11:51:03.307698858 -0300
+@@ -1,19 +1,19 @@
+--- trial_balance_at('t1', -infinity, infinity, 15760)
+-01a05d61-52a1-7f83-b40d-2da9d28abc8a|USD|18000|0|18000
+-01a05d61-52a2-7ca2-b1e5-1c3adb3edf14|USD|0|18000|-18000
+--- balance_sheet_at('t1', infinity, 15760, 3)
+-USD|3|borrowings|0|liability|15760
+-USD|3|cash|0|asset|15760
+-USD|3|current_year_earnings|18000|equity|15760
+-USD|3|customer_funds|0|liability|15760
+-USD|3|equity|0|equity|15760
+-USD|3|other_assets|0|asset|15760
+-USD|3|payables|0|liability|15760
+-USD|3|receivables|18000|asset|15760
+-USD|3|restricted_cash|0|asset|15760
+-USD|3|retained_earnings|0|equity|15760
+--- income_statement_for('t1', -infinity, infinity, 15760, 3)
+-USD|3|cost_of_revenue|0|debit|15760
+-USD|3|credit_losses|0|debit|15760
+-USD|3|interest|0|debit|15760
+-USD|3|revenue|18000|credit|15760
++-- trial_balance_at('t1', -infinity, infinity, 15789)
++01a05d61-52a1-7f83-b40d-2da9d28abc8a|USD|442000|0|442000
+
+########## 5 · the NULL cursor
+ currency |        fs_line        | amount_minor |   side    | pinned_cursor 
+----------+-----------------------+--------------+-----------+---------------
+ USD      | borrowings            |            0 | liability |              
+ USD      | cash                  |            0 | asset     |              
+ USD      | current_year_earnings |            0 | equity    |              
+ USD      | customer_funds        |            0 | liability |              
+ USD      | equity                |            0 | equity    |              
+ USD      | other_assets          |            0 | asset     |              
+ USD      | payables              |            0 | liability |              
+ USD      | receivables           |            0 | asset     |              
+ USD      | restricted_cash       |            0 | asset     |              
+ USD      | retained_earnings     |            0 | equity    |              
+(10 rows)
+
+ rows | assets | liab_eq_earnings 
+------+--------+------------------
+   10 |      0 |                0
+(1 row)
+
+ is_rows 
+---------
+       4
+(1 row)
+
+ tb_rows 
+---------
+       0
+(1 row)
+
+ equation_breaks 
+-----------------
+               0
+(1 row)
+
+
+########## 6 · the range and as-of arguments are unguarded too
+ rows | total 
+------+-------
+   10 |     0
+(1 row)
+
+ rows | total 
+------+-------
+    4 |     0
+(1 row)
+
+ rows 
+------
+    0
+(1 row)
+
+
+########## 7 · the chart-version default is read at RUN time
+default resolves to version 3
+explicit v1 vs default: 1 vs 3
+and a frozen version cannot gain rows, while the CURRENT one can:
+  rows at v3 BEFORE any append:
+10
+  appending a line to the FROZEN version 1 (must be refused):
+BEGIN
+ERROR:  fs_lines names chart version 1, below the current maximum 3 -- a superseded chart version is frozen history; append a new version instead
+CONTEXT:  PL/pgSQL function refuse_stale_chart_version() line 7 at RAISE
+  appending a line to the CURRENT version 3 (permitted), at a FIXED cursor:
+ rows_at_v3_after_append 
+-------------------------
+                      11
+(1 row)
+
+ROLLBACK
+
+########## 8 · the scopes CTE: a new account changes the ROW SET at a FIXED cursor
+--- same cursor 15760, one new EUR account, nothing posted to it ---
+DIFFERENT — the row set moved under a fixed cursor:
+--- out/q3-report-scopes-before.txt	2026-09-01 11:51:03.566694793 -0300
++++ out/q3-report-scopes-after.txt	2026-09-01 11:51:03.642693600 -0300
+@@ -2,6 +2,16 @@
+ 01a05d61-52a1-7f83-b40d-2da9d28abc8a|USD|18000|0|18000
+ 01a05d61-52a2-7ca2-b1e5-1c3adb3edf14|USD|0|18000|-18000
+ -- balance_sheet_at('t1', infinity, 15760, 3)
++EUR|3|borrowings|0|liability|15760
++EUR|3|cash|0|asset|15760
++EUR|3|current_year_earnings|0|equity|15760
++EUR|3|customer_funds|0|liability|15760
++EUR|3|equity|0|equity|15760
++EUR|3|other_assets|0|asset|15760
++EUR|3|payables|0|liability|15760
++EUR|3|receivables|0|asset|15760
++EUR|3|restricted_cash|0|asset|15760
++EUR|3|retained_earnings|0|equity|15760
+ USD|3|borrowings|0|liability|15760
+ USD|3|cash|0|asset|15760
+ USD|3|current_year_earnings|18000|equity|15760
+@@ -13,6 +23,10 @@
+ USD|3|restricted_cash|0|asset|15760
+ USD|3|retained_earnings|0|equity|15760
+ -- income_statement_for('t1', -infinity, infinity, 15760, 3)
++EUR|3|cost_of_revenue|0|debit|15760
++EUR|3|credit_losses|0|debit|15760
++EUR|3|interest|0|debit|15760
++EUR|3|revenue|0|credit|15760
+ USD|3|cost_of_revenue|0|debit|15760
+ USD|3|credit_losses|0|debit|15760
+ USD|3|interest|0|debit|15760
+(amount columns unchanged on the pre-existing rows; the diff is added rows)
+
+########## 9 · Q4 · backdating, both axes, and both reproducible
+-- the effective axis: ADR-0006's own table, scaled 100x
+    label     |         as_of          | receivable_minor 
+--------------+------------------------+------------------
+ as of Jan 15 | 2026-01-15 00:00:00+00 |            10000
+ as of Jan 25 | 2026-01-25 00:00:00+00 |            13000
+ as of Feb 01 | 2026-02-01 00:00:00+00 |            18000
+(3 rows)
+
+-- the recorded axis is the SAME function with the cursor as the parameter
+        label         |  cur  | receivable_minor 
+----------------------+-------+------------------
+ at the pinned cursor | 15760 |            18000
+ at a fresh cursor    | 15760 |            18000
+(2 rows)
+
+
+########## 10 · the oracle
+openledger: reconciliation found breaks in 1 of 10 checks:
+  cursor_forgery: 16 break(s)
+The matching recon_* break list carries the rows. ADR-0010's disposition table says what may be repaired (the cache, from the journal) and what must never be (anything on the journal — there a repair is a new transaction).
+== loadavg at end: 1.70 2.07 1.78 ==

@@ -1,0 +1,50 @@
+=== A14 guard (the EXISTS that refuses an unpresented type) ===
+ Result  (cost=0.98..0.99 rows=1 width=1) (actual rows=1.00 loops=1)
+     ->  Nested Loop  (cost=0.43..343430.21 rows=621671 width=0) (actual rows=0.00 loops=1)
+           ->  Nested Loop  (cost=0.00..22457.94 rows=451638 width=86) (actual rows=0.00 loops=1)
+                 ->  Nested Loop Anti Join  (cost=0.00..15.62 rows=1 width=64) (actual rows=0.00 loops=1)
+                       ->  Seq Scan on ledger_accounts a  (cost=0.00..13.62 rows=1 width=96) (actual rows=2.00 loops=1)
+                       ->  Seq Scan on chart_presentation p  (cost=0.00..1.75 rows=20 width=19) (actual rows=9.00 loops=2)
+                 ->  Seq Scan on ledger_transactions x  (cost=0.00..17424.12 rows=501820 width=22) (never executed)
+   Buffers: shared hit=836 read=31
+ Execution Time: 0.087 ms
+=== pos (the per-account position) ===
+ HashAggregate  (cost=55687.36..55688.46 rows=88 width=73) (actual rows=2.00 loops=1)
+   Buffers: shared hit=4544 read=22605 written=2, temp read=16183 written=16183
+   ->  Hash Join  (cost=27522.70..54133.18 rows=69075 width=53) (actual rows=1000000.00 loops=1)
+         Buffers: shared hit=4544 read=22605 written=2, temp read=16183 written=16183
+         ->  Seq Scan on ledger_transactions x  (cost=0.00..17424.12 rows=501820 width=22) (actual rows=500000.00 loops=1)
+         ->  Hash  (cost=25849.28..25849.28 rows=69074 width=69) (actual rows=1000000.00 loops=1)
+               Buffers: shared hit=4544 read=13506 written=2, temp written=10292
+               ->  Nested Loop  (cost=2005.00..25849.28 rows=69074 width=69) (actual rows=1000000.00 loops=1)
+                     Buffers: shared hit=4544 read=13506 written=2
+                     ->  Nested Loop  (cost=0.15..10.17 rows=1 width=79) (actual rows=2.00 loops=1)
+                           Buffers: shared hit=3 read=1
+                           ->  Index Scan using uq_accounts__id_currency on ledger_accounts a  (cost=0.15..8.17 rows=1 width=96) (actual rows=2.00 loops=1)
+                                 Buffers: shared hit=1 read=1
+                           ->  Seq Scan on chart_presentation p  (cost=0.00..1.75 rows=20 width=34) (actual rows=9.00 loops=2)
+                     ->  Bitmap Heap Scan on ledger_entries e  (cost=2004.86..24587.13 rows=125198 width=54) (actual rows=500000.00 loops=2)
+                           Buffers: shared hit=4541 read=13505 written=2
+                           ->  Bitmap Index Scan on ix_entries__asof_commit  (cost=0.00..1973.56 rows=125210 width=0) (actual rows=500000.00 loops=2)
+ Execution Time: 1015.517 ms
+=== plug (the un-closed-earnings correlated subquery, per scope row) ===
+ Subquery Scan on s  (cost=8.18..21155.44 rows=1 width=56) (actual rows=1.00 loops=1)
+   Buffers: shared hit=2482317 read=28746
+   ->  Unique  (cost=8.18..8.18 rows=1 width=48) (actual rows=1.00 loops=1)
+         Buffers: shared hit=4 read=1
+         ->  Sort  (cost=8.18..8.18 rows=1 width=48) (actual rows=2.00 loops=1)
+               Buffers: shared hit=4 read=1
+               ->  Index Scan using uq_accounts__id_owner on ledger_accounts l  (cost=0.15..8.17 rows=1 width=48) (actual rows=2.00 loops=1)
+                     Buffers: shared hit=1 read=1
+     ->  Aggregate  (cost=21147.24..21147.25 rows=1 width=32) (actual rows=1.00 loops=1)
+           Buffers: shared hit=2482313 read=28745
+           ->  Nested Loop  (cost=4420.33..21060.53 rows=6937 width=12) (actual rows=500000.00 loops=1)
+                 Buffers: shared hit=2482313 read=28745
+                 ->  Nested Loop  (cost=4419.90..16997.68 rows=3469 width=86) (actual rows=500000.00 loops=1)
+                       Buffers: shared hit=3 read=11055
+                       ->  Nested Loop  (cost=0.15..10.13 rows=1 width=64) (actual rows=1.00 loops=1)
+                             Buffers: shared hit=3 read=1
+                             ->  Index Scan using uq_accounts__id_purpose on ledger_accounts a  (cost=0.15..8.17 rows=1 width=96) (actual rows=2.00 loops=1)
+                                   Buffers: shared hit=1 read=1
+                             ->  Seq Scan on chart_presentation p  (cost=0.00..1.90 rows=5 width=19) (actual rows=3.50 loops=2)
+                       ->  Bitmap Heap Scan on ledger_transactions x  (cost=4419.75..15600.03 rows=138752 width=22) (actual rows=500000.00 loops=1)
