@@ -221,7 +221,7 @@ tenant"*), so inventing the status means inventing the registry.
 | **Pagination** | At a million entries the three reports return **2, 10 and 4 rows**. There is nothing to page, and pagination would answer a cost question with an interface change. |
 | **Any listing, search or filter endpoint** | Each needs an ordering and a page key this spike did not design; shipping one under ADR-0014's machine-checked route table documents it forever. **Partially reversed 2026-09-01 by [0021](/decisions/0021-accounts-over-http)**: for *accounts* that ordering already existed — `pk_accounts` is `(tenant_id, id)` and `id` is `uuidv7` — so this row was scoped reasoning stated as a principle, and `GET /v1/accounts` ships keyset-paginated. It stands for **transactions**, which is where it was load-bearing: a transaction listing must choose between the recorded and the effective axis, and that is the one place a listing can be confidently wrong. |
 | **Exposing the reconciliation views or `close_disclosures` over HTTP** | Cross-tenant views on a deliberately unauthenticated service ([0017](/decisions/0017-no-authentication)), and a disclosure whose attestation feed does not exist. |
-| **A cursor-minting endpoint** | Every report already returns the cursor it used. |
+| **A cursor-minting endpoint** | Every report already returns the cursor it used. *(**Qualified 2026-09-01 by building a client against this.** True, and it means asking for the horizon alone costs a whole report: the dashboard's "refresh the horizon" is a trial balance over `0001-01-01`…`9999-12-31` run for one scalar, which on a large book is the 28-second query this ADR's own cost list records. The refusal stands — one more route for a scalar is a poor trade — but the reasoning was incomplete, and a caller that wants only the horizon has no cheap way to get it.)* |
 | **`plan_cache_mode = force_custom_plan`** | It pins the **slow** plan — see the costs. |
 | **A 404 for an unknown tenant** | There is no registry to distinguish it from an empty one. |
 
@@ -267,6 +267,19 @@ tenant"*), so inventing the status means inventing the registry.
   holding an exact integer. **Posting amounts on the way in are unaffected and stay `i64`**: a single
   posting is bounded by `ledger_entries.amount_minor` and only an *aggregate* can exceed it. The
   asymmetry is deliberate and costs every caller one parse.
+- **The string decision protects aggregates and leaves a single entry exposed — a hole, found by
+  building a client.** `EntryRead.amount_minor` and `PostingBody.amount_minor` are declared
+  `integer/int64`, and JSON has no integer type: RFC 8259 leaves precision beyond an IEEE-754 double
+  to the implementation, and JavaScript's parser is one that loses it. Demonstrated against the
+  shipped API rather than reasoned: a posting of **9,007,199,254,740,993** (2⁵³+1, a legal `i64` and
+  above the schema's `minimum: 1`) is **accepted**, and `JSON.parse` on the read-back returns
+  **9,007,199,254,740,992** — silently off by one, before any client code exists to defend itself.
+  The same rounding applies on the way *in* for such a client. So the asymmetry this decision
+  chose — strings for aggregates, numbers for single amounts, on the grounds that a single posting is
+  bounded by its column — is right about the *column* and wrong about the *wire*: `bigint` reaches
+  well past 2⁵³. Fixing it means the same string treatment for entry and posting amounts, which is a
+  breaking wire change to the write path and therefore its own decision. **Named here, unfixed, and
+  on the roadmap.**
 - **Two round trips per read**, from refusing the single-statement scope-and-select. Negligible
   against a report; dominant only against the balance endpoint, which is the one read that should be
   measured over a network before it is trusted.

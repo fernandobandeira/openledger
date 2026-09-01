@@ -505,6 +505,18 @@ round ([spike 020](/spikes/020-checkpoint-on-the-report-path),
   ([ADR-0019](/decisions/0019-read-path)). Giving it one — with the column-level `INSERT` exclusion
   `ledger_entries.xact_id` already has — is the honest fix, and it needs a backfill decision for any
   deployed database.
+- **A single entry amount above 2⁵³ is silently wrong for any JSON consumer that uses doubles.**
+  [ADR-0019](/decisions/0019-read-path) gave *aggregates* exact-integer strings and left single
+  amounts as JSON numbers, on the grounds that a posting is bounded by its column — right about the
+  column, wrong about the wire, since `bigint` reaches far past 2⁵³. Demonstrated against the shipped
+  API: a posting of **9,007,199,254,740,993** is accepted, and `JSON.parse` on the read-back returns
+  **9,007,199,254,740,992**. The fix is the same string treatment for `PostingBody.amount_minor` and
+  `EntryRead.amount_minor`, which is a **breaking wire change to the write path** and wants its own
+  decision.
+- **`POST /v1/accounts` should return the account it created**, so the derived chart triple is
+  readable without a paged search; or `GET /v1/accounts/{id}` should exist. Either closes the gap
+  [ADR-0021](/decisions/0021-accounts-over-http) records. The listing also returns no `metadata`, so
+  a caller that sets metadata currently has no route that reads it back.
 - **Per-row hash chaining** for tamper evidence. Needs a total order, so decide it alongside
   [ADR-0006](/decisions/0006-time-and-as-of). Never build Formance's block-hashing layer.
 - **The auth path has never been measured.** It writes no ledger entry and serializes per company,

@@ -111,6 +111,15 @@ handler match on refusals it cannot receive, which is exactly the shared-error-e
   `(tenant, owner_type, owner_id, purpose, currency)`, so within one tenant a collision is always the
   caller's own account; the refusal says the account exists and does not say more. That is the same
   fail-closed silence [0019](/decisions/0019-read-path) records for tenants, and it is deliberate.
+- **`POST /v1/accounts` does not return what it derived, which undercuts this decision's own point.**
+  The response is two UUIDs. The derived `category` / `normal_balance` / `counterparty_scope` — the
+  thing that makes the "server derives the triple" design worth having — can only be shown by a
+  second call to `GET /v1/accounts` **plus a client-side scan for the id**, because there is no
+  `GET /v1/accounts/{id}` and the listing's equality filters cover `purpose` and `owner_id` but not
+  `account_id`. So "show me the account I just opened" is a paged search. Found by building a client
+  against it, not by reading it. A `201` carrying the full account representation would remove the
+  problem outright and is the obvious fix; it is not made here because this decision is already
+  built and the change is a wire change.
 - **This is the second decision to add routes since the surface was declared**, and each route is
   permanent under [0014](/decisions/0014-http-api)'s machine-checked route table. Two more is two
   more forever.
