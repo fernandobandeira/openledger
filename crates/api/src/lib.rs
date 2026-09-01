@@ -38,12 +38,14 @@
 use axum::Router;
 use ledger::{Ledger, Reports};
 
+mod dashboard;
 mod reports;
 mod serve;
 mod spec;
 mod transactions;
 mod wire;
 
+pub use dashboard::Dashboard;
 pub use serve::{ServeError, run};
 pub use spec::openapi_json;
 
@@ -105,6 +107,13 @@ route_table! { L, R =>
 }
 
 /// The router, over any implementation of the two ports.
+///
+/// This is the API and only the API: every route it carries came out of
+/// `route_table!` above, so it is exactly what [`ROUTES`] names and exactly
+/// what the committed specification describes. The operator dashboard — an
+/// inspection affordance, off by default — is mounted onto the result of this
+/// by `serve`, outside the table, for the reasons the `dashboard` module
+/// states.
 ///
 /// Generic rather than `dyn` — a considered trade, not a habit: both ports'
 /// methods are native async fns (RPITIT `+ Send`), which have no `dyn` form

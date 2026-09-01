@@ -68,6 +68,17 @@ balances are per currency and per stripe, a balance per row would be N+1, and
 read path — its own pool, its own login, RLS-scoped — like every other read
 ([0019](/decisions/0019-read-path)).
 
+**The two operations split by direction, not by resource.** Listing is a read, so it goes on
+`Reports` behind the read pool and the read login — the same reasoning
+[0019](/decisions/0019-read-path) used to put `GET /v1/transactions/{id}` there rather than inventing
+a third port: *from the caller's side it is the same capability, tell me what the book says.* Opening
+an account is a write, and unlike a read it **can** honour `Ledger`'s promise that a refusal wrote
+nothing — so it earns the second method on `Ledger` that port's own doc invites (*"anything else the
+API grows must earn its place here first"*). It carries **its own error type**, not `WriteError`: the
+posting enum's ten variants are about postings, and widening it with `account_exists` would make every
+handler match on refusals it cannot receive, which is exactly the shared-error-enum shape
+[0014](/decisions/0014-http-api) refused for the wire.
+
 ## What we considered
 
 | | Why not |

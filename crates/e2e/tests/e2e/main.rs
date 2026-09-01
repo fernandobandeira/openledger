@@ -35,11 +35,16 @@
 //! command's contract edges, and the sweep racing live writers),
 //! `schema_snapshot` (ADR-0007 §2: the migrated catalog, dumped as
 //! deterministic text and diffed against the committed `schema/snapshot.txt`),
-//! and `concurrency` (M2's proof: N writers over overlapping account subsets,
-//! batching on, zero deadlocks on both of the statement's order sources).
+//! `concurrency` (M2's proof: N writers over overlapping account subsets,
+//! batching on, zero deadlocks on both of the statement's order sources), and
+//! `dashboard` (the operator page behind `--dashboard`: served with the flag,
+//! a 404 without it, and — the one that matters — in neither `api::ROUTES`
+//! nor the committed spec, so the conformance guarantee ranges over exactly
+//! the same six routes it did before the page existed).
 
 mod concurrency;
 mod conformance;
+mod dashboard;
 mod endpoints;
 mod exit_codes;
 mod reconcile;

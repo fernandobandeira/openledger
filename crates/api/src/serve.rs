@@ -6,6 +6,8 @@ use std::net::SocketAddr;
 
 use ledger::{Ledger, Reports};
 
+use crate::dashboard::{self, Dashboard};
+
 /// Binding or serving failed — the binary's exit 1. The `Usage` half of the
 /// old split is gone on purpose: `--bind` reaches [`run`] as an
 /// already-parsed [`SocketAddr`], because clap owns the usage error (exit 2,
@@ -19,7 +21,12 @@ fn say(message: &str) {
     let _ = writeln!(std::io::stdout(), "{message}");
 }
 
-pub async fn run<L, R>(ledger: L, reports: R, bind: SocketAddr) -> Result<(), ServeError>
+pub async fn run<L, R>(
+    ledger: L,
+    reports: R,
+    bind: SocketAddr,
+    dashboard: Dashboard,
+) -> Result<(), ServeError>
 where
     L: Ledger + Clone + 'static,
     R: Reports + Clone + 'static,
@@ -33,8 +40,16 @@ where
     // The first line of output is a contract: the e2e suite binds port 0 and
     // reads the address from here.
     say(&format!("listening on http://{bound}"));
+    // The second line, and only when the dashboard is on: the first one is a
+    // contract and nothing may be appended to it.
+    if dashboard == Dashboard::Served {
+        say(&format!("dashboard on http://{bound}{}", dashboard::PATH));
+    }
 
-    axum::serve(listener, crate::router(ledger, reports))
-        .await
-        .map_err(|e| ServeError(format!("server error: {e}")))
+    axum::serve(
+        listener,
+        dashboard.mounted_on(crate::router(ledger, reports)),
+    )
+    .await
+    .map_err(|e| ServeError(format!("server error: {e}")))
 }

@@ -115,9 +115,24 @@ fn dispatch(cli: Cli) -> Result<(), Failure> {
             database_url,
             read_database_url,
             bind,
+            dashboard,
         }) => {
             let database_url = require_database_url(database_url)?;
-            block_on(serve_the_api(&database_url, read_database_url, bind))
+            // The flag is a bool at the command line and a named choice
+            // everywhere below it: the api crate decides what serving the
+            // dashboard means, and this is the one place the two spellings
+            // meet.
+            let dashboard = if dashboard {
+                api::Dashboard::Served
+            } else {
+                api::Dashboard::NotServed
+            };
+            block_on(serve_the_api(
+                &database_url,
+                read_database_url,
+                bind,
+                dashboard,
+            ))
         }
     }
 }
@@ -133,6 +148,7 @@ async fn serve_the_api(
     database_url: &str,
     read_database_url: Option<String>,
     bind: std::net::SocketAddr,
+    dashboard: api::Dashboard,
 ) -> Result<(), Failure> {
     // Lazy, so nothing has connected yet: a malformed URL is the only failure
     // here, and it is a usage error.
@@ -156,6 +172,7 @@ async fn serve_the_api(
         batching::BatchingLedger::dispatching_over(writers),
         the_reader(&read_database),
         bind,
+        dashboard,
     )
     .await
     .map_err(Failure::from)
