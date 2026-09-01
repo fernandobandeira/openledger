@@ -24,7 +24,23 @@ becomes decoration. Measured side by side: the dual-membership login read **6 en
 t2** with `app.tenant_id = 't1'` set, and **4 — t1 only** — behind `SET LOCAL ROLE`. The shipped tree
 could not observe this, because its one `DATABASE_URL` is the owner's and the owner is not subject to
 RLS at all. The separate login makes the fence structural; the `SET LOCAL ROLE` keeps it if a
-deployment ever wires one login for both. A third permissive `USING (true)` family exists for
+deployment ever wires one login for both.
+
+*(**Amended 2026-09-01, by the e2e slice that was written to prove this.** The sentence above once
+read that a one-login deployment "is safe **only** because the adapter issues `SET LOCAL ROLE`". That
+"only" is wrong, and the correction is worth more than the claim: **over HTTP the tenant fence is not
+falsifiable at all.** Deleting the adapter's `SET LOCAL ROLE` leaves every fence test green; deleting
+the pool's `SET ROLE` **as well** also leaves them green. The reason is structural — every statement
+this read path issues carries its own tenant predicate, `trial_balance_at(p_tenant, …)` and
+`balance_sheet_at(p_tenant, …)` by argument, and `WHERE a.tenant_id = $1` on the balance, transaction
+and bounds reads — so RLS is the **second** line of defence on all five routes and never the only one.
+And because there is no authentication ([0017](/decisions/0017-no-authentication)), a caller may name
+any tenant and legitimately be given it, so RLS buys **no confidentiality at the API boundary** in the
+first place. What it does buy is real and worth keeping: a defence against SQL that forgets its
+predicate, and a fence around the direct database readers — analysts, BI tools, a `psql` session —
+that reach these functions without passing through this contract at all.)*
+
+A third permissive `USING (true)` family exists for
 `openledger_recon`, which a login carrying *that* membership would union in exactly the same way.
 
 **Two things this ruling rests on that were not previously written down.** First, the fence's

@@ -18,13 +18,21 @@ requests, and the concurrency proof that pins the deterministic lock ordering
 ([ADR-0018](/decisions/0018-batching-and-stripe-selection),
 [spike 018](/spikes/018-batching-and-stripe-selection)).
 
-**What is missing is now the read path**, and one honest asymmetry inside what just landed: striping
+**One honest asymmetry sits inside the write path**, and it is unchanged by anything since: striping
 is worth a measured **4.3×** and pays today, while cross-request batching buys nothing until offered
 load approaches the unbatched ceiling — **at or a little above ~1,940 clearings/s**, which the
 measurement ladder brackets from below only, about **39× the peak
 [ADR-0002](/decisions/0002-scaling) derives** — and ships inert below that by dispatching on
-completion rather than on a timer. That
-gap — not a deployment — is the story now. Phase 1 is the ordered list of code to build to close it.
+completion rather than on a timer.
+
+**Phase 1 is complete as of 2026-09-01.** M5 was the last milestone, and its three criteria now hold
+through the compiled binary rather than through a spike harness — the read path ships as five GET
+routes ([ADR-0019](/decisions/0019-read-path)), `balance_sheet_at` reads the period-close checkpoint
+([ADR-0020](/decisions/0020-checkpoint-on-the-report-path), migration `00004`), and the suite stands
+at **190 tests**. What that does *not* mean is that the core is finished in every sense: the
+deliberately-deferred work is listed under *Known work, not yet scheduled* below, and it is real —
+migration `00005`, a partitioning measurement, a chart-version seal, and a correctness debt where the
+A14 refusal has never been seen to fire.
 
 **Since 2026-09-01 the read path has a decided contract and an audited substrate.**
 [ADR-0019](/decisions/0019-read-path) settles how a read reaches the database and what its cursor
@@ -32,14 +40,15 @@ promises ([spike 019](/spikes/019-read-path-contract)), and an adversarial round
 reporting layer produced twelve findings, eleven of them reproduced on a real book
 ([spike 021](/spikes/021-reporting-layer-defects)) — including a check the schema calls its
 highest-leverage one that **cannot fail**, and a forgotten `INSERT` that reports a period's revenue
-as 0.00 while the sweep exits 0. Neither the endpoints nor the fixes are built yet, and this page
+as 0.00 while the sweep exits 0. **Both the endpoints and those fixes are built now**, and this page
 says which is which throughout.
 
 ---
 
 # Phase 1 — the core
 
-**The build order.** The schema is done; what is missing is the Rust, in dependency order:
+**The build order — every item below is now built.** The list is kept as the record of what depended
+on what, and why it was done in that order:
 
 1. **The writer** ([M3](#m3--the-posting-engine)) — the posting API that is balanced by
    construction, the two-statement idempotency replay, the posted-only cache update and the
@@ -67,13 +76,13 @@ says which is which throughout.
    [0007](/decisions/0007-schema-conventions-and-chart)'s highest-leverage guard against schema
    drift landed on 2026-08-31, closing [M1](#m1--schema-invariants-and-the-snapshot-test).)*
 4. **The as-of read path** ([M5](#m5--bitemporal-reads)) — a Rust read path over the report
-   functions, correct on both time axes. **Its contract is decided as of 2026-09-01**
+   functions, correct on both time axes. **Built 2026-09-01**, and its three criteria hold through
+   the compiled binary. Its contract was decided first
    ([ADR-0019](/decisions/0019-read-path), [spike 019](/spikes/019-read-path-contract)): a second
    inbound port on its own pool and its own login, five GET routes, and the cursor validated in Rust
    before it reaches SQL. What that spike found is why the contract is a decision and not a
    detail — **a login that is a member of both the writer and reader roles reads every tenant**,
-   because RLS policies are permissive and OR'd and `pg_has_role` decides which apply. Building it
-   is what remains.
+   because RLS policies are permissive and OR'd and `pg_has_role` decides which apply.
 
 The milestone numbers are stable identifiers carried over from the decision log; the list above is
 the order to build in. Cards and durable timers are Phase 2, deliberately later.
@@ -381,12 +390,36 @@ a period that earned**, with the balance sheet correct to the unit and `openledg
 0. Migration `00004` is where those fixes land; `FIX-NOTES.md` in that spike carries each one's cost.
 
 **Done when:** an as-of query at instant T returns the same answer when re-run under concurrent
-writes (**proven on the SQL as of 2026-09-01**; still to hold through the compiled binary), the
-backdating case (insertion order ≠ effective order) is correct on both axes, and
+writes, the backdating case (insertion order ≠ effective order) is correct on both axes, and
 **`balance_sheet_at` reads** the checkpoint rather than scanning from inception — one function, not
 three ([ADR-0020](/decisions/0020-checkpoint-on-the-report-path)); `income_statement_for` is refused
 it structurally and `trial_balance_at` is proven able to take it and left unadopted pending a
 measurement.
+
+**All three hold as of 2026-09-01, through the compiled binary over HTTP** — which is the bar that
+matters, because every earlier proof was a spike harness that spoke no HTTP. The read path ships as
+five GET routes behind a second inbound port on its own pool
+([ADR-0019](/decisions/0019-read-path)), and 31 e2e tests hold the milestone:
+
+- **Reproducible under concurrent writes**, with the control that makes it mean something: eight
+  sustained clients post through the same binary while the balance sheet and trial balance are
+  re-issued at a stored `pinned_cursor` and come back byte-identical, and the same reports at a
+  **fresh** cursor are asserted to have *moved*. A reproducibility test that passes on a book where
+  nothing was written proves nothing.
+- **Backdated on both axes**: a charge dated the 20th posted first and one dated the 10th posted
+  second — the fixture asserts its own premise, a higher `xact_id` against an earlier `effective_at`
+  — and the effective axis places the late arrival by its business date while the *same* query at a
+  cursor pinned before it committed does not see it at all.
+- **The checkpoint is what answers the face**, held as a regression guard: the balance sheet over
+  HTTP is compared line by line against the same position scanned from inception at the cursor and
+  chart version the answer itself names.
+
+Both were **proved red before they were trusted**: making the service ignore a supplied cursor fails
+both reproducibility tests, and writing a close without its checkpoint fails both checkpoint tests
+(the HTTP face reads zeros where the journal reads 2,500). The first of those injections found a real
+weakness in the test rather than in the code — the trial-balance case *passed* with the cursor thrown
+away, because sustained writers hold `pg_snapshot_xmin` down and a freshly re-pinned cursor admitted
+nothing new, so the fixture now also re-issues after the load drains and the horizon has retired.
 
 ---
 

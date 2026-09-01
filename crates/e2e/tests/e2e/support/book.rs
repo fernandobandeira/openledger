@@ -20,6 +20,11 @@ pub type PostAnswer = (reqwest::StatusCode, Option<String>, serde_json::Value);
 /// What one [`TestBook::spawn_post`] task resolves to.
 pub type PostOutcome = Result<PostAnswer, reqwest::Error>;
 
+/// One GET, read to the end: status and body. No header travels with it — the
+/// five read routes carry `Idempotency-Replayed` on none of them, because
+/// nothing they do is a write.
+pub type ReadAnswer = (reqwest::StatusCode, serde_json::Value);
+
 /// One charge of 100 between a pair, under `t1` — the body every concurrent
 /// burst in the suite sends. It lives here rather than in one endpoint file
 /// because three of them send it: a burst must be tenant-homogeneous or the
@@ -73,6 +78,204 @@ pub async fn post_a_pending_hold(
         .parse()?)
 }
 
+/// One posted charge of `minor` between a pair, dated `effective_at` — the
+/// shape every READ test's book is built from, because what a read test varies
+/// is WHEN a posting is dated rather than what it contains, and
+/// [`charge`] fixes that date at one day. Returns the transaction id, and
+/// asserts its own 201 exactly as [`post_a_pending_hold`] does: a fixture that
+/// failed to land silently surfaces as an incomprehensible report.
+pub async fn post_a_charge_dated(
+    book: &TestBook,
+    key: &str,
+    effective_at: &str,
+    minor: i64,
+    source: Uuid,
+    destination: Uuid,
+) -> Result<Uuid, Box<dyn std::error::Error>> {
+    let created = book
+        .post(&serde_json::json!({
+            "tenant_id": "t1",
+            "idempotency_key": key,
+            "effective_at": effective_at,
+            "postings": [{
+                "source": source, "destination": destination,
+                "amount_minor": minor, "currency": "USD"
+            }],
+        }))
+        .await?;
+    assert_eq!(created.status(), 201, "seeding the charge {key}");
+    let body: serde_json::Value = created.json().await?;
+    Ok(body
+        .get("transaction_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("no transaction_id on the charge's 201")?
+        .parse()?)
+}
+
+/// `GET /v1/reports/balance-sheet` as a path: the two parameters every call
+/// needs, plus whatever this call is varying — `cursor`, `chart_version`, or a
+/// deliberately malformed one of either.
+///
+/// The builders live here rather than in one test file because four files
+/// assemble the same routes, and a query string written out four times is four
+/// places for a parameter name to drift from the one the router reads.
+pub fn balance_sheet_path(tenant: &str, as_of: &str, and: &[(&str, &str)]) -> String {
+    with_parameters(
+        &format!("/v1/reports/balance-sheet?tenant_id={tenant}&as_of={as_of}"),
+        and,
+    )
+}
+
+/// `GET /v1/reports/trial-balance` as a path. The range is HALF-OPEN on both
+/// report routes that take one (ADR-0011 §A3), so `effective_to` is the first
+/// instant NOT reported.
+pub fn trial_balance_path(tenant: &str, from: &str, to: &str, and: &[(&str, &str)]) -> String {
+    with_parameters(
+        &format!(
+            "/v1/reports/trial-balance?tenant_id={tenant}&effective_from={from}\
+             &effective_to={to}"
+        ),
+        and,
+    )
+}
+
+/// `GET /v1/accounts/{account_id}/balance` as a path. `currency` is required:
+/// the balance row's key includes it.
+pub fn account_balance_path(tenant: &str, account: Uuid, currency: &str) -> String {
+    format!("/v1/accounts/{account}/balance?tenant_id={tenant}&currency={currency}")
+}
+
+/// `GET /v1/transactions/{transaction_id}` as a path.
+pub fn transaction_path(tenant: &str, transaction: Uuid) -> String {
+    format!("/v1/transactions/{transaction}?tenant_id={tenant}")
+}
+
+fn with_parameters(path: &str, and: &[(&str, &str)]) -> String {
+    let mut path = path.to_owned();
+    for (name, value) in and {
+        path.push_str(&format!("&{name}={value}"));
+    }
+    path
+}
+
+/// One report issued and its body taken, asserting its own 200 — an ARRANGE
+/// helper, for the report a test then re-issues or compares against. A test
+/// whose subject is the status reads [`TestBook::read`] instead and states the
+/// status itself, in its own assert phase.
+pub async fn a_report_issued(
+    book: &TestBook,
+    path: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let (status, body) = book.read(path).await?;
+    assert_eq!(status.as_u16(), 200, "issuing {path}: {body}");
+    Ok(body)
+}
+
+/// The cursor a report says it ran at — the value a caller stores to re-run
+/// exactly this report. Every report route answers with one, whether or not
+/// the caller supplied it (ADR-0019).
+pub fn pinned_cursor_of(report: &serde_json::Value) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(report
+        .get("pinned_cursor")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("the report carried no pinned_cursor: {report}"))?
+        .to_owned())
+}
+
+/// The amount of one line of a statement face, as it came off the wire: a
+/// decimal STRING holding an exact integer, never a JSON number (ADR-0019), so
+/// nothing here parses it and no comparison in this suite goes through a
+/// float.
+pub fn amount_of_the_line(
+    face: &serde_json::Value,
+    fs_line: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let lines = face
+        .get("lines")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("the answer carried no lines array: {face}"))?;
+    let line = lines
+        .iter()
+        .find(|line| line.get("fs_line").and_then(serde_json::Value::as_str) == Some(fs_line))
+        .ok_or_else(|| format!("the face carries no {fs_line} line: {face}"))?;
+    Ok(line
+        .get("amount_minor")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("the {fs_line} line carried no amount_minor: {line}"))?
+        .to_owned())
+}
+
+/// One account's `(debits, credits, balance_debit_positive)` of a trial
+/// balance — three decimal strings, in the order the answer carries them.
+pub type TrialBalanceAmounts = (String, String, String);
+
+/// One account's row of a trial balance, as `(debits, credits,
+/// balance_debit_positive)` — all three decimal strings, for the same reason
+/// [`amount_of_the_line`] returns one. `None` is the account having no
+/// activity in the window at all, which is a different answer from a zero row
+/// and must not be flattened into one.
+pub fn row_of_the_account(
+    report: &serde_json::Value,
+    account: Uuid,
+) -> Result<Option<TrialBalanceAmounts>, Box<dyn std::error::Error>> {
+    let rows = report
+        .get("rows")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("the answer carried no rows array: {report}"))?;
+    let Some(row) = rows.iter().find(|row| {
+        row.get("account_id").and_then(serde_json::Value::as_str) == Some(&account.to_string())
+    }) else {
+        return Ok(None);
+    };
+    let mut amounts = Vec::with_capacity(3);
+    for column in ["debits", "credits", "balance_debit_positive"] {
+        amounts.push(
+            row.get(column)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("the row carried no {column}: {row}"))?
+                .to_owned(),
+        );
+    }
+    let [debits, credits, balance] = <[String; 3]>::try_from(amounts)
+        .map_err(|amounts| format!("a trial-balance row read {} amounts", amounts.len()))?;
+    Ok(Some((debits, credits, balance)))
+}
+
+/// Which accounts a trial balance reported at all, in the order it answered
+/// them. The witness a tenant fence needs: a leak shows up as an account id
+/// that is not this tenant's, whatever the amounts beside it say.
+pub fn accounts_reported_by(
+    report: &serde_json::Value,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let rows = report
+        .get("rows")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("the answer carried no rows array: {report}"))?;
+    let mut reported = Vec::with_capacity(rows.len());
+    for row in rows {
+        reported.push(
+            row.get("account_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("a trial-balance row carried no account_id: {row}"))?
+                .to_owned(),
+        );
+    }
+    Ok(reported)
+}
+
+/// The `type` a refusal came back under — ADR-0014's subject-then-condition
+/// name, which is the half of an error a caller branches on.
+pub fn refusal_type(body: &serde_json::Value) -> Option<&str> {
+    body.get("type").and_then(serde_json::Value::as_str)
+}
+
+/// The `detail` a refusal came back with — the half a human reads.
+pub fn refusal_detail(body: &serde_json::Value) -> &str {
+    body.get("detail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+}
+
 /// Every member of a burst accepted. Called from a test's assert phase, never
 /// from the helper that posts: a burst helper that asserted on the way past
 /// would run this silently at the call site — and in more than one test here
@@ -115,9 +318,31 @@ pub struct TestBook {
     server: Server,
 }
 
+/// How one test's book is SERVED — the two credentials a deployment chooses
+/// between, as a fixture. Which login the server itself connects under, and
+/// which login (if any) the READ path is given of its own.
+struct Serving<'a> {
+    /// The server connects as `e2e_app_login`, inheriting `openledger_app`,
+    /// rather than as the schema owner.
+    as_the_app_role: bool,
+    /// `READ_DATABASE_URL`: a login of this name, made a member of every
+    /// policy role beside it. **`None` is the SHIPPED DEFAULT** — the flag is
+    /// optional and falls back to `DATABASE_URL` (`cli.rs`), so a deployment
+    /// that has not created a read login yet reads on the WRITER's credential
+    /// and the tenant fence rests entirely on the `SET LOCAL ROLE` inside
+    /// every read transaction (ADR-0019).
+    read_login: Option<(&'a str, &'a [&'a str])>,
+}
+
+/// The default shape: the owner's URL for both paths, no `READ_DATABASE_URL`.
+const AS_SHIPPED: Serving<'static> = Serving {
+    as_the_app_role: false,
+    read_login: None,
+};
+
 impl TestBook {
     pub async fn new(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::build(name, false).await
+        Self::build(name, &AS_SHIPPED).await
     }
 
     /// Like [`new`](Self::new), but the spawned `serve` connects as the
@@ -129,16 +354,59 @@ impl TestBook {
     /// are deliberately not granted to the app role) are the test's, not the
     /// server's.
     pub async fn new_as_app_role(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::build(name, true).await
+        Self::build(
+            name,
+            &Serving {
+                as_the_app_role: true,
+                read_login: None,
+            },
+        )
+        .await
     }
 
-    /// Six named steps, and nothing else: a fresh database, the migrator, a
-    /// pool, the published chart, the URL the server will connect under, and
-    /// the server itself.
-    async fn build(
+    /// The deployment ADR-0019 asks for: `READ_DATABASE_URL` set, under a
+    /// login whose ONLY membership is `openledger_read`. The fence is then a
+    /// property of the credential — the connection cannot write and cannot
+    /// match the writer's permissive `USING (true)` — rather than of a
+    /// statement the adapter has to remember to send.
+    pub async fn new_with_a_read_login_of_its_own(
         name: &str,
-        serve_as_app_role: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::build(
+            name,
+            &Serving {
+                as_the_app_role: false,
+                read_login: Some((postgres::READ_LOGIN, &["openledger_read"])),
+            },
+        )
+        .await
+    }
+
+    /// The deployment ADR-0019 measured and refuses: `READ_DATABASE_URL` under
+    /// a login that is a member of BOTH `openledger_app` and
+    /// `openledger_read`. RLS policies are permissive and OR'd, so this
+    /// credential's own qual is the writer's `USING (true)` unioned with the
+    /// reader's tenant predicate — it reads every tenant, and the only thing
+    /// standing between it and a cross-tenant answer is the
+    /// `SET LOCAL ROLE openledger_read` the adapter issues inside every read
+    /// transaction.
+    pub async fn new_with_a_read_login_that_can_write_too(
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::build(
+            name,
+            &Serving {
+                as_the_app_role: false,
+                read_login: Some((postgres::DUAL_LOGIN, &["openledger_app", "openledger_read"])),
+            },
+        )
+        .await
+    }
+
+    /// Seven named steps, and nothing else: a fresh database, the migrator, a
+    /// pool, the published chart, the URL the server will connect under, the
+    /// URL its READ path will connect under, and the server itself.
+    async fn build(name: &str, serving: &Serving<'_>) -> Result<Self, Box<dyn std::error::Error>> {
         // The adopter's own path: a fresh database, `openledger migrate`, the
         // published chart.
         let db_url = postgres::create_scratch_db(name).await?;
@@ -150,12 +418,19 @@ impl TestBook {
         sqlx::raw_sql(include_str!("../../../../../schema/chart.sql"))
             .execute(&pool)
             .await?;
-        let serve_url = if serve_as_app_role {
+        let serve_url = if serving.as_the_app_role {
             serve_url_under_the_app_role(&pool, &db_url).await?
         } else {
             db_url.clone()
         };
-        let (server, base) = spawn_the_server_and_read_its_address(&serve_url)?;
+        let read_url = match serving.read_login {
+            Some((login, policy_roles)) => {
+                Some(read_url_under_its_own_login(&pool, &db_url, login, policy_roles).await?)
+            }
+            None => None,
+        };
+        let (server, base) =
+            spawn_the_server_and_read_its_address(&serve_url, read_url.as_deref())?;
 
         Ok(Self {
             pool,
@@ -293,6 +568,20 @@ impl TestBook {
             }
             answers
         })
+    }
+
+    /// One GET at a path this book serves, read to the end — status and body,
+    /// both the caller's to assert on. Every read route is a GET with its
+    /// parameters in the query string (ADR-0019), so this is the whole of what
+    /// a read caller does.
+    pub async fn read(&self, path: &str) -> Result<ReadAnswer, Box<dyn std::error::Error>> {
+        let response = self
+            .client
+            .get(format!("{}{path}", self.base))
+            .send()
+            .await?;
+        let status = response.status();
+        Ok((status, response.json().await?))
     }
 
     /// A bodiless request with an arbitrary method and path, for the
@@ -734,19 +1023,47 @@ async fn serve_url_under_the_app_role(
     postgres::swap_credentials(db_url, postgres::APP_LOGIN, postgres::LOGIN_PASSWORD)
 }
 
+/// The URL the READ path connects under: a login of its own, a member of
+/// every policy role named, and the scratch database's credentials swapped for
+/// its. Cluster-wide and existence-guarded, exactly as the app login above is
+/// (postgres.rs says why they are never dropped).
+///
+/// Nothing is granted here beyond the memberships: `openledger_read` carries
+/// its own SELECT list in the baseline, and a read login that needed a grant
+/// the baseline does not make would be a finding about the baseline rather
+/// than something for a fixture to paper over.
+async fn read_url_under_its_own_login(
+    pool: &PgPool,
+    db_url: &str,
+    login: &str,
+    policy_roles: &[&str],
+) -> Result<String, Box<dyn std::error::Error>> {
+    for policy_role in policy_roles {
+        postgres::ensure_login_role(pool, login, policy_role).await?;
+    }
+    postgres::swap_credentials(db_url, login, postgres::LOGIN_PASSWORD)
+}
+
 /// The compiled binary, serving the given URL on a port the OS chose, and the
 /// base URL it announced on its first line of stdout — bound to port 0, so
 /// the announcement is the contract rather than a number this file guessed.
+///
+/// `READ_DATABASE_URL` is set only when a test asked for a read login of its
+/// own: unset is the shipped default, and the fallback to `DATABASE_URL` is a
+/// configuration the fence has to hold under (ADR-0019).
 fn spawn_the_server_and_read_its_address(
     serve_url: &str,
+    read_url: Option<&str>,
 ) -> Result<(Server, String), Box<dyn std::error::Error>> {
-    let mut server = Server(
-        postgres::openledger()?
-            .args(["serve", "--bind", "127.0.0.1:0"])
-            .env("DATABASE_URL", serve_url)
-            .stdout(Stdio::piped())
-            .spawn()?,
-    );
+    let mut command = postgres::openledger()?;
+    command
+        .args(["serve", "--bind", "127.0.0.1:0"])
+        .env("DATABASE_URL", serve_url)
+        .stdout(Stdio::piped());
+    if let Some(read_url) = read_url {
+        command.env("READ_DATABASE_URL", read_url);
+    }
+    let mut server = Server(command.spawn()?);
     let stdout = server.0.stdout.take().ok_or("server stdout not captured")?;
     let mut announced = String::new();
     BufReader::new(stdout).read_line(&mut announced)?;

@@ -192,6 +192,12 @@ pub async fn create_scratch_db(name: &str) -> Result<String, Box<dyn std::error:
 /// on a quiet cluster if they bother you; the next run recreates them.
 pub const APP_LOGIN: &str = "e2e_app_login";
 pub const READ_LOGIN: &str = "e2e_read_login";
+/// The login ADR-0019's central measurement is about: a member of BOTH
+/// `openledger_app` and `openledger_read`, which is what a deployment gets by
+/// pointing `READ_DATABASE_URL` at the credential it already had. It reads
+/// every tenant on its own — permissive RLS policies are OR'd — so the read
+/// path's `SET LOCAL ROLE openledger_read` is the only thing fencing it.
+pub const DUAL_LOGIN: &str = "e2e_dual_login";
 pub const LOGIN_PASSWORD: &str = "e2e-only";
 
 /// Create the LOGIN role `login`, inheriting `policy_role`'s grants and RLS

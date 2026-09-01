@@ -14,8 +14,15 @@
 //! for posting-and-idempotency, `pending` for pending → posted, `reverse`
 //! for reversals and the void, ADR-0016, `striping` for which physical
 //! balance row a posting lands on, ADR-0018 §1, and `batched` for what a
-//! caller gets when its posting shares a statement, ADR-0018 §§2–3);
-//! suite-wide checks live at the top level.
+//! caller gets when its posting shares a statement, ADR-0018 §§2–3; and
+//! `read_back` for the other verb, GET). M5's read path is
+//! `endpoints/reports/` — `reproducibility` and `backdating` for the
+//! milestone's two acceptance criteria over HTTP, `refusals` for every value
+//! ADR-0019 refuses before it reaches SQL, `tenant_fence` for the answer
+//! holding one tenant's book on each credential a deployment can wear, and
+//! `checkpoint` for migration `00004`'s reader against the journal — and
+//! `endpoints/accounts/balance` is the one read that is not a report.
+//! Suite-wide checks live at the top level.
 //! Today those are `conformance` (whether the committed OpenAPI document and
 //! the running router still describe the same surface), `startup` (whether
 //! `serve` refuses a database its migrate job never reached, is behind, or
