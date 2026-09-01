@@ -29,7 +29,10 @@ completion rather than on a timer.
 through the compiled binary rather than through a spike harness — the read path ships as five GET
 routes ([ADR-0019](/decisions/0019-read-path)), `balance_sheet_at` reads the period-close checkpoint
 ([ADR-0020](/decisions/0020-checkpoint-on-the-report-path), migration `00004`), and the suite stands
-at **190 tests**. What that does *not* mean is that the core is finished in every sense: the
+at **190 tests**. *(Since then the adoption surface grew again — accounts, an account statement and
+the period close, [ADR-0021](/decisions/0021-accounts-over-http) through
+[ADR-0024](/decisions/0024-closing-a-period) — and the suite stands at **311**. Every one of those
+came from building a client against the API and finding it one operation short.)* What that does *not* mean is that the core is finished in every sense: the
 deliberately-deferred work is listed under *Known work, not yet scheduled* below, and it is real —
 migration `00005`, a partitioning measurement, a chart-version seal, and a correctness debt where the
 A14 refusal has never been seen to fire.
@@ -505,18 +508,16 @@ round ([spike 020](/spikes/020-checkpoint-on-the-report-path),
   ([ADR-0019](/decisions/0019-read-path)). Giving it one — with the column-level `INSERT` exclusion
   `ledger_entries.xact_id` already has — is the honest fix, and it needs a backfill decision for any
   deployed database.
-- **A single entry amount above 2⁵³ is silently wrong for any JSON consumer that uses doubles.**
-  [ADR-0019](/decisions/0019-read-path) gave *aggregates* exact-integer strings and left single
-  amounts as JSON numbers, on the grounds that a posting is bounded by its column — right about the
-  column, wrong about the wire, since `bigint` reaches far past 2⁵³. Demonstrated against the shipped
-  API: a posting of **9,007,199,254,740,993** is accepted, and `JSON.parse` on the read-back returns
-  **9,007,199,254,740,992**. The fix is the same string treatment for `PostingBody.amount_minor` and
-  `EntryRead.amount_minor`, which is a **breaking wire change to the write path** and wants its own
-  decision.
-- **`POST /v1/accounts` should return the account it created**, so the derived chart triple is
-  readable without a paged search; or `GET /v1/accounts/{id}` should exist. Either closes the gap
-  [ADR-0021](/decisions/0021-accounts-over-http) records. The listing also returns no `metadata`, so
-  a caller that sets metadata currently has no route that reads it back.
+- **The close is an HTTP request, and at scale it should be a job.**
+  [ADR-0024](/decisions/0024-closing-a-period) ships it as a route because a close is a posting — but
+  it is ~49 s for a million accounts with the write dominating at 96%
+  ([spike 016](/spikes/016-close-cost-at-scale)), it blocks behind any open writer on an account it
+  sweeps, and two concurrent closes of one period and currency are caught by `checkpoint_drift`
+  rather than refused. A deployment at that size wants a different shape.
+- **`GET /v1/accounts` carries no balance, so a dashboard listing N accounts makes N+1 calls.**
+  Deliberate ([ADR-0021](/decisions/0021-accounts-over-http): balances are per currency and per
+  stripe), and it is the first place the refusal has cost a real consumer something. Whether a
+  listing should carry a posted balance per currency is a decision nobody has made.
 - **Per-row hash chaining** for tamper evidence. Needs a total order, so decide it alongside
   [ADR-0006](/decisions/0006-time-and-as-of). Never build Formance's block-hashing layer.
 - **The auth path has never been measured.** It writes no ledger entry and serializes per company,
