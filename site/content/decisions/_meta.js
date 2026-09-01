@@ -19,4 +19,6 @@ export default {
   '0016-pending-to-posted': '0016 · Pending → posted is a new transaction',
   '0017-no-authentication': '0017 · No auth; the perimeter is the boundary',
   '0018-batching-and-stripe-selection': '0018 · The stripe is keyed on the writer',
+  '0019-read-path': '0019 · Reads get their own port, pool and login',
+  '0020-checkpoint-on-the-report-path': '0020 · The checkpoint gets a reader',
 }

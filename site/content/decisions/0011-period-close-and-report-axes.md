@@ -216,10 +216,22 @@ deleted a column to avoid.**
 
 `ledger_period_balances` holds one row per account per closed period: the account's cumulative
 balance at the period end, computed from entries with `xact_id < C`. It is the **at-close** position,
-closing entries included — `computed_at_xid` (C) is held **at or above the closing transaction's own
-`xact_id`** (A4, enforced by `recon_close_breaks`, which fires on a checkpoint cursor that precedes its
-close), so a temporary account's checkpoint row is exactly 0 and `retained_earnings` carries the swept
-earnings. As-of then reads **checkpoint + two tails**:
+closing entries included, so a temporary account's checkpoint row is exactly 0 and
+`retained_earnings` carries the swept earnings.
+
+*(**A4's mechanism is replaced, 2026-09-01 — [0020](/decisions/0020-checkpoint-on-the-report-path).**
+This sentence read that the at-close position follows from holding `computed_at_xid` "at or above the
+closing transaction's own `xact_id`", enforced by `recon_close_breaks`. **That is unsatisfiable in one
+transaction rather than merely unbuilt**, proven across three candidate cursor values by two horizon
+states: `pg_current_xact_id()` gives equality, which holds only on an idle cluster — with one other
+writer open, `recon_close_breaks` fires `cursor_precedes_close` on a **correct** close — while
+`report_cursor()` sits below the close's own xid and silently loses a real posting, 10,570 read as
+10,500. `xid8` has no successor operator, so there is no third value to reach for. The at-close
+position is obtained instead by admitting the close **by transaction identity**, which holds under
+both horizon states. Until that migration lands, the shipped checkpoint is the **pre-close**
+position.)*
+
+As-of then reads **checkpoint + two tails**:
 
 - entries effective **after** the close boundary and at or before the as-of instant, and
 - entries effective **before** it whose `xact_id` is at or above the close's cursor — the backdated
@@ -251,8 +263,17 @@ minor unit at every point, including after a posting **backdated into an already
 **This benefit is real and, on the shipped baseline, not yet realized.** The measurement above is of a
 query that *reads the checkpoint*; the statement functions this ADR ships do **not** — `balance_sheet_at`,
 `income_statement_for` and `trial_balance_at` never reference `ledger_period_balances` (proven from
-`pg_get_functiondef`), so they aggregate `ledger_entries` from inception, and the checkpoint's only
-reader is `recon_checkpoint_breaks`. Wiring the read benefit into the report path — plus partitioning
+`pg_get_functiondef`), and the checkpoint's only reader is `recon_checkpoint_breaks`.
+
+*(**"so they aggregate `ledger_entries` from inception" is withdrawn as stated, 2026-09-01** —
+[0020](/decisions/0020-checkpoint-on-the-report-path). It is true of `balance_sheet_at` **alone**:
+`trial_balance_at` and `income_statement_for` each carry `effective_at >= p_from`, so a caller asking
+for one month scans one month. `balance_sheet_at` has no lower bound by nature — a position is
+cumulative — and it is the one the sweep calls at `'infinity'` per tenant, so it is the whole of the
+milestone. The flow statement is refused the checkpoint structurally: the accounts it reports are
+exactly the ones a close zeroes.)*
+
+Wiring the read benefit into the report path — plus partitioning
 the checkpoint by period — is roadmap **M5** work, re-measured at scale in [spike 020](/spikes/016-close-cost-at-scale)
 (this site's spike 016; the spike directories carry their own numbering)
 (the read benefit reproduces at ~40–230× at a close boundary on a million-entry book).

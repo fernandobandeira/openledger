@@ -29,7 +29,12 @@ period**.
 **The checkpoint has no reader on the report path — so the 45–49× benefit is real but unrealized.** A
 static check over `pg_get_functiondef` shows `balance_sheet_at`, `income_statement_for` and
 `trial_balance_at` **never reference `ledger_period_balances`**; the checkpoint's *only* reader is
-`recon_checkpoint_breaks`. So the shipped as-of path scans `ledger_entries` from inception. The benefit
+`recon_checkpoint_breaks`. So the shipped as-of path scans `ledger_entries` from inception —
+*(**corrected 2026-09-01 by [spike 020](/spikes/020-checkpoint-on-the-report-path):** this sentence
+applies to `balance_sheet_at` **only**. The other two carry `effective_at >= p_from`, so they scan
+their window rather than the book; `balance_sheet_at` has no lower bound because a position is
+cumulative. The catalog finding above stands unchanged — none of the three reads the checkpoint — but
+the consequence is one function's, not three.)* The benefit
 itself reproduces — a query that *does* read the last period's checkpoint plus tails is **~40–230× faster
 at a close boundary** than the from-inception aggregate on a million-entry book — but nothing on the
 report path takes it. Wiring it in is roadmap [M5](/roadmap#m5--bitemporal-reads).

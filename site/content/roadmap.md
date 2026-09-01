@@ -487,6 +487,14 @@ been reversed:
   constraint they actually have, which is precisely what tenant-leading keys bought. Not now
   because there is no in-place `ALTER TABLE` conversion, and it buys per-tenant `DETACH` rather
   than throughput: table size barely affects an append-only workload.
+  *(**Caveat added 2026-09-01** — [spike 020](/spikes/020-checkpoint-on-the-report-path): that claim
+  needs one, because `ck_journal__no_inherit` refuses a child of any protected table, so the
+  statement is not true as written on the shipped schema. And a second, larger one applies to
+  partitioning **anything** here: the snapshot test records `relkind`, so converting a table to
+  partitioned is visible, but the partition key, the bounds and whether a child is attached are
+  dumped nowhere — so one `DETACH PARTITION` removes rows from every reader with the snapshot
+  byte-identical ([ADR-0020](/decisions/0020-checkpoint-on-the-report-path) amends
+  [0007](/decisions/0007-schema-conventions-and-chart) §2 for it).)*
 - **Caching balances.** `posted` is read straight off the ledger. `ledger_account_balances` ships as the write-side serialisation point and an **O(stripes)** read — a `SUM` over the account's rows, one per stripe — so there *is* a second copy: it is rebuildable from the journal, and a drift view is what keeps it honest. *(This read "an O(1) read". The primary key is `(tenant_id, account_id, currency, stripe)`, so a striped account holds many rows and a naive single-row read under-reports the balance — the same correction applied in [the card walkthrough](/card) and [the database page](/database), made live by [ADR-0018](/decisions/0018-batching-and-stripe-selection).)*
 - **Multi-currency FX.** The schema carries currency and balances per currency; conversion is a
   separate problem with its own ADR.
