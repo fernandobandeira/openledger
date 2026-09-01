@@ -90,26 +90,6 @@ exit 0; breaks are exit 1 with each breaking check named on
 stderr. The sweep takes ACCESS SHARE only and cannot block a
 posting. Schedule it once a day at a cut-off (ADR-0010).";
 
-const DASHBOARD_HELP: &str = "\
-Serve the operator dashboard at /dashboard.
-
-One HTML page and nothing else: no build step, no assets, no
-outbound requests. The write side on the left — post a
-transaction, read one back — the four reports on the right, and
-across the top the cursor rail, which shows how far the
-cluster horizon has moved past the cursor you pinned.
-
-This binary serves it because the API has no CORS layer, so a
-page opened from a file:// URL can send a request and read
-nothing back. Served from here, every call it makes is
-same-origin, and the ledger takes on no dependency to allow it.
-
-A development and internal-inspection affordance, NOT part of
-the API. The route is mounted outside the route table, so it
-appears in no OpenAPI document and in no conformance check;
-left off — the default — /dashboard is a 404 like any other
-path nothing registered.";
-
 const LOCK_SECS_HELP: &str = "\
 Seconds to wait for another migrator to finish before
 giving up.
@@ -247,18 +227,6 @@ pub enum Command {
             value_parser = clap::value_parser!(std::net::SocketAddr)
         )]
         bind: std::net::SocketAddr,
-
-        /// Serve the operator dashboard at /dashboard
-        ///
-        // Off unless asked for, in both spellings: a deployment acquires this
-        // route by choosing it and never by upgrading.
-        #[arg(
-            long,
-            env = "OPENLEDGER_DASHBOARD",
-            hide_env_values = true,
-            long_help = DASHBOARD_HELP
-        )]
-        dashboard: bool,
     },
 }
 

@@ -342,18 +342,12 @@ struct Serving<'a> {
     /// and the tenant fence rests entirely on the `SET LOCAL ROLE` inside
     /// every read transaction (ADR-0019).
     read_login: Option<(&'a str, &'a [&'a str])>,
-    /// `--dashboard`: whether the served process also mounts the operator
-    /// dashboard at `/dashboard`. **`false` is the SHIPPED DEFAULT** — the
-    /// page is an inspection affordance and a deployment acquires the route
-    /// by asking for it, never by upgrading (`cli.rs`).
-    dashboard: bool,
 }
 
 /// The default shape: the owner's URL for both paths, no `READ_DATABASE_URL`.
 const AS_SHIPPED: Serving<'static> = Serving {
     as_the_app_role: false,
     read_login: None,
-    dashboard: false,
 };
 
 impl TestBook {
@@ -375,7 +369,6 @@ impl TestBook {
             &Serving {
                 as_the_app_role: true,
                 read_login: None,
-                dashboard: false,
             },
         )
         .await
@@ -394,24 +387,6 @@ impl TestBook {
             &Serving {
                 as_the_app_role: false,
                 read_login: Some((postgres::READ_LOGIN, &["openledger_read"])),
-                dashboard: false,
-            },
-        )
-        .await
-    }
-
-    /// The book served with `--dashboard` on: everything as shipped, plus the
-    /// operator dashboard mounted at `/dashboard`. The flag is off by default,
-    /// so every other book in this suite is a book WITHOUT the page — which is
-    /// what lets the pair of dashboard tests say whether the route follows the
-    /// flag rather than merely exists.
-    pub async fn new_with_the_dashboard(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::build(
-            name,
-            &Serving {
-                as_the_app_role: false,
-                read_login: None,
-                dashboard: true,
             },
         )
         .await
@@ -433,7 +408,6 @@ impl TestBook {
             &Serving {
                 as_the_app_role: false,
                 read_login: Some((postgres::DUAL_LOGIN, &["openledger_app", "openledger_read"])),
-                dashboard: false,
             },
         )
         .await
@@ -465,11 +439,8 @@ impl TestBook {
             }
             None => None,
         };
-        let (server, base) = spawn_the_server_and_read_its_address(
-            &serve_url,
-            read_url.as_deref(),
-            serving.dashboard,
-        )?;
+        let (server, base) =
+            spawn_the_server_and_read_its_address(&serve_url, read_url.as_deref())?;
 
         Ok(Self {
             pool,
@@ -1133,7 +1104,6 @@ async fn read_url_under_its_own_login(
 fn spawn_the_server_and_read_its_address(
     serve_url: &str,
     read_url: Option<&str>,
-    dashboard: bool,
 ) -> Result<(Server, String), Box<dyn std::error::Error>> {
     let mut command = postgres::openledger()?;
     command
@@ -1142,9 +1112,6 @@ fn spawn_the_server_and_read_its_address(
         .stdout(Stdio::piped());
     if let Some(read_url) = read_url {
         command.env("READ_DATABASE_URL", read_url);
-    }
-    if dashboard {
-        command.arg("--dashboard");
     }
     let mut server = Server(command.spawn()?);
     let stdout = server.0.stdout.take().ok_or("server stdout not captured")?;
