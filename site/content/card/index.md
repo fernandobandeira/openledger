@@ -104,14 +104,29 @@ function synthesises.
 
 ## Reading a balance, and the trap in the as-of query
 
-`posted` — what the customer owes — is the ledger's own current balance, so it is a primary-key read
-of one row. There is no running balance on the entries to read instead:
+`posted` — what the customer owes — is the ledger's own current balance, so it is a small aggregate
+over that account's stripe rows. There is no running balance on the entries to read instead:
 [spike 009](/spikes/009-where-the-balance-lives) dropped it, because a running balance is only
 correct on the order rows were inserted in.
 
+> **Correction, 2026-09-01 — and this one had teeth.** This section used to present the query below
+> without its `SUM`, as *"one row, by primary key"*. The primary key of
+> `ledger_account_balances` is **four** columns — `(tenant_id, account_id, currency, stripe)` — so on
+> a striped account that predicate matches **N rows, one per stripe**, and a client reading the
+> first row gets a fraction of the debt. **A fraction of the debt is more available credit**, in the
+> authorization path, which is the one place on this page where being wrong low costs money.
+> [ADR-0002](/decisions/0002-scaling) has always said *"every read SUMs the stripes"*; this query
+> contradicted it. The defect was latent while the writer bound a literal stripe `0` and every
+> account had exactly one row. **[ADR-0018](/decisions/0018-batching-and-stripe-selection) made it
+> live on 2026-09-01**, and the committed e2e test
+> `an_accounts_total_across_its_stripes_is_everything_that_was_posted_to_it` is what holds the
+> corrected shape.
+
 ```sql
--- current balance: one row, by primary key.
-SELECT input - output FROM ledger_account_balances
+-- current balance: SUM the account's stripes. The primary key is
+-- (tenant_id, account_id, currency, stripe) -- one account can hold many
+-- rows, and a read that omits the SUM under-reports the balance.
+SELECT sum(input - output) FROM ledger_account_balances
 WHERE tenant_id = :tenant AND account_id = :acct AND currency = :ccy;
 
 -- balance as of a pinned COMMIT cursor: an aggregate, not a lookup. The predicate
@@ -124,9 +139,10 @@ WHERE tenant_id = :tenant AND account_id = :acct AND xact_id < :cursor;
 
 > **The current-balance read is the one the ~1s authorization deadline depends on**, and dropping
 > the running balance made it slightly worse, not better: `ledger_account_balances` is rewritten on
-> every posting to that account, so a hot account's row never gets its visibility-map bit set and
-> the read always visits the heap. It is one heap fetch on one row. Spike 009 took that trade
-> deliberately, and the card rail is where it is felt first.
+> every posting to that account, so a hot account's rows never get their visibility-map bit set and
+> the read always visits the heap. It is one heap fetch per stripe — one row on an unstriped
+> account, and up to `stripe_count` on a hot one, which is the cost striping trades for write
+> throughput. Spike 009 took that trade deliberately, and the card rail is where it is felt first.
 
 **The as-of query is not "the current balance with one more predicate".** It cannot be, now: the
 current balance is a different table. `ix_entries__asof_commit` exists for exactly the second

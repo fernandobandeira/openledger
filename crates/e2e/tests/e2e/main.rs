@@ -11,9 +11,11 @@
 //! **The layout rule:** `support/` holds helpers and contains no `#[test]`;
 //! `endpoints/` holds one file per (resource, verb) — split only when one
 //! verb's contract outgrows a single read (transactions POST holds `post`
-//! for posting-and-idempotency, `pending` for pending → posted, and
-//! `reverse` for reversals and the void, ADR-0016); suite-wide checks live
-//! at the top level.
+//! for posting-and-idempotency, `pending` for pending → posted, `reverse`
+//! for reversals and the void, ADR-0016, `striping` for which physical
+//! balance row a posting lands on, ADR-0018 §1, and `batched` for what a
+//! caller gets when its posting shares a statement, ADR-0018 §§2–3);
+//! suite-wide checks live at the top level.
 //! Today those are `conformance` (whether the committed OpenAPI document and
 //! the running router still describe the same surface), `startup` (whether
 //! `serve` refuses a database its migrate job never reached, is behind, or
@@ -23,10 +25,13 @@
 //! pending controls to exit 0, a red-path injection for EVERY one of the
 //! summary's ten checks — spike 013's drift classes and the four checks
 //! that joined after the spike — each named on stderr at exit 1, the
-//! command's contract edges, and the sweep racing live writers), and
+//! command's contract edges, and the sweep racing live writers),
 //! `schema_snapshot` (ADR-0007 §2: the migrated catalog, dumped as
-//! deterministic text and diffed against the committed `schema/snapshot.txt`).
+//! deterministic text and diffed against the committed `schema/snapshot.txt`),
+//! and `concurrency` (M2's proof: N writers over overlapping account subsets,
+//! batching on, zero deadlocks on both of the statement's order sources).
 
+mod concurrency;
 mod conformance;
 mod endpoints;
 mod exit_codes;

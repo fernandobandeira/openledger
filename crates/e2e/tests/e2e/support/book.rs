@@ -13,10 +13,45 @@ use super::postgres;
 
 pub type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-/// What one [`TestBook::spawn_post`] task resolves to: status, the
-/// `Idempotency-Replayed` header if the response carried one, and the body.
-pub type PostOutcome =
-    Result<(reqwest::StatusCode, Option<String>, serde_json::Value), reqwest::Error>;
+/// One POST, read to the end: status, the `Idempotency-Replayed` header if
+/// the response carried one, and the body.
+pub type PostAnswer = (reqwest::StatusCode, Option<String>, serde_json::Value);
+
+/// What one [`TestBook::spawn_post`] task resolves to.
+pub type PostOutcome = Result<PostAnswer, reqwest::Error>;
+
+/// One charge of 100 between a pair, under `t1` — the body every concurrent
+/// burst in the suite sends. It lives here rather than in one endpoint file
+/// because three of them send it: a burst must be tenant-homogeneous or the
+/// drain steps over its members and nothing shares a statement, so "the same
+/// tenant, the same shape, only the key differing" is a property of the
+/// FIXTURE and not of any one test.
+pub fn charge(key: &str, source: Uuid, destination: Uuid) -> serde_json::Value {
+    serde_json::json!({
+        "tenant_id": "t1",
+        "idempotency_key": key,
+        "effective_at": "2026-08-27T12:00:00Z",
+        "postings": [{
+            "source": source, "destination": destination,
+            "amount_minor": 100, "currency": "USD"
+        }],
+    })
+}
+
+/// Every member of a burst accepted. Called from a test's assert phase, never
+/// from the helper that posts: a burst helper that asserted on the way past
+/// would run this silently at the call site — and in more than one test here
+/// these statuses ARE the second half of the test's name.
+pub fn assert_every_member_was_accepted(answers: &[PostAnswer]) {
+    for (n, (status, _, body)) in answers.iter().enumerate() {
+        assert_eq!(
+            status.as_u16(),
+            201,
+            "member {n} of the burst was not accepted — a 500 here is what a deadlock victim \
+             looks like: {body}"
+        );
+    }
+}
 
 /// Kills the served process when the test ends, pass or fail.
 struct Server(Child);
@@ -37,7 +72,12 @@ pub struct TestBook {
     pub db_url: String,
     base: String,
     client: reqwest::Client,
-    _server: Server,
+    /// Held so the served process outlives the test. Never read: the served
+    /// process is no longer a writer identity — it runs a POOL of dispatchers,
+    /// each owning its own index — so nothing about the book can be predicted
+    /// from it (ADR-0018 §1).
+    #[expect(dead_code, reason = "the field's value is the process staying alive")]
+    server: Server,
 }
 
 impl TestBook {
@@ -116,7 +156,7 @@ impl TestBook {
             db_url,
             base,
             client: reqwest::Client::new(),
-            _server: server,
+            server,
         })
     }
 
@@ -199,16 +239,45 @@ impl TestBook {
         let client = self.client.clone();
         let url = format!("{}/v1/transactions", self.base);
         let body = body.clone();
+        tokio::task::spawn(async move { post_one(&client, &url, &body).await })
+    }
+
+    /// Every body posted AT ONCE, answered in the order given. The one shape
+    /// three files needed and each had written for itself; nothing is
+    /// asserted on the way past, because a helper that asserts hides the
+    /// test's own assert phase inside its arrange phase.
+    pub async fn post_all_at_once(
+        &self,
+        bodies: &[serde_json::Value],
+    ) -> Result<Vec<PostAnswer>, Box<dyn std::error::Error>> {
+        let handles: Vec<_> = bodies.iter().map(|body| self.spawn_post(body)).collect();
+        let mut answers = Vec::with_capacity(handles.len());
+        for handle in handles {
+            answers.push(handle.await??);
+        }
+        Ok(answers)
+    }
+
+    /// ONE CLIENT as a spawned task: the given bodies posted one after
+    /// another, each answered before the next is sent. N of these are N
+    /// SUSTAINED writers, which is a different workload from N callers
+    /// arriving at once and the one a concurrency proof needs — a single
+    /// burst is drained by a couple of dispatchers into a couple of very
+    /// large batches, while sustained arrivals keep many dispatchers holding
+    /// small batches at the same time, which is what puts differing account
+    /// subsets in flight together.
+    pub fn spawn_client(
+        &self,
+        bodies: Vec<serde_json::Value>,
+    ) -> tokio::task::JoinHandle<Vec<PostOutcome>> {
+        let client = self.client.clone();
+        let url = format!("{}/v1/transactions", self.base);
         tokio::task::spawn(async move {
-            let response = client.post(url).json(&body).send().await?;
-            let status = response.status();
-            let replayed = response
-                .headers()
-                .get("idempotency-replayed")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            let body: serde_json::Value = response.json().await?;
-            Ok((status, replayed, body))
+            let mut answers = Vec::with_capacity(bodies.len());
+            for body in &bodies {
+                answers.push(post_one(&client, &url, body).await);
+            }
+            answers
         })
     }
 
@@ -247,6 +316,63 @@ impl TestBook {
         )
         .fetch_one(&self.pool)
         .await
+    }
+
+    /// How many database transactions on this book wrote MORE THAN ONE ledger
+    /// transaction — which is exactly how many batched statements carried
+    /// company (ADR-0018 §2). `ledger_entries.xact_id` defaults to
+    /// `pg_current_xact_id()`, so entries written by one statement share one
+    /// value and entries written by two share none.
+    ///
+    /// **This is the only witness a batch leaves.** A batched post is
+    /// indistinguishable on the wire from an unbatched one — same endpoint,
+    /// same response, same error grammar, deliberately — so a test that means
+    /// to exercise the batched statement has no way to ask for it and must
+    /// read afterwards whether it got it. Without this, a concurrency test
+    /// that happened to dispatch every member alone would pass while proving
+    /// nothing about the path it named.
+    pub async fn statements_that_carried_more_than_one_transaction(
+        &self,
+    ) -> Result<i64, sqlx::Error> {
+        let (shared,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM (
+                 SELECT xact_id FROM ledger_entries
+                 GROUP BY xact_id
+                 HAVING count(DISTINCT transaction_id) > 1
+             ) AS shared",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(shared)
+    }
+
+    /// Every counter on this book, asserted gapless from 1 within its own
+    /// `(account, currency, stripe)`. That grain is the contract, not the
+    /// account's: a stripe is a separate lock issuing a separate run
+    /// (ADR-0013 §4), so two stripes of one account both issue 1 and an
+    /// account-wide run would be unfalsifiable.
+    pub async fn assert_every_counter_is_gapless_from_one(&self) -> TestResult {
+        let counters: Vec<(Uuid, String, i16, Vec<i64>)> = sqlx::query_as(
+            "SELECT account_id, currency, stripe,
+                    array_agg(account_seq ORDER BY account_seq)
+             FROM ledger_entries
+             GROUP BY account_id, currency, stripe
+             ORDER BY account_id, currency, stripe",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        assert!(
+            !counters.is_empty(),
+            "no entries to check a counter against"
+        );
+        for (account, currency, stripe, seqs) in counters {
+            let expected: Vec<i64> = (1..=seqs.len() as i64).collect();
+            assert_eq!(
+                seqs, expected,
+                "account_seq of ({account}, {currency}, stripe {stripe}) is not a gapless run from 1"
+            );
+        }
+        Ok(())
     }
 
     /// The sweep's quiescence assumption, made explicit and waitable-for.
@@ -395,6 +521,21 @@ impl TestBook {
         }
         Ok(())
     }
+}
+
+/// One POST, read to the end — status, the `Idempotency-Replayed` header if
+/// the response carried one, body — because a `reqwest::Response` cannot
+/// cross a `JoinHandle` usefully once the assertions need the body consumed.
+async fn post_one(client: &reqwest::Client, url: &str, body: &serde_json::Value) -> PostOutcome {
+    let response = client.post(url).json(body).send().await?;
+    let status = response.status();
+    let replayed = response
+        .headers()
+        .get("idempotency-replayed")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body: serde_json::Value = response.json().await?;
+    Ok((status, replayed, body))
 }
 
 pub fn header(

@@ -17,5 +17,6 @@ export default {
   '014-write-path-contract': '014 · What the write path requires',
   '015-managed-postgres-event-triggers': '015 · Event triggers on managed Postgres',
   '016-close-cost-at-scale': '016 · What a period close costs at scale',
-  '017-openapi-tooling': '017 · aide or utoipa for the OpenAPI spec'
+  '017-openapi-tooling': '017 · aide or utoipa for the OpenAPI spec',
+  '018-batching-and-stripe-selection': '018 · Do batching and striping compose?'
 }

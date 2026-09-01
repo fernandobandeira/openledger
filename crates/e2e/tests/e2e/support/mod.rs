@@ -6,4 +6,6 @@
 mod book;
 pub mod postgres;
 
-pub use book::{TestBook, TestResult, header};
+pub use book::{
+    PostAnswer, TestBook, TestResult, assert_every_member_was_accepted, charge, header,
+};

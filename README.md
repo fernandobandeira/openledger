@@ -51,7 +51,9 @@ parked/card/      the card product's schema, written and not deployed.
 crates/           the workspace: `ledger` (the domain and the writer, no
                   sqlx), its `postgres` adapter, `db` (connections and
                   migrations), `api` (HTTP), `openledger` (the one binary:
-                  `migrate`, `serve`, `reconcile`), and `e2e` (the suite that spawns
+                  `migrate`, `serve`, `reconcile` — and the dispatcher pool
+                  that coalesces concurrent postings into one statement),
+                  and `e2e` (the suite that spawns
                   the binary and posts over the wire).
 scripts/          check-migrations-immutable.sh — the CI guard that keeps
                   committed migrations immutable.

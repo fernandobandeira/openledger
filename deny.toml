@@ -83,6 +83,61 @@ deny = [
     # databases with raw SQL.
     "e2e",
   ] },
+  # tokio is a RUNTIME, and ADR-0018 §5's whole argument is that none of it
+  # reaches the domain: the accumulator's queue, dispatcher pool and permits
+  # live in the binary precisely so that `ledger` — where the batch use-case
+  # and its fake-repository tests are — still compiles with no scheduler in
+  # the room, which is what keeps ADR-0002's "the core needs no scheduler,
+  # ever" a fact rather than an intention. Until this row existed, adding
+  # `tokio.workspace = true` to crates/ledger/Cargo.toml passed CI, and the
+  # boundary ADR-0015 calls "machine-enforced, not conventional" was, for
+  # this one crate, conventional. `ledger` and `ledger-postgres` are both
+  # deliberately absent: the adapter runs its statements on the caller's
+  # task and names no runtime either.
+  { crate = "tokio", wrappers = [
+    # The pool and the session settings it applies on connect; sqlx's
+    # runtime-tokio feature is this crate's choice to make.
+    "db",
+    # axum handlers run on it, and `api::run` owns the listener.
+    "api",
+    # The composition root builds the one runtime by hand (so its failure is
+    # a message rather than a panic) and spawns the dispatcher pool.
+    "openledger",
+    # The suite's own async test harness.
+    "e2e",
+    # Everything below is THIRD-PARTY and grants no workspace crate
+    # anything: a wrapper entry must name every DIRECT parent in the graph,
+    # workspace or not (the same rule `tonic` appears under `axum` for). They
+    # are listed by the stack they belong to so the list can be re-read
+    # rather than re-derived. The check that matters is the one that is
+    # absent: no path here reaches `ledger`.
+    #
+    # sqlx's own runtime, under `db` and the adapter.
+    "sqlx-core",
+    "sqlx-macros-core",
+    # The HTTP server stack under axum, plus the client stack under reqwest —
+    # hyper and everything hyper is built out of.
+    "axum",
+    "h2",
+    "hyper",
+    "hyper-rustls",
+    "hyper-util",
+    "reqwest",
+    "tokio-rustls",
+    "tokio-util",
+    # Dev-only, all of it: testcontainers' Docker client (bollard) and the
+    # transports it speaks to a daemon over — a unix socket, a Windows named
+    # pipe — plus the tonic/tower gRPC stack under buildkit.
+    "astral-tokio-tar",
+    "bollard",
+    "hyperlocal",
+    "hyper-named-pipe",
+    "hyper-timeout",
+    "testcontainers",
+    "tokio-stream",
+    "tonic",
+    "tower",
+  ] },
   # The workspace's own adapter and pool crates are capabilities too, not
   # conveniences — these two entries are what close the api -> adapter edge
   # by machine, which until they existed was a convention review had to hold:

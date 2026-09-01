@@ -18,6 +18,10 @@ db.workspace         = true
 ledger.workspace     = true
 serde_json.workspace = true
 sqlx.workspace       = true
+# Named directly only since the batched claim (ADR-0018 §3): a batch binds N
+# members' effective dates as one `timestamptz[]`, and an array's element type
+# has to be spelled out where a scalar bind could stay inferred.
+time.workspace       = true
 uuid.workspace       = true
 
 [lints]

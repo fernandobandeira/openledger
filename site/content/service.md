@@ -12,9 +12,10 @@ this page walks that code — the startup gate, the write path and what it guara
 contract, the crate boundaries that enforce the design, what the e2e suite proves, and
 [what is not built yet](#still-open--what-is-not-there).
 
-The census, counted 2026-08-31 against the workspace: **6 crates · 3 subcommands · 1 endpoint ·
-4 exit codes · 63 end-to-end tests · 10 reconciliation checks asserted at zero after every
-endpoint test.**
+The census, recounted 2026-09-01 against the workspace: **6 crates · 3 subcommands · 1 endpoint ·
+4 exit codes · 78 end-to-end tests · 10 reconciliation checks asserted at zero after every
+endpoint test.** *(It read 63, a count taken before the batching, striping and concurrency files
+existed, and 73 for one pass before the adversary round added five more.)*
 
 The API itself is browsable as rendered documentation: **[the API reference](/api-reference/)**,
 generated on every site build from the committed `crates/api/openapi.json` — never a second
@@ -97,6 +98,14 @@ into one call measured ~14% on localhost, where a round trip costs ~0.05 ms — 
 saved round trips are ~2.5 ms against ~1.3 ms of real work at RDS-like latency, which is the
 number that made this a design constraint rather than a tuning knob.
 
+**Since 2026-09-01 a posting may share that statement with other callers' postings**, and the round
+trips do not change: a batch is still `BEGIN`, one statement, `COMMIT`. Two qualifications, both
+load-bearing. A batch that contains any member whose idempotency key was already claimed costs a
+**fourth** round trip — one replay lookup for the whole unclaimed subset, never one per member. And
+a batch of exactly one member is not a batch: it takes the **single statement** this section
+describes, which is what makes the batched path unreachable until requests actually queue behind an
+in-flight write ([ADR-0018](/decisions/0018-batching-and-stripe-selection) §2).
+
 ```mermaid
 sequenceDiagram
     participant C as caller
@@ -152,7 +161,27 @@ Step by step, with the reasoning each one carries:
    summed per (account, currency) so N legs cost one balance upsert, and the coalesced map is a
    `BTreeMap` so the deltas arrive in account-id order — inside the statement, the `ORDER BY` on
    the `SELECT` feeding the upsert is what holds that order batch-wide when the row locks are
-   taken; the spike measured the unordered alternative collapsing 10× into deadlocks. The upsert's
+   taken; the spike measured the unordered alternative collapsing 10× into deadlocks. **The batched
+   path's sort is pinned rather than assumed**: deleting it fails the committed concurrency test
+   **4 of 4**, with 95–218 deadlocks reaching callers as HTTP 500s
+   ([spike 018](/spikes/018-batching-and-stripe-selection) §E).
+
+   **Correction, 2026-09-01: this paragraph used to claim the same removal produces "294 deadlocks
+   per 1,000 statements on this path", and it cited the section that retracts that.** Spike 018 §E's
+   correction block found the shipped **single** path is ordered *twice*: `coalesce` returns a
+   `BTreeMap`, so `columns_for_deltas` binds its arrays already sorted by `(account_id, currency)`
+   and the lock order is settled in Rust *before* the statement runs. Delete the SQL sort from the
+   shipped single statement and the suite stays **green**, because the Rust guarantee still holds.
+   The 294/1k came from a harness arm that let raw leg order reach the bind, which this writer
+   cannot do. The batched path has no second line — its delta order comes from a `GROUP BY` across
+   members *inside* the statement, so the SQL `ORDER BY` is the only thing ordering those locks.
+   **Batching trades a compile-time ordering guarantee for a runtime one**, and the runtime one has
+   to be tested because nothing else holds it. (A sort two writers can *disagree* about — `ORDER BY
+   input, output, account_id` — fails both paths, which is the property the sort actually encodes.)
+
+   It orders
+   `(account_id, currency, stripe)` — the stripe joined the key when selection was built, because
+   the counter it protects lives at that grain. The upsert's
    row lock *is* the serialization point (the database page's `ledger_account_balances` section is
    the long version), and its `INSERT` arm selects the account's frozen identity columns from
    `ledger_accounts` itself — which doubles as the existence check: an unknown account or a wrong
@@ -289,7 +318,10 @@ binary, named `openledger-e2e-pg` and reused across runs (testcontainers 0.27 sh
 an anonymous container would leak one per run; a named, reused one caps the population at exactly
 one).
 
-The sixty-three tests, by what each holds:
+The seventy-eight tests, by what each holds *(this line read "sixty-three" and the list below was
+missing three files — `batched.rs`, `striping.rs` and `concurrency.rs`, the last of which three other
+documents on this site cite as the proof M2 is closed; it then read "seventy-three" for one pass,
+before the adversary round added five more)*:
 
 - **Nine endpoint tests** (`endpoints/transactions/post.rs`) — the posting-and-idempotency half of
   the `POST /v1/transactions` contract in one file: a posting lands on both accounts' balance rows;
@@ -335,6 +367,40 @@ The sixty-three tests, by what each holds:
   `target_already_superseded`, never a 500 — the supersession index refereeing the twin the two
   per-pointer indexes never could), and a key reused with a different target or the defaulted
   date spelled out.
+- **Seven batching tests** (`endpoints/transactions/batched.rs`) — the cross-request accumulator
+  ([ADR-0018](/decisions/0018-batching-and-stripe-selection) §3) held from the wire: concurrent
+  distinct postings each come back with their own transaction, and the book is asserted to show a
+  statement that genuinely carried more than one member, so a suite that quietly stopped batching
+  fails rather than passes; a batch writes **one event, one transaction and two legs per member**, so
+  a cross-member coalesce that swallowed a member's rows fails here; a burst carrying one unknown
+  account **refuses that member by name and commits the rest** — the per-member gate, proved from
+  outside; **a refused member leaves no `ledger_events` row behind**, held on its own because it is
+  the one assertion in the whole suite that can see the burned-key defect — no reconciliation check
+  reads the event log; **the refused member's idempotency key is free to use again**, the other half
+  of the same defect; **one idempotency key raced across the whole dispatcher pool never answers a
+  500** — the duplicate-key abort made unreachable by the drain leaving a rival key for the next
+  batch; and **a reused key is refused as a reused key whether or not it shared a statement**, which
+  pins the claim-before-gate reading order that keeps the two paths' error grammar identical.
+- **Four striping tests** (`endpoints/transactions/striping.rs`) — stripe selection
+  ([ADR-0018](/decisions/0018-batching-and-stripe-selection) §1) from the wire, against an account
+  declaring `stripe_count = 32`: an account's total **across** its stripes is everything posted to
+  it (the reader must `SUM`, never read one row); **`account_seq` runs from one with no gap within
+  each stripe** — gaplessness is per `(account, stripe)`, ADR-0013 §4's grain; concurrent posts
+  occupy more than one stripe, which is the only thing that makes the other three mean anything; and
+  raising `stripe_count` on an account with history **opens a new stripe lazily** and reconciles
+  clean on its first write — the hint-not-invariant claim, with no backfill.
+- **Four concurrency tests** (`concurrency.rs`) — the lock-order proof the roadmap demanded and
+  [spike 018](/spikes/018-batching-and-stripe-selection) §E measured, both of the two order sources
+  the roadmap requires: eight accounts, writers drawing **overlapping account subsets** so
+  concurrent coalesced batches differ in *which* rows they take, deadlocking never; and concurrent
+  reversals of overlapping transactions deadlocking never, the mirror path's own `GROUP BY` order
+  source. Each carries a **twin holding gaplessness under the same load**, split out so that a
+  counter regression fails a test named for counters rather than one named `…_deadlock_never` and
+  sends its reader after a lock-ordering bug that is not there.
+  The shape is measured, not chosen — 128 writers × 8 rounds catches the batched `ORDER BY`
+  removed on 4 runs of 4, where 64 × 16 caught it on 1 of 4, because concurrency rather than volume
+  is what puts differing subsets in flight together. **This is the file three other pages on this
+  site cite as the proof M2 is closed**, and it was missing from this list.
 - **Conformance** (`conformance.rs`) — the committed `openapi.json` against the running router:
   every documented (path, method) must answer neither 404 nor 405 on the wire, an undocumented
   method on the same path must answer exactly 405, and the spec's path set must *equal* the
@@ -396,14 +462,35 @@ The sixty-three tests, by what each holds:
 
 Stated the way the database page states its gaps: each of these is a hole today, not a design.
 
-> **STILL OPEN — the writer is the lean single-stripe one.** Every write touches stripe 0 only:
-> the schema's balance striping ([ADR-0013 §4](/decisions/0013-write-path-contract)) is applied
-> but no selection policy is built, and the throughput numbers on this site are the spikes'
-> measurements of the SQL shape, not a load test of *this* binary — batching under load has no
-> proof yet. And hold EXPIRY — the timer
-> that fires a void unprompted — is M8's, so an abandoned pending waits on a caller-invoked void
-> and the bridge's `oldest_pending_effective_at` stays the aging alarm
-> ([ADR-0016](/decisions/0016-pending-to-posted)).
+> **CLOSED 2026-09-01 — the writer stripes and coalesces across requests. It has still not been
+> load-tested.**
+> This paragraph used to read *"the writer is the lean single-stripe one … every write touches
+> stripe 0 only … the throughput numbers on this site are the spikes' measurements of the SQL shape,
+> not a load test of this binary."* **Two of those three are now false.**
+> The stripe is chosen inside the statement from the account's `stripe_count`, keyed on the
+> dispatcher that runs the write; and postings from concurrent requests coalesce into one statement
+> when any are queued, and never wait for company that has not arrived
+> ([ADR-0018](/decisions/0018-batching-and-stripe-selection),
+> [spike 018](/spikes/018-batching-and-stripe-selection)).
+>
+> **The third sentence still stands, and a first version of this block wrongly declared it closed by
+> claiming "this binary's own throughput is measured".** It is not. Spike 018's figures — **623
+> clearings/s contended and unstriped, 2,687 striped 64 ways** — come from a throwaway harness whose
+> manifest depends on `clap`, `sqlx`, `tokio`, `uuid`, `serde_json` and `sha2`, and on **none** of
+> `ledger`, `ledger-postgres`, `api` or `openledger`. It builds the statements as strings,
+> re-implements the canonical hash, and has no HTTP client and no accumulator. Those numbers are a
+> large advance on spike 003's — they run the *shipped SQL* against the *shipped schema* rather than
+> a bench schema — but they measure the SQL shape, not this binary. **A load test of the compiled
+> `openledger` is still owed**, and the [roadmap](/roadmap) carries it.
+>
+> **STILL OPEN — hold expiry**, the timer that fires a void unprompted, is M8's: an abandoned pending
+> waits on a caller-invoked void, and the bridge's `oldest_pending_effective_at` stays the aging
+> alarm ([ADR-0016](/decisions/0016-pending-to-posted)).
+>
+> **STILL OPEN — a batch carries plain posted postings only.** Pending, resolutions and reversals
+> take the single statement they have always taken; the accumulator routes rather than refuses, so
+> no caller sees a difference. The batching speedup therefore does not apply to them
+> ([ADR-0018](/decisions/0018-batching-and-stripe-selection) §4).
 
 > **STILL OPEN — one endpoint.** There is no read over HTTP: balances, entries and reports are
 > reachable only through SQL and the report functions the schema ships. The write path came first

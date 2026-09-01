@@ -67,6 +67,16 @@ fn start_container() -> Result<Fallback, String> {
         .with_tag("18-alpine")
         .with_container_name(REUSED_CONTAINER)
         .with_reuse(ReuseDirective::Always)
+        // 400, not the image's 100, and for the same reason
+        // `docker-compose.yml` says it there: this suite runs one serving
+        // process per test in parallel, each holding a writer pool of one
+        // connection per dispatcher (`db`'s POOL_CONNECTIONS, 38). The
+        // measured peak across four 16-thread `make test` runs is 187-227
+        // backends; 100 fails the run with `sorry, too many clients already`.
+        // Reuse means an ALREADY-RUNNING container
+        // from before this line keeps whatever it was started with —
+        // `docker rm -f openledger-e2e-pg` is what picks the new setting up.
+        .with_cmd(["postgres", "-c", "max_connections=400"])
         .start()
         .map_err(|e| format!("starting the fallback postgres container: {e}"))?;
     // Host and mapped port resolved here, on this thread, for the same reason

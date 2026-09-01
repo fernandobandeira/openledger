@@ -29,9 +29,34 @@ Four things follow from the scaling half:
 2. **House accounts are per tenant.** `uq_accounts__house` is `(tenant_id, purpose, currency) WHERE
    owner_type = 'house'` — a modelling fix and a prerequisite for tenant isolation, **not** a
    throughput mechanism.
-3. **Say which lever applies where.** Batching and *randomly* chosen stripes cancel each other —
-   worse together than either alone, because random selection scatters a batch and defeats
-   coalescing. Give a writer its own stripe, or key the stripe on the tenant.
+3. **Say which lever applies where.** Give a writer its own stripe. **The stripe is keyed on the
+   writer, never on a business key.**
+
+   > **Corrected in place, 2026-09-01, by
+   > [ADR-0018](/decisions/0018-batching-and-stripe-selection) — both halves of this rule were
+   > wrong.** It read: *"Batching and randomly chosen stripes cancel each other — worse together than
+   > either alone, because random selection scatters a batch and defeats coalescing. Give a writer
+   > its own stripe, or key the stripe on the tenant."*
+   >
+   > **The cancellation does not reproduce.** On the shipped writer, striping under batching is still
+   > worth **1.42×**, and choosing the stripe *after* the coalesce rather than per member is worth
+   > **+7.6%** — a real effect and a small one, not "worse together than either alone". Spike 003
+   > measured the cancellation on a bench schema driven by a per-leg posting function
+   > ([spike 018](/spikes/018-batching-and-stripe-selection) §B).
+   >
+   > **"Or key the stripe on the tenant" is refuted.** A business key relocates the hot spot wherever
+   > that key is skewed, and payment volume is always skewed: under a tenant generating 90% of
+   > traffic, the worker key delivers **2.8× what the tenant key does** on the identical workload —
+   > 1,897 against 677 clearings/s. It is this ADR's own whale finding (the one that collapsed
+   > per-tenant house accounts to 1.07×, four paragraphs down) applied one level lower, and this rule
+   > walked into it. The "or" is deleted; **the writer key is the only one.**
+   >
+   > **What replaces the cancellation warning** is an overlap rule: batching trades *lock count* for
+   > *lock hold time*, so it pays only when batch members share accounts — measured 2–2.8× *slower*
+   > across 32 uniform tenants, and 1.24× faster under a dominant tenant where members coalesce.
+   >
+   > *(ADR-0018 spends a whole section on this ADR's **scheduler** sentence, which it did not
+   > contradict, and for a day said nothing about this rule, which it did.)*
 4. **Publish no throughput number until it is measured on RDS.** A round trip costs ~0.05 ms on
    localhost and ~0.5 ms on managed Postgres, which changes the *ranking* of the levers, not just
    their size.
@@ -62,6 +87,47 @@ exist rather than `0..stripe_count`, you can stripe *down* as safely as up — l
 stops new writes from spreading, it never strands a stripe's balance. `stripe_count` is an
 operator's write-side tuning knob, not part of the account's frozen identity.
 
+### The operator story, corrected 2026-09-01 — `stripe_count` alone is not the striping knob
+
+**"An operator just raises its `stripe_count`" is now misleading on its own, and this is the one
+surprise [ADR-0018](/decisions/0018-batching-and-stripe-selection) hands an operator.** Everything
+above stays true — no DDL, no backfill, no id change, correct at every instant — but the sentence
+implies the column is the knob, and it is not the *binding* one.
+
+**The stripe a write picks is the index of the dispatcher that runs it.** The serving process holds a
+fixed pool of writer tasks (`batching::DISPATCHERS`, **32**), each with a stable index for its
+lifetime, and the statement selects `index mod stripe_count`. So:
+
+- **A pool of N reaches at most N stripes**, however many an account declares. Measured at 64
+  declared and **32 reached** ([spike 018](/spikes/018-batching-and-stripe-selection) §A). Raising
+  `stripe_count` past the pool depth is **inert** — the extra stripes are simply never selected.
+- **The two numbers are tuned together or not at all.** Raising `stripe_count` from 8 to 64 on a
+  default deployment changes nothing; raising the pool is what widens the spread, and a pool of 8
+  measures **3.42×** against a pool of 32's **4.31×** on the same account.
+- **Lowering the pool has a second effect the column does not**: it also lowers how many concurrent
+  *batched* statements can pile onto one account's rows above the unbatched ceiling. ADR-0018 takes
+  32 as the default deliberately, because a shallow pool pays its striping penalty on every posting
+  forever while a deep pool pays only at ~39× this deployment's derived peak.
+- **And the occupied count is lower still than the reachable one.** A dispatcher drains everything
+  queued, so a burst is absorbed by a handful of dispatchers — and a dispatcher is a stripe. In the
+  committed end-to-end books, 32 declared stripes are reached by **3 to 6**, with up to 25 of 40
+  postings landing on one (ADR-0018's cost list has the counts). Striping spreads *sustained*
+  contention; it does not spread a burst that one drain can swallow.
+
+**A serving process now holds 38 database connections, up from 8** — `db::POOL_CONNECTIONS`, which is
+`DISPATCHERS + 6` and asserted against the pool depth at compile time so the two cannot drift. A
+dispatcher without a connection is worse than no dispatcher: it forms its batch and then blocks in
+`begin` while the members it meant to coalesce keep arriving. The six above the pool are what keep
+the startup schema gate — and any future reader — from waiting behind a pool of writers that is full
+by design.
+
+**So size the database for it.** PostgreSQL's default `max_connections` is 100. Two serving replicas
+plus a migration job is ~80 connections before anything else connects, and three replicas exceeds the
+default outright. Count `38 × replicas`, add the migrator, the sweep and whatever else holds a
+session, and raise `max_connections` or put a pooler in front — the same class of setting as the
+`shm_size: 1gb` [ADR-0010](/decisions/0010-reconciliation) documents for the sweep's parallel plan,
+and it fails the same way: fine on one node, an incident at three.
+
 ## The evidence
 
 A $30M facility divided by a ~35-day receivable turn is **$100–300M/yr of card spend** at full
@@ -90,8 +156,11 @@ Spike 003, durable settings, stock Postgres, one 16-core machine:
   **hot account** — settlement, fee revenue, the one nearly every transaction touches — is the whole
   ceiling, plateauing at four concurrent writers and then *declining*. pgledger's published numbers
   agree: **10,636.8 transfers/s across 50 accounts against 7,558.9 across 10**, same worker count.
-- **Striping works however load is distributed:** 872 → 6,970 clearings/s with one tenant; 948 →
-  7,405 with 32 tenants where one generates 90% of traffic.
+- **Striping works however load is distributed** — *when its key is the writer.* 872 → 6,970
+  clearings/s with one tenant; 948 → 7,405 with 32 tenants where one generates 90% of traffic.
+  ([Spike 018](/spikes/018-batching-and-stripe-selection) supplies the qualifier: keyed on the
+  *tenant*, striping under a whale reproduces this section's own 1.07× collapse one level lower —
+  the writer key beats it 2.8× on the identical workload. See rule 3's correction above.)
 - **Per-tenant accounts are not the mechanism.** A uniform benchmark shows 9.1× from splitting per
   tenant; with a dominant tenant — what real payment volume looks like — it collapses to **1.07×**,
   because that tenant's own house accounts become the new hot row. Splitting *relocates* the

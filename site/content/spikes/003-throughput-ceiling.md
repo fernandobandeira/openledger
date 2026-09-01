@@ -70,6 +70,16 @@ better for reconciliation).
 - **Batching** (coalescing many postings into one write) is worth 4.4× on its own and needs no
   schema change — but it *cancels out* with random striping. Pick one, or use affinity striping
   where each writer owns a stripe, which makes them compose (4,790/s).
+
+  > **Corrected 2026-09-01 by [spike 018](/spikes/018-batching-and-stripe-selection), which
+  > re-measured this on the shipped writer. The cancellation does not reproduce.** Striping under
+  > batching is still worth **1.42×** there, and choosing the stripe after the coalesce rather than
+  > per member is worth **+7.6%** — a real effect and a small one, not "pick one". What replaces it
+  > is worse for batching and was not visible on this bench schema: **batching itself is a net loss
+  > unless members share accounts**, measured 2–2.8× *slower* across 32 uniform tenants. The
+  > affinity-striping half of this bullet stands and is what shipped. The 4.4× is coalescing *within*
+  > one request; coalescing *across* requests is worth nothing until offered load approaches the
+  > unbatched ceiling.
 - **Dropping the running balance** buys only 22% over contention-free locking and costs the O(1)
   balance read (0.018 ms → 105.91 ms at a million entries -- unmeasured here, see below), the corruption cross-check, and the
   gaplessness proof. **Recommendation: don't.**
@@ -255,7 +265,17 @@ That coalesced write order is precisely what [spike 001](/spikes/001-formance) r
 Formance "demoting" the running balance. **It is not a demotion — it is what makes batching
 possible.** We misread it the first time.
 
-### Batching and random striping cancel
+### Batching and random striping cancel — on this bench schema only
+
+> **Corrected in place, 2026-09-01.** This heading and the "worst of each" conclusion below are
+> **overturned by [spike 018](/spikes/018-batching-and-stripe-selection) §B**, which re-ran the
+> comparison against the shipped writer — `migrations/00001_baseline.sql`, a single-call CTE pipeline
+> at three round trips — rather than against `bench_schema.sql` and a per-leg `post_entry()` over
+> six. There, striping under batching is still worth **1.42×** and per-batch placement is worth
+> **+7.6%** over per-member. The table below is real; what it is not is a property of this design.
+> The mechanism spike 018 substitutes generalizes better: **batching trades lock count for lock hold
+> time, and pays only when members overlap** — which is why this section's uniform workload made it
+> look like a cancellation.
 
 | stripes | batch=1 | batch=25 |
 | --- | --- | --- |
@@ -266,7 +286,9 @@ possible.** We misread it the first time.
 Monotonic in both directions — in *opposite* directions. Striping reduces contention by
 *spreading* writes; coalescing reduces lock acquisitions by *concentrating* them. Stripe 64 ways
 and a batch of 25 lands on ~25 different stripes: ~75 locks instead of ~27, with nothing left to
-coalesce. **Doing both gives the worst of each.**
+coalesce. **Doing both gives the worst of each** — *on this bench schema; see the correction above.
+On the shipped writer doing both is worth 1.42×, and the penalty for choosing the stripe per member
+rather than per batch is 7.6%, not a cancellation.*
 
 ### Affinity striping makes them compose
 
@@ -287,6 +309,18 @@ row it alone owns, every transaction stays balanced, and a periodic sweep consol
 real house account. [Spike 004](/spikes/004-chart-of-accounts) refines the affinity key: it
 should be the **tenant**, not the worker, because a business key survives a restart and needs no
 sweep process.
+
+> **That refinement is refuted, 2026-09-01, and this spike supplied the evidence against it.**
+> [Spike 018](/spikes/018-batching-and-stripe-selection) §C measured both keys on the identical
+> workload — 32 tenants, one generating 90% of traffic, 64 stripes — and the **worker** key delivers
+> **2.8× what the tenant key does**, 1,897 against 677 clearings/s. The whale hashes to one stripe,
+> so 64 stripes are 1 for 90% of the traffic. **That is this spike's own whale finding — the one two
+> sections up, where per-tenant house accounts collapse from 9.1× under uniform load to 1.07× at
+> 90/10 skew — applied one level lower.** A business key relocates the hot spot wherever the key is
+> skewed, and the reason spike 004 gave was void anyway:
+> [ADR-0013](/decisions/0013-write-path-contract) §4 removed the sweep by putting the stripe below
+> the account, so no key needs to survive a restart. **The worker key is what shipped**
+> ([ADR-0018](/decisions/0018-batching-and-stripe-selection) §1).
 
 ## Do we need the lock at all? (No — but that is not the lever)
 
@@ -480,12 +514,16 @@ costs ~0.5 ms and reorders the levers. Treat the *ranking* as hardware-specific 
 
 ## External validation — what the industry does
 
-> **SOURCING: every third-party figure and quotation below is UNVERIFIED.** None
-> carries a fetchable URL, and that makes them unverified, not merely unsourced. They are recorded because the
-> *shapes* they describe shaped our design, and marking them is cheaper than
-> pretending. Do not quote any number here as evidence without finding the source
-> first. Twice already, a figure attributed to a named project turned out never to
-> have existed.
+> **SOURCING: most third-party figures below were UNVERIFIED, and three of them no longer are.**
+> The original charge stands for everything still unmarked: no fetchable URL makes a figure
+> unverified, not merely unsourced, and twice already a figure attributed to a named project turned
+> out never to have existed. Do not quote an unmarked number here as evidence without finding the
+> source first.
+>
+> **Updated 2026-08-31 by [spike 018](/spikes/018-batching-and-stripe-selection)'s peer survey.** The
+> Uber and Modern Treasury rows now carry primary sources and are verified. The TigerBeetle row is
+> **corrected**: it was measuring a different mechanism from the other three, and this table's
+> conclusion rested partly on that conflation. See the note under the table.
 
 
 **We rediscovered a benchmark from 1985.** Jim Gray et al., *"A Measure of Transaction Processing
@@ -494,14 +532,16 @@ branches, 100 tellers, 10,000 accounts, so ~10 branch rows absorb every write. T
 hot-shared-account bottleneck was constructed deliberately, forty years ago, as the defining OLTP
 stress case. Our `network_settlement_payable` is TPC-B's branch record.
 
-**The consensus fix is batching, not splitting** — and two teams rejected splitting explicitly:
+**The consensus fix is batching, not splitting** — and two teams rejected splitting explicitly.
+**But "batching" names two different mechanisms in this table, and only two of these four teams do
+the one this project means** (corrected 2026-08-31; the distinction is drawn below):
 
-| Team | Approach | Evidence |
-| --- | --- | --- |
-| **Uber** | 250 ms batch windows, one read + one write per batch | 3–4 → **30+ ops/sec per account**; bulk jobs 21–24 h → minutes |
-| **Modern Treasury** | Sync/async router; hot entries queued and coalesced | p90 processing 1 s; **1,200 txn/s** in production |
-| **TigerBeetle** | Batching up to 8,189 transfers per query ([docs](https://docs.tigerbeetle.com/coding/requests/)) | — |
-| **Fragment** | Coalesced balance updates | p95 staleness 10 s at 10k entries/s ([source](https://fragment.dev/blog/building-balances-high-throughput-writes)) — **eventually-consistent path only** |
+| Team | Approach | Which batching? | Evidence |
+| --- | --- | --- | --- |
+| **Uber** | 250 ms batch windows, one read + one write per batch | **across independent requests** | 3–4 → **30+ ops/sec per account**; bulk jobs 21–24 h → minutes. ~1 s hold SLA is the stated reason for 250 ms ([source](https://www.uber.com/en-SE/blog/high-throughput-processing/)) — **verified 2026-08-31** |
+| **Modern Treasury** | Sync/async router; hot entries queued and coalesced | **across independent requests** | p90 processing 1 s; **1,200 txn/s** ([source](https://www.moderntreasury.com/journal/behind-the-scenes-how-we-built-ledgers-for-high-throughput)) — **verified 2026-08-31** |
+| **TigerBeetle** | Up to 8,189 transfers per request ([docs](https://docs.tigerbeetle.com/coding/requests/)) | **within one caller** — *not* the same mechanism | — |
+| **Fragment** | Coalesced balance updates | balance-update coalescing | p95 staleness 10 s at 10k entries/s ([source](https://fragment.dev/blog/building-balances-high-throughput-writes)) — **eventually-consistent path only** |
 
 > **The Fragment row carried no source until 2026-08-27; it does now.** Fragment's own words: *"With
 > 4 granularity levels, an average hierarchy depth of 5, and 4 lines per Ledger Entry, a typical
@@ -520,6 +560,29 @@ Postgres; ADR-0002 leaned on it slightly too heavily.
 
 This ranks batching **above** striping more strongly than our localhost numbers do — which is
 exactly the reordering the round-trip finding predicts for managed Postgres.
+
+> **That ranking is weaker than it looks, and the reason is a conflation in the table above**
+> (corrected 2026-08-31 by [spike 018](/spikes/018-batching-and-stripe-selection)'s peer survey).
+> **"Batching" names two mechanisms that are not the same thing.** One accumulates *independent
+> client requests* server-side and commits them together; the other packs work that was always
+> **one caller's** unit into one storage transaction. Only **Uber** and **Modern Treasury** do the
+> first. TigerBeetle does the second — its own protocol-batching PR describes a client library
+> accumulating concurrent calls that share **one client instance**, and two client processes are
+> never merged by the server ([PR #2617](https://github.com/tigerbeetle/tigerbeetle/pull/2617),
+> [issue #489](https://github.com/tigerbeetle/tigerbeetle/issues/489)). Formance's `_bulk` endpoint
+> and pgledger's multi-transfer call are the same within-one-caller shape.
+>
+> So the "consensus" is **two teams, not four** — and this row was being read as corroboration for a
+> mechanism TigerBeetle does not implement. The 4.4× this document measured for coalesced batching
+> is unaffected: that number is ours, measured here. What weakens is the external support for
+> ranking batching above striping.
+>
+> **What TigerBeetle should be cited for instead is its *window policy*, which is more useful to us
+> than the row it replaces.** It uses no timer at all: the stated model is explicitly Nagle-like —
+> maintain at least one request in flight, so nothing waits when nothing is queued. PostgreSQL
+> reaches the same conclusion at the commit layer, where `commit_siblings` defaults to **5** rather
+> than 0 because a delay is pure latency cost if nobody else is around to join
+> ([wiki](https://wiki.postgresql.org/wiki/Group_commit)).
 
 **A third option we never measured**, from Modern Treasury's published guidance: *"ensure that the
 hot account receives only asynchronous entries… the optimal design is locking only on these user

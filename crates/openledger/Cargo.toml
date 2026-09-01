@@ -19,5 +19,17 @@ ledger.workspace          = true
 ledger-postgres.workspace = true
 tokio.workspace           = true
 
+# The accumulator's tests build commands to queue, which means the two
+# value types a `PostTransaction` is made of — and, for the one test that
+# runs a dispatcher over a fake repository, the payload type the outbound
+# port's signature names plus tokio's test macro. Test-only: nothing in this
+# crate's own code names a uuid, an instant or a JSON value — it queues what
+# the api crate already parsed.
+[dev-dependencies]
+serde_json.workspace = true
+time.workspace       = true
+tokio                = { workspace = true, features = ["macros", "rt"] }
+uuid.workspace       = true
+
 [lints]
 workspace = true

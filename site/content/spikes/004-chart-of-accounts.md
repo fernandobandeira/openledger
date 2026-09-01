@@ -352,6 +352,34 @@ balance."* **The affinity key should be the tenant, not the worker** — a batch
 clearings naturally coalesces onto that tenant's rows, and a business key survives a restart and
 needs no sweep process.
 
+> **REFUTED 2026-09-01 — and this section's own evidence base is what refuted it.** Measured on the
+> shipped writer by [spike 018](/spikes/018-batching-and-stripe-selection) §C, on the identical
+> workload with only the selection expression changing: 32 tenants, one generating 90% of traffic,
+> 64 stripes. The **worker** key delivers **2.8× what the tenant key does** — 1,897 against 677
+> clearings/s. The whale hashes to one stripe, so sixty-four stripes are one stripe for 90% of the
+> traffic. **This is [spike 003](/spikes/003-throughput-ceiling)'s own whale finding — per-tenant
+> house accounts collapsing from 9.1× under uniform load to 1.07× at 90/10 skew — reproduced one
+> level lower down.** A business key relocates the hot spot wherever the business key is skewed, and
+> payment volume always is.
+>
+> **The reason offered above was void before the measurement.**
+> [ADR-0013](/decisions/0013-write-path-contract) §4 removed the sweep by putting the stripe *below*
+> the account, so nothing needs a key that survives a restart: `stripe_count` is a hint, a reader
+> `SUM`s the stripes that exist rather than enumerating `0..n-1`, and a stripe created lazily by
+> whichever dispatcher first picks it reconciles clean on its first write.
+>
+> **What survives**, and it is the more valuable half: the *coalescing* observation. A batch of one
+> tenant's clearings does coalesce onto shared rows — which is why
+> [ADR-0018](/decisions/0018-batching-and-stripe-selection) §3 makes every batch
+> **tenant-homogeneous**, measured 8% faster while collecting a quarter of the members. This section
+> was right that tenant grouping matters; it attached it to the wrong knob. Grouping is what the
+> *batch* is keyed on; the *stripe* is keyed on the writer.
+>
+> The DynamoDB "calculated suffix" argument above does not transfer either, because a stripe is
+> never a read key here: **every balance read `SUM`s the stripes**
+> ([ADR-0002](/decisions/0002-scaling)), so there is no per-tenant point read for a calculated
+> suffix to buy.
+
 ### THE design rule: put the invariant on the rollup, not the shard
 
 Found in the wild (`dineshsuthar123/Nexus`, `008_account_sharding.sql`): an

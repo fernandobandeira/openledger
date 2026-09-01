@@ -5,6 +5,23 @@ services:
     # fails 3/3 with `could not resize shared memory segment ... No space left on
     # device` under the default /dev/shm (ADR-0010).
     shm_size: 1gb
+    # 400, not the image's 100: the e2e suite runs ONE serving process per
+    # test, in parallel across the harness's threads, and a serving process
+    # holds a writer pool of one connection per dispatcher (`db`'s
+    # POOL_CONNECTIONS, 38 — ADR-0018 §2 sizes it with the pool depth). The
+    # tests that saturate that pool cost ~10 connections each; the measured
+    # peak across four 16-thread `make test` runs is 187-227 backends, and 100
+    # fails the run outright with `sorry, too many clients already`. 400 leaves
+    # room for a machine with more cores than this one.
+    #
+    # This is the suite's number and nothing a DEPLOYMENT needs — one serving
+    # process wants 38. It is also NOT a workaround for pools that hold what
+    # they no longer use: `db`'s IDLE_TIMEOUT fixes that, was measured against
+    # this suite, and moves the peak here by nothing at all, because each
+    # test's process is killed when its test ends and never lives long enough
+    # to hold anything idle. What this number covers is simultaneous demand,
+    # which is real and is what the suite is for.
+    command: ["postgres", "-c", "max_connections=400"]
     environment:
       POSTGRES_USER: openledger
       POSTGRES_PASSWORD: openledger

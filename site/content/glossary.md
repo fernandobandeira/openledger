@@ -158,19 +158,31 @@ forty-year-old problem: it is the branch record in the 1985 DebitCredit benchmar
 disk, which is why a bigger instance doesn't help.
 
 **Striping** — storing one logical account as N physical rows so writers spread across them;
-balance = sum of the stripes. **The schema is applied** — `ledger_account_balances.stripe`, the
-`(tenant_id, account_id, currency, stripe)` primary key and `fk_entries__stripe`
-([0013](/decisions/0013-write-path-contract)) — but the **writer that picks a stripe is not built**
-(roadmap M3). Measured in [spike 003](/spikes/003-throughput-ceiling) only, on the same single machine
-as the figure above: 872 → 6,970 clearings/s at 64 stripes.
+balance = sum of the stripes. **Built 2026-09-01** — the writer picks a stripe inside the statement
+from `ledger_accounts.stripe_count`, keyed on the dispatcher that runs the write
+([0018](/decisions/0018-batching-and-stripe-selection)), on the schema
+[0013](/decisions/0013-write-path-contract) applied: `ledger_account_balances.stripe`, the
+`(tenant_id, account_id, currency, stripe)` primary key and `fk_entries__stripe`. Measured on the
+shipped SQL at **4.31×** — 623 → 2,687 clearings/s at 64 stripes declared and 32 reached
+([spike 018](/spikes/018-batching-and-stripe-selection) §A). *(This entry read "the writer that picks
+a stripe is not built", and quoted spike 003's bench-schema 872 → 6,970.)*
 
 **Skew** — how unevenly traffic is spread across customers. Uniform = everyone equal; skewed = one
 customer is most of your volume, which is what real platforms look like. It matters because giving
 each tenant its own accounts gives 9.1× under uniform load but only 1.07× at 90/10 skew — the big
-tenant's own account just becomes the new hot row. Striping is immune to this.
+tenant's own account just becomes the new hot row. **Striping is immune to skew only when its key
+is the *writer*.** *(This entry said "Striping is immune to this", full stop, and that is false of
+any business key.)* Keyed on the tenant, striping reproduces the very collapse it is meant to fix —
+the whale hashes to one stripe, so 64 stripes are 1 for 90% of the traffic, and the worker key beats
+it 2.8× on the identical workload ([0018](/decisions/0018-batching-and-stripe-selection) §1).
 
-**Coalescing / batching** — combining many postings to one account into a single write. Worth
-~4.4× on its own.
+**Coalescing / batching** — combining many postings to one account into a single write. **Worth
+nothing at this ledger's sizing, and a net loss when the postings do not share accounts.** *(This
+entry said "worth ~4.4× on its own", which was spike 003's bench-schema figure for coalescing
+*within* one request.)* Coalescing **across** requests trades lock count for lock hold time, so it
+pays only where members overlap: measured **2–2.8× slower** across 32 uniform tenants, 1.24× faster
+under a dominant tenant, and indistinguishable from not batching at all below the unbatched ceiling
+([0018](/decisions/0018-batching-and-stripe-selection) §2, [spike 018](/spikes/018-batching-and-stripe-selection) §B).
 
 **Round trip** — one request to the database and back. Cheap on localhost, ~10× more on managed
 Postgres — which is why our local numbers are not publishable figures.

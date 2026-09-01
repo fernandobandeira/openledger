@@ -13,12 +13,28 @@ the ADRs don't each stop to re-explain them.
   this project's own bugs into each: Rust's compiler caught **5 of 5**, Go's caught **0 of 5**, and
   two of the five were guarantees an accepted ADR had already claimed in writing and did not have.
 - **Postgres**, one instance — measured at ~800 **clearings**/s untuned (a clearing is one card
-  transaction = 3 ledger entries), rising to ~6,970/s with the hot account striped 64 ways and 7,897/s
+  transaction; on spike 003's bench schema that was **3 ledger entries**, and on the shipped writer
+  it is **4** — see the paragraph below, which is the era that counts), rising to ~6,970/s with the
+  hot account striped 64 ways and 7,897/s
   striping *and* posting in a single call, on a 2 GB table; the comparable 43 MB figure is 7,816.
   Re-measured on the shipped baseline plus the stripe column at **7.7–9.2×** over three runs
   ([0013](/decisions/0013-write-path-contract)). Spike 003's own banner applies: re-auditing the same
   configurations moved the baseline from 833 to 482, so **treat these as shape, not as a benchmark**.
   Nothing has been measured over a network.
+
+  **Every figure above predates the shipped writer. The numbers for its SQL, measured 2026-09-01,
+  are lower and are the ones to quote**: **623 clearings/s** contended and unstriped, **2,687 striped
+  64 ways** — 4.31× — through the whole statement pipeline including the real idempotency hash, the
+  payload rendering and **four** entry rows per clearing — `expand_postings` emits two legs per
+  posting and `ledger_entries` takes one row per leg, so an entry count is always even and the "3"
+  above was never a shape this writer could produce
+  ([spike 018](/spikes/018-batching-and-stripe-selection)). *(This read "its own numbers". Spike
+  018's harness depends on none of the workspace crates, builds the statements as strings and speaks
+  no HTTP: it measured the **shipped SQL against the shipped schema**, which is a real advance on
+  spike 003's bench schema and still not a load test of the compiled binary. That remains
+  unmeasured.)* The 7.7–9.2× above is *upserts/s against
+  one account* and is not the same measurement; quoting the two interchangeably reads the striping
+  lever as a regression when it is Amdahl.
 - **sqlx**, no ORM — we write the SQL; it is checked against a live database at compile time. The hot
   queries stay reviewable *as SQL*.
 - **Postgres for durable timers too** — an in-process job queue, no scheduler cluster to run.
@@ -31,7 +47,7 @@ the ADRs don't each stop to re-explain them.
 
 ## The decisions
 
-Seventeen, each one file, each stating the decision first and then its evidence, its alternatives and
+Eighteen, each one file, each stating the decision first and then its evidence, its alternatives and
 what it costs. Each decision shows its `Status` — the decision itself — and, where useful, an
 `Artifact:` line for what is actually in the tree, with build status tracked on the [roadmap](/roadmap).
 The card rail's own two live under [the card decisions](/card). There is no separate
@@ -57,6 +73,7 @@ decision accepted lives in that ADR's own *"What it costs"*.
 | [0015](/decisions/0015-workspace-enforcement) | **Five crates plus a test-only crate, hexagonal by dependency direction — and the boundary machine-enforced** by deny.toml's capability ratchet, strict advisories, and the clock lint | An in-crate module cannot be forbidden a dependency; a crate can. The domain crate holds zero sqlx and `cargo deny check` fails the build if that ever changes — the boundary is a refusal, not a review habit | accepted |
 | [0016](/decisions/0016-pending-to-posted) | **Pending → posted is a new posted transaction carrying `resolves_id`, surfaced as two optional fields on `POST /v1/transactions`** — the target must be pending and unsuperseded, and the writer is what holds that. A reversals-and-void section (ratified and built 2026-08-31, migration 00003) adds `reverses_id`: server-derived contra mirror, the void as a zero-posting marker, one supersession index | The schema carried the whole shape since the baseline; what it cannot hold is the semantic linkage — ADR-0004 reproduced a posted transaction "resolved" by another posted one at revenue −49,223 with every check green. A `/resolve` route would restate the body schema to add one field | accepted (ratified 2026-08-31; reversals-and-void built same day) |
 | [0017](/decisions/0017-no-authentication) | **No authentication: the ledger deploys internally only, and `tenant_id` in the body is data scoping, not an auth claim** — authenticating callers is the deployer's layer (mesh, gateway, mTLS) | A second, ledger-shaped copy of the perimeter's identity machinery is security every deployment would have to configure correctly twice; the binary cannot verify its own network position either way, so the honest form of the requirement is a stated one | accepted (ruled 2026-08-31) |
+| [0018](/decisions/0018-batching-and-stripe-selection) | **The stripe is keyed on the writer, not the tenant; batches dispatch on completion rather than on a timer, carry one tenant and posted postings only, and refuse a bad member by withholding its key claim** | A business key relocates the hot spot wherever that key is skewed — worth 4.31× keyed on the writer against an unstriped control, and 2.8× what the tenant key delivers on the identical whale workload (1,897 against 677 clearings/s). A fixed window is a pure latency tax below saturation (10× the median at 50 TPS to collect 2.26 members). And gating a refused member *below* the key claim burns its idempotency key, turning a refusal into a success no reconciliation check can see | accepted (2026-09-01) |
 
 ## Non-negotiable
 

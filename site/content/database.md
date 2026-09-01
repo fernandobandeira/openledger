@@ -253,9 +253,17 @@ about. [Spike 009](/spikes/009-where-the-balance-lives) has the prior art, inclu
 sentence on why they store no such column: computing historical balances on write *"leads to
 cascading updates when posting a backdated Ledger Entry."*
 
-So there are two mechanisms and each read names its axis. "What is this balance now" is a
-primary-key read of the one row in `ledger_account_balances` that holds it. "What was it as of a
-business date" aggregates over `effective_at`,
+So there are two mechanisms and each read names its axis. "What is this balance now" is a `SUM` over
+the rows in `ledger_account_balances` that hold it — one per stripe.
+
+*(**Correction, 2026-09-01:** this sentence read "a primary-key read of the one row". The primary key
+is `(tenant_id, account_id, currency, stripe)` — four columns — so a striped account holds many rows
+and reading one under-reports the balance.
+[ADR-0002](/decisions/0002-scaling) has always said every read SUMs the stripes; the claim was
+harmless only while the writer bound a literal stripe `0`, which
+[ADR-0018](/decisions/0018-batching-and-stripe-selection) ended.)*
+
+"What was it as of a business date" aggregates over `effective_at`,
 which is linear in history — and the accountants' answer to that is a **period close**, which
 stores each period's closing balance so the query becomes *prior close plus entries since*. Those
 close tables (`ledger_periods`, `ledger_period_closes`, `ledger_period_balances`) are applied in the
@@ -592,6 +600,24 @@ is rebuildable from the journal at any time. A **stripe** is a shard of a hot ac
 (ADR-0013): to spread lock contention the balance is stored as N physical rows, a reader SUMs them,
 and an unstriped account holds exactly stripe 0 — so the primary key is `(tenant_id, account_id,
 currency, stripe)` and each stripe is a separate lock.
+
+**Which stripe a write lands on is the writer's choice, and since 2026-09-01 it makes one**
+([ADR-0018](/decisions/0018-batching-and-stripe-selection)): the statement reads the account's
+`stripe_count` and keys the selection on the dispatcher running the write — worth a measured
+**4.31×** on a contended account. Two consequences visible from this table. `stripe_count` is a
+**hint, not an invariant**, so raising it needs no backfill — the first writer to pick a new stripe
+creates its row with the upsert it was going to run anyway, and history stays where it is. And the
+number of stripes actually occupied is bounded by the **writer pool**, not by `stripe_count`: a
+declared 64 with 32 writers reaches 32, and raising the column alone changes nothing — the operator
+story is in [ADR-0002](/decisions/0002-scaling), including that a serving process now holds **38**
+database connections rather than 8.
+
+**In a burst it is narrower still, and the reason is the batching that ships alongside.** A
+dispatcher drains everything queued and *is* a stripe, so a burst is absorbed by whichever handful
+of dispatchers are free: in the committed end-to-end books, 32 declared stripes are reached by
+**3 to 6**, with up to 25 of 40 concurrent postings landing on one row. Striping spreads *sustained*
+contention, which is what the 4.31× measures; it does not spread a burst one drain can swallow
+([ADR-0018](/decisions/0018-batching-and-stripe-selection)'s cost list has the counts).
 
 **The obvious objection first: why store a balance at all, when you can add up the entries?** You
 can, and it stays correct forever — that is what makes this table a *cache* and not the truth. But

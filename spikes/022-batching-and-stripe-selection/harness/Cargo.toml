@@ -1,0 +1,29 @@
+# Spike 022's harness. THROWAWAY, and deliberately NOT a workspace member:
+# the empty `[workspace]` table below detaches this crate from the repo root's
+# workspace so its dependencies never reach the root manifest, the root
+# Cargo.lock, or deny.toml's capability map. It carries its own Cargo.lock.
+[workspace]
+
+[package]
+name = "spike022"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+sqlx = { version = "0.9", default-features = false, features = [
+  "runtime-tokio",
+  "tls-rustls-ring-webpki",
+  "postgres",
+  "macros",
+  "uuid",
+  "json",
+] }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[profile.release]
+debug = 1

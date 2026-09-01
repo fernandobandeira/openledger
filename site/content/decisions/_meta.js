@@ -18,4 +18,5 @@ export default {
   '0015-workspace-enforcement': '0015 · The workspace, machine-enforced',
   '0016-pending-to-posted': '0016 · Pending → posted is a new transaction',
   '0017-no-authentication': '0017 · No auth; the perimeter is the boundary',
+  '0018-batching-and-stripe-selection': '0018 · The stripe is keyed on the writer',
 }

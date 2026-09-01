@@ -12,9 +12,18 @@ product matters.
 ([ADR-0014](/decisions/0014-http-api)), and the e2e suite that spawns the binary and posts over the
 wire; since 2026-08-28 the writer posts in a **single server-side call**, and since 2026-08-31 it
 holds pending → posted — and its undo: reversals, and the void — too
-([M3](#m3--the-posting-engine), [ADR-0016](/decisions/0016-pending-to-posted)). What is missing is
-the rest of the load-bearing
-half — batching under load, stripe selection, the concurrency proof — and the read path. That
+([M3](#m3--the-posting-engine), [ADR-0016](/decisions/0016-pending-to-posted)). **Since 2026-09-01
+the load-bearing half is built too**: stripe selection on the write path, coalescing across
+requests, and the concurrency proof that pins the deterministic lock ordering
+([ADR-0018](/decisions/0018-batching-and-stripe-selection),
+[spike 018](/spikes/018-batching-and-stripe-selection)).
+
+**What is missing is now the read path**, and one honest asymmetry inside what just landed: striping
+is worth a measured **4.3×** and pays today, while cross-request batching buys nothing until offered
+load approaches the unbatched ceiling — **at or a little above ~1,940 clearings/s**, which the
+measurement ladder brackets from below only, about **39× the peak
+[ADR-0002](/decisions/0002-scaling) derives** — and ships inert below that by dispatching on
+completion rather than on a timer. That
 gap — not a deployment — is the story now. Phase 1 is the ordered list of code to build to close it.
 
 ---
@@ -27,14 +36,25 @@ gap — not a deployment — is the story now. Phase 1 is the ordered list of co
    construction, the two-statement idempotency replay, the posted-only cache update and the
    transaction seal. **The lean core of this landed on 2026-08-27**, behind one HTTP endpoint
    ([ADR-0014](/decisions/0014-http-api)), **single-call posting followed on 2026-08-28**, and
-   **pending → posted on 2026-08-31** ([ADR-0016](/decisions/0016-pending-to-posted));
-   what remains of M3 is batching under load and stripe selection.
+   **pending → posted on 2026-08-31** ([ADR-0016](/decisions/0016-pending-to-posted)), and
+   **batching under load plus stripe selection on 2026-09-01**
+   ([ADR-0018](/decisions/0018-batching-and-stripe-selection)) — **M3 is done**.
 2. **`openledger reconcile`** ([M2](#m2--openledger-reconcile-and-the-concurrency-proof)) — wire the
    ten reconciliation views to an exit code so the daily sweep is a real command. **Built
-   2026-08-28**: the subcommand runs the views in one snapshot as `openledger_recon`; what remains
-   of M2 is the concurrency proof, which waits on M3's batching.
+   2026-08-28**: the subcommand runs the views in one snapshot as `openledger_recon`. **M2 closed
+   2026-09-01** when the concurrency proof landed with the batching it waited on — `concurrency.rs`,
+   two tests, both order sources. *(This line read "what remains of M2 is the concurrency proof,
+   which waits on M3's batching" in the same commit that shipped both.)*
 3. **The stripe-picking writer** ([M3](#m3--the-posting-engine)) — stripe selection on the write
-   path. *(This step used to carry **the CI schema-snapshot test** too —
+   path. **Built 2026-09-01**, keyed on the writer rather than the tenant:
+   [spike 018](/spikes/018-batching-and-stripe-selection) measured **4.31×** against an unstriped
+   control, and on the whale workload where the two keys are compared side by side the writer key
+   beats the tenant key **2.8×** (1,897 against 677 clearings/s) — refuting
+   [spike 004](/spikes/004-chart-of-accounts)'s refinement on its own whale evidence.
+   *(This line quoted a tenant-keyed "1.09×". That ratio paired the whale workload against a
+   no-whale baseline; **no unstriped whale control was ever run**, so it is withdrawn — see
+   [ADR-0018 §1](/decisions/0018-batching-and-stripe-selection).)*
+   *(This step used to carry **the CI schema-snapshot test** too —
    [0007](/decisions/0007-schema-conventions-and-chart)'s highest-leverage guard against schema
    drift landed on 2026-08-31, closing [M1](#m1--schema-invariants-and-the-snapshot-test).)*
 4. **The as-of read path** ([M5](#m5--bitemporal-reads)) — a Rust read path over the report
@@ -103,7 +123,16 @@ the index that refuses two house accounts of one purpose is untouched while 64 s
 account are 64 balance rows. Re-measured on the shipped baseline plus the stripe column: 7.7–9.2×,
 and it is *striping* that removes contention, not per-tenant splitting: at 90/10 skew per-tenant
 accounts gave 1.07× while striping still gave 7.8× ([spike 003](/spikes/003-throughput-ceiling)).
-The writer that picks a stripe is M3's.
+**The writer that picks a stripe was built on 2026-09-01**
+([ADR-0018](/decisions/0018-batching-and-stripe-selection)).
+
+**Through that writer the figure is 4.31×, not 7.7–9.2×, and the two measure different things.** The
+number above is **upserts/s against one logical account**; end to end it is clearings/s through a
+writer that also hashes a payload, claims a key and inserts an event, a transaction and four
+entries, one of whose accounts is per-company and never contended
+([spike 018](/spikes/018-batching-and-stripe-selection) §A). Amdahl, not a regression — but the two
+should never be quoted as the same measurement, and an earlier draft of that spike did exactly that
+and would have reported ADR-0013 as overstated.
 
 **Done when:** the schema snapshot test is in CI, and striping exists. **Both hold as of
 2026-08-31.** The migration runner is done, striping's schema is applied, and the snapshot test —
@@ -129,7 +158,9 @@ reset were each injected by hand, and each failed the test naming exactly the dr
 **The lean core of this landed on 2026-08-27** ([ADR-0014](/decisions/0014-http-api)): given a
 balanced set of entries and an idempotency key, post atomically or return the stored result — built,
 behind `POST /v1/transactions`, and verified by the caller-shaped e2e suite with
-`SELECT * FROM reconciliation` as its oracle. What remains here is the load-bearing half.
+`SELECT * FROM reconciliation` as its oracle. **The load-bearing half is now built too** — the last
+of it on 2026-09-01. *(This sentence read "what remains here is the load-bearing half" after that
+half had shipped.)*
 Pending → posted is a **new** transaction with `resolves_id`, never an UPDATE — **built 2026-08-31**
 ([ADR-0016](/decisions/0016-pending-to-posted)): the same endpoint takes an optional `status` and
 `resolves_id`, a pending post issues sequence numbers without moving the posted cache, and the
@@ -139,14 +170,22 @@ semantic linkage [ADR-0004](/decisions/0004-where-logic-lives) proved no foreign
 `reverses_id` on the same endpoint, the mirror derived server-side from a posted target, a pending
 target voided by a zero-entry marker, and one supersession index refereeing the resolve-vs-reverse
 race. Hold *expiry* — the timer that fires a void unprompted — stays M8's. Three
-design constraints, not later optimizations — the second landed on 2026-08-28, the other two are
-not in the lean core yet:
+design constraints, not later optimizations — **all three are now settled**: the second landed on
+2026-08-28, the first on 2026-09-01, and the third was re-measured on the shipped writer the same
+day. *(This line read "the other two are not in the lean core yet" directly above a bullet headed
+"built 2026-09-01".)*
 
-- **Coalesced batching.** N postings to one account collapse into a single upsert advancing the
-  balance by the total and `last_seq` by the count; each entry's running balance is derived by
-  walking backwards from the returned totals. This is the only batching that does not deadlock.
-  What ships today coalesces *within* one posting request; coalescing *across* requests under load
-  is the unbuilt half.
+- **Coalesced batching — built 2026-09-01.** N postings to one account collapse into a single upsert
+  advancing the balance by the total and `last_seq` by the count; each entry's `account_seq` is
+  derived by walking backwards from the returned totals. This is the only batching that does not
+  deadlock. Coalescing *across* requests is now built too, and it arrived with a finding that
+  reframes it: **batching trades lock count for lock hold time, so it pays only when members share
+  accounts.** Measured 2–2.8× *slower* across 32 uniform tenants where a batch of 25 touches 25
+  different account pairs, and 1.24× faster under a dominant tenant where it coalesces. Batches are
+  therefore tenant-homogeneous, and the accumulator dispatches **on completion rather than on a
+  timer** — below saturation every batch has one member and takes the single statement, so the
+  batched path is unreachable until requests actually queue
+  ([ADR-0018](/decisions/0018-batching-and-stripe-selection)).
 - **Single-call posting — built 2026-08-28.** The whole append — key claim, transaction row,
   balance upserts in account order, entries — is one `unnest`-based CTE pipeline in one statement
   ([the service page has the shape](/service#the-write-path-as-implemented)), so a posting costs
@@ -156,11 +195,22 @@ not in the lean core yet:
   [ADR-0013 §2](/decisions/0013-write-path-contract) reproduced. Why it is a constraint and not a
   knob: worth ~14% on localhost, and worth more the higher round-trip latency climbs, where five
   saved round trips cost ~2.5 ms against ~1.3 ms of real work
-  ([spike 003](/spikes/003-throughput-ceiling) — the spike's numbers; this binary's own throughput
-  is still unmeasured).
-- **Striping and batching must not both be applied blindly.** Random stripe selection makes them
-  *cancel*, measured worse than either alone; tenant- or worker-affinity selection composes. The
-  stripe-picking writer is the third build step above.
+  ([spike 003](/spikes/003-throughput-ceiling) — the spike's numbers). **This binary's own
+  throughput is still unmeasured**, and [spike 018](/spikes/018-batching-and-stripe-selection) did
+  not close it: its harness depends on none of `ledger`, `ledger-postgres`, `api` or `openledger`,
+  builds the statements as strings and speaks no HTTP, so it measured the *shipped SQL against the
+  shipped schema* — a real advance on spike 003's bench schema, and still not a load test of the
+  compiled binary.
+- **Striping and batching must not both be applied blindly** — **and the cancellation this line
+  warned about does not reproduce on the shipped writer.** [Spike 003](/spikes/003-throughput-ceiling)
+  measured random stripe selection making the two levers *cancel*, worse than either alone, on a
+  bench schema with a per-leg posting function. Re-measured on the shipped SQL, striping under
+  batching is still worth **1.42×** *(this read 1.43×; the committed medians are 1,427 → 2,020, a
+  ratio of 1.415)*, and choosing the stripe after the coalesce rather than per member is
+  worth only **+7.6%** — a real effect, far smaller than "worse than either alone"
+  ([spike 018](/spikes/018-batching-and-stripe-selection) §B). What replaces the warning is the
+  overlap rule in the bullet above. The affinity key is the **writer**, not the tenant: a business
+  key relocates the hot spot wherever that key is skewed, and payment volume always is.
 
 **Decided: RLS and batching are not mutually exclusive, and the `BYPASSRLS` sketch is refused**
 ([ADR-0013](/decisions/0013-write-path-contract) §5, answering the [settled RLS framing decision](#rls-guards-reads-the-writer-is-admitted-not-exempt)
@@ -170,7 +220,10 @@ be granted on RDS or Aurora at all. The writer posts under an explicit admit-all
 the read role.
 
 **Done when:** M0's conformance suite, rebuilt in Rust, passes under concurrent load, with and
-without batching, and with striping on and off.
+without batching, and with striping on and off. **Held as of 2026-09-01** — the e2e suite posts
+concurrently through the accumulator against striped accounts and reads
+`SELECT * FROM reconciliation` at ten zeros, and the spike ran the same shapes across 302
+configurations, every one oracle-gated.
 
 ## M2 · `openledger reconcile` and the concurrency proof
 
@@ -189,8 +242,10 @@ class was reproduced and caught with a clean-book negative control
 ([spike 011](/spikes/011-reconciliation)) — and the e2e suite now holds both halves against the
 compiled binary: a clean book to exit 0, a forged cache to exit 1.
 
-**The concurrency proof — waits on M3's writer and batching.** The mechanism is settled: a
-per-(account, currency) balance row, updated by [one atomic upsert](/database) returning **both** the
+**The concurrency proof — built 2026-09-01, and the `ORDER BY` is finally pinned.** The mechanism is settled: a
+per-(account, currency, stripe) balance row *(the stripe joined the grain on 2026-09-01,
+[ADR-0018](/decisions/0018-batching-and-stripe-selection) §1)*, updated by
+[one atomic upsert](/database) returning **both** the
 new balance and the next sequence number, so the row lock *is* the serialization point — no
 `SELECT max()`, no advisory lock, no retry loop. `tenant_id` leads the conflict target because it
 leads the primary key; without it the statement does not run at all. Three traps:
@@ -212,22 +267,47 @@ leads the primary key; without it the statement does not run at all. Three traps
   `SELECT … FOR UPDATE` — you cannot lock a row that does not exist — but
   `INSERT … ON CONFLICT DO UPDATE` *is* the insert-and-lock, so there is no gap to race through.
 
-**Done when:** the reconcile command runs the views to an exit code (**done**, above), and — once the writer and
-batching exist — N writers against overlapping account sets, half posting their legs in reverse
-order, produce zero deadlocks, gapless per-account sequences and balanced transactions **with
-batching enabled**. Batch-wide ordering is the harder half and is untested — measured on the
-shipped writer: removing or inverting the statement's `ORDER BY` survives the entire suite today,
-exactly as this section predicts with two-account fixtures. The proof must cover **both order
-sources**: the planned path takes its delta order from the bound arrays (the coalesced `BTreeMap`),
-while the mirror path ([ADR-0016](/decisions/0016-pending-to-posted)'s server-derived reversal)
-takes its order from a `GROUP BY` over the target's entries — two different producers feeding one
-`ORDER BY`, and a regression in either is invisible until this test exists. The acceptance test is
-`SELECT * FROM reconciliation` returning ten zeros under concurrent load, with batching on.
+**Done when:** the reconcile command runs the views to an exit code (**done**), and N writers against
+overlapping account sets produce zero deadlocks, gapless per-account sequences and balanced
+transactions **with batching enabled**, with `SELECT * FROM reconciliation` at ten zeros under
+concurrent load. **Both hold as of 2026-09-01.** The proof covers **both order sources**: the planned
+path takes its delta order from the bound arrays, while the mirror path
+([ADR-0016](/decisions/0016-pending-to-posted)'s server-derived reversal) takes its order from a
+`GROUP BY` over the target's entries.
+
+**Two amendments this section owes the reader, because the criterion above is not the one it
+originally stated.**
+
+*The `ORDER BY` is no longer unpinned — and it turned out to be load-bearing on only one of the two
+paths.* This section used to record that "removing or inverting the statement's `ORDER BY` survives
+the entire suite today", with two-account fixtures as the reason. Eight accounts and 128 concurrent
+writers is the configuration that fails, and **the committed suite now holds it red**: delete the
+batched statement's sort and the concurrency test fails **4 of 4**, with 95–218 deadlocks reaching
+callers as 500s.
+
+The **single** statement's sort is a *second* line of defence, not the only one. `coalesce` returns
+a `BTreeMap`, so the writer binds its deltas already sorted by `(account_id, currency)` — remove the
+SQL sort there and the suite stays green, because the Rust guarantee still holds. The batched path
+has no such guarantee: its delta order comes from a `GROUP BY` across members inside the statement.
+**Batching trades a compile-time ordering guarantee for a runtime one**, which is precisely why the
+runtime one needed a test. A sort two writers can *disagree* about fails both paths.
+
+*"Half posting their legs in reverse order" is not achievable on the batched path, and that is a
+finding rather than a shortfall.* Coalescing normalizes lock order before the insert, so **a caller
+cannot influence it there at all**. Reversed presentation is the *single* path's hazard and is
+tested as such; the batched path's real hazard is differing account subsets across concurrent
+batches, which is what produced the 95–218 deadlocks above. *(This read "the 833 above". 833 is
+[spike 018](/spikes/018-batching-and-stripe-selection) §E's deadlocks-per-1,000-statements on the
+harness's batched arm, and it appears nowhere on this page.)* An earlier version of the harness
+conflated the two
+and credited real deadlocks to a flag that was inert on that path.
 
 ## M5 · Bitemporal reads
 
 Two axes, two mechanisms ([ADR-0006](/decisions/0006-time-and-as-of)): the current balance is a
-primary-key read of `ledger_account_balances`, recorded-axis and business-date balances are
+`SUM` over an account's stripe rows in `ledger_account_balances` *(this read "a primary-key read of
+the one row" — the primary key is `(tenant_id, account_id, currency, stripe)`, so a striped account
+holds several and every read SUMs them)*, recorded-axis and business-date balances are
 aggregates over `recorded_at` and `effective_at` respectively, and every reporting function names
 its axis explicitly.
 
@@ -359,7 +439,7 @@ been reversed:
   constraint they actually have, which is precisely what tenant-leading keys bought. Not now
   because there is no in-place `ALTER TABLE` conversion, and it buys per-tenant `DETACH` rather
   than throughput: table size barely affects an append-only workload.
-- **Caching balances.** `posted` is read straight off the ledger. `ledger_account_balances` ships as the write-side serialisation point and an O(1) read, so there *is* a second copy — it is rebuildable from the journal, and a drift view is what keeps it honest.
+- **Caching balances.** `posted` is read straight off the ledger. `ledger_account_balances` ships as the write-side serialisation point and an **O(stripes)** read — a `SUM` over the account's rows, one per stripe — so there *is* a second copy: it is rebuildable from the journal, and a drift view is what keeps it honest. *(This read "an O(1) read". The primary key is `(tenant_id, account_id, currency, stripe)`, so a striped account holds many rows and a naive single-row read under-reports the balance — the same correction applied in [the card walkthrough](/card) and [the database page](/database), made live by [ADR-0018](/decisions/0018-batching-and-stripe-selection).)*
 - **Multi-currency FX.** The schema carries currency and balances per currency; conversion is a
   separate problem with its own ADR.
 - **A scripting language for transactions**, and configurable correctness in any form.
@@ -380,8 +460,16 @@ done:
   reproducible number exists for a named instance class — with its method published alongside — no
   throughput figure goes in a README. And the docs must state **which lever applies to which write
   path**: [spike 003](/spikes/003-throughput-ceiling) measured striping *and* batching together at
-  2,356 clearings/s against 6,850 for striping alone and 3,338 for batching alone, so recommending
-  both is actively harmful.
+  2,356 clearings/s against 6,850 for striping alone and 3,338 for batching alone. *(This line
+  concluded from those numbers that "recommending both is actively harmful", and the shipped writer
+  does not bear that out — **the cancellation does not reproduce on this binary**. Spike 003
+  measured it on a bench schema driven by a per-leg posting function; re-measured on the shipped SQL,
+  striping under batching is worth **1.42×** and choosing the stripe per member rather than per batch
+  costs only **+7.6%** ([spike 018](/spikes/018-batching-and-stripe-selection) §B, retracted at
+  length in the M3 bullet above and in [ADR-0002](/decisions/0002-scaling)). Both levers ship
+  together. The spike 003 figures stand as what they were — a property of that bench schema, not of
+  this design — and what the docs owe an RDS reader is the overlap rule that replaced the warning:
+  batching trades lock count for lock hold time and pays only where batch members share accounts.)*
 - **Can managed Postgres install the append-only perimeter?** Answered.
   [Spike 015](/spikes/015-managed-postgres-event-triggers) confirmed the baseline's event triggers
   install on **AWS RDS and Aurora PostgreSQL 18** via the master account, and **not** on GCP Cloud

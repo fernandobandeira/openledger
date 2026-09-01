@@ -18,7 +18,17 @@
 //! map to an exit code — and the composition root in `dispatch`, the one
 //! place the Postgres repository is wired into the writer service, and the
 //! service into the api router as its `Ledger`.
+//!
+//! Beside it, since ADR-0018, is `batching` — the accumulator's machinery:
+//! the queue, the dispatcher pool and the permit each dispatcher's turn is.
+//! It is here because it needs a runtime and nothing in the core does, and
+//! the ADR states the cost plainly: this crate is no longer ONLY a
+//! composition root. The branching business logic it would otherwise have
+//! brought stayed in `ledger::LedgerService::post_batch`, where the
+//! fake-repository tests are; if the machinery grows past a few hundred
+//! lines, a `ledger-batch` crate is the right move rather than more of this.
 
+mod batching;
 mod cli;
 mod failure;
 
@@ -122,8 +132,20 @@ fn dispatch(cli: Cli) -> Result<(), Failure> {
                 db::verify_schema_is_current(&database)
                     .await
                     .map_err(Failure::Failed)?;
-                let repository = ledger_postgres::PgRepository::new(&database);
-                api::run(ledger::LedgerService::new(repository), bind)
+                // The writer pool: one writer per dispatcher, each striping
+                // on the index it will hold for its lifetime (ADR-0018 §1 —
+                // a single writer holding a single affinity puts every write
+                // for one account on one stripe, and striping then buys
+                // nothing).
+                let writers = (0..batching::DISPATCHERS)
+                    .map(|index| {
+                        ledger::LedgerService::new(ledger_postgres::PgRepository::for_writer(
+                            &database,
+                            index as u32,
+                        ))
+                    })
+                    .collect();
+                api::run(batching::BatchingLedger::dispatching_over(writers), bind)
                     .await
                     .map_err(Failure::from)
             })

@@ -1,0 +1,2 @@
+# Build artifacts only. transcript.txt is a DELIVERABLE (SPEC.md) and is kept.
+harness/target/

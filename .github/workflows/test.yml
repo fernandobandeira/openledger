@@ -173,10 +173,30 @@ jobs:
       # holding the test-only capability allowances; the binary it spawns was
       # built by the `cargo run -- migrate` steps above, and the explicit
       # build keeps that true if those steps ever move.)
+      #
+      # `--test-threads=2` is a connection budget, not a flake workaround, and
+      # it belongs to THIS job only. A serving process holds
+      # `db::POOL_CONNECTIONS` — one per dispatcher plus six, ADR-0018 §2 — and
+      # every e2e test spawns its own `serve`. The service container above runs
+      # PostgreSQL's default `max_connections` of 100, because GitHub service
+      # containers accept `options:` but no command override: there is nowhere
+      # to pass `-c max_connections=400`, which is exactly what the
+      # testcontainer path DOES pass (support/postgres.rs) and why the `rust`
+      # job above has never hit this. `ubuntu-latest` gives 4 test threads, so
+      # at the pool depth ADR-0018 shipped (38) the demand here is ~152 plus the
+      # migrator's, against 100. It has been passing on the tests' staggered
+      # start, not on arithmetic. Two threads keeps it under the default with
+      # headroom for the psql steps.
+      #
+      # The alternative considered: `ALTER SYSTEM SET max_connections` plus a
+      # `docker restart` of the service container. Refused as more moving parts
+      # in the one job whose value is that it runs the documented commands
+      # against a stock server. If the pool depth drops, raise this back — the
+      # number to keep true is `POOL_CONNECTIONS × threads < max_connections`.
       - name: e2e — a caller on the wire
         run: |
           cargo build --locked -p openledger
-          cargo test --locked -p e2e --test e2e
+          cargo test --locked -p e2e --test e2e -- --test-threads=2
 
       - name: What the applied schema is
         run: |

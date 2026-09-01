@@ -41,6 +41,7 @@ pub use domain::{Invalid, PostTransaction, Posted, Posting, TransactionStatus};
 pub use port::{Ledger, WriteError};
 pub use postings::{Append, Delta, Direction, Leg};
 pub use repository::{
-    Appended, BalanceUpsert, Claimed, Repository, StorageError, SupersedeRefusal,
+    Appended, BalanceUpsert, BatchMember, Claimed, MemberOutcome, Repository, StorageError,
+    StoredResult, SupersedeRefusal,
 };
 pub use service::LedgerService;

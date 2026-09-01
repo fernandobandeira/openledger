@@ -25,6 +25,11 @@ use uuid::Uuid;
 // crate — `new` stays the only door. The Postgres adapter (its own crate
 // since the deny.toml capability map) sees postings only through that
 // expansion.
+// `Clone` only because `PostTransaction` carries it and this is one of that
+// value's fields — the accumulator's queue owns whole commands, not loose
+// postings. It does not widen the door either: a clone of a valid posting is
+// a valid posting, and `new` remains the only way to make a first one.
+#[derive(Clone)]
 pub struct Posting {
     pub(crate) source: Uuid,
     pub(crate) destination: Uuid,
@@ -101,6 +106,20 @@ const MAX_IDENTITY_BYTES: usize = 512;
 /// idempotency key, or return the stored result of having done so.
 // `pub(crate)` for the same reason as `Posting`'s fields; the adapter crate
 // reads through the accessors below.
+//
+// `Clone` is a change to the DOMAIN made for a consumer, so what the consumer
+// needs is named here rather than left to be inferred (ADR-0018 §5). The
+// `Ledger` port hands `post` a BORROW, and that borrow lives exactly as long
+// as the call: the accumulator's queue must OWN the command, because the
+// dispatcher that posts it runs on another task and answers minutes of
+// requests later — the command outlives the call it arrived on, and a
+// reference into the caller's frame cannot. One clone per post, of a few
+// strings and its postings, against a statement shared with N callers.
+//
+// It does not widen the door: every field is `pub(crate)` and `new` is still
+// the only way to make a first one, so a clone is a command that was
+// validated once, exactly like the original.
+#[derive(Clone)]
 pub struct PostTransaction {
     pub(crate) tenant_id: String,
     pub(crate) idempotency_key: String,

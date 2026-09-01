@@ -35,7 +35,10 @@ publish = false
 # ("did you mean" over a two-word command surface, for one more crate).
 clap = { version = "4.6", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "migrate", "macros", "uuid", "time"] }
-tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
+# `sync` is the accumulator's: a queue's wakeup and one reply channel per
+# waiting caller (ADR-0018 §2). No `macros` — the runtime is still built by
+# hand so its failure is a message rather than a panic.
+tokio = { version = "1", default-features = false, features = ["rt", "net", "sync", "time"] }
 
 # The API surface (roadmap: the HTTP API is the adoption surface; the guarantee
 # stays in the writer, ADR-0005). Same trimming instinct as clap above.

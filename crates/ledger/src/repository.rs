@@ -2,7 +2,10 @@
 //! one method per statement the adapter runs, plus the transaction bracket
 //! around them. Since single-call posting (roadmap M3, spike 003) the
 //! first-writer path IS one statement, so the port carries two: the claim
-//! with the whole append riding on it, and the replay lookup.
+//! with the whole append riding on it, and the replay lookup — each in a
+//! single-command form and an N-command form, because a batch is ONE
+//! statement for N callers rather than N calls (ADR-0018 §5), and a method
+//! per statement is what that costs.
 //!
 //! This seam is NOT storage-agnosticism. There is one adapter
 //! (`crates/ledger/postgres`, a nested workspace member) and no swappability
@@ -75,6 +78,87 @@ pub enum Claimed {
     SupersessionRefused(SupersedeRefusal),
 }
 
+/// One member of a batch: the same four values a single post hands
+/// [`Repository::claim_and_append`], gathered so that N independent commands
+/// travel to storage as one slice. Borrowed throughout — a batch is
+/// assembled from callers still waiting on their own answers, and copying
+/// their commands to post them would be a copy per member per statement.
+///
+/// The planned `append` rides along for its LEGS, in posting order. The
+/// batched statement re-coalesces and re-numbers ACROSS members — one
+/// balance upsert for an account every member touched, not one per member —
+/// so `deltas` and `seq_offsets` are the single path's shape and the batched
+/// statement recomputes both (ADR-0018's recorded cost: the walk-back moves
+/// from unit-tested Rust into a SQL window function). The plan is still what
+/// refuses a member whose own legs overflow 64 bits, before any of this runs.
+///
+/// `Copy`, because the service selects SUBSETS of a batch — the members whose
+/// key an earlier caller already held go on to the replay lookup — and a
+/// member is four shared references: copying one copies no command, no hash
+/// and no plan.
+#[derive(Clone, Copy)]
+pub struct BatchMember<'a> {
+    pub command: &'a PostTransaction,
+    pub hash: &'a [u8],
+    pub payload: &'a serde_json::Value,
+    pub append: &'a Append,
+}
+
+/// What the batched statement answered for ONE member. Every variant except
+/// `Appended` means nothing was written FOR THIS MEMBER while its batch-mates
+/// committed — the per-member form of the port's standing promise
+/// (ADR-0018 §3).
+pub enum MemberOutcome {
+    /// This member claimed its key and its transaction is written,
+    /// uncommitted, in the shared bracket.
+    ///
+    /// It carries the claim and the transaction and NOTHING ELSE — not the
+    /// [`Appended`] the single path answers with — because the balance
+    /// upserts that value's third field would name do not exist at member
+    /// grain: the batched statement coalesces every member's deltas into one
+    /// upsert per `(tenant, account, currency, stripe)`, which is the whole
+    /// reason a batch beats N statements, so no row of that upsert belongs to
+    /// one member. Carrying an `Appended` whose `balance_upserts` is ALWAYS
+    /// empty would be a trap rather than a shape: anything reading it the way
+    /// `commit_or_refuse_unknown_account` reads the single path's — one
+    /// upsert per delta, and a `NULL` counter is an unknown account — would
+    /// refuse its own success. The wrong state is unrepresentable instead.
+    ///
+    /// Nothing is lost: the existence check the single path reads off a
+    /// `NULL` counter is answered ABOVE the claim here, and comes back as
+    /// [`AccountUnknown`](MemberOutcome::AccountUnknown).
+    Appended {
+        event_id: Uuid,
+        transaction_id: Uuid,
+    },
+    /// This member named an account that does not exist, or one that does
+    /// not hold the currency it posted. The gate withheld the member's
+    /// CLAIM, so its idempotency key is untouched and its retry is a fresh
+    /// request — which is the point: gate below the claim instead and the
+    /// refused member's event row commits with its innocent neighbours, its
+    /// key is burned forever, and every retry is answered
+    /// `transaction_id: null, replayed: true` — a success the caller cannot
+    /// tell from a real one (ADR-0018 §3).
+    ///
+    /// The account named is the first in account order, as the single path's
+    /// refusal names it.
+    AccountUnknown { account_id: Uuid, currency: String },
+    /// An earlier caller holds this member's key. It appended nothing, and
+    /// its answer is [`stored_result`](Repository::stored_result)'s — the
+    /// replay half stays a separate statement here for the same reason it
+    /// does on the single path (ADR-0013 §2: folded into the claim it
+    /// returns zero rows under the very race it exists to handle). So a
+    /// batch carrying any replay costs a fourth round trip.
+    KeyAlreadyClaimed,
+}
+
+/// What an already-claimed key stored, as the replay lookup answers it: the
+/// event, and the transaction it caused — `None` for an operation that wrote
+/// no transaction at all, which ADR-0013 records as the legitimate shape for
+/// the majority of accepted operations. The lookup answering `None` for the
+/// whole pair is a different fact: the key was reused with a different body.
+pub type StoredResult = (Uuid, Option<Uuid>);
+
 /// The opaque storage failure. The port names no backend error type — the
 /// Postgres error stays inside the adapter crate, boxed at exactly one
 /// function — and the service forwards it unread into
@@ -144,17 +228,74 @@ pub trait Repository: Send + Sync {
         append: &Append,
     ) -> impl Future<Output = Result<Option<Claimed>, StorageError>> + Send;
 
-    /// Statement B: the stored `(event_id, transaction_id)` of the already
-    /// claimed key — with the hash in the lookup's WHERE, never compared by
-    /// the caller: a same-key/different-body replay finds NO row, so a
-    /// caller that forgets to compare gets nothing instead of the wrong
-    /// stored result (ADR-0013 §2).
+    /// Statement A, batched — the SAME append for N independent commands in
+    /// ONE statement (ADR-0018 §3). Nothing here waits for company: the
+    /// caller assembles whatever arrived while the previous statement was in
+    /// flight and hands it over, so a one-member batch is the common case
+    /// and takes [`claim_and_append`](Repository::claim_and_append) instead.
+    ///
+    /// **The batch carries plain POSTED postings only** (ADR-0018 §4).
+    /// Pending transactions, resolutions and reversals keep the single
+    /// statement, which already holds the supersede gate, the server-derived
+    /// mirror and the pending rule; reapplying those per member inside SQL
+    /// would move ADR-0010's "the cache means posted" ruling out of the pure
+    /// math that unit-tests it. The caller routes; a member the batch cannot
+    /// carry is a disagreement between caller and adapter, not a caller
+    /// error, and is answered as [`StorageError`].
+    ///
+    /// **One outcome per member, in the order given.** A shorter or longer
+    /// answer means the adapter and the caller disagree about the statement:
+    /// that is an internal fault, exactly as a delta/upsert count mismatch
+    /// is on the single path, and never a refusal wearing a caller error's
+    /// name.
+    ///
+    /// **A refused member is refused alone, and the others commit.** Every
+    /// refusal outside `Storage` promises "nothing was written"; a batch
+    /// cannot roll back for one member without destroying the rest, so the
+    /// promise is kept by WITHHOLDING — a member that cannot proceed
+    /// contributes nothing to the shared statement, its idempotency key
+    /// included. Three failures still take the whole batch down, and they
+    /// are accepted rather than fixed (ADR-0018 §3); each is documented at
+    /// the line of SQL that produces it.
+    fn claim_and_append_batch(
+        &self,
+        tx: &mut Self::Tx,
+        members: &[BatchMember<'_>],
+    ) -> impl Future<Output = Result<Vec<MemberOutcome>, StorageError>> + Send;
+
+    /// Statement B: the [`StoredResult`] of the already claimed key — with
+    /// the hash in the lookup's WHERE, never compared by the caller: a
+    /// same-key/different-body replay finds NO row, so a caller that forgets
+    /// to compare gets nothing instead of the wrong stored result
+    /// (ADR-0013 §2).
     fn stored_result(
         &self,
         tx: &mut Self::Tx,
         command: &PostTransaction,
         hash: &[u8],
-    ) -> impl Future<Output = Result<Option<(Uuid, Option<Uuid>)>, StorageError>> + Send;
+    ) -> impl Future<Output = Result<Option<StoredResult>, StorageError>> + Send;
+
+    /// Statement B, batched — the stored results of N already-claimed keys in
+    /// ONE lookup. A batch carrying any replay costs a fourth round trip, and
+    /// this is what keeps it FOUR: one lookup for the whole unclaimed subset,
+    /// never one per member. A batch carrying no replay runs it not at all.
+    ///
+    /// The members are the ones [`claim_and_append_batch`](Repository::claim_and_append_batch)
+    /// answered [`MemberOutcome::KeyAlreadyClaimed`] for, handed back whole
+    /// because they are the same members; only `command` and `hash` are read.
+    ///
+    /// **One answer per member, in the order given**, and the hash is in the
+    /// lookup's WHERE exactly as it is on the single path: a member whose key
+    /// was reused with a DIFFERENT body comes back `None` — never another
+    /// member's stored result, and never the right member's wrong one. A
+    /// shorter or longer answer is the same disagreement about the statement
+    /// that a mismatched outcome count is, and is internal, never a caller
+    /// error.
+    fn stored_result_batch(
+        &self,
+        tx: &mut Self::Tx,
+        members: &[BatchMember<'_>],
+    ) -> impl Future<Output = Result<Vec<Option<StoredResult>>, StorageError>> + Send;
 
     /// Commit the bracket: the event claim and everything it caused become
     /// durable together.
