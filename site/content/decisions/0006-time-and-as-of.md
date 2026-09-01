@@ -31,9 +31,9 @@ answer. Why we keep no stored running total is in the evidence below.
 
 | Question | Mechanism |
 | --- | --- |
-| Current balance (the hot path) | `ledger_account_balances` — one row per account, read by primary key |
+| Current balance (the hot path) | `ledger_account_balances` — a `SUM` over the account's **stripe** rows *(this read "one row per account, read by primary key". The primary key is `(tenant_id, account_id, currency, stripe)`, so a striped account holds several rows and a naive single-row read under-reports the balance — the same correction the roadmap applied to the card walkthrough and the database page, made live by [0018](/decisions/0018-batching-and-stripe-selection))* |
 | Balance as *recorded* at instant T | aggregate filtered by the commit cursor `xact_id < :cursor`, on `ix_entries__asof_commit` — [0011](/decisions/0011-period-close-and-report-axes) proved `recorded_at` cannot order commits and re-pointed the index at `xact_id` |
-| **Balance as of business date T** | **aggregate over `effective_at <= T`**, denormalized onto `ledger_entries` so it is a single-table index scan, not a join |
+| **Balance as of business date T** | **aggregate over `effective_at < T`**, denormalized onto `ledger_entries` so it is a single-table index scan, not a join *(this read `effective_at <= T`. The shipped `balance_sheet_at` filters `effective_at < p_asof`, half-open to match the period model — [0011](/decisions/0011-period-close-and-report-axes) §A3 — and `BETWEEN`'s inclusive form was measured dropping an entry effective at `…23:59:59.999999`. A caller who followed this row's old bound got the position at the **start** of its business date and silently lost a day at every period boundary, so `p_asof` takes a period's `ends_at`, never a business date)* |
 
 **An as-of query names the column it filters, and a resource has one such column** — naming the axis on
 the *parameter* is not enough. The cursor is `pg_snapshot_xmin(pg_current_snapshot())`, the lowest

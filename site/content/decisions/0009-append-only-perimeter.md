@@ -132,7 +132,7 @@ copies held honest by composite foreign keys; the half usually overlooked is tha
 default `NO ACTION` also **refuses an `UPDATE` of the referenced columns while a dependent row points
 at the old value** — which [0007](/decisions/0007-schema-conventions-and-chart) already records for
 `fk_accounts__type`. That is a column freeze, spelled declaratively. Applied to the owner, on
-`ledger_account_balances` (one row per account, not one per entry), the four two-statement directions
+`ledger_account_balances` (one row per account, currency and stripe — not one per entry), the four two-statement directions
 are refused **as the database owner** — owned → house, owned → another owner, `company` → `platform`,
 and house → owned — while `metadata` stays editable. Two details cost a round each: a composite foreign
 key is `MATCH SIMPLE`, so one NULL and it is **not checked at all** (hence a `GENERATED ALWAYS`

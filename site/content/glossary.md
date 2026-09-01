@@ -55,9 +55,13 @@ to us because it's what bounds an otherwise unbounded scan when computing histor
 **Entry** — one line: this account, this direction, this amount. **Transaction** — a balanced set
 of entries. **Account** — the thing entries attach to.
 
-**Balance cache** (`ledger_account_balances`) — one row per account holding what it is worth *now*,
-so reading a current balance is a primary-key lookup instead of summing history. It is also the row
-a writer locks, which is what serializes two people spending the same money.
+**Balance cache** (`ledger_account_balances`) — what an account is worth *now*, held as one row per
+account **per currency per stripe**, so reading a current balance is a `SUM` over that account's
+handful of stripe rows instead of over its whole history. It is also the row a writer locks, which is
+what serializes two people spending the same money — and striping the row is how many writers stop
+queueing behind one lock ([ADR-0018](/decisions/0018-batching-and-stripe-selection)).
+*(This entry read "one row per account … a primary-key lookup". A striped account holds several rows,
+and a single-row read under-reports the balance.)*
 
 **Running balance** — a balance stored on *each entry*, giving the account's total immediately after
 that entry. This ledger has **no such column**: it had one and
