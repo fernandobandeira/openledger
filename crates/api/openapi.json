@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "OpenLedger API",
-    "description": "OpenLedger, an open-source double-entry ledger on PostgreSQL. The write path is one endpoint under the idempotent replay contract of ADR-0013 — the same key with the same body returns the stored result, marked by the `Idempotency-Replayed` header. The read path is seven, and three things about it are contract rather than presentation (ADR-0019): every report answers with the `pinned_cursor` it ran at, including when the caller supplied none, and that value is what re-runs the report — `GET /v1/cursor` answers the same horizon on its own, for a caller that wants it without paying for a report; EVERY amount on this surface is an exact-integer decimal STRING, single postings and entries included, because JSON has no integer type and both a `numeric` total and a `bigint` posting reach past 2^53, where a consumer's parser rounds silently; and an unknown tenant is answered 200-with-nothing rather than 404, because nothing in the schema declares a tenant and inventing the status would mean inventing the registry.",
+    "description": "OpenLedger, an open-source double-entry ledger on PostgreSQL. The write path is one endpoint under the idempotent replay contract of ADR-0013 — the same key with the same body returns the stored result, marked by the `Idempotency-Replayed` header. The read path is eight, and three things about it are contract rather than presentation (ADR-0019): every report answers with the `pinned_cursor` it ran at, including when the caller supplied none, and that value is what re-runs the report — `GET /v1/cursor` answers the same horizon on its own, for a caller that wants it without paying for a report; EVERY amount on this surface is an exact-integer decimal STRING, single postings and entries included, because JSON has no integer type and both a `numeric` total and a `bigint` posting reach past 2^53, where a consumer's parser rounds silently; and an unknown tenant is answered 200-with-nothing rather than 404, because nothing in the schema declares a tenant and inventing the status would mean inventing the registry.",
     "license": {
       "name": "MIT",
       "identifier": "MIT"
@@ -306,6 +306,162 @@
           },
           "422": {
             "description": "Refused. `type` is `tenant_mismatch`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The read failed. `type` is `internal`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The read exceeded this deployment's `statement_timeout` (`57014`). `type` is `report_timed_out`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/entries": {
+      "get": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "Read one account's entries, in order, at a cursor.",
+        "description": "**The listing ADR-0019 refused, and the axis is why it can ship.** That\ndecision refused a listing of entries because one *\"must choose between the\nrecorded axis and the effective axis\"*; this one does not choose — it takes\nthe axis as a parameter, which is exactly what ADR-0019 itself ruled for the\ntrial balance. Each ordering is served by the index the schema already\ncarries for it, and the entry id breaks ties so that each is total:\n`recorded` is `(xact_id, id)` on `ix_entries__asof_commit`, `effective` is\n`(effective_at, xact_id, id)` on `ix_entries__effective`.",
+        "operationId": "getAccountStatement",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "path",
+            "description": "The account whose entries to read.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "description": "The book to read.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "t1"
+          },
+          {
+            "name": "axis",
+            "in": "query",
+            "description": "**Required, and there is no default** (ADR-0023). `recorded` orders by\ncommit position — what the ledger learnt, and when — and `effective`\norders by business date. The two disagree about where a backdated\nentry sits, which is what two axes MEAN (ADR-0006): whichever one were\nchosen for a caller who named none would be the axis they did not\nthink about, so this endpoint refuses rather than picks.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "recorded"
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The commit position to pin the page to — a `pinned_cursor` from an\nearlier read. Omit it and one is pinned server-side and returned. It\nbounds BOTH axes: an entry is on this page only if it had committed by\nthis cursor, whatever it is dated.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "231000"
+          },
+          {
+            "name": "effective_from",
+            "in": "query",
+            "description": "Inclusive lower bound on `effective_at`, RFC 3339. **`axis=effective`\nonly** — on `axis=recorded` it is refused rather than ignored, because\nthe page there is ordered and bounded by commit position and a\nbusiness-date window would be a filter over the account's whole\nhistory.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "2026-01-01T00:00:00Z"
+          },
+          {
+            "name": "effective_to",
+            "in": "query",
+            "description": "EXCLUSIVE upper bound on `effective_at`, RFC 3339 — half-open, as every\nrange on this surface is (ADR-0011 §A3). `axis=effective` only.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "2026-02-01T00:00:00Z"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "How many entries at most, 1–1000. Omitted means 100. A value outside\nthe window is REFUSED rather than clamped, exactly as on\n`GET /v1/accounts`.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "maximum": 1000,
+              "minimum": 1
+            },
+            "example": 100
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "The `next_after` an earlier page of **this same axis** answered with,\nsent back unchanged. It is the last row's ordering key — `xact_id` and\nentry id on the recorded axis, the business date as well on the\neffective one — and a key of the other axis is refused rather than\nused as a bound of an order it does not name.\n\n**It is never `account_seq`**, and that is the trap worth naming:\n`uq_entries__account_seq` is per `(tenant, account, stripe, seq)`, so\non a striped account the counter is not a total order and paging by it\nwould interleave two counters and silently drop or repeat rows\n(ADR-0023). The number is returned on every entry — it is what a drift\ncheck walks — and it does not order the page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page of the account's entries, in the axis's order, with the cursor the page was pinned at and the key of the next page. **The two axes answer the same SET in different ORDERS**, and a backdated entry is where they disagree: it sits in its own past on the effective axis and at the end of the recorded one. An account that exists and has no entries in range answers an empty list, never a 404.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountStatementRead"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A required query parameter is missing — `tenant_id`, or the `axis` this endpoint will not choose for you — or a value would not deserialize into its documented type, including an `account_id` path segment that is not a UUID. `type` is `invalid_request`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such account on this book. `type` is `account_unknown` — note that the write path returns 422 under this same `type`, deliberately: there the caller must change the request, here the resource does not exist. An account that exists with no entries is a 200 with an empty page, and only the account register can draw that distinction (ADR-0019).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Refused. `type` is one of: `invalid_request` (an `axis` that is not `recorded` or `effective`; an `effective_from` or `effective_to` that is not an RFC 3339 instant, or either of them on `axis=recorded`, where the page is bounded by commit position; a `limit` outside 1–1000, zero and negative included — refused rather than clamped; an `after` that is not a page key of the axis being paged; or a `cursor` that is not an `xid8` at all), `cursor_invalid` (a legal `xid8` above this cluster's horizon or at or below the book's oldest entry), or `tenant_mismatch`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1132,6 +1288,43 @@
           }
         }
       },
+      "AccountStatementRead": {
+        "type": "object",
+        "description": "One page of one account's entries: the axis they were ordered by, the\ncursor they were pinned at, and the key of the next page.",
+        "required": [
+          "pinned_cursor",
+          "axis",
+          "entries",
+          "next_after"
+        ],
+        "properties": {
+          "axis": {
+            "type": "string",
+            "description": "The axis this page was ordered by, echoed — `recorded` or `effective`.",
+            "example": "recorded"
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StatementEntryRead"
+            },
+            "description": "The page, in the axis's order. **An empty list is a legitimate answer**\nfor an account with no entries at this cursor, in this range; an\naccount that does not exist is a 404 instead, which is a distinction\nonly the account register can draw (ADR-0019)."
+          },
+          "next_after": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `after` to send for the next page, or `null` when this page did not\nfill. **A full page means \"there may be more\", never \"there is\"** — the\nsame rule `GET /v1/accounts` follows, and for the same reason: the\nalternative is reading one row past every page to be certain.",
+            "example": "231000,0198f0c9-1f8a-7c31-9e1a-000000000001"
+          },
+          "pinned_cursor": {
+            "type": "string",
+            "description": "The commit position this page ran at — supplied or server-pinned.\nStore it and send it back to walk the rest of this same book: the page\nafter it is then the page after it *was*, whatever has committed since.",
+            "example": "231000"
+          }
+        }
+      },
       "CursorRead": {
         "type": "object",
         "description": "The commit horizon, on its own.",
@@ -1240,6 +1433,59 @@
             "type": "string",
             "format": "uuid",
             "description": "Account the amount leaves."
+          }
+        }
+      },
+      "StatementEntryRead": {
+        "type": "object",
+        "description": "One entry of an account's statement — **the leg that touched THIS\naccount**, never the transaction's other legs, which belong to other\naccounts. `transaction_id` is on every row and\n`GET /v1/transactions/{transaction_id}` answers the rest (ADR-0023).",
+        "required": [
+          "entry_id",
+          "transaction_id",
+          "direction",
+          "amount_minor",
+          "currency",
+          "effective_at",
+          "recorded_at",
+          "account_seq"
+        ],
+        "properties": {
+          "account_seq": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The account's own gapless sequence number for this leg. The counter is\nper `(account, stripe)` — documented, never exposed: no stripe appears\nin any response (ADR-0013 §4). It is what a drift check walks, and it\nis **not** the page key (see `after`)."
+          },
+          "amount_minor": {
+            "type": "string",
+            "description": "Minor units, as an exact-integer decimal string — **not a JSON\nnumber** (ADR-0022). `ledger_entries.amount_minor` is a `bigint` and\nJSON has no integer type, so a large amount read as a number comes back\nsilently wrong.",
+            "example": "2500"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "direction": {
+            "type": "string",
+            "description": "`debit` or `credit`. Direction carries the sign; the amount never does."
+          },
+          "effective_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the entry is DATED — the business date, and the effective axis's\nposition."
+          },
+          "entry_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The entry's own id — `pk_entries`'s column, and the tie-break that\nmakes each axis a TOTAL order."
+          },
+          "recorded_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the entry was WRITTEN — the database's clock. It is provenance\nrather than an ordering: the recorded axis is ordered by commit\nposition (`xact_id`), which `recorded_at` cannot stand in for, because\na clock reading taken before a commit does not order commits\n(ADR-0006)."
+          },
+          "transaction_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The transaction this leg belongs to."
           }
         }
       },
@@ -1545,7 +1791,7 @@
     },
     {
       "name": "accounts",
-      "description": "Open an account, list them, and read one's posted balance."
+      "description": "Open an account, list them, read one's posted balance, and read one's entries in order on either time axis."
     },
     {
       "name": "reports",

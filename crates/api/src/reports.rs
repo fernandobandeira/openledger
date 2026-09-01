@@ -255,7 +255,12 @@ pub(crate) struct StatementLineRead {
 /// The one thing this layer parses: an RFC 3339 instant, named, so a
 /// malformed one refuses under the parameter the caller has to fix rather
 /// than under a deserializer's path.
-fn instant(parameter: &'static str, text: &str) -> Result<OffsetDateTime, Refusal> {
+///
+/// `pub(crate)` because the account statement next door takes the same
+/// half-open range under the same two parameter names (ADR-0023), and a
+/// second parsing site is a second place for the message to drift from this
+/// one.
+pub(crate) fn instant(parameter: &'static str, text: &str) -> Result<OffsetDateTime, Refusal> {
     OffsetDateTime::parse(text, &Rfc3339).map_err(|failed| {
         Refusal::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -301,9 +306,16 @@ pub(crate) fn refusal_for_read(error: ledger::ReadError) -> Response {
         } => refuse(
             StatusCode::NOT_FOUND,
             "account_unknown",
-            format!(
-                "account {account_id} does not exist on this book, or does not hold {currency}"
-            ),
+            match currency {
+                // The balance read names a currency because its row key
+                // includes one, and "or does not hold USD" is half of what
+                // went wrong there. A read that named none must not claim it.
+                Some(currency) => format!(
+                    "account {account_id} does not exist on this book, or does not hold \
+                     {currency}"
+                ),
+                None => format!("account {account_id} does not exist on this book"),
+            },
         ),
         ledger::ReadError::TransactionUnknown { transaction_id } => refuse(
             StatusCode::NOT_FOUND,

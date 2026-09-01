@@ -32,16 +32,18 @@
 //! direction that matters: `pg_snapshot_xmin` is non-decreasing, so a cursor
 //! valid when it was stored never rises above a later horizon.
 
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::accounts::Account;
 use crate::report_store::{
-    AccountListingRead, BalanceSheetRead, IncomeStatementRead, ReadBounds, ReportRefusal,
-    ReportStore, Scoped, TrialBalanceRead,
+    AccountListingRead, AccountStatementRead, BalanceSheetRead, IncomeStatementRead, ReadBounds,
+    ReportRefusal, ReportStore, Scoped, TrialBalanceRead,
 };
 use crate::reports::{
-    AccountBalance, AccountBalanceQuery, AccountListing, AccountListingQuery, BalanceSheetQuery,
-    Cursor, CursorQuery, IncomeStatementQuery, ReadError, Reports, Statement, Transaction,
+    AccountBalance, AccountBalanceQuery, AccountListing, AccountListingQuery, AccountStatement,
+    AccountStatementEntry, AccountStatementQuery, BalanceSheetQuery, Cursor, CursorQuery,
+    IncomeStatementQuery, ReadError, Reports, Statement, StatementAxis, StatementKey, Transaction,
     TransactionQuery, TrialBalance, TrialBalanceQuery,
 };
 
@@ -90,6 +92,13 @@ impl<S: ReportStore> Reports for ReportService<S> {
     async fn accounts(&self, query: &AccountListingQuery) -> Result<AccountListing, ReadError> {
         accounts(&self.store, query).await
     }
+
+    async fn account_statement(
+        &self,
+        query: &AccountStatementQuery,
+    ) -> Result<AccountStatement, ReadError> {
+        account_statement(&self.store, query).await
+    }
 }
 
 /// One account's posted balance, now — pinned by nothing, so this read never
@@ -107,7 +116,7 @@ async fn account_balance<S: ReportStore>(
     let found = answered_for_the_tenant_that_asked(&query.tenant_id, scoped)?;
     found.ok_or_else(|| ReadError::AccountUnknown {
         account_id: query.account_id,
-        currency: query.currency.clone(),
+        currency: Some(query.currency.clone()),
     })
 }
 
@@ -248,7 +257,11 @@ async fn accounts<S: ReportStore>(
     store: &S,
     query: &AccountListingQuery,
 ) -> Result<AccountListing, ReadError> {
-    let limit = page_size_or_refuse_one_outside_the_window(query.limit)?;
+    let limit = page_size_or_refuse_one_outside_the_window(
+        query.limit,
+        ACCOUNTS_PER_PAGE,
+        MOST_ACCOUNTS_PER_PAGE,
+    )?;
     let scoped = store
         .accounts(&AccountListingRead {
             tenant_id: &query.tenant_id,
@@ -270,14 +283,21 @@ async fn accounts<S: ReportStore>(
 /// the window. Zero and negatives are refused here rather than sent to a
 /// `LIMIT`, where zero would answer an empty page that looks exactly like the
 /// end of the register.
-fn page_size_or_refuse_one_outside_the_window(asked_for: Option<i64>) -> Result<i64, ReadError> {
+///
+/// One rule, two windows — the register's and the statement's — passed in
+/// rather than chosen here, because the number is per listing and the RULE
+/// (refuse, never clamp) is not.
+fn page_size_or_refuse_one_outside_the_window(
+    asked_for: Option<i64>,
+    a_page: i64,
+    at_most: i64,
+) -> Result<i64, ReadError> {
     let Some(limit) = asked_for else {
-        return Ok(ACCOUNTS_PER_PAGE);
+        return Ok(a_page);
     };
-    if !(1..=MOST_ACCOUNTS_PER_PAGE).contains(&limit) {
+    if !(1..=at_most).contains(&limit) {
         return Err(ReadError::InvalidRequest(format!(
-            "limit {limit} is outside 1..={MOST_ACCOUNTS_PER_PAGE}; omit it for \
-             {ACCOUNTS_PER_PAGE}"
+            "limit {limit} is outside 1..={at_most}; omit it for {a_page}"
         )));
     }
     Ok(limit)
@@ -300,6 +320,169 @@ fn the_key_of_the_next_page(accounts: &[Account], limit: i64) -> Option<Uuid> {
         return None;
     }
     accounts.last().map(|last| last.account_id)
+}
+
+/// The page size an account statement answers a caller who named none, and
+/// the largest one it will answer at all. The same two numbers the account
+/// register uses, and the same standing: chosen, not measured (ADR-0023 lists
+/// it as a cost). Stated separately because they are a different listing's
+/// window and would be free to move apart the day either is measured.
+const ENTRIES_PER_PAGE: i64 = 100;
+const MOST_ENTRIES_PER_PAGE: i64 = 1_000;
+
+/// One page of one account's entries, on the axis the caller named
+/// (ADR-0023).
+///
+/// Four judgements before the first store call and one after, and the order
+/// matters: **everything the request can be refused for on its own face is
+/// refused before any statement runs**, so a caller who named no axis or a
+/// page size outside the window pays for no database work at all. Then the
+/// cursor rule, which needs the book's bounds and is therefore the read that
+/// makes this two brackets rather than one — exactly as it is for a report.
+async fn account_statement<S: ReportStore>(
+    store: &S,
+    query: &AccountStatementQuery,
+) -> Result<AccountStatement, ReadError> {
+    let axis = the_axis_the_caller_named_or_refuse_to_pick_one(query.axis.as_deref())?;
+    let limit = page_size_or_refuse_one_outside_the_window(
+        query.limit,
+        ENTRIES_PER_PAGE,
+        MOST_ENTRIES_PER_PAGE,
+    )?;
+    let after = the_page_key_of_this_axis_or_refuse_a_foreign_one(query.after.as_deref(), axis)?;
+    let (effective_from, effective_to) = the_range_only_the_effective_axis_takes(query, axis)?;
+    let bounds = bounds_for_the_book(store, &query.tenant_id).await?;
+    let cursor = pin_the_cursor_or_refuse_an_implausible_one(query.cursor.as_deref(), &bounds)?;
+    let scoped = store
+        .account_statement(&AccountStatementRead {
+            tenant_id: &query.tenant_id,
+            account_id: query.account_id,
+            axis,
+            cursor,
+            effective_from,
+            effective_to,
+            limit,
+            after,
+        })
+        .await
+        .map_err(refused)?;
+    let found = answered_for_the_tenant_that_asked(&query.tenant_id, scoped)?;
+    // An account with no entries in range answers an empty page; an account
+    // that does not exist is refused by name. Only `ledger_accounts` can draw
+    // that distinction, which is why the statement reads it (ADR-0019 C4's
+    // argument, on a second route).
+    let entries = found.ok_or(ReadError::AccountUnknown {
+        account_id: query.account_id,
+        currency: None,
+    })?;
+    Ok(AccountStatement {
+        pinned_cursor: cursor,
+        axis,
+        next_after: the_key_of_the_next_page_of_entries(&entries, limit, axis),
+        entries,
+    })
+}
+
+/// ADR-0023's central rule: **the axis is a parameter with two named values,
+/// and this read has no default to fall back on.**
+///
+/// Both refusals are `invalid_request` and both name the two values, because
+/// the caller's fix is the same in either case — say which order you meant.
+/// Nothing here guesses from the other parameters: a request carrying an
+/// effective range plainly *suggests* the effective axis, and inferring it
+/// would be exactly the silent choice this decision exists to refuse.
+fn the_axis_the_caller_named_or_refuse_to_pick_one(
+    named: Option<&str>,
+) -> Result<StatementAxis, ReadError> {
+    let Some(named) = named else {
+        return Err(ReadError::InvalidRequest(
+            "axis is required: name `recorded` (commit order, what the ledger learnt and when) \
+             or `effective` (business order, what the entries are dated). There is no default — \
+             whichever one were chosen for you would be the axis you did not think about"
+                .to_owned(),
+        ));
+    };
+    StatementAxis::parse(named).ok_or_else(|| {
+        ReadError::InvalidRequest(format!(
+            "axis {named:?} is not an axis of this ledger; it is `recorded` or `effective`"
+        ))
+    })
+}
+
+/// The `after` a caller sent back, read against the axis they are paging.
+///
+/// A key belongs to the ORDER it was issued under — `(xact_id, id)` on the
+/// recorded axis, `(effective_at, xact_id, id)` on the effective one — so a
+/// key of the other axis is refused rather than read as far as it parses. The
+/// alternative is a page bounded by a value that is not this order's, which
+/// walks past rows and never says it did.
+fn the_page_key_of_this_axis_or_refuse_a_foreign_one(
+    after: Option<&str>,
+    axis: StatementAxis,
+) -> Result<Option<StatementKey>, ReadError> {
+    let Some(after) = after else {
+        return Ok(None);
+    };
+    StatementKey::parse(after, axis).map(Some).ok_or_else(|| {
+        ReadError::InvalidRequest(format!(
+            "after {after:?} is not a page key of the {} axis; send back the `next_after` an \
+             earlier page of this same axis answered with, unchanged",
+            axis.named()
+        ))
+    })
+}
+
+/// The half-open effective range, which **only the effective axis takes**.
+///
+/// A range on the recorded axis is refused rather than ignored, and rather
+/// than served: ignoring it answers a question the caller did not ask while
+/// looking like it did, and serving it would be an effective-axis FILTER on a
+/// commit-ordered walk — a scan of the account's whole history behind a
+/// predicate no index of this schema covers, which is a cost this decision
+/// did not measure. Refusing is the reversible half of that pair.
+fn the_range_only_the_effective_axis_takes(
+    query: &AccountStatementQuery,
+    axis: StatementAxis,
+) -> Result<(Option<OffsetDateTime>, Option<OffsetDateTime>), ReadError> {
+    let range = (query.effective_from, query.effective_to);
+    if axis == StatementAxis::Recorded && (range.0.is_some() || range.1.is_some()) {
+        return Err(ReadError::InvalidRequest(
+            "effective_from and effective_to filter the effective axis; on axis=recorded the \
+             page is ordered and bounded by commit position, and a business-date window there \
+             would be a filter over the account's whole history. Ask for axis=effective, or \
+             drop the range"
+                .to_owned(),
+        ));
+    }
+    Ok(range)
+}
+
+/// The `after` a caller should send for the next page of entries — the last
+/// row of a FULL page, as its own axis's key, and nothing at all otherwise.
+///
+/// The same rule the account register's page key follows, and for the same
+/// reason: a full page means "there may be more", never "there is".
+fn the_key_of_the_next_page_of_entries(
+    entries: &[AccountStatementEntry],
+    limit: i64,
+    axis: StatementAxis,
+) -> Option<StatementKey> {
+    let page_is_full = usize::try_from(limit).is_ok_and(|limit| entries.len() >= limit);
+    if !page_is_full {
+        return None;
+    }
+    let last = entries.last()?;
+    Some(match axis {
+        StatementAxis::Recorded => StatementKey::Recorded {
+            xact_id: last.xact_id,
+            entry_id: last.entry_id,
+        },
+        StatementAxis::Effective => StatementKey::Effective {
+            effective_at: last.effective_at,
+            xact_id: last.xact_id,
+            entry_id: last.entry_id,
+        },
+    })
 }
 
 /// The horizon, the floor and the book's chart version — one statement in one
@@ -567,6 +750,10 @@ mod tests {
         /// is asked for — the listing tests set it to make a page FULL or
         /// short without a database deciding.
         accounts_on_the_register: usize,
+        /// The commit position of each entry the account holds, in order —
+        /// the statement tests set it to make a page FULL or short, and the
+        /// positions are what a page key is traced back to.
+        entries_on_the_account: Vec<Cursor>,
         calls: Calls,
     }
 
@@ -581,6 +768,7 @@ mod tests {
                 refuses_reports_with: None,
                 holds_the_row: true,
                 accounts_on_the_register: 0,
+                entries_on_the_account: Vec::new(),
                 calls: Calls::default(),
             })
         }
@@ -631,6 +819,17 @@ mod tests {
         fn a_book_of(accounts: usize) -> Result<Self, CursorUnparseable> {
             let mut fake = Self::a_book()?;
             fake.accounts_on_the_register = accounts;
+            Ok(fake)
+        }
+
+        /// An account holding this many entries, at consecutive commit
+        /// positions from [`FIRST_ENTRY`] — enough to fill a page, or not to,
+        /// without a database deciding which.
+        fn a_book_of_entries(entries: usize) -> Result<Self, CursorUnparseable> {
+            let mut fake = Self::a_book()?;
+            fake.entries_on_the_account = (0..entries)
+                .map(|position| Cursor::parse(&(FIRST_ENTRY + position as u64).to_string()))
+                .collect::<Result<Vec<Cursor>, CursorUnparseable>>()?;
             Ok(fake)
         }
 
@@ -772,6 +971,31 @@ mod tests {
             Ok(self.scoped(&query.tenant_id, found))
         }
 
+        async fn account_statement(
+            &self,
+            read: &AccountStatementRead<'_>,
+        ) -> Result<Scoped<Option<Vec<AccountStatementEntry>>>, ReportRefusal> {
+            // The call log SPELLS what reached the statement: the order it
+            // was asked for, the cursor it runs at, the page size and the key
+            // it starts strictly above — which is the whole of what this
+            // service decides on this route.
+            self.record(format!(
+                "account_statement on {} at {} limit {} after {:?}",
+                read.axis.named(),
+                read.cursor,
+                read.limit,
+                read.after.map(|key| key.rendered()),
+            ));
+            let held = self.holds_the_row.then(|| {
+                self.entries_on_the_account
+                    .iter()
+                    .enumerate()
+                    .map(|(position, xact_id)| a_statement_entry(position, *xact_id))
+                    .collect()
+            });
+            Ok(self.scoped(read.tenant_id, held))
+        }
+
         async fn accounts(
             &self,
             read: &AccountListingRead<'_>,
@@ -781,6 +1005,52 @@ mod tests {
                 .map(a_listed_account)
                 .collect();
             Ok(self.scoped(read.tenant_id, listed))
+        }
+    }
+
+    /// The commit position of an account's first entry in the fake below.
+    /// Above [`OLDEST`] and below [`HORIZON`], so every entry sits inside the
+    /// plausible range the cursor rule draws.
+    const FIRST_ENTRY: u64 = 200;
+
+    /// A day, in seconds — the spacing between the fake entries' business
+    /// dates, so the effective axis's page key is a different value per row
+    /// rather than one instant repeated.
+    const A_DAY: i64 = 86_400;
+
+    /// One entry of a fake statement: its id, its business date and its
+    /// counter all derived from its position, so a page key can be traced
+    /// back to the row that earned it.
+    fn a_statement_entry(position: usize, xact_id: Cursor) -> AccountStatementEntry {
+        AccountStatementEntry {
+            entry_id: Uuid::from_u128(0xE00 + position as u128),
+            transaction_id: TRANSACTION,
+            direction: "debit".to_owned(),
+            amount_minor: 100,
+            currency: "USD".to_owned(),
+            effective_at: OffsetDateTime::from_unix_timestamp(A_DAY * position as i64)
+                .unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            recorded_at: an_instant(),
+            account_seq: position as i64 + 1,
+            xact_id,
+        }
+    }
+
+    /// One statement asked for, with everything but the varying part fixed.
+    fn an_account_statement_query(
+        axis: Option<&str>,
+        limit: Option<i64>,
+        after: Option<&str>,
+    ) -> AccountStatementQuery {
+        AccountStatementQuery {
+            tenant_id: "acme".to_owned(),
+            account_id: ACCOUNT,
+            axis: axis.map(str::to_owned),
+            cursor: None,
+            effective_from: None,
+            effective_to: None,
+            limit,
+            after: after.map(str::to_owned),
         }
     }
 
@@ -1169,10 +1439,13 @@ mod tests {
             spoken(&run(service.account_balance(&an_account_balance_query()))),
             spoken(&run(service.transaction(&a_transaction_query()))),
             spoken(&run(service.accounts(&an_account_listing_query(None)))),
+            spoken(&run(service.account_statement(
+                &an_account_statement_query(Some("recorded"), None, None),
+            ))),
             spoken(&run(service.cursor(&a_cursor_query()))),
         ];
 
-        assert_eq!(refused, ["tenant_mismatch"; 7]);
+        assert_eq!(refused, ["tenant_mismatch"; 8]);
         Ok(())
     }
 
@@ -1292,6 +1565,296 @@ mod tests {
         // A short page is the end of the register, and a key here would send
         // the caller after a page that cannot exist.
         assert_eq!(answered.ok().map(|page| page.next_after), Some(None));
+        Ok(())
+    }
+
+    /// ADR-0023's central rule, and the only one that cannot be satisfied by
+    /// answering something plausible: **the axis is required.** A caller who
+    /// named none is refused before any statement runs — never given the axis
+    /// they did not think about.
+    #[test]
+    fn a_statement_that_names_no_axis_is_refused_and_reads_nothing() -> Result<(), CursorUnparseable>
+    {
+        let store = FakeStore::a_book_of_entries(3)?;
+        let calls = store.calls();
+        let service = ReportService::new(store);
+        let query = an_account_statement_query(None, None, None);
+
+        let answered = run(service.account_statement(&query));
+
+        assert_eq!(spoken(&answered), "invalid_request");
+        assert!(taken(&calls).is_empty(), "an unnamed axis reached the book");
+        Ok(())
+    }
+
+    /// Anything that is not one of the two names is refused rather than read
+    /// as the nearest one: `RECORDED`, `commit` and an empty string are each
+    /// a caller naming an order this ledger does not have.
+    #[test]
+    fn an_axis_this_ledger_does_not_have_is_refused_rather_than_interpreted()
+    -> Result<(), CursorUnparseable> {
+        for named in ["RECORDED", "commit", "Effective", "", " recorded"] {
+            let store = FakeStore::a_book_of_entries(3)?;
+            let calls = store.calls();
+            let service = ReportService::new(store);
+            let query = an_account_statement_query(Some(named), None, None);
+
+            let answered = run(service.account_statement(&query));
+
+            assert_eq!(spoken(&answered), "invalid_request", "for axis {named:?}");
+            assert!(
+                taken(&calls).is_empty(),
+                "axis {named:?} reached a statement"
+            );
+        }
+        Ok(())
+    }
+
+    /// Each axis reaches the statement as the order it names, and comes back
+    /// on the answer — the parameter that decided every row's position is not
+    /// something a caller should have to remember it sent.
+    #[test]
+    fn each_axis_reaches_the_statement_as_the_order_it_names() -> Result<(), CursorUnparseable> {
+        for named in ["recorded", "effective"] {
+            let store = FakeStore::a_book_of_entries(2)?;
+            let calls = store.calls();
+            let service = ReportService::new(store);
+            let query = an_account_statement_query(Some(named), None, None);
+
+            let answered = run(service.account_statement(&query));
+
+            assert_eq!(
+                answered.map(|page| page.axis.named()).ok(),
+                Some(named),
+                "the answer must echo the axis it was ordered by"
+            );
+            assert_eq!(
+                taken(&calls),
+                [
+                    "read_bounds".to_owned(),
+                    format!("account_statement on {named} at {HORIZON} limit 100 after None")
+                ],
+                "for axis {named}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The cursor rule is ADR-0019's and this route is under it unchanged: an
+    /// absent cursor is pinned to the horizon and answered back, and an
+    /// implausible one is refused before the page is read.
+    #[test]
+    fn a_statement_pins_an_absent_cursor_and_refuses_an_implausible_one()
+    -> Result<(), CursorUnparseable> {
+        let store = FakeStore::a_book_of_entries(1)?;
+        let service = ReportService::new(store);
+        let query = an_account_statement_query(Some("recorded"), None, None);
+
+        let answered = run(service.account_statement(&query));
+
+        assert_eq!(
+            answered.map(|page| page.pinned_cursor.to_string()).ok(),
+            Some(HORIZON.to_owned())
+        );
+
+        let store = FakeStore::a_book_of_entries(1)?;
+        let calls = store.calls();
+        let service = ReportService::new(store);
+        let mut query = an_account_statement_query(Some("recorded"), None, None);
+        query.cursor = Some(OLDEST.to_owned());
+
+        let answered = run(service.account_statement(&query));
+
+        assert_eq!(spoken(&answered), "cursor_invalid");
+        // Refused after the bounds read and before the page: a cursor the
+        // database cannot refuse must not reach it.
+        assert_eq!(taken(&calls), ["read_bounds".to_owned()]);
+        Ok(())
+    }
+
+    /// The page size, refused outside its window rather than clamped — the
+    /// same rule the account register's follows, with its own window.
+    #[test]
+    fn a_statements_page_size_is_refused_outside_the_window_rather_than_clamped()
+    -> Result<(), CursorUnparseable> {
+        for limit in [0, -1, 1_001] {
+            let store = FakeStore::a_book_of_entries(3)?;
+            let calls = store.calls();
+            let service = ReportService::new(store);
+            let query = an_account_statement_query(Some("recorded"), Some(limit), None);
+
+            let answered = run(service.account_statement(&query));
+
+            assert_eq!(spoken(&answered), "invalid_request", "limit {limit}");
+            assert!(
+                taken(&calls).is_empty(),
+                "limit {limit} reached a statement"
+            );
+        }
+        Ok(())
+    }
+
+    /// A full page hands back the last row's ORDERING KEY, per axis — the
+    /// recorded axis's `(xact_id, id)` and the effective axis's
+    /// `(effective_at, xact_id, id)`. **Never `account_seq`**, which is per
+    /// `(account, stripe)` and interleaves on a striped account (ADR-0023).
+    #[test]
+    fn a_full_page_hands_back_the_last_rows_key_in_the_axiss_own_shape()
+    -> Result<(), CursorUnparseable> {
+        let second_entry = FIRST_ENTRY + 1;
+        let last = Uuid::from_u128(0xE01);
+        let cases = [
+            ("recorded", format!("{second_entry},{last}")),
+            (
+                "effective",
+                format!("{},{second_entry},{last}", A_DAY * 1_000_000_000),
+            ),
+        ];
+        for (named, expected) in cases {
+            let store = FakeStore::a_book_of_entries(2)?;
+            let service = ReportService::new(store);
+            let query = an_account_statement_query(Some(named), Some(2), None);
+
+            let answered = run(service.account_statement(&query));
+
+            assert_eq!(
+                answered
+                    .ok()
+                    .and_then(|page| page.next_after.map(|key| key.rendered())),
+                Some(expected),
+                "for axis {named}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_statement_page_that_did_not_fill_hands_back_no_key() -> Result<(), CursorUnparseable> {
+        let store = FakeStore::a_book_of_entries(1)?;
+        let service = ReportService::new(store);
+        let query = an_account_statement_query(Some("recorded"), Some(2), None);
+
+        let answered = run(service.account_statement(&query));
+
+        // A short page is the end of this account's history at this cursor,
+        // and a key here would send the caller after a page that cannot
+        // exist.
+        assert_eq!(
+            answered.ok().map(|page| page.next_after.is_none()),
+            Some(true)
+        );
+        Ok(())
+    }
+
+    /// The key a caller sends back reaches the statement as the bound the
+    /// next page starts strictly above — parsed here, in the axis's own
+    /// shape, so the adapter is handed a key and never a string.
+    #[test]
+    fn the_key_a_caller_sends_back_reaches_the_statement_as_this_axiss_bound()
+    -> Result<(), CursorUnparseable> {
+        let after = format!("{FIRST_ENTRY},{}", Uuid::from_u128(0xE00));
+        let store = FakeStore::a_book_of_entries(2)?;
+        let calls = store.calls();
+        let service = ReportService::new(store);
+        let query = an_account_statement_query(Some("recorded"), Some(2), Some(&after));
+
+        let answered = run(service.account_statement(&query));
+
+        assert_eq!(spoken(&answered), "answered");
+        assert_eq!(
+            taken(&calls),
+            [
+                "read_bounds".to_owned(),
+                format!("account_statement on recorded at {HORIZON} limit 2 after Some({after:?})")
+            ]
+        );
+        Ok(())
+    }
+
+    /// **A key belongs to the order it was issued under.** A recorded key
+    /// replayed against the effective axis — and anything else that is not
+    /// this axis's key — is refused, rather than read as far as it parses and
+    /// used as a bound of an order it does not name.
+    #[test]
+    fn a_page_key_of_another_axis_is_refused_rather_than_read_as_far_as_it_parses()
+    -> Result<(), CursorUnparseable> {
+        let recorded_key = format!("{FIRST_ENTRY},{}", Uuid::from_u128(0xE00));
+        let cases = [
+            ("effective", recorded_key.clone()),
+            ("recorded", format!("0,{recorded_key}")),
+            ("recorded", "not-a-key".to_owned()),
+            ("recorded", format!("{FIRST_ENTRY},not-a-uuid")),
+            ("effective", format!("9,{FIRST_ENTRY}")),
+        ];
+        for (named, after) in cases {
+            let store = FakeStore::a_book_of_entries(2)?;
+            let calls = store.calls();
+            let service = ReportService::new(store);
+            let query = an_account_statement_query(Some(named), None, Some(&after));
+
+            let answered = run(service.account_statement(&query));
+
+            assert_eq!(
+                spoken(&answered),
+                "invalid_request",
+                "{after:?} on the {named} axis"
+            );
+            assert!(
+                taken(&calls).is_empty(),
+                "{after:?} reached a statement on the {named} axis"
+            );
+        }
+        Ok(())
+    }
+
+    /// The half-open range is the EFFECTIVE axis's filter. On the recorded
+    /// axis it is refused rather than ignored: ignoring it answers a question
+    /// the caller did not ask while looking like it did.
+    #[test]
+    fn an_effective_range_is_refused_on_the_recorded_axis_and_taken_on_the_effective_one()
+    -> Result<(), CursorUnparseable> {
+        let store = FakeStore::a_book_of_entries(2)?;
+        let calls = store.calls();
+        let service = ReportService::new(store);
+        let mut query = an_account_statement_query(Some("recorded"), None, None);
+        query.effective_from = Some(an_instant());
+
+        let answered = run(service.account_statement(&query));
+
+        assert_eq!(spoken(&answered), "invalid_request");
+        assert!(taken(&calls).is_empty(), "the range reached a statement");
+
+        let store = FakeStore::a_book_of_entries(2)?;
+        let service = ReportService::new(store);
+        let mut query = an_account_statement_query(Some("effective"), None, None);
+        query.effective_from = Some(an_instant());
+
+        let answered = run(service.account_statement(&query));
+
+        assert_eq!(spoken(&answered), "answered");
+        Ok(())
+    }
+
+    /// An account with no entries answers an EMPTY page; an account that does
+    /// not exist is refused by name. The two must not answer alike — the same
+    /// distinction the balance read draws, on a second route (ADR-0019 C4).
+    #[test]
+    fn an_account_with_no_entries_answers_an_empty_page_and_an_unknown_one_is_refused()
+    -> Result<(), CursorUnparseable> {
+        let store = FakeStore::a_book_of_entries(0)?;
+        let service = ReportService::new(store);
+        let query = an_account_statement_query(Some("recorded"), None, None);
+
+        let answered = run(service.account_statement(&query));
+
+        assert_eq!(answered.map(|page| page.entries.len()).ok(), Some(0));
+
+        let store = FakeStore::a_book_without_the_row()?;
+        let service = ReportService::new(store);
+
+        let answered = run(service.account_statement(&query));
+
+        assert_eq!(spoken(&answered), "account_unknown");
         Ok(())
     }
 }

@@ -210,6 +210,37 @@ export type AccountRead = {
 };
 
 /**
+ * One page of one account's entries: the axis they were ordered by, the
+ * cursor they were pinned at, and the key of the next page.
+ */
+export type AccountStatementRead = {
+    /**
+     * The axis this page was ordered by, echoed — `recorded` or `effective`.
+     */
+    axis: string;
+    /**
+     * The page, in the axis's order. **An empty list is a legitimate answer**
+     * for an account with no entries at this cursor, in this range; an
+     * account that does not exist is a 404 instead, which is a distinction
+     * only the account register can draw (ADR-0019).
+     */
+    entries: Array<StatementEntryRead>;
+    /**
+     * The `after` to send for the next page, or `null` when this page did not
+     * fill. **A full page means "there may be more", never "there is"** — the
+     * same rule `GET /v1/accounts` follows, and for the same reason: the
+     * alternative is reading one row past every page to be certain.
+     */
+    next_after: string | null;
+    /**
+     * The commit position this page ran at — supplied or server-pinned.
+     * Store it and send it back to walk the rest of this same book: the page
+     * after it is then the page after it *was*, whatever has committed since.
+     */
+    pinned_cursor: string;
+};
+
+/**
  * The commit horizon, on its own.
  */
 export type CursorRead = {
@@ -297,6 +328,56 @@ export type PostingBody = {
      * Account the amount leaves.
      */
     source: string;
+};
+
+/**
+ * One entry of an account's statement — **the leg that touched THIS
+ * account**, never the transaction's other legs, which belong to other
+ * accounts. `transaction_id` is on every row and
+ * `GET /v1/transactions/{transaction_id}` answers the rest (ADR-0023).
+ */
+export type StatementEntryRead = {
+    /**
+     * The account's own gapless sequence number for this leg. The counter is
+     * per `(account, stripe)` — documented, never exposed: no stripe appears
+     * in any response (ADR-0013 §4). It is what a drift check walks, and it
+     * is **not** the page key (see `after`).
+     */
+    account_seq: number;
+    /**
+     * Minor units, as an exact-integer decimal string — **not a JSON
+     * number** (ADR-0022). `ledger_entries.amount_minor` is a `bigint` and
+     * JSON has no integer type, so a large amount read as a number comes back
+     * silently wrong.
+     */
+    amount_minor: string;
+    currency: string;
+    /**
+     * `debit` or `credit`. Direction carries the sign; the amount never does.
+     */
+    direction: string;
+    /**
+     * When the entry is DATED — the business date, and the effective axis's
+     * position.
+     */
+    effective_at: string;
+    /**
+     * The entry's own id — `pk_entries`'s column, and the tie-break that
+     * makes each axis a TOTAL order.
+     */
+    entry_id: string;
+    /**
+     * When the entry was WRITTEN — the database's clock. It is provenance
+     * rather than an ordering: the recorded axis is ordered by commit
+     * position (`xact_id`), which `recorded_at` cannot stand in for, because
+     * a clock reading taken before a commit does not order commits
+     * (ADR-0006).
+     */
+    recorded_at: string;
+    /**
+     * The transaction this leg belongs to.
+     */
+    transaction_id: string;
 };
 
 /**
@@ -690,6 +771,107 @@ export type GetAccountBalanceResponses = {
 };
 
 export type GetAccountBalanceResponse = GetAccountBalanceResponses[keyof GetAccountBalanceResponses];
+
+export type GetAccountStatementData = {
+    body?: never;
+    path: {
+        /**
+         * The account whose entries to read.
+         */
+        account_id: string;
+    };
+    query: {
+        /**
+         * The book to read.
+         */
+        tenant_id: string;
+        /**
+         * **Required, and there is no default** (ADR-0023). `recorded` orders by
+         * commit position — what the ledger learnt, and when — and `effective`
+         * orders by business date. The two disagree about where a backdated
+         * entry sits, which is what two axes MEAN (ADR-0006): whichever one were
+         * chosen for a caller who named none would be the axis they did not
+         * think about, so this endpoint refuses rather than picks.
+         */
+        axis: string;
+        /**
+         * The commit position to pin the page to — a `pinned_cursor` from an
+         * earlier read. Omit it and one is pinned server-side and returned. It
+         * bounds BOTH axes: an entry is on this page only if it had committed by
+         * this cursor, whatever it is dated.
+         */
+        cursor?: string;
+        /**
+         * Inclusive lower bound on `effective_at`, RFC 3339. **`axis=effective`
+         * only** — on `axis=recorded` it is refused rather than ignored, because
+         * the page there is ordered and bounded by commit position and a
+         * business-date window would be a filter over the account's whole
+         * history.
+         */
+        effective_from?: string;
+        /**
+         * EXCLUSIVE upper bound on `effective_at`, RFC 3339 — half-open, as every
+         * range on this surface is (ADR-0011 §A3). `axis=effective` only.
+         */
+        effective_to?: string;
+        /**
+         * How many entries at most, 1–1000. Omitted means 100. A value outside
+         * the window is REFUSED rather than clamped, exactly as on
+         * `GET /v1/accounts`.
+         */
+        limit?: number;
+        /**
+         * The `next_after` an earlier page of **this same axis** answered with,
+         * sent back unchanged. It is the last row's ordering key — `xact_id` and
+         * entry id on the recorded axis, the business date as well on the
+         * effective one — and a key of the other axis is refused rather than
+         * used as a bound of an order it does not name.
+         *
+         * **It is never `account_seq`**, and that is the trap worth naming:
+         * `uq_entries__account_seq` is per `(tenant, account, stripe, seq)`, so
+         * on a striped account the counter is not a total order and paging by it
+         * would interleave two counters and silently drop or repeat rows
+         * (ADR-0023). The number is returned on every entry — it is what a drift
+         * check walks — and it does not order the page.
+         */
+        after?: string;
+    };
+    url: '/v1/accounts/{account_id}/entries';
+};
+
+export type GetAccountStatementErrors = {
+    /**
+     * A required query parameter is missing — `tenant_id`, or the `axis` this endpoint will not choose for you — or a value would not deserialize into its documented type, including an `account_id` path segment that is not a UUID. `type` is `invalid_request`.
+     */
+    400: ErrorBody;
+    /**
+     * No such account on this book. `type` is `account_unknown` — note that the write path returns 422 under this same `type`, deliberately: there the caller must change the request, here the resource does not exist. An account that exists with no entries is a 200 with an empty page, and only the account register can draw that distinction (ADR-0019).
+     */
+    404: ErrorBody;
+    /**
+     * Refused. `type` is one of: `invalid_request` (an `axis` that is not `recorded` or `effective`; an `effective_from` or `effective_to` that is not an RFC 3339 instant, or either of them on `axis=recorded`, where the page is bounded by commit position; a `limit` outside 1–1000, zero and negative included — refused rather than clamped; an `after` that is not a page key of the axis being paged; or a `cursor` that is not an `xid8` at all), `cursor_invalid` (a legal `xid8` above this cluster's horizon or at or below the book's oldest entry), or `tenant_mismatch`.
+     */
+    422: ErrorBody;
+    /**
+     * The read failed. `type` is `internal`.
+     */
+    500: ErrorBody;
+    /**
+     * The read exceeded this deployment's `statement_timeout` (`57014`). `type` is `report_timed_out`.
+     */
+    503: ErrorBody;
+};
+
+export type GetAccountStatementError = GetAccountStatementErrors[keyof GetAccountStatementErrors];
+
+export type GetAccountStatementResponses = {
+    /**
+     * One page of the account's entries, in the axis's order, with the cursor the page was pinned at and the key of the next page. **The two axes answer the same SET in different ORDERS**, and a backdated entry is where they disagree: it sits in its own past on the effective axis and at the end of the recorded one. An account that exists and has no entries in range answers an empty list, never a 404.
+     */
+    200: AccountStatementRead;
+};
+
+export type GetAccountStatementResponse = GetAccountStatementResponses[keyof GetAccountStatementResponses];
 
 export type GetCursorData = {
     body?: never;

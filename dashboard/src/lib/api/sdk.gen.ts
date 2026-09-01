@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { GetAccountBalanceData, GetAccountBalanceErrors, GetAccountBalanceResponses, GetBalanceSheetData, GetBalanceSheetErrors, GetBalanceSheetResponses, GetCursorData, GetCursorErrors, GetCursorResponses, GetIncomeStatementData, GetIncomeStatementErrors, GetIncomeStatementResponses, GetTransactionData, GetTransactionErrors, GetTransactionResponses, GetTrialBalanceData, GetTrialBalanceErrors, GetTrialBalanceResponses, ListAccountsData, ListAccountsErrors, ListAccountsResponses, OpenAccountData, OpenAccountErrors, OpenAccountResponses, PostTransactionData, PostTransactionErrors, PostTransactionResponses } from './types.gen';
+import type { GetAccountBalanceData, GetAccountBalanceErrors, GetAccountBalanceResponses, GetAccountStatementData, GetAccountStatementErrors, GetAccountStatementResponses, GetBalanceSheetData, GetBalanceSheetErrors, GetBalanceSheetResponses, GetCursorData, GetCursorErrors, GetCursorResponses, GetIncomeStatementData, GetIncomeStatementErrors, GetIncomeStatementResponses, GetTransactionData, GetTransactionErrors, GetTransactionResponses, GetTrialBalanceData, GetTrialBalanceErrors, GetTrialBalanceResponses, ListAccountsData, ListAccountsErrors, ListAccountsResponses, OpenAccountData, OpenAccountErrors, OpenAccountResponses, PostTransactionData, PostTransactionErrors, PostTransactionResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -59,6 +59,20 @@ export const openAccount = <ThrowOnError extends boolean = false>(options: Optio
  * balance next door.
  */
 export const getAccountBalance = <ThrowOnError extends boolean = false>(options: Options<GetAccountBalanceData, ThrowOnError>): RequestResult<GetAccountBalanceResponses, GetAccountBalanceErrors, ThrowOnError> => (options.client ?? client).get<GetAccountBalanceResponses, GetAccountBalanceErrors, ThrowOnError>({ url: '/v1/accounts/{account_id}/balance', ...options });
+
+/**
+ * Read one account's entries, in order, at a cursor.
+ *
+ * **The listing ADR-0019 refused, and the axis is why it can ship.** That
+ * decision refused a listing of entries because one *"must choose between the
+ * recorded axis and the effective axis"*; this one does not choose — it takes
+ * the axis as a parameter, which is exactly what ADR-0019 itself ruled for the
+ * trial balance. Each ordering is served by the index the schema already
+ * carries for it, and the entry id breaks ties so that each is total:
+ * `recorded` is `(xact_id, id)` on `ix_entries__asof_commit`, `effective` is
+ * `(effective_at, xact_id, id)` on `ix_entries__effective`.
+ */
+export const getAccountStatement = <ThrowOnError extends boolean = false>(options: Options<GetAccountStatementData, ThrowOnError>): RequestResult<GetAccountStatementResponses, GetAccountStatementErrors, ThrowOnError> => (options.client ?? client).get<GetAccountStatementResponses, GetAccountStatementErrors, ThrowOnError>({ url: '/v1/accounts/{account_id}/entries', ...options });
 
 /**
  * Read the commit horizon.

@@ -65,6 +65,20 @@ one's precedent.
   that is what two axes *mean*, and a caller paging one while writes land on the other will see them
   in different places. It is the same property [0006](/decisions/0006-time-and-as-of) records; the
   statement makes it visible rather than introducing it.
+- **No bound parameter may ever be NULL, and that is measured rather than preferred.** The keyset's
+  predicates must stay `column op $n::type`, which the planner keeps as an INDEX COND. Both
+  `COALESCE($n, …)` and `$n IS NULL OR …` are index conds only while the plan is a **custom** one: on
+  400,000 entries the `COALESCE` form, planned generically, dropped the bound to a `Filter` and a deep
+  page removed **299,999 rows by filter (62 ms)** where the bound form reads six buffers (0.2 ms). So
+  the first page binds the *floor of the order* — `'0'` for `xid8`, whose counting starts at 3, and
+  the nil UUID, which `uuidv7()` never issues. **A keyset that degrades to an offset on the sixth
+  execution of a prepared statement is an offset.**
+
+  This is the same mechanism [0019](/decisions/0019-read-path) records for `balance_sheet_at`, biting
+  the other way: there the **generic** plan is the fast one and a pooled reader has a warm-up, here
+  the generic plan is the dangerous one. PostgreSQL's custom-to-generic switch at the sixth execution
+  is a property this codebase now has to reason about in both directions, and neither instance was
+  visible without an `EXPLAIN` under `force_generic_plan`.
 - **Page size is chosen, not measured**, like the account listing's before it.
 - **This is the third decision in a day to add routes**, all three from building a client. That is the
   adoption surface being exercised for the first time, and it should be expected to settle.

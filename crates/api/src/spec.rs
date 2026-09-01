@@ -25,7 +25,7 @@ pub fn openapi_json() -> Result<String, serde_json::Error> {
         description = "OpenLedger, an open-source double-entry ledger on PostgreSQL. \
                        The write path is one endpoint under the idempotent replay contract of \
                        ADR-0013 — the same key with the same body returns the stored result, \
-                       marked by the `Idempotency-Replayed` header. The read path is seven, and \
+                       marked by the `Idempotency-Replayed` header. The read path is eight, and \
                        three things about it are contract rather than presentation (ADR-0019): \
                        every report answers with the `pinned_cursor` it ran at, including when \
                        the caller supplied none, and that value is what re-runs the report — \
@@ -44,6 +44,7 @@ pub fn openapi_json() -> Result<String, serde_json::Error> {
         crate::transactions::get_transaction,
         crate::accounts::open_account,
         crate::accounts::list_accounts,
+        crate::accounts::get_account_statement,
         crate::reports::get_account_balance,
         crate::reports::get_cursor,
         crate::reports::get_trial_balance,
@@ -52,8 +53,9 @@ pub fn openapi_json() -> Result<String, serde_json::Error> {
     ),
     tags(
         (name = "transactions", description = "Post a transaction, and read one back."),
-        (name = "accounts", description = "Open an account, list them, and read one's posted \
-                                           balance."),
+        (name = "accounts", description = "Open an account, list them, read one's posted \
+                                           balance, and read one's entries in order on either \
+                                           time axis."),
         (name = "reports", description = "The pinned reports: both time axes, by parameter — \
                                           and the horizon they pin at, on its own."),
     ),

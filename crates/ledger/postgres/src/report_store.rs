@@ -57,12 +57,14 @@
 //! pretend a report total fits in 64 bits.
 
 use ledger::{
-    Account, AccountBalance, AccountBalanceQuery, AccountListingRead, BalanceSheetRead, Cursor,
-    IncomeStatementRead, ReadBounds, ReportRefusal, ReportStore, Scoped, StatementLine,
-    Transaction, TransactionEntry, TransactionQuery, TrialBalanceRead, TrialBalanceRow,
+    Account, AccountBalance, AccountBalanceQuery, AccountListingRead, AccountStatementEntry,
+    AccountStatementRead, BalanceSheetRead, Cursor, IncomeStatementRead, ReadBounds, ReportRefusal,
+    ReportStore, Scoped, StatementAxis, StatementKey, StatementLine, Transaction, TransactionEntry,
+    TransactionQuery, TrialBalanceRead, TrialBalanceRow,
 };
 use sqlx::{PgPool, Postgres, Row as _};
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 /// The Postgres report store: the `ledger` crate's outbound read port,
@@ -329,6 +331,143 @@ const ACCOUNTS: &str = "SELECT a.id AS account_id,
         ORDER BY a.id
         LIMIT $5";
 
+/// One page of an account's entries in RECORDED order — `(xact_id, id)`,
+/// served by `ix_entries__asof_commit (tenant_id, account_id, xact_id)` with
+/// the entry id breaking ties inside one commit.
+///
+/// **`a.id` is selected from the ACCOUNT and every `entry.*` column is NULL
+/// together** when the account holds no entry in range. That is the whole of
+/// how this read tells an unknown account from an empty page — the same
+/// distinction `ACCOUNT_BALANCE` draws by reading `ledger_accounts`, and the
+/// same `LEFT JOIN` shape `TRANSACTION` uses for the void.
+///
+/// **The tie-break is what makes this a keyset and not a guess.** One
+/// transaction can touch one account twice, so `xact_id` alone is not a total
+/// order, and a page boundary falling inside a commit would repeat or drop
+/// the rows sharing it. `id` is `pk_entries`'s own column, so the pair is
+/// total.
+///
+/// The keyset is a redundant lower bound plus the exact comparison:
+/// `xact_id >= after` is what the index can RANGE on, and
+/// `(xact_id > after OR (xact_id = after AND id > after_id))` is what makes
+/// the boundary exact. A row-wise `(xact_id, id) > (…, …)` would be correct
+/// and would NOT be an index bound, because `id` is not a column of this
+/// index.
+///
+/// **No parameter here is ever NULL, and that is a measured requirement
+/// rather than a preference.** The first page binds the floor of the order —
+/// `'0'` for `xid8`, whose counting starts at 3, and the nil UUID, which
+/// `uuidv7()` never issues — so every predicate is `column op $n::type`, a
+/// form the planner keeps as an INDEX COND. Both `COALESCE($n, …)` and
+/// `$n IS NULL OR …` are index conds only while the plan is a custom one: on
+/// 400,000 entries the `COALESCE` form planned generically dropped the bound
+/// to a `Filter` and a deep page removed **299,999 rows** by filter (62 ms)
+/// where the bound form reads six buffers (0.2 ms). A keyset that degrades to
+/// an offset on the sixth execution of a prepared statement is an offset.
+///
+/// **No `stripe`** (ADR-0013 §4). `account_seq` IS selected, because it is
+/// what a drift check walks — and it appears in no `ORDER BY` here or below,
+/// because `uq_entries__account_seq` is per `(tenant, account, STRIPE, seq)`
+/// and a striped account's counters interleave (ADR-0023).
+const ACCOUNT_STATEMENT_BY_RECORDED: &str = "SELECT a.id AS account_id,
+            entry.entry_id AS entry_id,
+            entry.transaction_id AS transaction_id,
+            entry.direction AS direction,
+            entry.amount_minor AS amount_minor,
+            entry.currency AS currency,
+            entry.effective_at AS effective_at,
+            entry.recorded_at AS recorded_at,
+            entry.account_seq AS account_seq,
+            entry.xact_id AS xact_id
+         FROM ledger_accounts a
+         LEFT JOIN LATERAL (
+              SELECT e.id AS entry_id,
+                     e.transaction_id AS transaction_id,
+                     e.direction::text AS direction,
+                     e.amount_minor AS amount_minor,
+                     e.currency::text AS currency,
+                     e.effective_at AS effective_at,
+                     e.recorded_at AS recorded_at,
+                     e.account_seq AS account_seq,
+                     e.xact_id::text AS xact_id
+                FROM ledger_entries e
+               WHERE e.tenant_id = $1
+                 AND e.account_id = $2
+                 AND e.xact_id < $3::xid8
+                 AND e.xact_id >= $4::xid8
+                 AND (e.xact_id > $4::xid8
+                      OR (e.xact_id = $4::xid8 AND e.id > $5::uuid))
+               ORDER BY e.xact_id, e.id
+               LIMIT $6
+         ) entry ON true
+        WHERE a.tenant_id = $1 AND a.id = $2";
+
+/// One page of an account's entries in EFFECTIVE order — `(effective_at,
+/// xact_id, id)`, served by
+/// `ix_entries__effective (tenant_id, account_id, effective_at, xact_id)`
+/// with the entry id breaking the last tie.
+///
+/// The same columns and the same `LEFT JOIN` as
+/// [`ACCOUNT_STATEMENT_BY_RECORDED`] — the two differ in their `ORDER BY`,
+/// their keyset and this axis's range filter, and in nothing else. They are
+/// written out separately rather than assembled from parts because an
+/// `ORDER BY` cannot be bound as a parameter and a statement composed at run
+/// time is a statement no reader can read whole.
+///
+/// The half-open `[from, to)` range is this axis's filter and the same
+/// predicate family every report range uses (ADR-0011 §A3). Absent bounds are
+/// bound as `±infinity` rather than as NULL, for the index reason above —
+/// `ck_entries__effective_finite` guarantees every entry sits strictly inside
+/// them, so the widened bounds change no answer and the predicate stays a
+/// range the index can be scanned on.
+///
+/// The three instants cross as TEXT with an explicit `::timestamptz` cast, and
+/// that is why: `±infinity` is a legal `timestamptz` and not a value
+/// `OffsetDateTime` can hold, so a typed bind has no way to say "no bound" but
+/// NULL — which is the form that stops being an index cond under a generic
+/// plan. The text is RFC 3339 with an offset, so the cast is unambiguous
+/// whatever the session's `TimeZone` is.
+///
+/// The keyset is the lexicographic comparison written out in full rather than
+/// leaning on the redundant bound: `effective_at >= after` is the index
+/// range, and the nested disjunction is the exact `>` on the triple.
+const ACCOUNT_STATEMENT_BY_EFFECTIVE: &str = "SELECT a.id AS account_id,
+            entry.entry_id AS entry_id,
+            entry.transaction_id AS transaction_id,
+            entry.direction AS direction,
+            entry.amount_minor AS amount_minor,
+            entry.currency AS currency,
+            entry.effective_at AS effective_at,
+            entry.recorded_at AS recorded_at,
+            entry.account_seq AS account_seq,
+            entry.xact_id AS xact_id
+         FROM ledger_accounts a
+         LEFT JOIN LATERAL (
+              SELECT e.id AS entry_id,
+                     e.transaction_id AS transaction_id,
+                     e.direction::text AS direction,
+                     e.amount_minor AS amount_minor,
+                     e.currency::text AS currency,
+                     e.effective_at AS effective_at,
+                     e.recorded_at AS recorded_at,
+                     e.account_seq AS account_seq,
+                     e.xact_id::text AS xact_id
+                FROM ledger_entries e
+               WHERE e.tenant_id = $1
+                 AND e.account_id = $2
+                 AND e.xact_id < $3::xid8
+                 AND e.effective_at >= $4::timestamptz
+                 AND e.effective_at <  $5::timestamptz
+                 AND e.effective_at >= $6::timestamptz
+                 AND (e.effective_at > $6::timestamptz
+                      OR (e.effective_at = $6::timestamptz
+                          AND (e.xact_id > $7::xid8
+                               OR (e.xact_id = $7::xid8 AND e.id > $8::uuid))))
+               ORDER BY e.effective_at, e.xact_id, e.id
+               LIMIT $9
+         ) entry ON true
+        WHERE a.tenant_id = $1 AND a.id = $2";
+
 /// The SQLSTATE this connection's `statement_timeout` fires as.
 const STATEMENT_TIMEOUT: &str = "57014";
 
@@ -374,6 +513,47 @@ fn refusal(error: sqlx::Error) -> ReportRefusal {
 /// `report_cursor()::text` comes back as.
 fn as_bound_xid8(cursor: Cursor) -> String {
     cursor.to_string()
+}
+
+/// The `xid8` a keyset's lower bound is bound as: the last row's commit
+/// position, or the floor of the order for a first page. `'0'` is below every
+/// real `xid8` — counting starts at 3 — so the floor admits every row while
+/// staying a value rather than a NULL (see [`ACCOUNT_STATEMENT_BY_RECORDED`]
+/// for the measurement that makes the difference).
+const THE_BOTTOM_OF_THE_COMMIT_ORDER: &str = "0";
+
+/// ...and the beginning and end of the effective order, as `timestamptz` text.
+/// Every entry sits strictly inside them (`ck_entries__effective_finite`), so
+/// binding these where a caller named no bound changes no answer.
+const THE_BEGINNING_OF_TIME: &str = "-infinity";
+const THE_END_OF_TIME: &str = "infinity";
+
+/// The entry id a keyset's tie-break is bound as on a first page. `uuidv7()`
+/// never issues the nil UUID, so nothing compares equal to or below it.
+fn the_bottom_of_the_entry_order() -> Uuid {
+    Uuid::nil()
+}
+
+/// An instant as the `timestamptz` text a bound is cast from, or the sentinel
+/// that means "no bound on this side".
+///
+/// A failure here is not a caller's: every instant that reaches this point
+/// either parsed from RFC 3339 at the HTTP edge or came out of a page key,
+/// and both are inside the range `OffsetDateTime` holds — so a format error
+/// is a can't-happen answered as storage rather than dressed up as a refusal
+/// a caller could act on, exactly as [`cursor_from`] does.
+fn as_bound_instant(
+    instant: Option<OffsetDateTime>,
+    when_unbounded: &'static str,
+) -> Result<String, ReportRefusal> {
+    let Some(instant) = instant else {
+        return Ok(when_unbounded.to_owned());
+    };
+    instant.format(&Rfc3339).map_err(|failed| {
+        ReportRefusal::Storage(
+            format!("the instant {instant} could not be rendered as RFC 3339: {failed}").into(),
+        )
+    })
 }
 
 /// A cursor the DATABASE produced, read back from text. A failure here is not
@@ -460,6 +640,92 @@ fn transaction_from(rows: Vec<TransactionSqlRow>) -> Option<Transaction> {
         event_id: first.event_id,
         entries,
     })
+}
+
+/// One row of an account statement's answer: the account's id, and one
+/// entry's columns — every one of them NULL together when the account holds
+/// no entry in range, which is the `LEFT JOIN`'s whole purpose here.
+#[derive(sqlx::FromRow)]
+struct AccountStatementSqlRow {
+    #[expect(
+        dead_code,
+        reason = "the column's value is the account existing at all"
+    )]
+    account_id: Uuid,
+    entry_id: Option<Uuid>,
+    transaction_id: Option<Uuid>,
+    direction: Option<String>,
+    amount_minor: Option<i64>,
+    currency: Option<String>,
+    effective_at: Option<OffsetDateTime>,
+    recorded_at: Option<OffsetDateTime>,
+    account_seq: Option<i64>,
+    xact_id: Option<String>,
+}
+
+/// The page, in the port's own shape — and `None` for *no such account*.
+///
+/// No rows at all is the account not existing on this tenant's book. One row
+/// whose entry half is NULL is an account that exists with nothing to show at
+/// this cursor, in this range, on this page, which is a real answer and an
+/// empty page rather than a 404.
+fn statement_page_from(
+    rows: Vec<AccountStatementSqlRow>,
+) -> Result<Option<Vec<AccountStatementEntry>>, ReportRefusal> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut entries = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(entry) = statement_entry_from(row)? {
+            entries.push(entry);
+        }
+    }
+    Ok(Some(entries))
+}
+
+/// One row as an entry, or nothing where the entry half is NULL. The columns
+/// are taken as a group precisely because they are NULL as a group: a partial
+/// entry is not a state this join can produce, and reading them one by one
+/// would invent a way to describe one.
+fn statement_entry_from(
+    row: AccountStatementSqlRow,
+) -> Result<Option<AccountStatementEntry>, ReportRefusal> {
+    let (
+        Some(entry_id),
+        Some(transaction_id),
+        Some(direction),
+        Some(amount_minor),
+        Some(currency),
+        Some(effective_at),
+        Some(recorded_at),
+        Some(account_seq),
+        Some(xact_id),
+    ) = (
+        row.entry_id,
+        row.transaction_id,
+        row.direction,
+        row.amount_minor,
+        row.currency,
+        row.effective_at,
+        row.recorded_at,
+        row.account_seq,
+        row.xact_id,
+    )
+    else {
+        return Ok(None);
+    };
+    Ok(Some(AccountStatementEntry {
+        entry_id,
+        transaction_id,
+        direction,
+        amount_minor,
+        currency,
+        effective_at,
+        recorded_at,
+        account_seq,
+        xact_id: cursor_from("ledger_entries.xact_id", &xact_id)?,
+    }))
 }
 
 /// One row of [`ACCOUNTS`]'s answer.
@@ -635,6 +901,76 @@ impl ReportStore for PgReportStore {
             .await
             .map_err(refusal)?;
         scope.end_with(transaction_from(rows)).await
+    }
+
+    async fn account_statement(
+        &self,
+        read: &AccountStatementRead<'_>,
+    ) -> Result<Scoped<Option<Vec<AccountStatementEntry>>>, ReportRefusal> {
+        let mut scope = self.begin_the_scoped_read(read.tenant_id).await?;
+        // The axis chooses the STATEMENT, because what it decides — the ORDER
+        // BY and the shape of the keyset — is the one thing that cannot be
+        // bound as a parameter. Everything else about the two is identical,
+        // including the columns.
+        let rows: Vec<AccountStatementSqlRow> = match read.axis {
+            StatementAxis::Recorded => {
+                let (after_xact, after_entry) = match read.after {
+                    Some(StatementKey::Recorded { xact_id, entry_id }) => {
+                        (as_bound_xid8(xact_id), entry_id)
+                    }
+                    // A key of the other axis cannot arrive — the service
+                    // parses it against the axis it is paging — and an
+                    // absent one is the first page, which starts at the
+                    // bottom of the order rather than at a NULL.
+                    _ => (
+                        THE_BOTTOM_OF_THE_COMMIT_ORDER.to_owned(),
+                        the_bottom_of_the_entry_order(),
+                    ),
+                };
+                sqlx::query_as(ACCOUNT_STATEMENT_BY_RECORDED)
+                    .bind(read.tenant_id)
+                    .bind(read.account_id)
+                    .bind(as_bound_xid8(read.cursor))
+                    .bind(after_xact)
+                    .bind(after_entry)
+                    .bind(read.limit)
+                    .fetch_all(&mut *scope.tx)
+                    .await
+                    .map_err(refusal)?
+            }
+            StatementAxis::Effective => {
+                let (after_effective, after_xact, after_entry) = match read.after {
+                    Some(StatementKey::Effective {
+                        effective_at,
+                        xact_id,
+                        entry_id,
+                    }) => (Some(effective_at), as_bound_xid8(xact_id), entry_id),
+                    _ => (
+                        None,
+                        THE_BOTTOM_OF_THE_COMMIT_ORDER.to_owned(),
+                        the_bottom_of_the_entry_order(),
+                    ),
+                };
+                sqlx::query_as(ACCOUNT_STATEMENT_BY_EFFECTIVE)
+                    .bind(read.tenant_id)
+                    .bind(read.account_id)
+                    .bind(as_bound_xid8(read.cursor))
+                    .bind(as_bound_instant(
+                        read.effective_from,
+                        THE_BEGINNING_OF_TIME,
+                    )?)
+                    .bind(as_bound_instant(read.effective_to, THE_END_OF_TIME)?)
+                    .bind(as_bound_instant(after_effective, THE_BEGINNING_OF_TIME)?)
+                    .bind(after_xact)
+                    .bind(after_entry)
+                    .bind(read.limit)
+                    .fetch_all(&mut *scope.tx)
+                    .await
+                    .map_err(refusal)?
+            }
+        };
+        let page = statement_page_from(rows)?;
+        scope.end_with(page).await
     }
 
     async fn accounts(

@@ -3,7 +3,7 @@
 //! Its own port rather than a method on [`Repository`](crate::Repository),
 //! for the reason that port's own doc gives: it is *"what the **writer**
 //! service asks of storage"*, and the rule that comes with it — **one method
-//! per statement** — carries over here unchanged. Eight methods, eight
+//! per statement** — carries over here unchanged. Nine methods, nine
 //! statements, each one a scoped read transaction of its own in the adapter.
 //!
 //! **The bracket is the adapter's** (ADR-0019, ADR-0004): `BEGIN … READ
@@ -31,8 +31,8 @@ use uuid::Uuid;
 
 use crate::accounts::Account;
 use crate::reports::{
-    AccountBalance, AccountBalanceQuery, Cursor, StatementLine, Transaction, TransactionQuery,
-    TrialBalanceRow,
+    AccountBalance, AccountBalanceQuery, AccountStatementEntry, Cursor, StatementAxis,
+    StatementKey, StatementLine, Transaction, TransactionQuery, TrialBalanceRow,
 };
 use crate::repository::StorageError;
 
@@ -119,6 +119,33 @@ pub struct AccountListingRead<'a> {
     pub owner_id: Option<&'a str>,
 }
 
+/// One page of one account's entries, with every value resolved (ADR-0023):
+/// the axis, the cursor and the page size are decisions, and this port is
+/// where forgetting to make one is unrepresentable.
+///
+/// `after` and the two range bounds stay `Option`s, and that is not the same
+/// thing: each is a FILTER whose absence means "do not filter" — the first
+/// page of a walk, and a statement over the whole of an account's history.
+///
+/// **The axis is a field rather than two methods** because it names one
+/// question — *in what order* — asked of one table by one caller; what it
+/// chooses inside the adapter is the ORDER BY and the keyset's shape, which
+/// cannot be bound as a parameter and so is the one thing a statement here
+/// selects between rather than binds.
+pub struct AccountStatementRead<'a> {
+    pub tenant_id: &'a str,
+    pub account_id: Uuid,
+    pub axis: StatementAxis,
+    pub cursor: Cursor,
+    pub effective_from: Option<OffsetDateTime>,
+    pub effective_to: Option<OffsetDateTime>,
+    pub limit: i64,
+    /// The last row of the previous page, as its own axis's key — never
+    /// `account_seq`, which is per `(account, stripe)` and therefore not a
+    /// total order on a striped account (ADR-0023).
+    pub after: Option<StatementKey>,
+}
+
 /// Why storage refused a read — the adapter's classification of what the
 /// backend said, in this port's own words.
 ///
@@ -203,6 +230,19 @@ pub trait ReportStore: Send + Sync {
         &self,
         query: &TransactionQuery,
     ) -> impl Future<Output = Result<Scoped<Option<Transaction>>, ReportRefusal>> + Send;
+
+    /// One page of one account's entries, ordered by the axis the read names
+    /// and keyed off the last row of the previous page (ADR-0023).
+    ///
+    /// `None` — as on [`transaction`](ReportStore::transaction) — is *no such
+    /// account on this tenant's book*, which an empty page cannot say: an
+    /// account with no entries in range and an account that does not exist
+    /// both answer no entries, and only `ledger_accounts` tells them apart
+    /// (the same distinction ADR-0019 C4 makes for a balance).
+    fn account_statement(
+        &self,
+        read: &AccountStatementRead<'_>,
+    ) -> impl Future<Output = Result<Scoped<Option<Vec<AccountStatementEntry>>>, ReportRefusal>> + Send;
 
     /// One page of the account register, ordered by `id` and keyed off the
     /// last one seen (ADR-0021). No report function is involved and no cursor

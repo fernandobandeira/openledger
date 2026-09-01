@@ -6,9 +6,10 @@
 //! response, and no invented 409 — a concurrent duplicate blocks on the key
 //! claim and finds a durable result, so there is no in-flight state to name.
 //!
-//! Nine endpoints: two writes, and the seven reads — a balance, three
+//! Ten endpoints: two writes, and the eight reads — a balance, three
 //! reports, a transaction read-back (ADR-0019), one account listing
-//! (ADR-0021) and the commit horizon on its own. The second write is
+//! (ADR-0021), one account statement (ADR-0023) and the commit horizon on its
+//! own. The second write is
 //! `POST /v1/accounts`, the operation that had no API at all until ADR-0021:
 //! accounts were seeded by SQL, which made `psql` a required part of
 //! onboarding a ledger whose whole adoption surface is this crate. The
@@ -111,6 +112,7 @@ route_table! { L, R =>
     post "/v1/accounts" accounts::open_account::<L, R>,
     get "/v1/accounts" accounts::list_accounts::<L, R>,
     get "/v1/accounts/{account_id}/balance" reports::get_account_balance::<L, R>,
+    get "/v1/accounts/{account_id}/entries" accounts::get_account_statement::<L, R>,
     get "/v1/cursor" reports::get_cursor::<L, R>,
     get "/v1/reports/trial-balance" reports::get_trial_balance::<L, R>,
     get "/v1/reports/balance-sheet" reports::get_balance_sheet::<L, R>,

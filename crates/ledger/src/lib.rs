@@ -64,13 +64,14 @@ pub use port::{Ledger, OpenAccountError, WriteError};
 pub use postings::{Append, Delta, Direction, Leg};
 pub use report_service::ReportService;
 pub use report_store::{
-    AccountListingRead, BalanceSheetRead, IncomeStatementRead, ReadBounds, ReportRefusal,
-    ReportStore, Scoped, TrialBalanceRead,
+    AccountListingRead, AccountStatementRead, BalanceSheetRead, IncomeStatementRead, ReadBounds,
+    ReportRefusal, ReportStore, Scoped, TrialBalanceRead,
 };
 pub use reports::{
-    AccountBalance, AccountBalanceQuery, AccountListing, AccountListingQuery, BalanceSheetQuery,
-    Cursor, CursorQuery, CursorUnparseable, IncomeStatementQuery, ReadError, Reports, Statement,
-    StatementLine, Transaction, TransactionEntry, TransactionQuery, TrialBalance,
+    AccountBalance, AccountBalanceQuery, AccountListing, AccountListingQuery, AccountStatement,
+    AccountStatementEntry, AccountStatementQuery, BalanceSheetQuery, Cursor, CursorQuery,
+    CursorUnparseable, IncomeStatementQuery, ReadError, Reports, Statement, StatementAxis,
+    StatementKey, StatementLine, Transaction, TransactionEntry, TransactionQuery, TrialBalance,
     TrialBalanceQuery, TrialBalanceRow,
 };
 pub use repository::{

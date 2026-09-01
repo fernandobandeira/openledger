@@ -111,6 +111,137 @@ impl std::fmt::Display for Cursor {
     }
 }
 
+/// Which of ADR-0006's two time axes orders an account statement — a
+/// PARAMETER with two named values, never a default and never a mode flag
+/// (ADR-0023).
+///
+/// **ADR-0019 refused a listing of entries** because one *"must choose
+/// between the recorded axis and the effective axis"*. This one does not
+/// choose: the caller names the axis, which is exactly what ADR-0019 itself
+/// ruled for the trial balance — *"one endpoint serves both time axes, by
+/// parameter and never by a mode flag"*. **Defaulting it would pick the axis
+/// a caller failed to think about**, and a statement that picks silently is
+/// the one place a listing can be confidently wrong.
+///
+/// Each variant is the ordering one of the schema's two entry indexes already
+/// carries, and the entry `id` breaks ties so that each is a TOTAL order —
+/// without which a keyset page is not exact:
+///
+/// | axis | ordered by | index |
+/// | --- | --- | --- |
+/// | `recorded` | `(xact_id, id)` | `ix_entries__asof_commit` |
+/// | `effective` | `(effective_at, xact_id, id)` | `ix_entries__effective` |
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StatementAxis {
+    /// Commit order — when the ledger LEARNT of the entry. It is the axis a
+    /// cursor pins, so a page of it is stable under later writes.
+    Recorded,
+    /// Business order — when the entry is DATED. A backdated arrival sits in
+    /// its own past here and at the end of the recorded axis, and that
+    /// disagreement is what two axes MEAN (ADR-0006).
+    Effective,
+}
+
+impl StatementAxis {
+    /// The two names the wire spells, and nothing else. Unknown text is
+    /// `None` and never a default: coercing it is the decision ADR-0023
+    /// refuses.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "recorded" => Some(Self::Recorded),
+            "effective" => Some(Self::Effective),
+            _ => None,
+        }
+    }
+
+    /// The name this axis is spelled by — for an answer that echoes back the
+    /// parameter every row of it was ordered by.
+    pub fn named(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::Effective => "effective",
+        }
+    }
+}
+
+/// The ordering key of the last entry on a page: an account statement's
+/// keyset `after`, which is the AXIS's key and therefore has a shape per axis.
+///
+/// **It is deliberately not `account_seq`, and that is the trap ADR-0023
+/// records.** The counter reads like the obvious page key — per account,
+/// gapless, already unique — but `uq_entries__account_seq` is
+/// `(tenant_id, account_id, stripe, account_seq)`: the counter is per
+/// *stripe*, because a single per-account counter would serialise every
+/// writer through one unique index, *"the bottleneck striping exists to
+/// remove, moved one table over"* (ADR-0013). So on a striped account it is
+/// not a total order, and paging by it would interleave two counters and
+/// silently drop or repeat rows. It is RETURNED on every entry — it is what a
+/// drift check walks — and it does not order the page.
+///
+/// A key is rendered by [`rendered`](Self::rendered) and returned verbatim by
+/// the caller; nothing else constructs one. The instant is carried as
+/// nanoseconds since the epoch rather than as RFC 3339 because a page key
+/// must render INFALLIBLY and compare exactly — an RFC 3339 rendering can
+/// fail on a year the format cannot hold, and a key that fails to render is a
+/// page a caller cannot follow.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StatementKey {
+    /// `(xact_id, id)` — the recorded axis's key.
+    Recorded { xact_id: Cursor, entry_id: Uuid },
+    /// `(effective_at, xact_id, id)` — the effective axis's key.
+    Effective {
+        effective_at: OffsetDateTime,
+        xact_id: Cursor,
+        entry_id: Uuid,
+    },
+}
+
+impl StatementKey {
+    /// The key as text, for the `next_after` a page hands back.
+    pub fn rendered(&self) -> String {
+        match self {
+            Self::Recorded { xact_id, entry_id } => format!("{xact_id},{entry_id}"),
+            Self::Effective {
+                effective_at,
+                xact_id,
+                entry_id,
+            } => format!(
+                "{},{xact_id},{entry_id}",
+                effective_at.unix_timestamp_nanos()
+            ),
+        }
+    }
+
+    /// A key a caller sent back, read against the axis they are paging.
+    ///
+    /// The axis is an argument rather than something read out of the text: a
+    /// key belongs to the order it was issued under, and a recorded key
+    /// replayed against the effective axis would page by a bound that is not
+    /// that order's — so the arity is the axis's, and text that does not fit
+    /// it is `None`.
+    pub fn parse(text: &str, axis: StatementAxis) -> Option<Self> {
+        let mut parts = text.split(',');
+        let key = match axis {
+            StatementAxis::Recorded => Self::Recorded {
+                xact_id: Cursor::parse(parts.next()?).ok()?,
+                entry_id: parts.next()?.parse().ok()?,
+            },
+            StatementAxis::Effective => Self::Effective {
+                effective_at: OffsetDateTime::from_unix_timestamp_nanos(
+                    parts.next()?.parse().ok()?,
+                )
+                .ok()?,
+                xact_id: Cursor::parse(parts.next()?).ok()?,
+                entry_id: parts.next()?.parse().ok()?,
+            },
+        };
+        // Nothing may follow the key: a longer text is a key of the OTHER
+        // axis, or a caller's own construction, and either is refused rather
+        // than read as far as it parses.
+        parts.next().is_none().then_some(key)
+    }
+}
+
 /// `GET /v1/accounts/{account_id}/balance` — *posted, now*, and pinned by
 /// nothing. This is the balance CACHE, not the journal (ADR-0010: the cache
 /// means POSTED), and pinning it to a cursor would be a second definition of
@@ -210,6 +341,86 @@ pub struct AccountListing {
     /// a caller that follows a cursor to an empty page has learnt the same
     /// thing one request later.
     pub next_after: Option<Uuid>,
+}
+
+/// `GET /v1/accounts/{account_id}/entries` — one account's entries, in order,
+/// at a cursor (ADR-0023).
+///
+/// **The axis is required.** Every other value here is optional and each
+/// absence has a meaning; the axis has none, because whichever one this read
+/// picked for a caller who did not name one would be the axis they failed to
+/// think about.
+///
+/// The commit cursor applies as on every other pinned read; the half-open
+/// `[effective_from, effective_to)` range is the EFFECTIVE axis's filter and
+/// is refused on the recorded axis rather than ignored there.
+pub struct AccountStatementQuery {
+    pub tenant_id: String,
+    pub account_id: Uuid,
+    /// `recorded` or `effective`, as text — and an `Option` so that the
+    /// refusal of an unnamed axis lives in the core, where ADR-0023's rule
+    /// is, rather than in a deserializer. The HTTP surface declares the
+    /// parameter required, so absence does not reach here over the wire; the
+    /// port is what makes defaulting it unavailable to any other caller.
+    pub axis: Option<String>,
+    /// Absent means *pin one server-side and tell me which* (ADR-0019), the
+    /// same as on every report route.
+    pub cursor: Option<String>,
+    /// Inclusive lower bound on `effective_at`. `axis=effective` only.
+    pub effective_from: Option<OffsetDateTime>,
+    /// EXCLUSIVE upper bound on `effective_at` — half-open, as every range on
+    /// this surface is (ADR-0011 §A3). `axis=effective` only.
+    pub effective_to: Option<OffsetDateTime>,
+    /// How many entries at most; `None` takes the read path's default, and a
+    /// value outside its window is refused rather than clamped — the same
+    /// shape the account listing has, deliberately, rather than a second
+    /// convention for the same question.
+    pub limit: Option<i64>,
+    /// The `next_after` of the previous page, verbatim: the last row's
+    /// ORDERING KEY, whose shape is the axis's ([`StatementKey`]). Text here
+    /// for the reason `cursor` is text — whether it is a key of the axis
+    /// being paged is judgement, and judgement is the service's.
+    pub after: Option<String>,
+}
+
+/// One page of an account's entries, the axis they were ordered by, and the
+/// cursor the page was pinned at.
+pub struct AccountStatement {
+    pub pinned_cursor: Cursor,
+    /// Echoed because it is the parameter that decided every row's position —
+    /// the same reason a statement echoes the `chart_version` it was
+    /// presented at.
+    pub axis: StatementAxis,
+    pub entries: Vec<AccountStatementEntry>,
+    /// The key to send as `after` for the next page, or `None` when this page
+    /// did not fill — a full page means "there may be more", never "there
+    /// is", exactly as the account listing's does.
+    pub next_after: Option<StatementKey>,
+}
+
+/// One entry of an account's statement — the leg that touched THIS account,
+/// never the transaction's other legs, which belong to other accounts
+/// (ADR-0023). `transaction_id` is on every row and the transaction read
+/// answers the rest.
+pub struct AccountStatementEntry {
+    pub entry_id: Uuid,
+    pub transaction_id: Uuid,
+    pub direction: String,
+    /// An `i64` here and an exact-integer decimal STRING on the wire, for the
+    /// reason every amount on this surface is one (ADR-0022).
+    pub amount_minor: i64,
+    pub currency: String,
+    pub effective_at: OffsetDateTime,
+    pub recorded_at: OffsetDateTime,
+    /// The account's own gapless counter for this leg — per `(account,
+    /// stripe)`, which is why it is returned and never ordered by.
+    pub account_seq: i64,
+    /// The entry's own commit position: the recorded axis's ordering key, and
+    /// half of the effective axis's. It is carried so the page key can be
+    /// built from the last row of a page and is not rendered on the wire —
+    /// `next_after` is where a caller meets it, as a key to return rather
+    /// than as a number to do arithmetic on.
+    pub xact_id: Cursor,
 }
 
 /// `GET /v1/cursor` — the commit horizon on its own, and nothing else.
@@ -365,7 +576,15 @@ pub enum ReadError {
     ChartVersionIncomplete(String),
     /// No such account on this tenant's book, or one that does not hold this
     /// currency. `404 account_unknown` — see the note above about the status.
-    AccountUnknown { account_id: Uuid, currency: String },
+    ///
+    /// The currency is `None` on a read that names none: an account holds one
+    /// currency, so only the balance read — whose row key includes it — can
+    /// fail for that second reason, and a statement's refusal must not claim
+    /// a currency the caller never asked about.
+    AccountUnknown {
+        account_id: Uuid,
+        currency: Option<String>,
+    },
     /// No such transaction on this tenant's book. `404 transaction_unknown`.
     TransactionUnknown { transaction_id: Uuid },
     /// The `tenant_id` asked about is not the scope the read path set on the
@@ -393,7 +612,7 @@ pub enum ReadError {
 
 /// The read path's inbound port: *tell me what the book says*.
 ///
-/// Seven methods for seven routes, and none of `transaction`, `accounts` or
+/// Eight methods for eight routes, and none of `transaction`, `accounts` or
 /// `cursor` got a port of its own — a manifest's worth of ceremony for one
 /// method buys a boundary nothing crosses (ADR-0015's own reason for refusing
 /// a `ports` crate), and from the caller's side reading a transaction back,
@@ -445,6 +664,15 @@ pub trait Reports: Send + Sync {
         &self,
         query: &TransactionQuery,
     ) -> impl Future<Output = Result<Transaction, ReadError>> + Send;
+
+    /// One page of one account's entries, on the axis the caller named
+    /// (ADR-0023) — the read that makes a ledger inspectable, because until
+    /// it shipped the only way to see a transaction was to already know its
+    /// id.
+    fn account_statement(
+        &self,
+        query: &AccountStatementQuery,
+    ) -> impl Future<Output = Result<AccountStatement, ReadError>> + Send;
 
     /// One page of the account register (ADR-0021). A listing is a READ, so
     /// it is here and not on [`Ledger`]: from the caller's side it is the

@@ -1,6 +1,7 @@
-//! The account resource's two new verbs (ADR-0021): open one, and list them.
-//! Their wire types, their handlers, and the `#[utoipa::path]` annotations the
-//! committed spec is generated from.
+//! The account resource's two new verbs (ADR-0021): open one, and list them —
+//! and, since ADR-0023, its statement: one account's entries, in order, at a
+//! cursor. Their wire types, their handlers, and the `#[utoipa::path]`
+//! annotations the committed spec is generated from.
 //!
 //! **Why this file exists at all.** Until ADR-0021 there was no way to open an
 //! account over HTTP — accounts were seeded by SQL, which is what the e2e
@@ -21,7 +22,16 @@
 //! What this layer owns is what every handler here owns: which status, which
 //! header, which error `type`. The judgement is one ring in — the chart
 //! derivation and every named refusal are `ledger`'s writer service, the page
-//! size is its report service — and the SQL another ring out.
+//! size, the axis and the cursor rule its report service — and the SQL another
+//! ring out.
+//!
+//! **Both listings on this resource page the same way**, deliberately: a
+//! `limit` with a stated default and maximum refused rather than clamped, an
+//! `after` carrying the last row's ordering key, and a `next_after` that is
+//! present exactly when the page came back full. What differs is the key —
+//! the register's is an `account_id`, the statement's is the AXIS's ordering
+//! key — and the difference is the shape of the key, never a second
+//! convention for asking.
 
 use axum::extract::State;
 use axum::http::{HeaderName, StatusCode};
@@ -32,8 +42,8 @@ use time::OffsetDateTime;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-use crate::reports::refusal_for_read;
-use crate::wire::{Body, ErrorBody, Params, refuse};
+use crate::reports::{instant, refusal_for_read};
+use crate::wire::{Body, ErrorBody, Params, Refusal, Segment, refuse};
 
 const IDEMPOTENCY_REPLAYED: HeaderName = HeaderName::from_static("idempotency-replayed");
 
@@ -579,6 +589,269 @@ fn answer_the_register_page(listing: ledger::AccountListing) -> Response {
             .accounts
             .into_iter()
             .map(account_on_the_wire)
+            .collect(),
+    })
+    .into_response()
+}
+
+/// The query half of `GET /v1/accounts/{account_id}/entries` — the book, the
+/// AXIS, the cursor, the effective range and the page.
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct AccountStatementParams {
+    /// The book to read.
+    #[param(example = "t1")]
+    tenant_id: String,
+    /// **Required, and there is no default** (ADR-0023). `recorded` orders by
+    /// commit position — what the ledger learnt, and when — and `effective`
+    /// orders by business date. The two disagree about where a backdated
+    /// entry sits, which is what two axes MEAN (ADR-0006): whichever one were
+    /// chosen for a caller who named none would be the axis they did not
+    /// think about, so this endpoint refuses rather than picks.
+    #[param(example = "recorded")]
+    axis: String,
+    /// The commit position to pin the page to — a `pinned_cursor` from an
+    /// earlier read. Omit it and one is pinned server-side and returned. It
+    /// bounds BOTH axes: an entry is on this page only if it had committed by
+    /// this cursor, whatever it is dated.
+    #[param(example = "231000")]
+    cursor: Option<String>,
+    /// Inclusive lower bound on `effective_at`, RFC 3339. **`axis=effective`
+    /// only** — on `axis=recorded` it is refused rather than ignored, because
+    /// the page there is ordered and bounded by commit position and a
+    /// business-date window would be a filter over the account's whole
+    /// history.
+    #[param(example = "2026-01-01T00:00:00Z")]
+    effective_from: Option<String>,
+    /// EXCLUSIVE upper bound on `effective_at`, RFC 3339 — half-open, as every
+    /// range on this surface is (ADR-0011 §A3). `axis=effective` only.
+    #[param(example = "2026-02-01T00:00:00Z")]
+    effective_to: Option<String>,
+    /// How many entries at most, 1–1000. Omitted means 100. A value outside
+    /// the window is REFUSED rather than clamped, exactly as on
+    /// `GET /v1/accounts`.
+    #[param(minimum = 1, maximum = 1000, example = 100)]
+    limit: Option<i64>,
+    /// The `next_after` an earlier page of **this same axis** answered with,
+    /// sent back unchanged. It is the last row's ordering key — `xact_id` and
+    /// entry id on the recorded axis, the business date as well on the
+    /// effective one — and a key of the other axis is refused rather than
+    /// used as a bound of an order it does not name.
+    ///
+    /// **It is never `account_seq`**, and that is the trap worth naming:
+    /// `uq_entries__account_seq` is per `(tenant, account, stripe, seq)`, so
+    /// on a striped account the counter is not a total order and paging by it
+    /// would interleave two counters and silently drop or repeat rows
+    /// (ADR-0023). The number is returned on every entry — it is what a drift
+    /// check walks — and it does not order the page.
+    after: Option<String>,
+}
+
+/// One page of one account's entries: the axis they were ordered by, the
+/// cursor they were pinned at, and the key of the next page.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct AccountStatementRead {
+    /// The commit position this page ran at — supplied or server-pinned.
+    /// Store it and send it back to walk the rest of this same book: the page
+    /// after it is then the page after it *was*, whatever has committed since.
+    #[schema(example = "231000")]
+    pinned_cursor: String,
+    /// The axis this page was ordered by, echoed — `recorded` or `effective`.
+    #[schema(example = "recorded")]
+    axis: String,
+    /// The page, in the axis's order. **An empty list is a legitimate answer**
+    /// for an account with no entries at this cursor, in this range; an
+    /// account that does not exist is a 404 instead, which is a distinction
+    /// only the account register can draw (ADR-0019).
+    entries: Vec<StatementEntryRead>,
+    /// The `after` to send for the next page, or `null` when this page did not
+    /// fill. **A full page means "there may be more", never "there is"** — the
+    /// same rule `GET /v1/accounts` follows, and for the same reason: the
+    /// alternative is reading one row past every page to be certain.
+    #[schema(required, example = "231000,0198f0c9-1f8a-7c31-9e1a-000000000001")]
+    next_after: Option<String>,
+}
+
+/// One entry of an account's statement — **the leg that touched THIS
+/// account**, never the transaction's other legs, which belong to other
+/// accounts. `transaction_id` is on every row and
+/// `GET /v1/transactions/{transaction_id}` answers the rest (ADR-0023).
+#[derive(Serialize, ToSchema)]
+pub(crate) struct StatementEntryRead {
+    /// The entry's own id — `pk_entries`'s column, and the tie-break that
+    /// makes each axis a TOTAL order.
+    entry_id: Uuid,
+    /// The transaction this leg belongs to.
+    transaction_id: Uuid,
+    /// `debit` or `credit`. Direction carries the sign; the amount never does.
+    direction: String,
+    /// Minor units, as an exact-integer decimal string — **not a JSON
+    /// number** (ADR-0022). `ledger_entries.amount_minor` is a `bigint` and
+    /// JSON has no integer type, so a large amount read as a number comes back
+    /// silently wrong.
+    #[schema(example = "2500")]
+    amount_minor: String,
+    currency: String,
+    /// When the entry is DATED — the business date, and the effective axis's
+    /// position.
+    #[serde(with = "time::serde::rfc3339")]
+    effective_at: OffsetDateTime,
+    /// When the entry was WRITTEN — the database's clock. It is provenance
+    /// rather than an ordering: the recorded axis is ordered by commit
+    /// position (`xact_id`), which `recorded_at` cannot stand in for, because
+    /// a clock reading taken before a commit does not order commits
+    /// (ADR-0006).
+    #[serde(with = "time::serde::rfc3339")]
+    recorded_at: OffsetDateTime,
+    /// The account's own gapless sequence number for this leg. The counter is
+    /// per `(account, stripe)` — documented, never exposed: no stripe appears
+    /// in any response (ADR-0013 §4). It is what a drift check walks, and it
+    /// is **not** the page key (see `after`).
+    account_seq: i64,
+}
+
+/// Read one account's entries, in order, at a cursor.
+///
+/// **The listing ADR-0019 refused, and the axis is why it can ship.** That
+/// decision refused a listing of entries because one *"must choose between the
+/// recorded axis and the effective axis"*; this one does not choose — it takes
+/// the axis as a parameter, which is exactly what ADR-0019 itself ruled for the
+/// trial balance. Each ordering is served by the index the schema already
+/// carries for it, and the entry id breaks ties so that each is total:
+/// `recorded` is `(xact_id, id)` on `ix_entries__asof_commit`, `effective` is
+/// `(effective_at, xact_id, id)` on `ix_entries__effective`.
+#[utoipa::path(
+    get,
+    path = "/v1/accounts/{account_id}/entries",
+    operation_id = "getAccountStatement",
+    tag = "accounts",
+    params(
+        ("account_id" = Uuid, Path, description = "The account whose entries to read."),
+        AccountStatementParams,
+    ),
+    responses(
+        (
+            status = 200,
+            description = "One page of the account's entries, in the axis's order, with the \
+                           cursor the page was pinned at and the key of the next page. **The \
+                           two axes answer the same SET in different ORDERS**, and a backdated \
+                           entry is where they disagree: it sits in its own past on the \
+                           effective axis and at the end of the recorded one. An account that \
+                           exists and has no entries in range answers an empty list, never a \
+                           404.",
+            body = AccountStatementRead
+        ),
+        (
+            status = 404,
+            description = "No such account on this book. `type` is `account_unknown` — note \
+                           that the write path returns 422 under this same `type`, \
+                           deliberately: there the caller must change the request, here the \
+                           resource does not exist. An account that exists with no entries is \
+                           a 200 with an empty page, and only the account register can draw \
+                           that distinction (ADR-0019).",
+            body = ErrorBody
+        ),
+        (
+            status = 422,
+            description = "Refused. `type` is one of: `invalid_request` (an `axis` that is not \
+                           `recorded` or `effective`; an `effective_from` or `effective_to` \
+                           that is not an RFC 3339 instant, or either of them on \
+                           `axis=recorded`, where the page is bounded by commit position; a \
+                           `limit` outside 1–1000, zero and negative included — refused rather \
+                           than clamped; an `after` that is not a page key of the axis being \
+                           paged; or a `cursor` that is not an `xid8` at all), `cursor_invalid` \
+                           (a legal `xid8` above this cluster's horizon or at or below the \
+                           book's oldest entry), or `tenant_mismatch`.",
+            body = ErrorBody
+        ),
+        (
+            status = 400,
+            description = "A required query parameter is missing — `tenant_id`, or the `axis` \
+                           this endpoint will not choose for you — or a value would not \
+                           deserialize into its documented type, including an `account_id` \
+                           path segment that is not a UUID. `type` is `invalid_request`.",
+            body = ErrorBody
+        ),
+        (
+            status = 503,
+            description = "The read exceeded this deployment's `statement_timeout` (`57014`). \
+                           `type` is `report_timed_out`.",
+            body = ErrorBody
+        ),
+        (
+            status = 500,
+            description = "The read failed. `type` is `internal`.",
+            body = ErrorBody
+        ),
+    ),
+)]
+pub(crate) async fn get_account_statement<L, R>(
+    State(state): State<crate::AppState<L, R>>,
+    Segment(account_id): Segment<Uuid>,
+    Params(params): Params<AccountStatementParams>,
+) -> Response
+where
+    L: Ledger,
+    R: Reports,
+{
+    let query = match statement_query(account_id, params) {
+        Ok(query) => query,
+        Err(refused) => return refused.into_response(),
+    };
+    match state.reports.account_statement(&query).await {
+        Ok(page) => answer_the_statement_page(page),
+        Err(refused) => refusal_for_read(refused),
+    }
+}
+
+/// The query string as the port's query. The two instants are parsed here, as
+/// they are on every report route; the axis and the page key are NOT — whether
+/// text names an axis of this ledger, and whether a key belongs to the order
+/// being paged, are the read path's judgement and not this layer's (ADR-0023).
+fn statement_query(
+    account_id: Uuid,
+    params: AccountStatementParams,
+) -> Result<ledger::AccountStatementQuery, Refusal> {
+    Ok(ledger::AccountStatementQuery {
+        tenant_id: params.tenant_id,
+        account_id,
+        axis: Some(params.axis),
+        cursor: params.cursor,
+        effective_from: params
+            .effective_from
+            .as_deref()
+            .map(|from| instant("effective_from", from))
+            .transpose()?,
+        effective_to: params
+            .effective_to
+            .as_deref()
+            .map(|to| instant("effective_to", to))
+            .transpose()?,
+        limit: params.limit,
+        after: params.after,
+    })
+}
+
+/// The page on the wire, with the axis it was ordered by and the key of the
+/// next page rendered as the text a caller sends back unchanged.
+fn answer_the_statement_page(page: ledger::AccountStatement) -> Response {
+    axum::Json(AccountStatementRead {
+        pinned_cursor: page.pinned_cursor.to_string(),
+        axis: page.axis.named().to_owned(),
+        next_after: page.next_after.map(|key| key.rendered()),
+        entries: page
+            .entries
+            .into_iter()
+            .map(|entry| StatementEntryRead {
+                entry_id: entry.entry_id,
+                transaction_id: entry.transaction_id,
+                direction: entry.direction,
+                amount_minor: entry.amount_minor.to_string(),
+                currency: entry.currency,
+                effective_at: entry.effective_at,
+                recorded_at: entry.recorded_at,
+                account_seq: entry.account_seq,
+            })
             .collect(),
     })
     .into_response()

@@ -155,6 +155,26 @@ pub fn account_balance_path(tenant: &str, account: Uuid, currency: &str) -> Stri
     format!("/v1/accounts/{account}/balance?tenant_id={tenant}&currency={currency}")
 }
 
+/// `GET /v1/accounts/{account_id}/entries` as a path (ADR-0023).
+///
+/// `axis` is an argument rather than one of the varying pairs because it is
+/// REQUIRED — there is no default and the endpoint refuses to pick one — so a
+/// builder that let it be forgotten would let a test forget the decision this
+/// route exists to make. The test that asks what a MISSING axis answers builds
+/// its path itself, which is the honest way to ask for something the shape
+/// here will not produce.
+pub fn account_entries_path(
+    tenant: &str,
+    account: Uuid,
+    axis: &str,
+    and: &[(&str, &str)],
+) -> String {
+    with_parameters(
+        &format!("/v1/accounts/{account}/entries?tenant_id={tenant}&axis={axis}"),
+        and,
+    )
+}
+
 /// `GET /v1/transactions/{transaction_id}` as a path.
 pub fn transaction_path(tenant: &str, transaction: Uuid) -> String {
     format!("/v1/transactions/{transaction}?tenant_id={tenant}")
