@@ -436,6 +436,37 @@ place is owning the *sweep* that consolidates suspense accounts, and draining ev
 
 ## Known work, not yet scheduled
 
+**Scheduled but not yet built, and named here so it is not lost** — all of it from the 2026-09-01
+round ([spike 020](/spikes/020-checkpoint-on-the-report-path),
+[spike 021](/spikes/021-reporting-layer-defects)):
+
+- **Migration `00005`: `recon_journal_to_reports` foots, and the summary survives a failing check.**
+  These two are **one change**, not two. The view buckets `out_of_window` out of its `reported`
+  figure while its `r` side carries no `effective_at` window at all, so `unexplained` is non-zero on a
+  book whose reports are correct — and worse, an out-of-window debit and an unpresented-type debit of
+  equal size cancel exactly, turning off the dropped-sub-book detector this view exists to be. Fixing
+  the window costs the check its only red path in the suite unless the out-of-window population gets
+  its own summary row, which moves `EXPECTED_CHECKS` from 10 to 11 in three places. And the summary
+  itself aborts entirely when one unpresented account type makes `balance_sheet_at` raise, so an
+  operator sees *nothing* rather than nine results — fixed in the sweep rather than in SQL, by reading
+  the nine non-raising checks and the equation check separately under the `REPEATABLE READ` the sweep
+  already declares.
+- **The partitioning measurement pass**, with its decision rule written in advance
+  ([ADR-0020](/decisions/0020-checkpoint-on-the-report-path)): six open questions, the two candidate
+  tail indexes refused if they cost more than 5% of clearings/s, and a ladder to 48 closes because at
+  twelve the bounded sweep and the current one are a plan-estimate dead heat.
+- **The chart-version seal.** `refuse_stale_chart_version` freezes history and not the present, so
+  the *default* chart version is the one whose content can still change: an appended `fs_lines` row
+  put eleven rows on a statement issued with ten, at an identical cursor and version. The mechanism
+  needs a `chart_version_seals` table, because `chart_versions` is append-only and the seal therefore
+  cannot be an `UPDATE`.
+- **The A14 refusal has never been seen to fire.** Every account type is presented at every chart
+  version on every book built so far, so the guard that makes a statement refuse an unpresented type
+  is a correctness debt rather than a passing test.
+- **`ledger_accounts` has no `xact_id`**, which is why an issued report's row set is not pinned
+  ([ADR-0019](/decisions/0019-read-path)). Giving it one — with the column-level `INSERT` exclusion
+  `ledger_entries.xact_id` already has — is the honest fix, and it needs a backfill decision for any
+  deployed database.
 - **Per-row hash chaining** for tamper evidence. Needs a total order, so decide it alongside
   [ADR-0006](/decisions/0006-time-and-as-of). Never build Formance's block-hashing layer.
 - **The auth path has never been measured.** It writes no ledger entry and serializes per company,

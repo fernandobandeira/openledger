@@ -178,12 +178,19 @@ tenant"*), so inventing the status means inventing the registry.
   at ~8 M entries instead of ~2.5 M. The real fix is the checkpoint, which is M5's other half.
   Corroborated from outside the harness: the daily sweep on a 1.11 M-entry book took **28,970 ms**,
   surviving only because `reconcile` sets no `statement_timeout` on its own connection.
-- **The wire type of an amount is not settled by this decision.** The three functions declare
-  `bigint` in their `RETURNS TABLE` and cast a `numeric` total back down, so a legal book can make a
-  report *raise* rather than answer ([spike 021](/spikes/021-reporting-layer-defects) — the inverse
-  of the defect that was reported). Widening them to `numeric` is a migration, and it makes a decimal
-  on the wire an API decision. Until that lands, the read path's amounts are `bigint` and the ceiling
-  is the one the SQL already has.
+- **A report total is an exact-integer *string* on the wire; a posting amount stays a JSON number.**
+  This is the API half of a schema fix, and it is decided here rather than left open. The three
+  functions declare `bigint` in their `RETURNS TABLE` and cast a `numeric` total back down, so a legal
+  book makes a report **raise** rather than answer — `ERROR: bigint out of range`, produced through
+  the shipped writer over HTTP in six calls ([spike 021](/spikes/021-reporting-layer-defects), the
+  inverse of the defect that was reported). Migration `00004` widens those declarations to `numeric`,
+  and a `numeric` cannot be handed to a JSON consumer as a number: **JSON's own numeric type loses
+  precision above 2⁵³**, so a total large enough to have needed widening would be silently rounded by
+  the parser at the other end — trading a loud refusal for a quiet wrong answer, which is the trade
+  this project exists to refuse. So a report's `amount_minor` is serialized as a decimal string
+  holding an exact integer. **Posting amounts on the way in are unaffected and stay `i64`**: a single
+  posting is bounded by `ledger_entries.amount_minor` and only an *aggregate* can exceed it. The
+  asymmetry is deliberate and costs every caller one parse.
 - **Two round trips per read**, from refusing the single-statement scope-and-select. Negligible
   against a report; dominant only against the balance endpoint, which is the one read that should be
   measured over a network before it is trusted.
