@@ -1502,8 +1502,7 @@ mod tests {
     /// batched statement has no supersede gate and writes the literal status
     /// `'posted'`, so a misrouted member would not be refused — it would be
     /// posted, its pointer dropped and its pending claim turned into moved
-    /// money. Every member is checked, not just the first, and a plain
-    /// posted posting still rides.
+    /// money. Every member is checked, not just the first.
     #[test]
     fn a_command_the_batch_cannot_carry_is_refused_before_the_statement_runs() -> Result<(), Invalid>
     {
@@ -1553,9 +1552,29 @@ mod tests {
                 ))
             );
         }
-        let all_plain = [carries(&plain)];
+        Ok(())
+    }
+
+    /// The other half of the scope check, and the half that keeps it from
+    /// being satisfied by a function that refuses everything: the batch the
+    /// statement was built for — plain, posted, resolving and reversing
+    /// nothing — passes the gate and rides.
+    #[test]
+    fn a_plain_posted_posting_is_what_the_batch_carries() -> Result<(), Invalid> {
+        let plain = a_command("key-0", TransactionStatus::Posted, None, None)?;
+        let plan = a_plan(vec![a_leg(SOURCE, Direction::Credit)]);
+        let payload = serde_json::json!({});
+        let all_plain = [BatchMember {
+            command: &plain,
+            hash: b"h",
+            payload: &payload,
+            append: &plan,
+        }];
+
+        let refused = refuse_a_member_the_batch_cannot_carry(&all_plain);
+
         assert!(
-            refuse_a_member_the_batch_cannot_carry(&all_plain).is_ok(),
+            refused.is_ok(),
             "a plain posted posting is exactly what the batch carries"
         );
         Ok(())

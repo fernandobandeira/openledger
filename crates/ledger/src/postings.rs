@@ -199,6 +199,9 @@ mod tests {
         ];
 
         let deltas = coalesce(&legs)?;
+        // Determinism: the same legs coalesce a second time, and the two
+        // maps must agree.
+        let again = coalesce(&legs)?;
 
         let order: Vec<Uuid> = deltas.keys().map(|(id, _)| *id).collect();
         assert_eq!(order, vec![account(1), account(5), account(9)]);
@@ -216,8 +219,6 @@ mod tests {
             ]
         );
 
-        // Determinism: the same legs coalesce to the same map.
-        let again = coalesce(&legs)?;
         let again: Vec<(Uuid, i64, i64, i64)> = again
             .iter()
             .map(|((id, _), d)| (*id, d.input, d.output, d.legs))
@@ -227,9 +228,9 @@ mod tests {
     }
 
     /// The walk-back arithmetic, offsets half: each leg's offset counts the
-    /// LATER legs on its own account, interleaved across accounts — so once
-    /// the single call subtracts them from each account's returned counter,
-    /// the legs number gaplessly, ending AT `last_seq`, in leg order.
+    /// LATER legs on its own account, interleaved across accounts. What the
+    /// offsets then NUMBER, once the single call subtracts them from each
+    /// account's returned counter, is the test below's.
     #[test]
     fn offsets_count_the_later_legs_of_each_account() {
         let legs = [
@@ -242,12 +243,25 @@ mod tests {
         let offsets = offsets_back_from_last_seq(&legs);
 
         assert_eq!(offsets, vec![1, 1, 0, 0]);
+    }
 
-        // The subtraction the statement performs, replayed here: account 1
-        // had 3 entries before this batch (counter now 5); account 2 was
-        // fresh (counter now 2). `last_seq - offset` numbers the legs
-        // [1, 4, 2, 5] — gapless per account, in leg order.
+    /// The walk-back arithmetic, numbering half: the subtraction the
+    /// statement performs, replayed here over the same interleaved legs.
+    /// Account 1 had 3 entries before this batch (counter now 5); account 2
+    /// was fresh (counter now 2). `last_seq - offset` numbers the legs
+    /// [1, 4, 2, 5] — gapless per account, ending AT `last_seq`, in leg
+    /// order.
+    #[test]
+    fn the_walk_back_numbers_each_accounts_legs_gaplessly() {
+        let legs = [
+            leg(account(2), Direction::Credit, 10),
+            leg(account(1), Direction::Debit, 10),
+            leg(account(2), Direction::Credit, 5),
+            leg(account(1), Direction::Debit, 5),
+        ];
         let counters = BTreeMap::from([(account(1), 5_i64), (account(2), 2_i64)]);
+
+        let offsets = offsets_back_from_last_seq(&legs);
         let seqs: Vec<i64> = legs
             .iter()
             .zip(&offsets)
@@ -255,6 +269,7 @@ mod tests {
                 counters.get(&leg.account_id).copied().unwrap_or_default() - offset
             })
             .collect();
+
         assert_eq!(seqs, vec![1, 4, 2, 5]);
     }
 

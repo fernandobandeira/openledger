@@ -18,6 +18,14 @@
 //! (ADR-0007 §9), and a chart-seeded database would put example rows into
 //! the `account_types` section below.
 //!
+//! **Two tests, and two scratch databases.** The byte-diff rests on the dump
+//! being DETERMINISTIC, which is a different property from the drift the diff
+//! reports, so it is asserted by a test of its own — and that test needs a
+//! migrated database of its own, because a scratch name may be claimed only
+//! once per test binary and the sections below have nothing to read on an
+//! unmigrated one. The second migrate is the honest price of the split: it
+//! runs under the same one-at-a-time mutex as every other migrate here.
+//!
 //! What the dump is FOR — the owner-accident DDL class ADR-0009 accepts as
 //! out-of-model and names this test the only backstop of: a disabled
 //! trigger or event trigger, a dropped policy, `DISABLE ROW LEVEL
@@ -448,29 +456,63 @@ const SECTIONS: [(&str, &str); 21] = [
     ),
 ];
 
-#[tokio::test]
-async fn the_committed_snapshot_matches_the_migrated_schema() -> TestResult {
-    let db_url = postgres::create_scratch_db("schema_snapshot").await?;
+/// One scratch database of this file's own, migrated, with a pool into it.
+/// Both tests here take one and neither can borrow the other's: a scratch
+/// name may be claimed exactly ONCE per test binary (`create_scratch_db`
+/// states why — its `DROP DATABASE WITH (FORCE)` would kill the sibling's
+/// backends), and the dump is of the migrated BASELINE, which an unmigrated
+/// database has nothing of to dump.
+async fn a_freshly_migrated_scratch_database(
+    name: &str,
+) -> Result<PgPool, Box<dyn std::error::Error>> {
+    let db_url = postgres::create_scratch_db(name).await?;
     postgres::migrate(&db_url)?;
-    let pool = PgPoolOptions::new()
+    Ok(PgPoolOptions::new()
         .max_connections(2)
         .connect(&db_url)
-        .await?;
+        .await?)
+}
 
-    // Deterministic or the diff means nothing: dump twice, compare —
-    // the same self-check the OpenAPI snapshot runs on its emission.
-    let generated = dump_catalog_state(&pool).await?;
+/// Whether this run was asked to rewrite the committed snapshot instead of
+/// comparing against it (`make schema-snapshot`). An explicit opt-in, so a
+/// normal run can only ever FAIL on drift, never paper over it by rewriting
+/// the file it was about to compare.
+fn asked_to_rewrite_the_committed_snapshot() -> bool {
+    std::env::var_os("OPENLEDGER_WRITE_SCHEMA_SNAPSHOT").is_some()
+}
+
+#[tokio::test]
+async fn two_catalog_dumps_of_one_database_are_byte_identical() -> TestResult {
+    // What the byte-diff below rests on, asserted as itself and not as a
+    // first act phase of the drift test: a dump that varies run to run fails
+    // the drift test with a message about the MIGRATIONS having changed, which
+    // is the wrong story about the wrong file. The same self-check the OpenAPI
+    // snapshot runs on its emission (`crates/api/tests/spec.rs`).
+    let pool = a_freshly_migrated_scratch_database("schema_snapshot_determinism").await?;
+    let dumped = dump_catalog_state(&pool).await?;
+
+    let dumped_again = dump_catalog_state(&pool).await?;
+
     assert_eq!(
-        generated,
-        dump_catalog_state(&pool).await?,
+        dumped, dumped_again,
         "the catalog dump is not deterministic — two dumps of one database disagree"
     );
+    Ok(())
+}
 
-    if std::env::var_os("OPENLEDGER_WRITE_SCHEMA_SNAPSHOT").is_some() {
+#[tokio::test]
+async fn the_committed_snapshot_matches_the_migrated_schema() -> TestResult {
+    let rewriting = asked_to_rewrite_the_committed_snapshot();
+    let pool = a_freshly_migrated_scratch_database("schema_snapshot").await?;
+
+    let generated = dump_catalog_state(&pool).await?;
+
+    // Under the opt-in the dump BECOMES the committed baseline instead of
+    // being compared to it — the only branch here, and it asserts nothing.
+    if rewriting {
         std::fs::write(SNAPSHOT_PATH, &generated)?;
         return Ok(());
     }
-
     let committed = std::fs::read_to_string(SNAPSHOT_PATH)
         .map_err(|e| format!("could not read {SNAPSHOT_PATH}: {e} — {REGENERATE}"))?;
     if committed != generated {

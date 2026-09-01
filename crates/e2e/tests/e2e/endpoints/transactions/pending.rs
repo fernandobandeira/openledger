@@ -20,36 +20,7 @@
 
 use uuid::Uuid;
 
-use crate::support::{TestBook, TestResult, header};
-
-/// One pending 5.00 between the fixture pair, posted through the front
-/// door — the injection the reconcile suite used to fake over an admin
-/// connection, now the endpoint's own. Returns the pending transaction id.
-async fn post_a_pending_hold(
-    book: &TestBook,
-    revenue: Uuid,
-    receivable: Uuid,
-) -> Result<Uuid, Box<dyn std::error::Error>> {
-    let created = book
-        .post(&serde_json::json!({
-            "tenant_id": "t1",
-            "idempotency_key": "hold-1",
-            "effective_at": "2026-08-28T00:00:00Z",
-            "status": "pending",
-            "postings": [{
-                "source": revenue, "destination": receivable,
-                "amount_minor": 500, "currency": "USD"
-            }],
-        }))
-        .await?;
-    assert_eq!(created.status(), 201, "seeding the pending hold");
-    let body: serde_json::Value = created.json().await?;
-    Ok(body
-        .get("transaction_id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("no transaction_id on the pending 201")?
-        .parse()?)
-}
+use crate::support::{TestBook, TestResult, header, post_a_pending_hold};
 
 /// The (status, resolves_id) pair of one transaction row — what the
 /// resolution tests must see mutate NEVER and reference exactly once.
@@ -347,40 +318,15 @@ async fn a_reused_key_differing_only_in_status_or_resolves_id_is_refused() -> Te
     book.assert_reconciled().await
 }
 
+/// Two targets t1 cannot resolve, and the point is that they are the SAME
+/// refusal: one that exists nowhere at all, and one that exists on ANOTHER
+/// tenant's book. The gate reads only this tenant's transactions — drop the
+/// tenant from its WHERE and the second of these posts across books.
 #[tokio::test]
 async fn resolving_a_transaction_that_does_not_exist_is_refused() -> TestResult {
     let book = TestBook::new("resolve_ghost").await?;
     let (receivable, revenue) = book.fixture_accounts().await?;
     let (t2_receivable, t2_revenue) = book.fixture_accounts_for("t2").await?;
-
-    // A target that exists nowhere: 422, named, and the whole write — the
-    // event claim included — rolled back.
-    let refused = book
-        .post(&serde_json::json!({
-            "tenant_id": "t1",
-            "idempotency_key": "capture-ghost",
-            "effective_at": "2026-08-29T00:00:00Z",
-            "resolves_id": Uuid::from_u128(0xDEAD_BEEF),
-            "postings": [{
-                "source": revenue, "destination": receivable,
-                "amount_minor": 500, "currency": "USD"
-            }],
-        }))
-        .await?;
-
-    assert_eq!(refused.status(), 422);
-    let error: serde_json::Value = refused.json().await?;
-    assert_eq!(error.get("type"), Some(&"resolve_target_unknown".into()));
-    assert_eq!(
-        book.write_counts().await?,
-        (0, 0, 0),
-        "a refused resolution left rows behind"
-    );
-
-    // A target that exists on ANOTHER tenant's book is the same refusal:
-    // the gate reads only this tenant's transactions, so t2's pending is
-    // not resolvable from t1 — drop the tenant from the gate's WHERE and
-    // this posts across books.
     let t2_hold = book
         .post(&serde_json::json!({
             "tenant_id": "t2",
@@ -393,9 +339,22 @@ async fn resolving_a_transaction_that_does_not_exist_is_refused() -> TestResult 
             }],
         }))
         .await?;
-    assert_eq!(t2_hold.status(), 201);
+    assert_eq!(t2_hold.status(), 201, "seeding t2's hold");
     let t2_hold: serde_json::Value = t2_hold.json().await?;
-    let cross = book
+
+    let nowhere = book
+        .post(&serde_json::json!({
+            "tenant_id": "t1",
+            "idempotency_key": "capture-ghost",
+            "effective_at": "2026-08-29T00:00:00Z",
+            "resolves_id": Uuid::from_u128(0xDEAD_BEEF),
+            "postings": [{
+                "source": revenue, "destination": receivable,
+                "amount_minor": 500, "currency": "USD"
+            }],
+        }))
+        .await?;
+    let on_another_book = book
         .post(&serde_json::json!({
             "tenant_id": "t1",
             "idempotency_key": "capture-cross",
@@ -408,11 +367,25 @@ async fn resolving_a_transaction_that_does_not_exist_is_refused() -> TestResult 
         }))
         .await?;
 
-    assert_eq!(cross.status(), 422);
-    let error: serde_json::Value = cross.json().await?;
-    assert_eq!(error.get("type"), Some(&"resolve_target_unknown".into()));
-    // Only t2's hold on the book; t1's attempts wrote nothing.
-    assert_eq!(book.write_counts().await?, (1, 1, 2));
+    for (case, refused) in [
+        ("a target that exists nowhere", nowhere),
+        ("a target on another tenant's book", on_another_book),
+    ] {
+        assert_eq!(refused.status(), 422, "resolving {case} must be refused");
+        let error: serde_json::Value = refused.json().await?;
+        assert_eq!(
+            error.get("type"),
+            Some(&"resolve_target_unknown".into()),
+            "for {case}"
+        );
+    }
+    // Only t2's hold on the book — the whole write, the event claim included,
+    // rolled back for BOTH of t1's attempts.
+    assert_eq!(
+        book.write_counts().await?,
+        (1, 1, 2),
+        "a refused resolution left rows behind"
+    );
     book.assert_reconciled().await
 }
 
@@ -524,9 +497,9 @@ async fn concurrent_resolutions_of_one_pending_produce_exactly_one() -> TestResu
     let (receivable, revenue) = book.fixture_accounts().await?;
     let pending = post_a_pending_hold(&book, revenue, receivable).await?;
 
-    let handles: Vec<_> = (0..CALLERS)
+    let racers: Vec<serde_json::Value> = (0..CALLERS)
         .map(|i| {
-            book.spawn_post(&serde_json::json!({
+            serde_json::json!({
                 "tenant_id": "t1",
                 "idempotency_key": format!("capture-race-{i}"),
                 "effective_at": "2026-08-29T00:00:00Z",
@@ -535,13 +508,11 @@ async fn concurrent_resolutions_of_one_pending_produce_exactly_one() -> TestResu
                     "source": revenue, "destination": receivable,
                     "amount_minor": 500, "currency": "USD"
                 }],
-            }))
+            })
         })
         .collect();
-    let mut responses = Vec::new();
-    for handle in handles {
-        responses.push(handle.await??);
-    }
+
+    let responses = book.post_all_at_once(&racers).await?;
 
     let created = responses
         .iter()

@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "OpenLedger API",
-    "description": "The write path of OpenLedger, an open-source double-entry ledger on PostgreSQL. One endpoint while the core structure is under review: posting a transaction, under the idempotent replay contract of ADR-0013 — the same key with the same body returns the stored result, marked by the `Idempotency-Replayed` header.",
+    "description": "OpenLedger, an open-source double-entry ledger on PostgreSQL. The write path is one endpoint under the idempotent replay contract of ADR-0013 — the same key with the same body returns the stored result, marked by the `Idempotency-Replayed` header. The read path is five, and three things about it are contract rather than presentation (ADR-0019): every report answers with the `pinned_cursor` it ran at, including when the caller supplied none, and that value is what re-runs the report; every report AMOUNT is an exact-integer decimal STRING, because a total above 2^53 would be silently rounded by a JSON parser while a posting amount, bounded by its own column, stays a number; and an unknown tenant is answered 200-with-nothing rather than 404, because nothing in the schema declares a tenant and inventing the status would mean inventing the registry.",
     "license": {
       "name": "MIT",
       "identifier": "MIT"
@@ -10,6 +10,426 @@
     "version": "0.0.0"
   },
   "paths": {
+    "/v1/accounts/{account_id}/balance": {
+      "get": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "Read one account's posted balance.",
+        "description": "**No cursor, and that is the contract**: this reads the balance cache,\nwhich means POSTED, NOW (ADR-0010). Pinning it to a cursor would be a\nsecond definition of a balance, and the journal-based answer is the trial\nbalance next door.",
+        "operationId": "getAccountBalance",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "path",
+            "description": "The account to read.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "description": "The book to read.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "t1"
+          },
+          {
+            "name": "currency",
+            "in": "query",
+            "description": "ISO 4217 alphabetic code.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "USD"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The posted balance, summed over the account's balance rows. An account that exists and has never been written answers `\"0\"` — which is why this endpoint reads the account register and not only the balance cache (ADR-0019).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountBalanceRead"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A required query parameter is missing, or a value would not deserialize into its documented type — including an `account_id` path segment that is not a UUID. `type` is `invalid_request`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such account on this book, or the account does not hold that currency. `type` is `account_unknown` — note that the write path returns 422 under this same `type`, deliberately: there the caller must change the request, here the resource does not exist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Refused. `type` is `tenant_mismatch`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The read failed. `type` is `internal`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The read exceeded this deployment's `statement_timeout` (`57014`). `type` is `report_timed_out`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/reports/balance-sheet": {
+      "get": {
+        "tags": [
+          "reports"
+        ],
+        "summary": "Read the balance-sheet face as at one instant.",
+        "operationId": "getBalanceSheet",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "t1"
+          },
+          {
+            "name": "as_of",
+            "in": "query",
+            "description": "The instant to report the position as at, RFC 3339. **This is a\nperiod's `ends_at`, never a business date**: the predicate is\n`effective_at < as_of`, so a business date returns the position at the\nSTART of that day and silently loses a day at every period boundary\n(ADR-0019). Nothing raises, and the number is plausible.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "2026-02-01T00:00:00Z"
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "231000"
+          },
+          {
+            "name": "chart_version",
+            "in": "query",
+            "description": "The chart version to present at. Omitted means the version the book is\non now, resolved by the read path and reported back in\n`chart_version` — never left to the SQL default, which resolves at run\ntime (ADR-0019 B6).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The face, the chart version it was presented at, and the cursor it was pinned at. An unknown tenant answers 200 with an empty list, never 404 (ADR-0019).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatementRead"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A required query parameter is missing, or a value would not deserialize into its documented type. `type` is `invalid_request`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Refused. `type` is one of: `invalid_request` (an `as_of` that is not an RFC 3339 instant, or a `cursor` that is not an `xid8`), `cursor_invalid` (a legal `xid8` outside the plausible range), `chart_version_unknown` (no such version, or no chart has been seeded at all), `chart_version_incomplete` (the version does not present every account type with posted entries as at this instant — refused rather than silently dropping a sub-book from a face that would still balance), or `tenant_mismatch`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The report failed. `type` is `internal`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The report exceeded this deployment's `statement_timeout` (`57014`). `type` is `report_timed_out`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/reports/income-statement": {
+      "get": {
+        "tags": [
+          "reports"
+        ],
+        "summary": "Read the income statement over a half-open effective range.",
+        "operationId": "getIncomeStatement",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "t1"
+          },
+          {
+            "name": "effective_from",
+            "in": "query",
+            "description": "Inclusive lower bound on `effective_at`, RFC 3339.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "2026-01-01T00:00:00Z"
+          },
+          {
+            "name": "effective_to",
+            "in": "query",
+            "description": "EXCLUSIVE upper bound on `effective_at`, RFC 3339.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "2026-02-01T00:00:00Z"
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "231000"
+          },
+          {
+            "name": "chart_version",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The statement, the chart version it was presented at, and the cursor it was pinned at. An unknown tenant answers 200 with an empty list, never 404 (ADR-0019).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatementRead"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A required query parameter is missing, or a value would not deserialize into its documented type. `type` is `invalid_request`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Refused. `type` is one of: `invalid_request` (an `effective_from` or `effective_to` that is not an RFC 3339 instant, or a `cursor` that is not an `xid8`), `cursor_invalid` (a legal `xid8` outside the plausible range), `chart_version_unknown`, `chart_version_incomplete` (the version does not present every account type with posted entries in this window), or `tenant_mismatch`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The report failed. `type` is `internal`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The report exceeded this deployment's `statement_timeout` (`57014`). `type` is `report_timed_out`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/reports/trial-balance": {
+      "get": {
+        "tags": [
+          "reports"
+        ],
+        "summary": "Read the trial balance.",
+        "description": "**One endpoint serves both of ADR-0006's time axes, by parameter and never\nby a mode flag**: the RECORDED axis is the cursor — widen the range and\nvary it — and the EFFECTIVE axis is the range — fix the cursor and vary\nit. Two resources for two parameters of one function is Formance's\n`pit`-resolves-to-six-columns mistake (ADR-0019 C2).",
+        "operationId": "getTrialBalance",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "t1"
+          },
+          {
+            "name": "effective_from",
+            "in": "query",
+            "description": "Inclusive lower bound on `effective_at`, RFC 3339.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "2026-01-01T00:00:00Z"
+          },
+          {
+            "name": "effective_to",
+            "in": "query",
+            "description": "EXCLUSIVE upper bound on `effective_at`, RFC 3339 — the range is\nhalf-open, as it is on all three report functions (ADR-0011 §A3).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "2026-02-01T00:00:00Z"
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The commit position to pin the report to — a `pinned_cursor` from an\nearlier report. Omit it and one is pinned server-side and returned.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "231000"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The trial balance, and the cursor it was pinned at. An unknown tenant answers 200 with an empty list, never 404: there is no tenant registry to consult, so inventing the status would mean inventing the registry (ADR-0019).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrialBalanceRead"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A required query parameter is missing, or a value would not deserialize into its documented type. `type` is `invalid_request`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Refused. `type` is one of: `invalid_request` (an `effective_from` or `effective_to` that is not an RFC 3339 instant, or a `cursor` that is not an `xid8` at all), `cursor_invalid` (a syntactically valid `xid8` that is above this cluster's horizon or at or below the book's oldest entry — `-1` wraps to the maximum and would return the entire UNPINNED book, `0` would return an all-zero balanced fabrication, and the database cannot refuse either), or `tenant_mismatch`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The report failed. `type` is `internal`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The report exceeded this deployment's `statement_timeout` (`57014`). `type` is `report_timed_out`. **503, not 500 and not 504**: the service is healthy, the request was too expensive, and retrying it unchanged fails identically (ADR-0019).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/transactions": {
       "post": {
         "tags": [
@@ -117,10 +537,166 @@
           }
         }
       }
+    },
+    "/v1/transactions/{transaction_id}": {
+      "get": {
+        "tags": [
+          "transactions"
+        ],
+        "summary": "Read a transaction back.",
+        "description": "No cursor and no chart version: a transaction and its entries are\nimmutable (`ck_txn__append_only` and `ck_entries__append_only`, both\n`ENABLE ALWAYS`), so there is nothing for an as-of to pin (ADR-0019).",
+        "operationId": "getTransaction",
+        "parameters": [
+          {
+            "name": "transaction_id",
+            "in": "path",
+            "description": "The transaction to read.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "description": "The book to read.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "t1"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The transaction and its entries. `entries` is empty for a void — the zero-posting marker a reversal of a PENDING transaction writes (ADR-0016).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransactionRead"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A required query parameter is missing, or a value would not deserialize into its documented type — including a `transaction_id` path segment that is not a UUID. `type` is `invalid_request`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such transaction on this tenant's book. `type` is `transaction_unknown`. Note that an unknown TENANT is not 404 but 200-with-nothing on the report routes, and 404 here: there is no tenant registry to consult, so a wrong `tenant_id` is indistinguishable from a book that does not hold this transaction.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Refused. `type` is `tenant_mismatch` — the `tenant_id` asked about is not the scope the read path set on the session. Vacuous today by construction and declared anyway (ADR-0019).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The read failed. `type` is `internal`, and the caller gets no internals — the operator's log has the error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The read exceeded the read pool's `statement_timeout` (`57014`). `type` is `report_timed_out`. **503, not 500 and not 504**: the service is healthy, the request was too expensive, and retrying it unchanged fails identically (ADR-0019).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
     "schemas": {
+      "AccountBalanceRead": {
+        "type": "object",
+        "description": "One account's posted balance.",
+        "required": [
+          "account_id",
+          "currency",
+          "posted_minor",
+          "as_of"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "as_of": {
+            "type": "string",
+            "description": "Always `now`. This endpoint reads the balance CACHE, which means\nPOSTED (ADR-0010), and pinning it to a cursor would be a second\ndefinition of a balance — so the field is a statement of what the\nnumber means rather than a parameter's echo."
+          },
+          "currency": {
+            "type": "string"
+          },
+          "posted_minor": {
+            "type": "string",
+            "description": "Minor units, debit-positive, as an exact-integer decimal string. A\ncredit-normal account reads negative here and the presentation flip is\nthe reader's (ADR-0010).",
+            "example": "442000"
+          }
+        }
+      },
+      "EntryRead": {
+        "type": "object",
+        "description": "One leg. `amount_minor` is a JSON number here and a decimal STRING on\nevery report, and the asymmetry is deliberate (ADR-0019): a single posting\nis bounded by its column, and only an aggregate can exceed what a JSON\nnumber carries exactly.",
+        "required": [
+          "account_id",
+          "direction",
+          "amount_minor",
+          "currency",
+          "account_seq"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "account_seq": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The account's own gapless sequence number for this leg. The counter is\nper `(account, stripe)` — documented, never exposed: no stripe appears\nin any response (ADR-0013 §4)."
+          },
+          "amount_minor": {
+            "type": "integer",
+            "format": "int64",
+            "example": 2500
+          },
+          "currency": {
+            "type": "string"
+          },
+          "direction": {
+            "type": "string",
+            "description": "`debit` or `credit`. Direction carries the sign; the amount never does."
+          }
+        }
+      },
       "ErrorBody": {
         "type": "object",
         "description": "The error body: a stable machine-readable `type`, prose in `detail`.",
@@ -173,6 +749,71 @@
             "type": "string",
             "format": "uuid",
             "description": "Account the amount leaves."
+          }
+        }
+      },
+      "StatementLineRead": {
+        "type": "object",
+        "description": "One line of a statement face.",
+        "required": [
+          "currency",
+          "fs_line",
+          "caption",
+          "sort_order",
+          "amount_minor",
+          "side"
+        ],
+        "properties": {
+          "amount_minor": {
+            "type": "string",
+            "description": "Minor units, as an exact-integer decimal string — **not a JSON\nnumber**. A report total is an aggregate and can exceed what a JSON\nnumber carries exactly, which would be rounded silently by the parser\nat the other end (ADR-0019). It costs every caller one parse,\ndeliberately.",
+            "example": "442000"
+          },
+          "caption": {
+            "type": "string"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "fs_line": {
+            "type": "string",
+            "description": "The chart's line code."
+          },
+          "side": {
+            "type": "string",
+            "description": "Which side of the face this line belongs to."
+          },
+          "sort_order": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The chart's ordering, not a row number."
+          }
+        }
+      },
+      "StatementRead": {
+        "type": "object",
+        "description": "A statement face — the same shape for the balance sheet and the income\nstatement, because the two functions return the same columns.",
+        "required": [
+          "pinned_cursor",
+          "chart_version",
+          "lines"
+        ],
+        "properties": {
+          "chart_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The chart version this face was presented at — always named, never\ndefaulted. **The residual, stated** (ADR-0019 B6): naming a version\npins the presentation only BELOW `max(version)`, because\n`refuse_stale_chart_version()` freezes history and not the present."
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StatementLineRead"
+            },
+            "description": "The face, in the chart's own `sort_order`.\n\n**What is reproducible at a stored cursor, and what is not**\n(ADR-0019 B7): the AMOUNTS are; the ROW SET is not. The lines are\nenumerated from tables that carry no `xact_id` — one new account with\nnothing posted to it added ten balance-sheet rows at a fixed cursor,\nevery pre-existing amount byte-identical. And an income statement's\namounts carry one carve-out of their own: a period close inserted\nAFTER a statement is issued retroactively removes that transaction's\nentries from it, because `ledger_period_closes` has no commit position."
+          },
+          "pinned_cursor": {
+            "type": "string",
+            "example": "231000"
           }
         }
       },
@@ -269,13 +910,155 @@
             "description": "The transaction the event caused. Nullable by contract: most accepted\noperations write no transaction at all (ADR-0013 §2). This endpoint\nalways writes one, but a replay re-renders whatever was stored."
           }
         }
+      },
+      "TransactionRead": {
+        "type": "object",
+        "description": "A transaction as the book holds it, with its entries.",
+        "required": [
+          "transaction_id",
+          "kind",
+          "status",
+          "effective_at",
+          "recorded_at",
+          "resolves_id",
+          "reverses_id",
+          "event_id",
+          "entries"
+        ],
+        "properties": {
+          "effective_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the movement is deemed to have happened — the caller's clock."
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EntryRead"
+            },
+            "description": "The legs. **Empty is a real answer**: a reversal of a pending\ntransaction is a zero-posting void marker (ADR-0016)."
+          },
+          "event_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The event that caused this transaction."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`posting` for an ordinary transaction, `period_close` for a close."
+          },
+          "recorded_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the row was written — the database's clock. The two axes are\ndifferent questions (ADR-0006) and neither is derivable from the other."
+          },
+          "resolves_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The pending transaction this one resolved, if it is a resolution."
+          },
+          "reverses_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The transaction this one reversed, if it is a reversal."
+          },
+          "status": {
+            "type": "string",
+            "description": "`pending` or `posted`. **It never mutates**: a pending transaction\nbecomes posted by a NEW transaction naming it in `resolves_id`\n(ADR-0016), so a `pending` here is what was recorded and not a stage\nthis row is passing through."
+          },
+          "transaction_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "TrialBalanceRead": {
+        "type": "object",
+        "description": "The trial balance, and the cursor it was pinned at.",
+        "required": [
+          "pinned_cursor",
+          "rows"
+        ],
+        "properties": {
+          "pinned_cursor": {
+            "type": "string",
+            "description": "The commit position this report ran at — supplied or server-pinned.\nStore it to re-run this exact report; a decimal string, because an\n`xid8` is a 64-bit unsigned value and JSON numbers are not.",
+            "example": "231000"
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrialBalanceRowRead"
+            },
+            "description": "One row per `(account, currency)` with any activity in the window.\n**An empty list is a legitimate answer** and never a 404: it is what\nan unknown tenant, a typo'd tenant, a tenant with no accounts, a\nreader scoped elsewhere and an unscoped session all produce, and two\nof those five are the fail-closed path working correctly (ADR-0019)."
+          }
+        }
+      },
+      "TrialBalanceRowRead": {
+        "type": "object",
+        "description": "One `(account, currency)` of the trial balance. Every amount is a decimal\nstring.",
+        "required": [
+          "account_id",
+          "purpose",
+          "category",
+          "currency",
+          "debits",
+          "credits",
+          "balance_debit_positive"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "balance_debit_positive": {
+            "type": "string",
+            "description": "The ARITHMETIC value — roll up with this one. `normal_balance` never\nenters it, so a contra account carries its own sign instead of being\nflipped twice.",
+            "example": "442000"
+          },
+          "category": {
+            "type": "string",
+            "description": "`asset`, `liability`, `equity`, `revenue` or `expense`."
+          },
+          "credits": {
+            "type": "string",
+            "description": "Gross credits in the window.",
+            "example": "0"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "debits": {
+            "type": "string",
+            "description": "Gross debits in the window.",
+            "example": "442000"
+          },
+          "purpose": {
+            "type": "string",
+            "description": "The account type — the chart's code, e.g. `operating_cash`."
+          }
+        }
       }
     }
   },
   "tags": [
     {
       "name": "transactions",
-      "description": "The write path."
+      "description": "Post a transaction, and read one back."
+    },
+    {
+      "name": "accounts",
+      "description": "The posted balance of one account, now."
+    },
+    {
+      "name": "reports",
+      "description": "The pinned reports: both time axes, by parameter."
     }
   ]
 }

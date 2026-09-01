@@ -7,5 +7,6 @@ mod book;
 pub mod postgres;
 
 pub use book::{
-    PostAnswer, TestBook, TestResult, assert_every_member_was_accepted, charge, header,
+    AClose, ASweep, PostAnswer, PostOutcome, TestBook, TestResult,
+    assert_every_member_was_accepted, charge, close_the_period, header, post_a_pending_hold,
 };

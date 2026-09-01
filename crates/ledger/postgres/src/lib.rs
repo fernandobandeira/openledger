@@ -12,11 +12,18 @@
 //! `begin` opens every transaction WITH `READ COMMITTED` rather than
 //! inheriting it.
 //!
-//! `repository` is the whole of it: [`PgRepository`] and its trait impl,
-//! implemented where the SQL lives — one statement per method, all of this
-//! crate's SQL in that one file, and no forwarding layer between the trait
-//! and the statements.
+//! Two files, one rule each. `repository` is the write path: [`PgRepository`]
+//! and its trait impl, implemented where the SQL lives — one statement per
+//! method, and no forwarding layer between the trait and the statements.
+//! `report_store` is the read path since ADR-0019: [`PgReportStore`] and its
+//! [`ledger::ReportStore`] impl, one statement per method again, each inside
+//! the `BEGIN … READ ONLY` / `SET LOCAL ROLE` / `set_config` bracket that
+//! file owns — because those session statements are PostgreSQL's dialect
+//! exactly as the reports' SQL is (ADR-0004), and because the tenant fence
+//! they arm is not something a caller should be able to forget.
 
+mod report_store;
 mod repository;
 
+pub use report_store::PgReportStore;
 pub use repository::PgRepository;

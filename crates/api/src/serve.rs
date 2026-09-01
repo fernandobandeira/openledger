@@ -1,10 +1,10 @@
 //! Binding and serving: everything between "the composition root handed us a
-//! `Ledger`" and "axum is answering on a socket".
+//! `Ledger` and a `Reports`" and "axum is answering on a socket".
 
 use std::io::Write;
 use std::net::SocketAddr;
 
-use ledger::Ledger;
+use ledger::{Ledger, Reports};
 
 /// Binding or serving failed — the binary's exit 1. The `Usage` half of the
 /// old split is gone on purpose: `--bind` reaches [`run`] as an
@@ -19,9 +19,10 @@ fn say(message: &str) {
     let _ = writeln!(std::io::stdout(), "{message}");
 }
 
-pub async fn run<L>(ledger: L, bind: SocketAddr) -> Result<(), ServeError>
+pub async fn run<L, R>(ledger: L, reports: R, bind: SocketAddr) -> Result<(), ServeError>
 where
     L: Ledger + Clone + 'static,
+    R: Reports + Clone + 'static,
 {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -33,7 +34,7 @@ where
     // reads the address from here.
     say(&format!("listening on http://{bound}"));
 
-    axum::serve(listener, crate::router(ledger))
+    axum::serve(listener, crate::router(ledger, reports))
         .await
         .map_err(|e| ServeError(format!("server error: {e}")))
 }

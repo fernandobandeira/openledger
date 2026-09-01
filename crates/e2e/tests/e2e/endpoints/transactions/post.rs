@@ -3,6 +3,13 @@
 //! idempotency key returns and a reused one refuses. Idempotency sits here
 //! rather than in a file of its own because it is this endpoint's contract
 //! (ADR-0013), not a concern beside it.
+//!
+//! The refusals are one test per GUARD, never one per wire name: an account
+//! that does not exist and a currency the account does not hold both answer
+//! `account_unknown`, and they are two different checks reached two different
+//! ways, so a book that fails one tells you which. The undated posting lives
+//! here for the same reason — `reverse.rs` holds where a missing date is
+//! DEFAULTED, this file holds where its absence is refused.
 
 use uuid::Uuid;
 
@@ -99,7 +106,7 @@ async fn two_postings_over_one_pair_coalesce_into_one_balance_row() -> TestResul
 #[tokio::test]
 async fn an_unknown_account_is_refused_and_nothing_is_written() -> TestResult {
     let book = TestBook::new("account_unknown").await?;
-    let (receivable, revenue) = book.fixture_accounts().await?;
+    let (receivable, _revenue) = book.fixture_accounts().await?;
 
     // An account that does not exist: 422, and the whole write — the event row
     // included — rolled back.
@@ -119,13 +126,29 @@ async fn an_unknown_account_is_refused_and_nothing_is_written() -> TestResult {
     assert_eq!(refused.status(), 422);
     let error: serde_json::Value = refused.json().await?;
     assert_eq!(error.get("type"), Some(&"account_unknown".into()));
+    assert_eq!(
+        book.write_counts().await?,
+        (0, 0, 0),
+        "a refused write left rows behind"
+    );
+    book.assert_reconciled().await
+}
 
-    // A currency the account does not hold, on accounts that DO exist: the
-    // same refusal, because the balance upsert's WHERE matches on (account,
-    // currency) together — existence and currency are one check in the SQL.
-    // This case lives here and not in the service's unit tests on purpose:
-    // the unit fake answers "accounts exist" as a boolean and cannot hold a
-    // WHERE clause's behavior; the real statement can.
+/// A DIFFERENT guard wearing the same wire name: accounts that exist, asked
+/// for a currency they do not hold. The refusal is `account_unknown` because
+/// the balance upsert's WHERE matches on (account, currency) TOGETHER —
+/// existence and currency are one check in the SQL — and the detail must name
+/// the currency, which is the only thing telling an operator these two
+/// refusals apart.
+///
+/// This case lives here and not in the service's unit tests on purpose: the
+/// unit fake answers "accounts exist" as a boolean and cannot hold a WHERE
+/// clause's behavior; the real statement can.
+#[tokio::test]
+async fn a_currency_the_account_does_not_hold_is_refused_as_an_unknown_account() -> TestResult {
+    let book = TestBook::new("account_currency_mismatch").await?;
+    let (receivable, revenue) = book.fixture_accounts().await?;
+
     let mismatched = book
         .post(&serde_json::json!({
             "tenant_id": "t1",
@@ -146,11 +169,46 @@ async fn an_unknown_account_is_refused_and_nothing_is_written() -> TestResult {
         detail.is_some_and(|detail| detail.contains("EUR")),
         "the refusal must name the currency the account does not hold; detail was {detail:?}"
     );
-
     assert_eq!(
         book.write_counts().await?,
         (0, 0, 0),
         "a refused write left rows behind"
+    );
+    book.assert_reconciled().await
+}
+
+/// The other half of the effective-date convention, and the half that lives
+/// on THIS endpoint rather than in `reverse.rs`: outside a reversal, the
+/// absence of `effective_at` stays a refusal — the writer does not invent
+/// dates for postings. (The reversal's own defaulting is `reverse.rs`'s.)
+#[tokio::test]
+async fn a_posting_with_no_effective_at_is_refused() -> TestResult {
+    let book = TestBook::new("undated_posting").await?;
+    let (receivable, revenue) = book.fixture_accounts().await?;
+
+    let undated = book
+        .post(&serde_json::json!({
+            "tenant_id": "t1",
+            "idempotency_key": "undated-charge",
+            "postings": [{
+                "source": revenue, "destination": receivable,
+                "amount_minor": 100, "currency": "USD"
+            }],
+        }))
+        .await?;
+
+    assert_eq!(undated.status(), 422);
+    let error: serde_json::Value = undated.json().await?;
+    assert_eq!(error.get("type"), Some(&"invalid_request".into()));
+    let detail = error.get("detail").and_then(serde_json::Value::as_str);
+    assert!(
+        detail.is_some_and(|detail| detail.contains("unless the request is a reversal")),
+        "the refusal must name the one exception; detail was {detail:?}"
+    );
+    assert_eq!(
+        book.write_counts().await?,
+        (0, 0, 0),
+        "an undated posting left rows behind"
     );
     book.assert_reconciled().await
 }
@@ -352,11 +410,7 @@ async fn concurrent_identical_posts_produce_one_write_and_replays_never_conflict
     });
 
     // All CALLERS posts in flight together, over one shared client.
-    let handles: Vec<_> = (0..CALLERS).map(|_| book.spawn_post(&charge)).collect();
-    let mut responses = Vec::new();
-    for handle in handles {
-        responses.push(handle.await??);
-    }
+    let responses = book.post_all_at_once(&vec![charge; CALLERS]).await?;
 
     // Exactly one 201 (the claim), everything else a 200 replay — and zero
     // 409s, zero 500s, zero anything else.
@@ -426,6 +480,12 @@ async fn a_storage_failure_is_a_500_that_commits_nothing_and_names_no_internals(
             }],
         }))
         .await?;
+    // Healed the moment the act is over: no assertion below needs the broken
+    // schema, and a rename left standing through a 40-line assert phase is a
+    // book the oracle cannot read if any of them fails first.
+    sqlx::raw_sql("ALTER TABLE ledger_events_hidden RENAME TO ledger_events")
+        .execute(&book.pool)
+        .await?;
 
     assert_eq!(failed.status(), 500);
     // The header appears only on the two accepted responses (per the spec);
@@ -463,10 +523,7 @@ async fn a_storage_failure_is_a_500_that_commits_nothing_and_names_no_internals(
         );
     }
 
-    // Nothing was committed — and the oracle runs on the healed schema.
-    sqlx::raw_sql("ALTER TABLE ledger_events_hidden RENAME TO ledger_events")
-        .execute(&book.pool)
-        .await?;
+    // Nothing was committed, read on the healed schema.
     assert_eq!(
         book.write_counts().await?,
         (0, 0, 0),

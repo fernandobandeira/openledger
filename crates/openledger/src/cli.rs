@@ -47,11 +47,35 @@ anyone who can read the process table.";
 const SERVE_ABOUT: &str = "\
 Serve the ledger API until stopped.
 
-One endpoint today: POST /v1/transactions, the posting engine
-behind it (M3). Run `openledger migrate` first: serve checks
-that the schema is current before it listens, and an unmigrated
-or behind database is exit 1 naming that command. The check
-takes no locks — the serving process never migrates (ADR-0003).";
+Six endpoints: POST /v1/transactions and the posting engine
+behind it (M3), plus the five reads of M5 — one account balance,
+the trial balance, the balance sheet, the income statement and a
+transaction read-back. Run `openledger migrate` first: serve
+checks that the schema is current before it listens, and an
+unmigrated or behind database is exit 1 naming that command. The
+check takes no locks — the serving process never migrates
+(ADR-0003).";
+
+const READ_DATABASE_URL_HELP: &str = "\
+PostgreSQL connection string for the READ path.
+
+Reads run on their own pool, and should run on their own login:
+a login whose only role membership is openledger_read. That is
+what makes the per-tenant fence structural rather than
+remembered — RLS policies are permissive and OR'd, so a login
+that can also write matches the writer's USING (true) and reads
+EVERY tenant, with every policy in the schema exactly as
+written (ADR-0019).
+
+Omitted, this falls back to DATABASE_URL. That deployment still
+works, because every read transaction issues SET LOCAL ROLE
+openledger_read of its own — but the fence is then one statement
+rather than a property of the credential, so supply this in
+production. The login behind it must be a member of
+openledger_read; the pool assumes that role on connect.
+
+Prefer READ_DATABASE_URL over this flag, which is visible to
+anyone who can read the process table.";
 
 const RECONCILE_ABOUT: &str = "\
 Run the ten reconciliation checks, then exit.
@@ -169,6 +193,22 @@ pub enum Command {
             long_help = DATABASE_URL_HELP
         )]
         database_url: Option<String>,
+
+        /// PostgreSQL connection string for the read path
+        ///
+        // `Option` and no `required`: a deployment that has not created its
+        // read login yet falls back to DATABASE_URL, and the read path's
+        // `SET LOCAL ROLE` is what keeps the tenant fence in that case
+        // (ADR-0019). Nothing here refuses the fallback — the help text names
+        // what it costs.
+        #[arg(
+            long,
+            env = "READ_DATABASE_URL",
+            hide_env_values = true,
+            value_name = "URL",
+            long_help = READ_DATABASE_URL_HELP
+        )]
+        read_database_url: Option<String>,
 
         /// Address to listen on
         ///

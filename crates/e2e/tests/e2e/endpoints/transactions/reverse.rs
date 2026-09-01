@@ -7,9 +7,11 @@
 //! because it is the same endpoint's third request shape.
 //!
 //! THE ORDER OF THIS FILE: the two green paths (the mirror, the void) → the
-//! void's return-shape pin (its own creation, never a replay of itself) →
-//! the effective-date convention (omitted defaults to the target's; a lower
-//! date is accepted; absence outside a reversal is refused) → the refusals,
+//! replay contract for both (each key replays its own stored result, never a
+//! second mirror and never a second marker) → the effective-date convention
+//! (omitted defaults to the target's; a lower date is accepted as given —
+//! while the absence of a date OUTSIDE a reversal is a plain posting's
+//! refusal, held in `post.rs`) → the refusals,
 //! each red against a specific guard: a request carrying postings, a target
 //! that does not exist (or exists on another tenant's book), a target that
 //! is itself a supersession (the neither-pointer arm — reversing a
@@ -23,7 +25,7 @@
 use sqlx::AssertSqlSafe;
 use uuid::Uuid;
 
-use crate::support::{TestBook, TestResult, header};
+use crate::support::{AClose, TestBook, TestResult, close_the_period, header, post_a_pending_hold};
 
 /// One posted 25.00 charge between the fixture pair, the mirror tests'
 /// target. Returns the charge's transaction id.
@@ -52,33 +54,6 @@ async fn post_one_charge(
         .parse()?)
 }
 
-/// One pending 5.00 hold between the fixture pair, the void tests' target.
-async fn post_a_pending_hold(
-    book: &TestBook,
-    revenue: Uuid,
-    receivable: Uuid,
-) -> Result<Uuid, Box<dyn std::error::Error>> {
-    let created = book
-        .post(&serde_json::json!({
-            "tenant_id": "t1",
-            "idempotency_key": "hold-1",
-            "effective_at": "2026-08-28T00:00:00Z",
-            "status": "pending",
-            "postings": [{
-                "source": revenue, "destination": receivable,
-                "amount_minor": 500, "currency": "USD"
-            }],
-        }))
-        .await?;
-    assert_eq!(created.status(), 201, "seeding the pending hold");
-    let body: serde_json::Value = created.json().await?;
-    Ok(body
-        .get("transaction_id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("no transaction_id on the pending 201")?
-        .parse()?)
-}
-
 /// The (status, reverses_id, entry count) of one transaction row — what the
 /// reversal tests must see: the marker's shape, and the original unmutated.
 async fn shape_of(book: &TestBook, id: Uuid) -> Result<(String, Option<Uuid>, i64), sqlx::Error> {
@@ -94,7 +69,7 @@ async fn shape_of(book: &TestBook, id: Uuid) -> Result<(String, Option<Uuid>, i6
 }
 
 #[tokio::test]
-async fn a_mirror_reversal_moves_the_cache_back_and_replays_its_stored_result() -> TestResult {
+async fn a_mirror_reversal_is_a_new_posted_transaction_that_moves_the_cache_back() -> TestResult {
     let book = TestBook::new("reverse_mirror").await?;
     let (receivable, revenue) = book.fixture_accounts().await?;
     let charge = post_one_charge(&book, revenue, receivable).await?;
@@ -155,14 +130,37 @@ async fn a_mirror_reversal_moves_the_cache_back_and_replays_its_stored_result() 
     .fetch_one(&book.pool)
     .await?;
     assert!(netted, "a mirrored charge must net to zero on the face");
+    assert_eq!(book.write_counts().await?, (2, 2, 4));
+    book.assert_reconciled().await
+}
 
-    // ...and the reversal's key replays its stored result (ADR-0013 §2 is
-    // shape-blind), never a second mirror.
+/// The reversal's own key under ADR-0013 §2, which is shape-blind: a retry
+/// replays the stored result and never derives a SECOND mirror — which on
+/// this shape would move the cache back twice off one caller's one intent.
+#[tokio::test]
+async fn a_reversals_key_replays_its_stored_mirror() -> TestResult {
+    let book = TestBook::new("reverse_mirror_replay").await?;
+    let (receivable, revenue) = book.fixture_accounts().await?;
+    let charge = post_one_charge(&book, revenue, receivable).await?;
+    let reversal_body = serde_json::json!({
+        "tenant_id": "t1",
+        "idempotency_key": "undo-1",
+        "effective_at": "2026-08-29T00:00:00Z",
+        "reverses_id": charge,
+    });
+    let reversed = book.post(&reversal_body).await?;
+    assert_eq!(reversed.status(), 201, "seeding the mirror");
+    let mirror: serde_json::Value = reversed.json().await?;
+
     let replayed = book.post(&reversal_body).await?;
+
     assert_eq!(replayed.status(), 200);
     assert_eq!(header(&replayed, "idempotency-replayed")?, "true");
     let replay: serde_json::Value = replayed.json().await?;
-    assert_eq!(replay, body, "the reversal key must replay its own result");
+    assert_eq!(
+        replay, mirror,
+        "the reversal key must replay its own result"
+    );
     assert_eq!(book.write_counts().await?, (2, 2, 4));
     book.assert_reconciled().await
 }
@@ -271,13 +269,14 @@ async fn a_void_is_its_own_creation_never_a_replay_of_itself() -> TestResult {
     book.assert_reconciled().await
 }
 
-/// The effective-date convention's other halves: a caller-supplied date
-/// BELOW the target's is accepted as given (the soft convention — the as-of
-/// window between the two dates is ADR-0016's recorded cost, not a refusal),
-/// and OUTSIDE a reversal the absence of effective_at stays a refusal — the
-/// writer does not invent dates for postings.
+/// The effective-date convention's other half: a caller-supplied date BELOW
+/// the target's is accepted AS GIVEN — the soft convention, where the as-of
+/// window between the two dates is ADR-0016's recorded cost rather than a
+/// refusal. (The convention's third half — that outside a reversal the
+/// absence of `effective_at` stays a refusal — is a plain posting's contract,
+/// held in `post.rs` where plain postings live.)
 #[tokio::test]
-async fn a_below_target_date_is_accepted_and_absence_outside_a_reversal_refused() -> TestResult {
+async fn a_reversal_dated_below_its_target_is_accepted_as_given() -> TestResult {
     let book = TestBook::new("reverse_dates").await?;
     let (receivable, revenue) = book.fixture_accounts().await?;
     let charge = post_one_charge(&book, revenue, receivable).await?;
@@ -310,40 +309,23 @@ async fn a_below_target_date_is_accepted_and_absence_outside_a_reversal_refused(
     .fetch_one(&book.pool)
     .await?;
     assert!(dated, "the supplied date must be taken as given");
-
-    // A plain posting with no effective_at: refused by name, nothing written.
-    let undated = book
-        .post(&serde_json::json!({
-            "tenant_id": "t1",
-            "idempotency_key": "undated-charge",
-            "postings": [{
-                "source": revenue, "destination": receivable,
-                "amount_minor": 100, "currency": "USD"
-            }],
-        }))
-        .await?;
-
-    assert_eq!(undated.status(), 422);
-    let error: serde_json::Value = undated.json().await?;
-    assert_eq!(error.get("type"), Some(&"invalid_request".into()));
-    let detail = error.get("detail").and_then(serde_json::Value::as_str);
-    assert!(
-        detail.is_some_and(|detail| detail.contains("unless the request is a reversal")),
-        "the refusal must name the one exception; detail was {detail:?}"
-    );
+    // The charge and its mirror, and nothing else.
     assert_eq!(book.write_counts().await?, (2, 2, 4));
     book.assert_reconciled().await
 }
 
+/// Two shapes the constructor refuses, each with its own sentence in the
+/// detail: a reversal that RESTATES the mirror by hand — exactly the failure
+/// surface the no-postings rule exists to remove — and a reversal posted as
+/// PENDING, one request moving the pending population twice (the constructor
+/// twin of the pending resolution).
 #[tokio::test]
 async fn a_reversal_carrying_postings_or_posted_as_pending_is_refused() -> TestResult {
     let book = TestBook::new("reverse_with_postings").await?;
     let (receivable, revenue) = book.fixture_accounts().await?;
     let charge = post_one_charge(&book, revenue, receivable).await?;
 
-    // The caller restates the mirror by hand — exactly the failure surface
-    // the no-postings rule exists to remove.
-    let refused = book
+    let carries_postings = book
         .post(&serde_json::json!({
             "tenant_id": "t1",
             "idempotency_key": "undo-1",
@@ -355,18 +337,7 @@ async fn a_reversal_carrying_postings_or_posted_as_pending_is_refused() -> TestR
             }],
         }))
         .await?;
-
-    assert_eq!(refused.status(), 422);
-    let error: serde_json::Value = refused.json().await?;
-    assert_eq!(error.get("type"), Some(&"invalid_request".into()));
-    let detail = error.get("detail").and_then(serde_json::Value::as_str);
-    assert!(
-        detail.is_some_and(|detail| detail.contains("must not carry postings")),
-        "the refusal must say the mirror is derived; detail was {detail:?}"
-    );
-    // ...and so is a pending "reversal": one request moving the pending
-    // population twice (the constructor twin of the pending resolution).
-    let pending_reversal = book
+    let posted_as_pending = book
         .post(&serde_json::json!({
             "tenant_id": "t1",
             "idempotency_key": "undo-pending",
@@ -375,40 +346,44 @@ async fn a_reversal_carrying_postings_or_posted_as_pending_is_refused() -> TestR
         }))
         .await?;
 
-    assert_eq!(pending_reversal.status(), 422);
-    let error: serde_json::Value = pending_reversal.json().await?;
-    assert_eq!(error.get("type"), Some(&"invalid_request".into()));
-    let detail = error.get("detail").and_then(serde_json::Value::as_str);
-    assert!(
-        detail.is_some_and(|detail| detail.contains("cannot itself be pending")),
-        "a pending reversal must be refused by shape; detail was {detail:?}"
-    );
+    for (case, says, refused) in [
+        (
+            "a reversal carrying postings",
+            "must not carry postings",
+            carries_postings,
+        ),
+        (
+            "a reversal posted as pending",
+            "cannot itself be pending",
+            posted_as_pending,
+        ),
+    ] {
+        assert_eq!(refused.status(), 422, "{case} must be refused");
+        let error: serde_json::Value = refused.json().await?;
+        assert_eq!(
+            error.get("type"),
+            Some(&"invalid_request".into()),
+            "for {case}"
+        );
+        let detail = error.get("detail").and_then(serde_json::Value::as_str);
+        assert!(
+            detail.is_some_and(|detail| detail.contains(says)),
+            "{case} must be refused by shape, saying {says:?}; detail was {detail:?}"
+        );
+    }
+    // The one charge, and nothing from either refusal.
     assert_eq!(book.write_counts().await?, (1, 1, 2));
     book.assert_reconciled().await
 }
 
+/// Two targets t1 cannot reverse, and the point is that they are the SAME
+/// refusal: one that exists nowhere, and one that exists on ANOTHER tenant's
+/// book. The gate reads only this tenant's transactions — drop the tenant
+/// from its WHERE and the second of these mirrors another book's money.
 #[tokio::test]
 async fn reversing_a_missing_or_foreign_target_is_refused() -> TestResult {
     let book = TestBook::new("reverse_ghost").await?;
     let (t2_receivable, t2_revenue) = book.fixture_accounts_for("t2").await?;
-
-    // A target that exists nowhere: 422, named, the claim rolled back.
-    let refused = book
-        .post(&serde_json::json!({
-            "tenant_id": "t1",
-            "idempotency_key": "undo-ghost",
-            "reverses_id": Uuid::from_u128(0xDEAD_BEEF),
-        }))
-        .await?;
-
-    assert_eq!(refused.status(), 422);
-    let error: serde_json::Value = refused.json().await?;
-    assert_eq!(error.get("type"), Some(&"reverse_target_unknown".into()));
-    assert_eq!(book.write_counts().await?, (0, 0, 0));
-
-    // A target on ANOTHER tenant's book is the same refusal: the gate reads
-    // only this tenant's transactions — drop the tenant from its WHERE and
-    // this mirrors another book's money.
     let t2_charge = book
         .post(&serde_json::json!({
             "tenant_id": "t2",
@@ -420,9 +395,17 @@ async fn reversing_a_missing_or_foreign_target_is_refused() -> TestResult {
             }],
         }))
         .await?;
-    assert_eq!(t2_charge.status(), 201);
+    assert_eq!(t2_charge.status(), 201, "seeding t2's charge");
     let t2_charge: serde_json::Value = t2_charge.json().await?;
-    let cross = book
+
+    let nowhere = book
+        .post(&serde_json::json!({
+            "tenant_id": "t1",
+            "idempotency_key": "undo-ghost",
+            "reverses_id": Uuid::from_u128(0xDEAD_BEEF),
+        }))
+        .await?;
+    let on_another_book = book
         .post(&serde_json::json!({
             "tenant_id": "t1",
             "idempotency_key": "undo-cross",
@@ -430,10 +413,25 @@ async fn reversing_a_missing_or_foreign_target_is_refused() -> TestResult {
         }))
         .await?;
 
-    assert_eq!(cross.status(), 422);
-    let error: serde_json::Value = cross.json().await?;
-    assert_eq!(error.get("type"), Some(&"reverse_target_unknown".into()));
-    assert_eq!(book.write_counts().await?, (1, 1, 2));
+    for (case, refused) in [
+        ("a target that exists nowhere", nowhere),
+        ("a target on another tenant's book", on_another_book),
+    ] {
+        assert_eq!(refused.status(), 422, "reversing {case} must be refused");
+        let error: serde_json::Value = refused.json().await?;
+        assert_eq!(
+            error.get("type"),
+            Some(&"reverse_target_unknown".into()),
+            "for {case}"
+        );
+    }
+    // Only t2's charge on the book — the claim rolled back for BOTH of t1's
+    // attempts.
+    assert_eq!(
+        book.write_counts().await?,
+        (1, 1, 2),
+        "a refused reversal left rows behind"
+    );
     book.assert_reconciled().await
 }
 
@@ -522,33 +520,31 @@ async fn reversing_a_period_close_is_refused() -> TestResult {
     let book = TestBook::new("reverse_close").await?;
     let (receivable, revenue) = book.fixture_accounts().await?;
     post_one_charge(&book, revenue, receivable).await?;
-    sqlx::raw_sql(AssertSqlSafe(
-        "INSERT INTO ledger_periods (tenant_id, code, starts_at, ends_at, tz)
-         VALUES ('t1', '2026-07', '2026-07-01T00:00:00Z', '2026-08-01T00:00:00Z', 'UTC');
-         INSERT INTO ledger_events (tenant_id, id, kind, source, idempotency_key,
-                                    idempotency_hash, payload, effective_at)
-         VALUES ('t1', '0e2e0000-0000-7000-8000-000000000080', 'period_close', 'internal',
-                 'close-2026-07', decode('00', 'hex'), '{}'::jsonb, '2026-07-31T00:00:00Z');
-         INSERT INTO ledger_transactions (tenant_id, id, event_id, kind, status, effective_at)
-         VALUES ('t1', '0e2e0000-0000-7000-8000-000000000081',
-                 '0e2e0000-0000-7000-8000-000000000080', 'period_close', 'posted',
-                 '2026-07-31T00:00:00Z');
-         INSERT INTO ledger_period_closes (tenant_id, period_code, currency, starts_at,
-                                           ends_at, transaction_id, txn_effective_at,
-                                           computed_at_xid)
-         VALUES ('t1', '2026-07', 'USD', '2026-07-01T00:00:00Z', '2026-08-01T00:00:00Z',
-                 '0e2e0000-0000-7000-8000-000000000081', '2026-07-31T00:00:00Z',
-                 pg_current_xact_id())"
-            .to_owned(),
-    ))
-    .execute(&book.pool)
+    // Injected by the SHARED close helper (support/book.rs), the one
+    // `reconcile.rs`'s forgeries are one field away from — because a second
+    // hand-rolled copy of these INSERTs is a copy that rots away from what
+    // the sweep now demands of a close.
+    let close = close_the_period(
+        &book,
+        &AClose {
+            period: "2026-07",
+            starts_at: "2026-07-01T00:00:00Z",
+            ends_at: "2026-08-01T00:00:00Z",
+            closes_at: "2026-07-31T00:00:00Z",
+            ids: "80",
+            computed_at_xid: "pg_current_xact_id()",
+            sweeps: None,
+            recorded: true,
+            checkpointed: true,
+        },
+    )
     .await?;
 
     let refused = book
         .post(&serde_json::json!({
             "tenant_id": "t1",
             "idempotency_key": "undo-the-close",
-            "reverses_id": "0e2e0000-0000-7000-8000-000000000081",
+            "reverses_id": close,
         }))
         .await?;
 
@@ -617,7 +613,7 @@ async fn a_resolved_pending_cannot_be_voided_nor_a_voided_one_resolved() -> Test
         }))
         .await?;
     assert_eq!(captured.status(), 201);
-    let voided_hold = book
+    let held = book
         .post(&serde_json::json!({
             "tenant_id": "t1",
             "idempotency_key": "hold-2",
@@ -629,9 +625,9 @@ async fn a_resolved_pending_cannot_be_voided_nor_a_voided_one_resolved() -> Test
             }],
         }))
         .await?;
-    assert_eq!(voided_hold.status(), 201);
-    let voided_hold: serde_json::Value = voided_hold.json().await?;
-    let voided_hold = voided_hold
+    assert_eq!(held.status(), 201, "seeding the hold to void");
+    let held_body: serde_json::Value = held.json().await?;
+    let voided_hold = held_body
         .get("transaction_id")
         .and_then(serde_json::Value::as_str)
         .ok_or("no transaction_id")?

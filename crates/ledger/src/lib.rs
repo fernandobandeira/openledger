@@ -24,10 +24,20 @@
 //! `repository` is the outbound port the adapter implements; and `service`
 //! is the writer — the claim-or-replay use-case, orchestrated over the
 //! repository.
+//!
+//! The read path is the same layout again, one ring over (ADR-0019): `reports`
+//! is the second INBOUND port — a port of its own rather than a method on
+//! [`Ledger`], because every variant of [`WriteError`] except `Storage`
+//! promises *"nothing was written"* and a read cannot say that; `report_store`
+//! is its outbound port; and `report_service` is the reader, whose one piece of
+//! judgement is the cursor rule.
 
 mod domain;
 mod port;
 mod postings;
+mod report_service;
+mod report_store;
+mod reports;
 mod repository;
 mod service;
 
@@ -40,6 +50,16 @@ mod service;
 pub use domain::{Invalid, PostTransaction, Posted, Posting, TransactionStatus};
 pub use port::{Ledger, WriteError};
 pub use postings::{Append, Delta, Direction, Leg};
+pub use report_service::ReportService;
+pub use report_store::{
+    BalanceSheetRead, IncomeStatementRead, ReadBounds, ReportRefusal, ReportStore, Scoped,
+    TrialBalanceRead,
+};
+pub use reports::{
+    AccountBalance, AccountBalanceQuery, BalanceSheetQuery, Cursor, CursorUnparseable,
+    IncomeStatementQuery, ReadError, Reports, Statement, StatementLine, Transaction,
+    TransactionEntry, TransactionQuery, TrialBalance, TrialBalanceQuery, TrialBalanceRow,
+};
 pub use repository::{
     Appended, BalanceUpsert, BatchMember, Claimed, MemberOutcome, Repository, StorageError,
     StoredResult, SupersedeRefusal,

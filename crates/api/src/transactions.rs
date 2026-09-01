@@ -1,17 +1,29 @@
-//! The one endpoint: its wire types, its handler, and the `#[utoipa::path]`
-//! annotation the committed spec is generated from. The types double as the
-//! schema — what the handler deserializes IS what the spec documents, so body
-//! drift is structurally impossible; status, header and path drift are not,
-//! which is what `tests/spec.rs` and the e2e conformance test hold.
+//! The transaction resource: post one, and read one back. Their wire types,
+//! their handlers, and the `#[utoipa::path]` annotations the committed spec is
+//! generated from. The types double as the schema — what the handler
+//! deserializes IS what the spec documents, so body drift is structurally
+//! impossible; status, header and path drift are not, which is what
+//! `tests/spec.rs` and the e2e conformance test hold.
+//!
+//! The read-back half arrived with ADR-0019, and its argument is that a
+//! write-only API is not an adoption surface: the post below answers two
+//! UUIDs, and until now nothing over HTTP could say what they point at —
+//! while ADR-0016 made `status`, `resolves_id` and `reverses_id` wire concepts
+//! a caller could not read back. It is cheap in the way scope creep is not:
+//! one statement, by primary key, no cursor (the rows are immutable) and no
+//! chart version.
 
-use axum::extract::{FromRequest, Request, State};
+use axum::extract::State;
 use axum::http::{HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
-use ledger::Ledger;
+use ledger::{Ledger, Reports};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
+
+use crate::reports::refusal_for_read;
+use crate::wire::{Body, ErrorBody, Params, Segment, refuse};
 
 const IDEMPOTENCY_REPLAYED: HeaderName = HeaderName::from_static("idempotency-replayed");
 
@@ -106,49 +118,6 @@ pub(crate) struct TransactionCreated {
     transaction_id: Option<Uuid>,
 }
 
-/// The error body: a stable machine-readable `type`, prose in `detail`.
-#[derive(Serialize, ToSchema)]
-pub(crate) struct ErrorBody {
-    /// Stable machine-readable identifier. Parse this, never `detail`.
-    #[schema(example = "invalid_request")]
-    r#type: &'static str,
-    /// Human-readable explanation. Not stable; do not parse.
-    detail: String,
-}
-
-fn refuse(status: StatusCode, r#type: &'static str, detail: String) -> Response {
-    (status, axum::Json(ErrorBody { r#type, detail })).into_response()
-}
-
-/// `axum::Json`, wearing the documented refusal shape: axum's own body
-/// rejections (syntax, wrong type, missing content-type, oversized) render
-/// its default plain-text bodies, which are not the [`ErrorBody`] the spec
-/// documents. This wrapper keeps the status axum chose — 400 for broken
-/// JSON, 413 for an oversized body, 415 for the wrong `Content-Type`, 422
-/// for a field that fails to deserialize — and re-renders the message as
-/// `{type: "invalid_request", detail}`, so every refusal on this surface is
-/// machine-readable the same way.
-pub(crate) struct Body<T>(pub(crate) T);
-
-impl<S, T> FromRequest<S> for Body<T>
-where
-    S: Send + Sync,
-    T: serde::de::DeserializeOwned,
-{
-    type Rejection = Response;
-
-    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        match axum::Json::<T>::from_request(req, state).await {
-            Ok(axum::Json(value)) => Ok(Self(value)),
-            Err(rejection) => Err(refuse(
-                rejection.status(),
-                "invalid_request",
-                rejection.body_text(),
-            )),
-        }
-    }
-}
-
 /// Post a transaction.
 ///
 /// The response set below is this endpoint's real one, not a shared error
@@ -231,12 +200,13 @@ where
         ),
     ),
 )]
-pub(crate) async fn post_transaction<L>(
-    State(state): State<crate::AppState<L>>,
+pub(crate) async fn post_transaction<L, R>(
+    State(state): State<crate::AppState<L, R>>,
     Body(body): Body<TransactionBody>,
 ) -> Response
 where
     L: Ledger,
+    R: Reports,
 {
     let command = match to_command(body) {
         Ok(command) => command,
@@ -392,4 +362,171 @@ fn to_command(body: TransactionBody) -> Result<ledger::PostTransaction, ledger::
         body.reverses_id,
         postings,
     )
+}
+
+/// The query half of `GET /v1/transactions/{transaction_id}` — which book to
+/// look in. Named in the query string for the same reason the write path
+/// names it in the body (ADR-0017): data scoping, never an identity claim.
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct TransactionParams {
+    /// The book to read.
+    #[param(example = "t1")]
+    tenant_id: String,
+}
+
+/// A transaction as the book holds it, with its entries.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct TransactionRead {
+    transaction_id: Uuid,
+    /// `posting` for an ordinary transaction, `period_close` for a close.
+    kind: String,
+    /// `pending` or `posted`. **It never mutates**: a pending transaction
+    /// becomes posted by a NEW transaction naming it in `resolves_id`
+    /// (ADR-0016), so a `pending` here is what was recorded and not a stage
+    /// this row is passing through.
+    status: String,
+    /// When the movement is deemed to have happened — the caller's clock.
+    #[serde(with = "time::serde::rfc3339")]
+    effective_at: OffsetDateTime,
+    /// When the row was written — the database's clock. The two axes are
+    /// different questions (ADR-0006) and neither is derivable from the other.
+    #[serde(with = "time::serde::rfc3339")]
+    recorded_at: OffsetDateTime,
+    /// The pending transaction this one resolved, if it is a resolution.
+    #[schema(required)]
+    resolves_id: Option<Uuid>,
+    /// The transaction this one reversed, if it is a reversal.
+    #[schema(required)]
+    reverses_id: Option<Uuid>,
+    /// The event that caused this transaction.
+    event_id: Uuid,
+    /// The legs. **Empty is a real answer**: a reversal of a pending
+    /// transaction is a zero-posting void marker (ADR-0016).
+    entries: Vec<EntryRead>,
+}
+
+/// One leg. `amount_minor` is a JSON number here and a decimal STRING on
+/// every report, and the asymmetry is deliberate (ADR-0019): a single posting
+/// is bounded by its column, and only an aggregate can exceed what a JSON
+/// number carries exactly.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct EntryRead {
+    account_id: Uuid,
+    /// `debit` or `credit`. Direction carries the sign; the amount never does.
+    direction: String,
+    #[schema(example = 2500)]
+    amount_minor: i64,
+    currency: String,
+    /// The account's own gapless sequence number for this leg. The counter is
+    /// per `(account, stripe)` — documented, never exposed: no stripe appears
+    /// in any response (ADR-0013 §4).
+    account_seq: i64,
+}
+
+/// Read a transaction back.
+///
+/// No cursor and no chart version: a transaction and its entries are
+/// immutable (`ck_txn__append_only` and `ck_entries__append_only`, both
+/// `ENABLE ALWAYS`), so there is nothing for an as-of to pin (ADR-0019).
+#[utoipa::path(
+    get,
+    path = "/v1/transactions/{transaction_id}",
+    operation_id = "getTransaction",
+    tag = "transactions",
+    params(
+        ("transaction_id" = Uuid, Path, description = "The transaction to read."),
+        TransactionParams,
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The transaction and its entries. `entries` is empty for a void — the \
+                           zero-posting marker a reversal of a PENDING transaction writes \
+                           (ADR-0016).",
+            body = TransactionRead
+        ),
+        (
+            status = 404,
+            description = "No such transaction on this tenant's book. `type` is \
+                           `transaction_unknown`. Note that an unknown TENANT is not 404 but \
+                           200-with-nothing on the report routes, and 404 here: there is no \
+                           tenant registry to consult, so a wrong `tenant_id` is \
+                           indistinguishable from a book that does not hold this transaction.",
+            body = ErrorBody
+        ),
+        (
+            status = 422,
+            description = "Refused. `type` is `tenant_mismatch` — the `tenant_id` asked about is \
+                           not the scope the read path set on the session. Vacuous today by \
+                           construction and declared anyway (ADR-0019).",
+            body = ErrorBody
+        ),
+        (
+            status = 400,
+            description = "A required query parameter is missing, or a value would not \
+                           deserialize into its documented type — including a \
+                           `transaction_id` path segment that is not a UUID. `type` is \
+                           `invalid_request`.",
+            body = ErrorBody
+        ),
+        (
+            status = 503,
+            description = "The read exceeded the read pool's `statement_timeout` (`57014`). \
+                           `type` is `report_timed_out`. **503, not 500 and not 504**: the \
+                           service is healthy, the request was too expensive, and retrying it \
+                           unchanged fails identically (ADR-0019).",
+            body = ErrorBody
+        ),
+        (
+            status = 500,
+            description = "The read failed. `type` is `internal`, and the caller gets no \
+                           internals — the operator's log has the error.",
+            body = ErrorBody
+        ),
+    ),
+)]
+pub(crate) async fn get_transaction<L, R>(
+    State(state): State<crate::AppState<L, R>>,
+    Segment(transaction_id): Segment<Uuid>,
+    Params(params): Params<TransactionParams>,
+) -> Response
+where
+    L: Ledger,
+    R: Reports,
+{
+    let query = ledger::TransactionQuery {
+        tenant_id: params.tenant_id,
+        transaction_id,
+    };
+    match state.reports.transaction(&query).await {
+        Ok(found) => answer_the_transaction(found),
+        Err(refused) => refusal_for_read(refused),
+    }
+}
+
+/// The transaction on the wire, rendered from what the book holds.
+fn answer_the_transaction(found: ledger::Transaction) -> Response {
+    axum::Json(TransactionRead {
+        transaction_id: found.transaction_id,
+        kind: found.kind,
+        status: found.status,
+        effective_at: found.effective_at,
+        recorded_at: found.recorded_at,
+        resolves_id: found.resolves_id,
+        reverses_id: found.reverses_id,
+        event_id: found.event_id,
+        entries: found
+            .entries
+            .into_iter()
+            .map(|entry| EntryRead {
+                account_id: entry.account_id,
+                direction: entry.direction,
+                amount_minor: entry.amount_minor,
+                currency: entry.currency,
+                account_seq: entry.account_seq,
+            })
+            .collect(),
+    })
+    .into_response()
 }

@@ -38,6 +38,41 @@ pub fn charge(key: &str, source: Uuid, destination: Uuid) -> serde_json::Value {
     })
 }
 
+/// One pending 5.00 between the fixture pair, posted through the front door
+/// — the injection the reconcile suite used to fake over an admin connection,
+/// now the endpoint's own. Returns the pending transaction id.
+///
+/// It lives here rather than in one endpoint file because two of them stage
+/// it identically: `pending.rs` needs a hold to resolve and `reverse.rs` needs
+/// one to void, and "a hold of 5.00 under `hold-1`, dated 2026-08-28" is a
+/// property of the FIXTURE, not of either file. It asserts its own 201 — see
+/// [`TestBook::post_all_at_once`] on where that line runs.
+pub async fn post_a_pending_hold(
+    book: &TestBook,
+    revenue: Uuid,
+    receivable: Uuid,
+) -> Result<Uuid, Box<dyn std::error::Error>> {
+    let created = book
+        .post(&serde_json::json!({
+            "tenant_id": "t1",
+            "idempotency_key": "hold-1",
+            "effective_at": "2026-08-28T00:00:00Z",
+            "status": "pending",
+            "postings": [{
+                "source": revenue, "destination": receivable,
+                "amount_minor": 500, "currency": "USD"
+            }],
+        }))
+        .await?;
+    assert_eq!(created.status(), 201, "seeding the pending hold");
+    let body: serde_json::Value = created.json().await?;
+    Ok(body
+        .get("transaction_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("no transaction_id on the pending 201")?
+        .parse()?)
+}
+
 /// Every member of a burst accepted. Called from a test's assert phase, never
 /// from the helper that posts: a burst helper that asserted on the way past
 /// would run this silently at the call site — and in more than one test here
@@ -97,6 +132,9 @@ impl TestBook {
         Self::build(name, true).await
     }
 
+    /// Six named steps, and nothing else: a fresh database, the migrator, a
+    /// pool, the published chart, the URL the server will connect under, and
+    /// the server itself.
     async fn build(
         name: &str,
         serve_as_app_role: bool,
@@ -112,44 +150,12 @@ impl TestBook {
         sqlx::raw_sql(include_str!("../../../../../schema/chart.sql"))
             .execute(&pool)
             .await?;
-
         let serve_url = if serve_as_app_role {
-            // Roles are cluster-wide; the fixture is existence-guarded and
-            // never dropped (postgres.rs says why). Created through the
-            // scratch pool because CREATE ROLE lands on the cluster no
-            // matter which database runs it.
-            postgres::ensure_login_role(&pool, postgres::APP_LOGIN, "openledger_app").await?;
-            // One grant the baseline cannot carry: `_sqlx_migrations` is
-            // sqlx's own bookkeeping table, created by the migrator and
-            // owned by whoever ran it — the frozen baseline's GRANT lists
-            // predate it by construction. serve's startup gate reads it
-            // (crates/db/src/verify.rs), so a deployment that serves as a
-            // non-owner role makes exactly this grant, and so does this
-            // fixture.
-            sqlx::raw_sql("GRANT SELECT ON _sqlx_migrations TO openledger_app")
-                .execute(&pool)
-                .await?;
-            postgres::swap_credentials(&db_url, postgres::APP_LOGIN, postgres::LOGIN_PASSWORD)?
+            serve_url_under_the_app_role(&pool, &db_url).await?
         } else {
             db_url.clone()
         };
-
-        // The server, bound to port 0; the announced address is the contract.
-        let mut server = Server(
-            postgres::openledger()?
-                .args(["serve", "--bind", "127.0.0.1:0"])
-                .env("DATABASE_URL", &serve_url)
-                .stdout(Stdio::piped())
-                .spawn()?,
-        );
-        let stdout = server.0.stdout.take().ok_or("server stdout not captured")?;
-        let mut announced = String::new();
-        BufReader::new(stdout).read_line(&mut announced)?;
-        let base = announced
-            .trim()
-            .strip_prefix("listening on ")
-            .ok_or_else(|| format!("unexpected first line: {announced:?}"))?
-            .to_owned();
+        let (server, base) = spawn_the_server_and_read_its_address(&serve_url)?;
 
         Ok(Self {
             pool,
@@ -244,8 +250,16 @@ impl TestBook {
 
     /// Every body posted AT ONCE, answered in the order given. The one shape
     /// three files needed and each had written for itself; nothing is
-    /// asserted on the way past, because a helper that asserts hides the
-    /// test's own assert phase inside its arrange phase.
+    /// asserted on the way past, because these statuses ARE the property
+    /// under test in most of the tests that call it.
+    ///
+    /// **The line the suite holds, stated exactly:** no helper ever asserts on
+    /// the property under test — that assertion belongs in the test's own
+    /// assert phase, under the test's own name. Arrange helpers DO assert that
+    /// their fixture landed (`post_a_pending_hold` in this file,
+    /// `post_one_charge` in three files), and that is not the same thing: a silently failed fixture
+    /// surfaces as an incomprehensible downstream failure, so the fixture says
+    /// so where it happened.
     pub async fn post_all_at_once(
         &self,
         bodies: &[serde_json::Value],
@@ -444,6 +458,31 @@ impl TestBook {
         Ok(false)
     }
 
+    /// A spawned burst has REACHED the book, waited for the same bounded way
+    /// as the two polls above rather than with a bare sleep. The e2e suite
+    /// runs on a current-thread runtime, so a burst of `spawn_post` tasks has
+    /// not necessarily sent a byte until something in the test yields; a
+    /// blocking subprocess started before that has nothing to race. Polling
+    /// for an event count above `were` yields, and the condition is
+    /// MONOTONIC — once a member of the burst has committed it stays
+    /// committed, so this cannot pass by luck of a timing window the way a
+    /// 5ms sleep did — and it says exactly what the caller needs: the burst
+    /// is landing, and the rest of it is still in flight.
+    pub async fn wait_until_a_post_of_the_burst_has_landed(&self, were: i64) -> TestResult {
+        for _ in 0..600 {
+            let (events, _, _) = self.write_counts().await?;
+            if events > were {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        Err(format!(
+            "no member of the spawned burst committed within 3s — the book still holds \
+             {were} event(s), so nothing was in flight to race"
+        )
+        .into())
+    }
+
     /// A rival resolution of `pending`, begun and HELD uncommitted — the
     /// staging both directions of the supersession race share (the
     /// adversary's original setup). Full, balanced and correctly cached —
@@ -495,32 +534,228 @@ impl TestBook {
                 .await?;
         assert_eq!(checks.len(), 10, "the reconciliation view lost a check");
         for (check, breaks) in checks {
-            // cursor_forgery carries a `reason` per row ('above_horizon' or
-            // 'predates_txn' — recon_cursor_breaks in the baseline), and the
-            // two point at different culprits; a failure message without it
-            // is a number where a diagnosis could be.
-            if check == "cursor_forgery" && breaks != 0 {
+            // ONE assertion per check, with the diagnosis built into its
+            // message: cursor_forgery carries a `reason` per row
+            // ('above_horizon' or 'predates_txn' — recon_cursor_breaks in the
+            // baseline), and the two point at different culprits, so a bare
+            // number here is a number where a diagnosis could be. Read only
+            // when the check has actually broken, because the reasons query
+            // costs a round trip and every other check's rows are empty.
+            let diagnosis = if check == "cursor_forgery" && breaks != 0 {
                 let reasons: Vec<(String,)> =
                     sqlx::query_as("SELECT coalesce(reason, '?') FROM recon_cursor_breaks")
                         .fetch_all(&self.pool)
                         .await?;
-                assert_eq!(
-                    breaks,
-                    0,
-                    "reconciliation check cursor_forgery reports {breaks} break(s); reasons: {:?}",
+                format!(
+                    "; reasons: {:?}",
                     reasons
                         .iter()
                         .map(|(reason,)| reason.as_str())
                         .collect::<Vec<_>>()
-                );
-            }
+                )
+            } else {
+                String::new()
+            };
             assert_eq!(
                 breaks, 0,
-                "reconciliation check {check} reports {breaks} break(s)"
+                "reconciliation check {check} reports {breaks} break(s){diagnosis}"
             );
         }
         Ok(())
     }
+}
+
+/// The sweep a close performs (ADR-0011 §2): `minor` debited out of
+/// `from_revenue` and credited into `into_retained_earnings`, which is what
+/// makes the period's temporary positions net to zero at the close. A close
+/// with no sweep is a period that had nothing to sweep, and it writes no legs
+/// at all — ADR-0020's empty-close carve-out.
+pub struct ASweep {
+    pub minor: i64,
+    pub from_revenue: Uuid,
+    pub into_retained_earnings: Uuid,
+}
+
+/// The axes a close can be wrong on, one field each — because a close is not
+/// one thing, and since ADR-0020 the sweep names five separate ways for it to
+/// be a `close_typing` break. ADR-0011 §2 says what the closing transaction
+/// CONTAINS, ADR-0020 says what its checkpoint holds and how its cursor
+/// relates to its own transaction, and each of those fails on its own. Spelled
+/// out so every forgery in `reconcile.rs` is ONE field away from the honest
+/// shape it forges, which is what stops a forgery drifting into an unrelated
+/// book.
+///
+/// It lives here rather than in `reconcile.rs` because `reverse.rs` stages a
+/// close too — the kind arm of the reversal gate needs a COMPLETE one, and a
+/// second hand-rolled copy of these five INSERTs is a copy that rots.
+pub struct AClose<'a> {
+    /// the period code and the half-open instants it resolved to
+    pub period: &'a str,
+    pub starts_at: &'a str,
+    pub ends_at: &'a str,
+    /// the closing transaction's own effective date, inside the period
+    /// (`ck_closes__txn_in_period`)
+    pub closes_at: &'a str,
+    /// the last two hex digits of every id this close writes, so two closes on
+    /// one book cannot collide
+    pub ids: &'a str,
+    /// the SQL expression stored as `computed_at_xid`
+    pub computed_at_xid: &'a str,
+    /// the sweep, or `None` for the ENTRYLESS close a period with nothing to
+    /// sweep produces (ADR-0020's carve-out).
+    pub sweeps: Option<ASweep>,
+    /// whether `ledger_period_closes` names the transaction at all. `false` is
+    /// spike 025 F2(a): an honest close whose one INSERT was forgotten.
+    pub recorded: bool,
+    /// whether the checkpoint lands. Computed at the STORED cursor with the
+    /// close's own transaction admitted by identity — migration 00004 part 1's
+    /// `INSERT … SELECT`, verbatim, because a fixture that computes the
+    /// checkpoint some other way is testing the fixture.
+    pub checkpointed: bool,
+}
+
+/// Write one close of `t1`'s book, and return the closing transaction's id.
+/// Every column here is one the app role may INSERT, and the cache is advanced
+/// the way the writer advances it (the entry carries the `last_seq` the cache
+/// row just took), so a close written by this helper leaves `balance_cache`
+/// and `unbalanced_transactions` green and only the axis under test red.
+pub async fn close_the_period(
+    book: &TestBook,
+    close: &AClose<'_>,
+) -> Result<Uuid, Box<dyn std::error::Error>> {
+    let AClose {
+        period,
+        starts_at,
+        ends_at,
+        closes_at,
+        ids,
+        computed_at_xid,
+        sweeps,
+        recorded,
+        checkpointed,
+    } = close;
+    let event = format!("0e2e0000-0000-7000-8000-0000000000{ids}");
+    let txn = format!("0e2e0000-0000-7000-8000-0000000001{ids}");
+    let mut sql = format!(
+        "INSERT INTO ledger_periods (tenant_id, code, starts_at, ends_at, tz)
+         VALUES ('t1', '{period}', '{starts_at}', '{ends_at}', 'UTC');
+         INSERT INTO ledger_events (tenant_id, id, kind, source, idempotency_key,
+                                    idempotency_hash, payload, effective_at)
+         VALUES ('t1', '{event}', 'period_close', 'internal',
+                 'close-{period}', decode('00', 'hex'), '{{}}'::jsonb, '{closes_at}');
+         INSERT INTO ledger_transactions (tenant_id, id, event_id, kind, status, effective_at)
+         VALUES ('t1', '{txn}', '{event}', 'period_close', 'posted', '{closes_at}');"
+    );
+    if let Some(ASweep {
+        minor,
+        from_revenue,
+        into_retained_earnings,
+    }) = sweeps
+    {
+        sql.push_str(&format!(
+            "INSERT INTO ledger_account_balances AS b
+                 (tenant_id, account_id, currency, input, output, last_seq,
+                  owner_type, owner_id_key, purpose, category, normal_balance)
+             SELECT 't1', a.id, 'USD',
+                    CASE WHEN a.id = '{from_revenue}' THEN {minor} ELSE 0 END,
+                    CASE WHEN a.id = '{from_revenue}' THEN 0 ELSE {minor} END,
+                    1, a.owner_type, a.owner_id_key, a.purpose, a.category, a.normal_balance
+             FROM ledger_accounts a
+             WHERE a.tenant_id = 't1' AND a.id IN ('{from_revenue}', '{into_retained_earnings}')
+             ON CONFLICT (tenant_id, account_id, currency, stripe) DO UPDATE
+                SET input = b.input + EXCLUDED.input, output = b.output + EXCLUDED.output,
+                    last_seq = b.last_seq + 1;
+             INSERT INTO ledger_entries (tenant_id, transaction_id, account_id, direction,
+                                         amount_minor, currency, account_seq, effective_at)
+             SELECT 't1', '{txn}', b.account_id,
+                    CASE WHEN b.account_id = '{from_revenue}' THEN 'debit'
+                         ELSE 'credit' END::ledger_direction,
+                    {minor}, 'USD', b.last_seq, '{closes_at}'
+             FROM ledger_account_balances b
+             WHERE b.tenant_id = 't1'
+               AND b.account_id IN ('{from_revenue}', '{into_retained_earnings}');"
+        ));
+    }
+    if *recorded {
+        sql.push_str(&format!(
+            "INSERT INTO ledger_period_closes (tenant_id, period_code, currency, starts_at,
+                                               ends_at, transaction_id, txn_effective_at,
+                                               computed_at_xid)
+             VALUES ('t1', '{period}', 'USD', '{starts_at}', '{ends_at}', '{txn}',
+                     '{closes_at}', {computed_at_xid});"
+        ));
+    }
+    if *checkpointed {
+        sql.push_str(&format!(
+            "INSERT INTO ledger_period_balances (tenant_id, period_code, currency, account_id,
+                                                 input, output)
+             SELECT 't1', '{period}', 'USD', e.account_id,
+                    COALESCE(SUM(e.amount_minor) FILTER (WHERE e.direction = 'debit'), 0),
+                    COALESCE(SUM(e.amount_minor) FILTER (WHERE e.direction = 'credit'), 0)
+             FROM ledger_entries e
+             JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+                                       AND x.status = 'posted'
+             WHERE e.tenant_id = 't1' AND e.currency = 'USD'
+               AND e.effective_at < '{ends_at}'
+               AND (e.xact_id < (SELECT c.computed_at_xid FROM ledger_period_closes c
+                                 WHERE c.tenant_id = 't1' AND c.period_code = '{period}'
+                                   AND c.currency = 'USD')
+                    OR e.transaction_id = '{txn}')
+             GROUP BY e.account_id;"
+        ));
+    }
+    sqlx::raw_sql(AssertSqlSafe(sql))
+        .execute(&book.pool)
+        .await?;
+    Ok(txn.parse()?)
+}
+
+/// The URL a server SERVING AS THE APP ROLE connects under: the login role
+/// exists, it can read the migrator's own bookkeeping table, and the
+/// credentials in the URL are swapped for its own.
+///
+/// Roles are cluster-wide; the fixture is existence-guarded and never dropped
+/// (postgres.rs says why). Created through the scratch pool because CREATE
+/// ROLE lands on the cluster no matter which database runs it.
+async fn serve_url_under_the_app_role(
+    pool: &PgPool,
+    db_url: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    postgres::ensure_login_role(pool, postgres::APP_LOGIN, "openledger_app").await?;
+    // One grant the baseline cannot carry: `_sqlx_migrations` is sqlx's own
+    // bookkeeping table, created by the migrator and owned by whoever ran it
+    // — the frozen baseline's GRANT lists predate it by construction. serve's
+    // startup gate reads it (crates/db/src/verify.rs), so a deployment that
+    // serves as a non-owner role makes exactly this grant, and so does this
+    // fixture.
+    sqlx::raw_sql("GRANT SELECT ON _sqlx_migrations TO openledger_app")
+        .execute(pool)
+        .await?;
+    postgres::swap_credentials(db_url, postgres::APP_LOGIN, postgres::LOGIN_PASSWORD)
+}
+
+/// The compiled binary, serving the given URL on a port the OS chose, and the
+/// base URL it announced on its first line of stdout — bound to port 0, so
+/// the announcement is the contract rather than a number this file guessed.
+fn spawn_the_server_and_read_its_address(
+    serve_url: &str,
+) -> Result<(Server, String), Box<dyn std::error::Error>> {
+    let mut server = Server(
+        postgres::openledger()?
+            .args(["serve", "--bind", "127.0.0.1:0"])
+            .env("DATABASE_URL", serve_url)
+            .stdout(Stdio::piped())
+            .spawn()?,
+    );
+    let stdout = server.0.stdout.take().ok_or("server stdout not captured")?;
+    let mut announced = String::new();
+    BufReader::new(stdout).read_line(&mut announced)?;
+    let base = announced
+        .trim()
+        .strip_prefix("listening on ")
+        .ok_or_else(|| format!("unexpected first line: {announced:?}"))?
+        .to_owned();
+    Ok((server, base))
 }
 
 /// One POST, read to the end — status, the `Idempotency-Replayed` header if

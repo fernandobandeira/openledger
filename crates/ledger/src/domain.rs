@@ -549,20 +549,13 @@ mod tests {
         Ok(())
     }
 
-    /// The byte cap: 512 bytes pass, 513 are refused — the bound that keeps
-    /// the (tenant_id, idempotency_key) pair out of PostgreSQL's btree
-    /// index-row limit (~2704 bytes), where the failure would be a 500.
+    /// The byte cap from above: 513 bytes are refused, in EITHER identity
+    /// string — the bound that keeps the (tenant_id, idempotency_key) pair
+    /// out of PostgreSQL's btree index-row limit (~2704 bytes), where the
+    /// failure would be a 500. That the cap itself stays open is the
+    /// sibling test's to hold.
     #[test]
     fn an_identity_string_past_512_bytes_is_refused() -> Result<(), Invalid> {
-        let at_cap = PostTransaction::new(
-            "acme".to_owned(),
-            "k".repeat(512),
-            Some(OffsetDateTime::UNIX_EPOCH),
-            TransactionStatus::Posted,
-            None,
-            None,
-            vec![posting()?],
-        );
         let past_cap_key = PostTransaction::new(
             "acme".to_owned(),
             "k".repeat(513),
@@ -582,7 +575,6 @@ mod tests {
             vec![posting()?],
         );
 
-        assert!(at_cap.is_ok(), "512 bytes is within the cap");
         assert!(
             past_cap_key.is_err(),
             "a 513-byte idempotency_key must be refused"
@@ -591,6 +583,27 @@ mod tests {
             past_cap_tenant.is_err(),
             "a 513-byte tenant_id must be refused"
         );
+        Ok(())
+    }
+
+    /// The cap from below, so the refusal above cannot be satisfied by a
+    /// check that refuses everything: 512 bytes — the bound exactly — is
+    /// within it and constructs.
+    #[test]
+    fn an_identity_string_of_exactly_512_bytes_is_accepted() -> Result<(), Invalid> {
+        let key_at_cap = "k".repeat(512);
+
+        let at_cap = PostTransaction::new(
+            "acme".to_owned(),
+            key_at_cap,
+            Some(OffsetDateTime::UNIX_EPOCH),
+            TransactionStatus::Posted,
+            None,
+            None,
+            vec![posting()?],
+        );
+
+        assert!(at_cap.is_ok(), "512 bytes is within the cap");
         Ok(())
     }
 
@@ -660,9 +673,9 @@ mod tests {
     }
 
     /// The reversal shape, held whole at the door (ADR-0016, Reversals and
-    /// the void): each illegal combination is a named constructor refusal —
-    /// and the two legal reversal forms construct, `effective_at` omitted
-    /// (deferring to the target's) or supplied.
+    /// the void): each illegal combination is a named constructor refusal.
+    /// That the two LEGAL reversal forms construct — and what their hashes
+    /// cover — is the test below's.
     #[test]
     fn the_reversal_shape_is_held_at_the_constructor() -> Result<(), Invalid> {
         let target = Some(Uuid::from_u128(7));
@@ -727,10 +740,22 @@ mod tests {
 
             assert_eq!(detail, Some(expected));
         }
-        // Both legal forms: date omitted (defaults to the target's in the
-        // statement) and date supplied — each hashes, and the two hashes
-        // DIFFER, because the hash covers what the caller said, never what
-        // the server would derive.
+
+        Ok(())
+    }
+
+    /// What `canonical_bytes` covers on the reversal shape, held through
+    /// three requests that differ in one field each. Both legal forms
+    /// construct here — date omitted (defaulting to the target's in the
+    /// statement) and date supplied — and the hash covers what the CALLER
+    /// said, never what the server would derive: an omitted date and a
+    /// spelled-out one are different requests, and so is the same key
+    /// pointed at a different target. Strip `reverses_id` from
+    /// `canonical_bytes` and the last two hash identical — these asserts
+    /// are the unit-level pin (the e2e reuse test is the wire-level one).
+    #[test]
+    fn a_reversals_hash_covers_its_target_and_whether_the_date_was_given() -> Result<(), Invalid> {
+        let target = Some(Uuid::from_u128(7));
         let deferred = PostTransaction::new(
             "acme".to_owned(),
             "key-1".to_owned(),
@@ -749,15 +774,6 @@ mod tests {
             target,
             vec![],
         )?;
-        assert_ne!(
-            deferred.idempotency_hash()?,
-            dated.idempotency_hash()?,
-            "an omitted and a spelled-out effective_at are different requests"
-        );
-        // ...and the hash covers the TARGET itself: the same key pointed at
-        // a different transaction is a different request. Strip reverses_id
-        // from `canonical_bytes` and these two hash identical — this assert
-        // is the unit-level pin (the e2e reuse test is the wire-level one).
         let other_target = PostTransaction::new(
             "acme".to_owned(),
             "key-1".to_owned(),
@@ -767,9 +783,19 @@ mod tests {
             Some(Uuid::from_u128(8)),
             vec![],
         )?;
-        assert_ne!(
+
+        let (deferred, dated, other_target) = (
             deferred.idempotency_hash()?,
+            dated.idempotency_hash()?,
             other_target.idempotency_hash()?,
+        );
+
+        assert_ne!(
+            deferred, dated,
+            "an omitted and a spelled-out effective_at are different requests"
+        );
+        assert_ne!(
+            deferred, other_target,
             "reversals of different targets must hash differently"
         );
         Ok(())

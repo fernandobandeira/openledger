@@ -73,8 +73,11 @@ async fn the_read_role_sees_one_tenant_when_scoped_and_none_when_not() -> TestRe
             .await?;
         assert_eq!(created.status(), 201, "seeding {tenant}");
     }
-    // The premise the isolation claim needs: BOTH tenants' rows exist, seen
-    // through the admin connection RLS does not bind.
+    // The premise the isolation claim needs, read through the admin
+    // connection RLS does not bind: BOTH tenants' rows exist. Asserted here
+    // in the arrange phase — as the fixture's own witness, the way the
+    // suite's `post_a_pending_hold` asserts its 201 — because a one-tenant
+    // book would make every assertion below vacuously green.
     let admin_tenants: Vec<(String,)> =
         sqlx::query_as("SELECT DISTINCT tenant_id FROM trial_balance ORDER BY tenant_id")
             .fetch_all(&book.pool)
@@ -92,31 +95,33 @@ async fn the_read_role_sees_one_tenant_when_scoped_and_none_when_not() -> TestRe
         postgres::swap_credentials(&book.db_url, postgres::READ_LOGIN, postgres::LOGIN_PASSWORD)?;
     let mut reader = PgConnection::connect(&read_url).await?;
 
-    // Scoped to t1: only t1's rows, and some rows — a zero here would be the
-    // green-because-it-never-ran shape, not isolation.
+    // One session, read twice: scoped to t1, then with the GUC reset. The
+    // pair is one act — the whole claim is that the SAME connection sees one
+    // tenant and then nothing, so neither read means much without the other.
     sqlx::raw_sql("SET app.tenant_id = 't1'")
         .execute(&mut reader)
         .await?;
     let scoped: Vec<(String,)> = sqlx::query_as("SELECT DISTINCT tenant_id FROM trial_balance")
         .fetch_all(&mut reader)
         .await?;
-    assert_eq!(
-        scoped,
-        [("t1".to_owned(),)],
-        "a t1-scoped reader saw other tenants' rows"
-    );
-
-    // GUC unset: ZERO rows. `current_setting('app.tenant_id', true)` is NULL
-    // and `tenant_id = NULL` matches nothing — an unscoped session fails
-    // CLOSED rather than seeing every tenant (ADR-0013 §5).
     sqlx::raw_sql("RESET app.tenant_id")
         .execute(&mut reader)
         .await?;
     let (unscoped,): (i64,) = sqlx::query_as("SELECT count(*) FROM trial_balance")
         .fetch_one(&mut reader)
         .await?;
-    assert_eq!(unscoped, 0, "an unscoped reader must see NO rows, not all");
-
     reader.close().await?;
+
+    // Scoped to t1: only t1's rows, and some rows — a zero here would be the
+    // green-because-it-never-ran shape, not isolation.
+    assert_eq!(
+        scoped,
+        [("t1".to_owned(),)],
+        "a t1-scoped reader saw other tenants' rows"
+    );
+    // GUC unset: ZERO rows. `current_setting('app.tenant_id', true)` is NULL
+    // and `tenant_id = NULL` matches nothing — an unscoped session fails
+    // CLOSED rather than seeing every tenant (ADR-0013 §5).
+    assert_eq!(unscoped, 0, "an unscoped reader must see NO rows, not all");
     book.assert_reconciled().await
 }
