@@ -24,4 +24,5 @@ export default {
   '0021-accounts-over-http': '0021 · Accounts get an API',
   '0022-amounts-are-strings': '0022 · Amounts are strings on the wire',
   '0023-account-statement': '0023 · An account has a statement',
+  '0024-closing-a-period': '0024 · Closing a period',
 }
