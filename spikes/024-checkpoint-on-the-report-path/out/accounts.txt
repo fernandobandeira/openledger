@@ -1,0 +1,45 @@
+            spike_account             |            spike_account             |            spike_account             |            spike_account             |            spike_account             |            spike_account             |            spike_account             |       spike_retained_earnings        
+--------------------------------------+--------------------------------------+--------------------------------------+--------------------------------------+--------------------------------------+--------------------------------------+--------------------------------------+--------------------------------------
+ c8856a97-5207-b0e0-48db-a61dda0bc66c | 198e4c3f-2fa9-9871-7f17-f3406a745aeb | 895a5e5b-2e16-4379-5e53-581eae2f2b4c | b170711a-19d2-dd1f-5f30-4ab406c29d40 | f112515b-180c-4f8d-0942-51c4fe82757a | 6385ce75-58c5-b145-ab4a-5a0f53b8da5b | 4deb0197-d674-6d79-fb2d-46bfabe4706a | 75ddd9cb-6627-d6a1-83e4-22de4e15c1e8
+ 92f28c35-ce0d-d904-739a-39618a6ff8cb | dea978e3-aaf7-1be4-af93-79e95a8d8d38 | 97abb3ad-04b5-380e-b287-5424b1422325 | 8d859372-352f-9546-a930-c6ede13f7906 | 41bb48ec-b1cb-3bf9-a7a2-423bd7812d98 | 2a224ad9-9fe3-2c1b-4af0-5af87213c219 | 0ae3f014-ccec-53d6-68be-369e6e633da4 | e5017d1a-a95d-c080-18fe-549ed1d2f7a4
+ 7f47e121-b9a1-81f4-4587-815530b9d3db | 65d8439a-9a25-0b30-40b8-1023d3be249c | 3aae1be8-a244-d735-fe7d-470a3a26031d | 68ec4f6c-d6d8-a840-1249-61c178ef6c10 | c54c59ce-3d07-52fc-c8b2-c811ee19f7c7 | 4c8b1731-025f-e549-306b-c7d5442bc7a2 | 53a63b84-de2b-3fb2-8cd7-e9a2c29cbd83 | e5f467ee-5405-63b8-82a2-827231db256e
+ 8d3aa0c5-81c2-0602-5c67-720314cc3bbc | b4127311-3b17-f5e6-7b12-1ef86b6e9726 | f68f0f6a-f1bf-17e9-0939-18225153a34b | a38ea8a4-759e-0799-6cd8-2653ccdf87a6 | d6b5f57f-a2b2-1c45-ebd4-1d3f186b513d | 75e90c3b-df9c-ae22-35fa-af98f025d39b | 60f26260-b78d-c86f-11cf-44ab6e4c9047 | 6f81d0d2-ab92-ec27-d738-7b271c32728f
+(4 rows)
+
+--- account ids ---
+ tenant_id |       purpose       | owner_id | currency |                  id                  
+-----------+---------------------+----------+----------+--------------------------------------
+ bk        | credit_loss_expense |          | EUR      | 2a224ad9-9fe3-2c1b-4af0-5af87213c219
+ bk        | customer_receivable | co_1     | EUR      | 92f28c35-ce0d-d904-739a-39618a6ff8cb
+ bk        | customer_receivable | co_2     | EUR      | dea978e3-aaf7-1be4-af93-79e95a8d8d38
+ bk        | customer_wallet     | co_1     | EUR      | 97abb3ad-04b5-380e-b287-5424b1422325
+ bk        | fee_revenue         |          | EUR      | 8d859372-352f-9546-a930-c6ede13f7906
+ bk        | interchange_revenue |          | EUR      | 41bb48ec-b1cb-3bf9-a7a2-423bd7812d98
+ bk        | paid_in_capital     |          | EUR      | 0ae3f014-ccec-53d6-68be-369e6e633da4
+ bk        | retained_earnings   |          | EUR      | e5017d1a-a95d-c080-18fe-549ed1d2f7a4
+ bk        | credit_loss_expense |          | USD      | 6385ce75-58c5-b145-ab4a-5a0f53b8da5b
+ bk        | customer_receivable | co_1     | USD      | c8856a97-5207-b0e0-48db-a61dda0bc66c
+ bk        | customer_receivable | co_2     | USD      | 198e4c3f-2fa9-9871-7f17-f3406a745aeb
+ bk        | customer_wallet     | co_1     | USD      | 895a5e5b-2e16-4379-5e53-581eae2f2b4c
+ bk        | fee_revenue         |          | USD      | b170711a-19d2-dd1f-5f30-4ab406c29d40
+ bk        | interchange_revenue |          | USD      | f112515b-180c-4f8d-0942-51c4fe82757a
+ bk        | paid_in_capital     |          | USD      | 4deb0197-d674-6d79-fb2d-46bfabe4706a
+ bk        | retained_earnings   |          | USD      | 75ddd9cb-6627-d6a1-83e4-22de4e15c1e8
+ nc        | credit_loss_expense |          | EUR      | 75e90c3b-df9c-ae22-35fa-af98f025d39b
+ nc        | customer_receivable | co_1     | EUR      | 8d3aa0c5-81c2-0602-5c67-720314cc3bbc
+ nc        | customer_receivable | co_2     | EUR      | b4127311-3b17-f5e6-7b12-1ef86b6e9726
+ nc        | customer_wallet     | co_1     | EUR      | f68f0f6a-f1bf-17e9-0939-18225153a34b
+ nc        | fee_revenue         |          | EUR      | a38ea8a4-759e-0799-6cd8-2653ccdf87a6
+ nc        | interchange_revenue |          | EUR      | d6b5f57f-a2b2-1c45-ebd4-1d3f186b513d
+ nc        | paid_in_capital     |          | EUR      | 60f26260-b78d-c86f-11cf-44ab6e4c9047
+ nc        | retained_earnings   |          | EUR      | 6f81d0d2-ab92-ec27-d738-7b271c32728f
+ nc        | credit_loss_expense |          | USD      | 4c8b1731-025f-e549-306b-c7d5442bc7a2
+ nc        | customer_receivable | co_1     | USD      | 7f47e121-b9a1-81f4-4587-815530b9d3db
+ nc        | customer_receivable | co_2     | USD      | 65d8439a-9a25-0b30-40b8-1023d3be249c
+ nc        | customer_wallet     | co_1     | USD      | 3aae1be8-a244-d735-fe7d-470a3a26031d
+ nc        | fee_revenue         |          | USD      | 68ec4f6c-d6d8-a840-1249-61c178ef6c10
+ nc        | interchange_revenue |          | USD      | c54c59ce-3d07-52fc-c8b2-c811ee19f7c7
+ nc        | paid_in_capital     |          | USD      | 53a63b84-de2b-3fb2-8cd7-e9a2c29cbd83
+ nc        | retained_earnings   |          | USD      | e5f467ee-5405-63b8-82a2-827231db256e
+(32 rows)
+

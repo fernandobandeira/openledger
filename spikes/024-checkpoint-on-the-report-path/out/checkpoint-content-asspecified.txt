@@ -1,0 +1,32 @@
+ period_code | currency | computed_at_xid | close_txn_xid | equal | breaks_recon_close 
+-------------+----------+-----------------+---------------+-------+--------------------
+ 2026-01     | EUR      |           15622 |         15622 | t     | f
+ 2026-01     | USD      |           15621 |         15621 | t     | f
+ 2026-02     | USD      |           15639 |         15639 | t     | f
+ 2026-03     | USD      |           15648 |         15648 | t     | f
+(4 rows)
+
+ period_code |       purpose       | input | output | dr_pos 
+-------------+---------------------+-------+--------+--------
+ 2026-01     | credit_loss_expense |   100 |      0 |    100
+ 2026-01     | customer_receivable | 10500 |      0 |  10500
+ 2026-01     | customer_wallet     |     0 |    100 |   -100
+ 2026-01     | fee_revenue         |     0 |    500 |   -500
+ 2026-01     | paid_in_capital     |     0 |  10000 | -10000
+ 2026-02     | credit_loss_expense |   100 |    200 |   -100
+ 2026-02     | customer_receivable |   300 |      0 |    300
+ 2026-02     | customer_receivable | 10900 |      0 |  10900
+ 2026-02     | customer_wallet     |   100 |    100 |      0
+ 2026-02     | fee_revenue         |   500 |   1200 |   -700
+ 2026-02     | paid_in_capital     |     0 |  10000 | -10000
+ 2026-02     | retained_earnings   |   100 |    500 |   -400
+ 2026-03     | credit_loss_expense |   200 |    200 |      0
+ 2026-03     | customer_receivable |   300 |      0 |    300
+ 2026-03     | customer_receivable | 11860 |      0 |  11860
+ 2026-03     | customer_wallet     |   100 |    100 |      0
+ 2026-03     | fee_revenue         |  1200 |   1260 |    -60
+ 2026-03     | interchange_revenue |     0 |    900 |   -900
+ 2026-03     | paid_in_capital     |     0 |  10000 | -10000
+ 2026-03     | retained_earnings   |   100 |   1300 |  -1200
+(20 rows)
+

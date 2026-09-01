@@ -1,0 +1,14 @@
+       check_name        | breaks 
+-------------------------+--------
+ accounting_equation     |      0
+ balance_cache           |      0
+ chart_lint              |      0
+ checkpoint_drift        |     12
+ close_typing            |      0
+ cross_scope_mirror      |      0
+ cursor_forgery          |      0
+ journal_to_reports      |      0
+ orphan_entries          |      0
+ unbalanced_transactions |      0
+(10 rows)
+

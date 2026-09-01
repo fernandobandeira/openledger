@@ -1,0 +1,30 @@
+NOTICE:  database "spike024i" does not exist, skipping
+== mode=identity db=spike024i
+== schema: the compiled binary, DATABASE_URL not --database-url
+schema up to date — 3 migrations applied or already present, 176 ms
+   chart + helpers + accounts loaded
+== server on http://127.0.0.1:37585
+== P0 (pre-close cursor) = 16403
+== closed bk/2026-01 in USD and EUR
+== P1 (after the January close and its three backdated arrivals) = 16421
+== closed bk/2026-02 in USD only
+== closed bk/2026-03 in USD
+== P2 (now) = 16443
+
+############ THE GATE: ten checks, zero breaks, or nothing below is a finding
+       check_name        | breaks 
+-------------------------+--------
+ accounting_equation     |      0
+ balance_cache           |      0
+ chart_lint              |      0
+ checkpoint_drift        |     12
+ close_typing            |      0
+ cross_scope_mirror      |      0
+ cursor_forgery          |      0
+ journal_to_reports      |      0
+ orphan_entries          |      0
+ unbalanced_transactions |      0
+(10 rows)
+
+total breaks = 12
+!! the book does not reconcile -- stop

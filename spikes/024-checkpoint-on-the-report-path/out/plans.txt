@@ -1,0 +1,297 @@
+== seeded:
+ entries | accounts | entries_size 
+---------+----------+--------------
+   30000 |      203 | 9960 kB
+(1 row)
+
+== THE GATE
+ check_name | breaks 
+------------+--------
+(0 rows)
+
+total breaks = 0
+
+== THE GATE, after twelve closes
+ check_name | breaks 
+------------+--------
+(0 rows)
+
+total breaks = 0
+checkpoint rows = 2424
+
+== and the reader still agrees on this book (60-point grid is on the small one;
+   here it is the four instants that matter)
+         as_of          | bs_disagreements | tb_disagreements 
+------------------------+------------------+------------------
+ 2026-07-01 00:00:00+00 |                0 |                0
+ 2026-07-15 00:00:00+00 |                0 |                0
+ 2027-01-01 00:00:00+00 |                0 |                0
+ infinity               |                0 |                0
+(4 rows)
+
+=== the indexes that exist on ledger_entries ===
+                                                              def                                                              
+-------------------------------------------------------------------------------------------------------------------------------
+ CREATE INDEX ix_entries__asof_commit ON public.ledger_entries USING btree (tenant_id, account_id, xact_id)
+ CREATE INDEX ix_entries__effective ON public.ledger_entries USING btree (tenant_id, account_id, effective_at, xact_id)
+ CREATE INDEX ix_entries__txn ON public.ledger_entries USING btree (tenant_id, transaction_id)
+ CREATE UNIQUE INDEX pk_entries ON public.ledger_entries USING btree (tenant_id, id)
+ CREATE UNIQUE INDEX uq_entries__account_seq ON public.ledger_entries USING btree (tenant_id, account_id, stripe, account_seq)
+(5 rows)
+
+
+=== TAIL A, tenant-wide: entries effective in [boundary, as_of) ===
+                                                                                                                      QUERY PLAN                                                                                                                      
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ HashAggregate  (cost=1251.60..1254.12 rows=202 width=48)
+   Group Key: account_id
+   ->  Seq Scan on ledger_entries e  (cost=0.00..1243.60 rows=1600 width=24)
+         Filter: ((effective_at >= '2026-12-01 00:00:00+00'::timestamp with time zone) AND (effective_at < '2026-12-20 00:00:00+00'::timestamp with time zone) AND (tenant_id = 'big'::text) AND (xact_id < pg_snapshot_xmin(pg_current_snapshot())))
+(4 rows)
+
+--- ...and with seqscan disabled, to see which index CAN serve it ---
+SET
+                                                                                                                           QUERY PLAN                                                                                                                           
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ HashAggregate  (cost=1488.05..1490.58 rows=202 width=48)
+   Group Key: account_id
+   ->  Bitmap Heap Scan on ledger_entries e  (cost=947.05..1480.05 rows=1600 width=24)
+         Recheck Cond: ((tenant_id = 'big'::text) AND (effective_at >= '2026-12-01 00:00:00+00'::timestamp with time zone) AND (effective_at < '2026-12-20 00:00:00+00'::timestamp with time zone) AND (xact_id < pg_snapshot_xmin(pg_current_snapshot())))
+         ->  Bitmap Index Scan on ix_entries__effective  (cost=0.00..946.65 rows=1600 width=0)
+               Index Cond: ((tenant_id = 'big'::text) AND (effective_at >= '2026-12-01 00:00:00+00'::timestamp with time zone) AND (effective_at < '2026-12-20 00:00:00+00'::timestamp with time zone) AND (xact_id < pg_snapshot_xmin(pg_current_snapshot())))
+(6 rows)
+
+RESET
+
+=== TAIL B, tenant-wide: entries effective below the boundary, committed above the close cursor ===
+                                                                 QUERY PLAN                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------
+ GroupAggregate  (cost=1.50..733.24 rows=100 width=48)
+   Group Key: e.account_id
+   InitPlan 1
+     ->  Seq Scan on ledger_period_closes  (cost=0.00..1.21 rows=1 width=8)
+           Filter: ((tenant_id = 'big'::text) AND (period_code = '2026-11'::text) AND (currency = 'USD'::bpchar))
+   ->  Index Scan using ix_entries__asof_commit on ledger_entries e  (cost=0.29..730.09 rows=138 width=24)
+         Index Cond: ((tenant_id = 'big'::text) AND (xact_id >= (InitPlan 1).col1) AND (xact_id < pg_snapshot_xmin(pg_current_snapshot())))
+         Filter: (effective_at < '2026-12-01 00:00:00+00'::timestamp with time zone)
+(8 rows)
+
+--- ...and with seqscan disabled ---
+SET
+                                                                 QUERY PLAN                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------
+ GroupAggregate  (cost=8.45..740.19 rows=100 width=48)
+   Group Key: e.account_id
+   InitPlan 1
+     ->  Index Scan using pk_closes on ledger_period_closes  (cost=0.14..8.16 rows=1 width=8)
+           Index Cond: ((tenant_id = 'big'::text) AND (period_code = '2026-11'::text) AND (currency = 'USD'::bpchar))
+   ->  Index Scan using ix_entries__asof_commit on ledger_entries e  (cost=0.29..730.09 rows=138 width=24)
+         Index Cond: ((tenant_id = 'big'::text) AND (xact_id >= (InitPlan 1).col1) AND (xact_id < pg_snapshot_xmin(pg_current_snapshot())))
+         Filter: (effective_at < '2026-12-01 00:00:00+00'::timestamp with time zone)
+(8 rows)
+
+RESET
+
+=== the SINGLE-ACCOUNT form ADR-0011 §3 measured, for contrast ===
+                                                                                                 QUERY PLAN                                                                                                 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=9.53..9.54 rows=1 width=32)
+   InitPlan 1
+     ->  Seq Scan on ledger_period_closes  (cost=0.00..1.21 rows=1 width=8)
+           Filter: ((tenant_id = 'big'::text) AND (period_code = '2026-11'::text) AND (currency = 'USD'::bpchar))
+   ->  Index Scan using ix_entries__asof_commit on ledger_entries e  (cost=0.29..8.32 rows=1 width=8)
+         Index Cond: ((tenant_id = 'big'::text) AND (account_id = '147f992f-cfef-cacf-489b-95664c5e0e59'::uuid) AND (xact_id >= (InitPlan 1).col1) AND (xact_id < pg_snapshot_xmin(pg_current_snapshot())))
+         Filter: (effective_at < '2026-12-01 00:00:00+00'::timestamp with time zone)
+(7 rows)
+
+
+=== the two CANDIDATE indexes, created and the same two plans re-taken ===
+CREATE INDEX
+CREATE INDEX
+ANALYZE
+--- TAIL A ---
+                                                                                                                           QUERY PLAN                                                                                                                           
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ HashAggregate  (cost=586.87..589.40 rows=202 width=48)
+   Group Key: account_id
+   ->  Bitmap Heap Scan on ledger_entries e  (cost=45.84..578.87 rows=1601 width=24)
+         Recheck Cond: ((tenant_id = 'big'::text) AND (effective_at >= '2026-12-01 00:00:00+00'::timestamp with time zone) AND (effective_at < '2026-12-20 00:00:00+00'::timestamp with time zone) AND (xact_id < pg_snapshot_xmin(pg_current_snapshot())))
+         ->  Bitmap Index Scan on ix_entries__tenant_effective  (cost=0.00..45.44 rows=1601 width=0)
+               Index Cond: ((tenant_id = 'big'::text) AND (effective_at >= '2026-12-01 00:00:00+00'::timestamp with time zone) AND (effective_at < '2026-12-20 00:00:00+00'::timestamp with time zone) AND (xact_id < pg_snapshot_xmin(pg_current_snapshot())))
+(6 rows)
+
+--- TAIL B ---
+                                                                                                     QUERY PLAN                                                                                                     
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ HashAggregate  (cost=226.52..227.77 rows=100 width=48)
+   Group Key: e.account_id
+   InitPlan 1
+     ->  Seq Scan on ledger_period_closes  (cost=0.00..1.21 rows=1 width=8)
+           Filter: ((tenant_id = 'big'::text) AND (period_code = '2026-11'::text) AND (currency = 'USD'::bpchar))
+   ->  Index Scan using ix_entries__tenant_commit on ledger_entries e  (cost=0.29..224.62 rows=138 width=24)
+         Index Cond: ((tenant_id = 'big'::text) AND (xact_id >= (InitPlan 1).col1) AND (xact_id < pg_snapshot_xmin(pg_current_snapshot())) AND (effective_at < '2026-12-01 00:00:00+00'::timestamp with time zone))
+(7 rows)
+
+
+=== what those two indexes COST: size against the table and its existing indexes ===
+           relname            |  size   
+------------------------------+---------
+ uq_entries__account_seq      | 2072 kB
+ pk_entries                   | 1536 kB
+ ix_entries__txn              | 1160 kB
+ ix_entries__effective        | 992 kB
+ ix_entries__asof_commit      | 240 kB
+ ix_entries__tenant_effective | 224 kB
+ ix_entries__tenant_commit    | 224 kB
+(7 rows)
+
+  heap   | all_indexes 
+---------+-------------
+ 3944 kB | 6448 kB
+(1 row)
+
+
+=== the whole rewritten balance sheet, planned (not run) ===
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Function Scan on balance_sheet_at_ckpt  (cost=0.26..10.26 rows=1000 width=184)
+(1 row)
+
+=== ...and the shipped one, planned ===
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Function Scan on balance_sheet_at  (cost=0.26..10.26 rows=1000 width=184)
+(1 row)
+
+
+=== the bounded reconciliation, planned, against the shipped level form ===
+                                                                                                                                                                                     QUERY PLAN                                                                                                                                                                                     
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=7199.07..7199.08 rows=1 width=8)
+   ->  Hash Full Join  (cost=7096.08..7168.77 rows=2424 width=208)
+         Hash Cond: ((s.tenant_id = c.tenant_id) AND (s.period_code = c.period_code) AND (s.currency = c.currency) AND (s.account_id = e.account_id))
+         Filter: (((COALESCE(s.input, '0'::bigint))::numeric <> COALESCE((COALESCE(sum(e.amount_minor) FILTER (WHERE (e.direction = 'debit'::ledger_direction)), '0'::numeric)), '0'::numeric)) OR ((COALESCE(s.output, '0'::bigint))::numeric <> COALESCE((COALESCE(sum(e.amount_minor) FILTER (WHERE (e.direction = 'credit'::ledger_direction)), '0'::numeric)), '0'::numeric)))
+         ->  Seq Scan on ledger_period_balances s  (cost=0.00..47.24 rows=2424 width=48)
+         ->  Hash  (cost=7047.60..7047.60 rows=2424 width=96)
+               ->  HashAggregate  (cost=7011.24..7047.60 rows=2424 width=96)
+                     Group Key: c.tenant_id, c.period_code, c.currency, e.account_id
+                     ->  Hash Join  (cost=849.64..6210.50 rows=40037 width=44)
+                           Hash Cond: ((e.tenant_id = x.tenant_id) AND (e.transaction_id = x.id))
+                           ->  Nested Loop  (cost=205.81..5356.44 rows=40037 width=64)
+                                 ->  Index Scan using pk_closes on ledger_period_closes c  (cost=0.14..12.31 rows=12 width=48)
+                                 ->  Bitmap Heap Scan on ledger_entries e  (cost=205.68..411.98 rows=3336 width=68)
+                                       Recheck Cond: (((xact_id < c.computed_at_xid) OR (transaction_id = c.transaction_id)) AND (c.tenant_id = tenant_id) AND (effective_at < c.ends_at))
+                                       Filter: (currency = c.currency)
+                                       ->  BitmapAnd  (cost=205.68..205.68 rows=3337 width=0)
+                                             ->  BitmapOr  (cost=94.89..94.89 rows=10010 width=0)
+                                                   ->  Bitmap Index Scan on ix_entries__tenant_commit  (cost=0.00..84.97 rows=10008 width=0)
+                                                         Index Cond: (xact_id < c.computed_at_xid)
+                                                   ->  Bitmap Index Scan on ix_entries__txn  (cost=0.00..8.26 rows=2 width=0)
+                                                         Index Cond: (transaction_id = c.transaction_id)
+                                             ->  Bitmap Index Scan on ix_entries__tenant_effective  (cost=0.00..109.70 rows=10008 width=0)
+                                                   Index Cond: ((tenant_id = c.tenant_id) AND (effective_at < c.ends_at))
+                           ->  Hash  (cost=418.65..418.65 rows=15012 width=20)
+                                 ->  Seq Scan on ledger_transactions x  (cost=0.00..418.65 rows=15012 width=20)
+                                       Filter: (status = 'posted'::ledger_txn_status)
+(26 rows)
+
+                                                                                                                                                                             QUERY PLAN                                                                                                                                                                              
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=60476.57..60476.58 rows=1 width=8)
+   ->  Append  (cost=6293.86..60100.65 rows=30074 width=208)
+         CTE stored
+           ->  WindowAgg  (cost=236.98..321.79 rows=2424 width=80)
+                 Window: w AS (PARTITION BY b.tenant_id, b.currency, b.account_id ORDER BY k.k)
+                 ->  Sort  (cost=236.95..243.01 rows=2424 width=56)
+                       Sort Key: b.tenant_id, b.currency, b.account_id, k.k
+                       ->  Hash Join  (cost=1.94..100.69 rows=2424 width=56)
+                             Hash Cond: ((b.tenant_id = k.tenant_id) AND (b.currency = k.currency) AND (b.period_code = k.period_code))
+                             ->  Seq Scan on ledger_period_balances b  (cost=0.00..47.24 rows=2424 width=48)
+                             ->  Hash  (cost=1.73..1.73 rows=12 width=24)
+                                   ->  Subquery Scan on k  (cost=1.36..1.73 rows=12 width=24)
+                                         ->  WindowAgg  (cost=1.36..1.61 rows=12 width=56)
+                                               Window: w1 AS (PARTITION BY c_2.tenant_id, c_2.currency ORDER BY c_2.ends_at ROWS UNBOUNDED PRECEDING)
+                                               ->  Sort  (cost=1.34..1.37 rows=12 width=24)
+                                                     Sort Key: c_2.tenant_id, c_2.currency, c_2.ends_at
+                                                     ->  Seq Scan on ledger_period_closes c_2  (cost=0.00..1.12 rows=12 width=24)
+         ->  Hash Full Join  (cost=5972.07..58476.03 rows=29873 width=208)
+               Hash Cond: ((s.tenant_id = r.tenant_id) AND (s.currency = r.currency) AND (s.account_id = r.account_id) AND (s.k = r.j))
+               Filter: (((COALESCE(s.d_in, '0'::bigint))::numeric <> COALESCE(r.dr, '0'::numeric)) OR ((COALESCE(s.d_out, '0'::bigint))::numeric <> COALESCE(r.cr, '0'::numeric)))
+               ->  CTE Scan on stored s  (cost=0.00..48.48 rows=2424 width=120)
+               ->  Hash  (cost=5374.59..5374.59 rows=29874 width=96)
+                     ->  Subquery Scan on r  (cost=3806.20..5374.59 rows=29874 width=96)
+                           ->  HashAggregate  (cost=3806.20..5075.85 rows=29874 width=96)
+                                 Group Key: e.tenant_id, e.currency, e.account_id, LEAST(NULLIF(GREATEST(((width_bucket(e.effective_at, (array_agg(cl_indexed.ends_at ORDER BY cl_indexed.k))))::bigint + 1), ((width_bucket(e.xact_id, (array_agg(cl_indexed.computed_at_xid ORDER BY cl_indexed.k))))::bigint + 1)), ((((count(*))::integer))::bigint + 1)), ci.k)
+                                 ->  Hash Join  (cost=647.71..3208.72 rows=29874 width=44)
+                                       Hash Cond: ((e.tenant_id = x.tenant_id) AND (e.transaction_id = x.id))
+                                       ->  Hash Left Join  (cost=3.88..1586.49 rows=29874 width=148)
+                                             Hash Cond: ((e.tenant_id = ci.tenant_id) AND (e.currency = ci.currency) AND (e.transaction_id = ci.transaction_id))
+                                             Filter: (LEAST(NULLIF(GREATEST(((width_bucket(e.effective_at, (array_agg(cl_indexed.ends_at ORDER BY cl_indexed.k))))::bigint + 1), ((width_bucket(e.xact_id, (array_agg(cl_indexed.computed_at_xid ORDER BY cl_indexed.k))))::bigint + 1)), ((((count(*))::integer))::bigint + 1)), ci.k) IS NOT NULL)
+                                             ->  Nested Loop  (cost=1.94..1245.89 rows=30024 width=140)
+                                                   Join Filter: ((e.tenant_id = cl_indexed.tenant_id) AND (cl_indexed.currency = e.currency))
+                                                   ->  GroupAggregate  (cost=1.94..2.28 rows=1 width=76)
+                                                         Group Key: cl_indexed.tenant_id, cl_indexed.currency
+                                                         ->  Incremental Sort  (cost=1.94..2.11 rows=12 width=32)
+                                                               Sort Key: cl_indexed.tenant_id, cl_indexed.currency, cl_indexed.k
+                                                               Presorted Key: cl_indexed.tenant_id, cl_indexed.currency
+                                                               ->  Subquery Scan on cl_indexed  (cost=1.36..1.73 rows=12 width=32)
+                                                                     ->  WindowAgg  (cost=1.36..1.61 rows=12 width=80)
+                                                                           Window: w1 AS (PARTITION BY c.tenant_id, c.currency ORDER BY c.ends_at ROWS UNBOUNDED PRECEDING)
+                                                                           ->  Sort  (cost=1.34..1.37 rows=12 width=24)
+                                                                                 Sort Key: c.tenant_id, c.currency, c.ends_at
+                                                                                 ->  Seq Scan on ledger_period_closes c  (cost=0.00..1.12 rows=12 width=24)
+                                                   ->  Seq Scan on ledger_entries e  (cost=0.00..793.24 rows=30024 width=68)
+                                             ->  Hash  (cost=1.73..1.73 rows=12 width=32)
+                                                   ->  Subquery Scan on ci  (cost=1.36..1.73 rows=12 width=32)
+                                                         ->  WindowAgg  (cost=1.36..1.61 rows=12 width=80)
+                                                               Window: w1 AS (PARTITION BY c_1.tenant_id, c_1.currency ORDER BY c_1.ends_at ROWS UNBOUNDED PRECEDING)
+                                                               ->  Sort  (cost=1.34..1.37 rows=12 width=32)
+                                                                     Sort Key: c_1.tenant_id, c_1.currency, c_1.ends_at
+                                                                     ->  Seq Scan on ledger_period_closes c_1  (cost=0.00..1.12 rows=12 width=32)
+                                       ->  Hash  (cost=418.65..418.65 rows=15012 width=20)
+                                             ->  Seq Scan on ledger_transactions x  (cost=0.00..418.65 rows=15012 width=20)
+                                                   Filter: (status = 'posted'::ledger_txn_status)
+               SubPlan 2
+                 ->  Subquery Scan on k_1  (cost=1.41..1.76 rows=1 width=8)
+                       Filter: (k_1.k = r.j)
+                       ->  WindowAgg  (cost=1.41..1.61 rows=12 width=56)
+                             Window: w1 AS (ORDER BY c_3.ends_at ROWS UNBOUNDED PRECEDING)
+                             Run Condition: (row_number() OVER w1 <= r.j)
+                             ->  Sort  (cost=1.40..1.43 rows=12 width=24)
+                                   Sort Key: c_3.ends_at
+                                   ->  Seq Scan on ledger_period_closes c_3  (cost=0.00..1.18 rows=12 width=24)
+                                         Filter: ((tenant_id = r.tenant_id) AND (currency = r.currency))
+         ->  Subquery Scan on "*SELECT* 2"  (cost=0.00..1152.45 rows=201 width=208)
+               ->  Subquery Scan on sp  (cost=0.00..1149.44 rows=201 width=160)
+                     ->  GroupAggregate  (cost=0.00..793.65 rows=201 width=88)
+                           Group Key: s_1.tenant_id, s_1.currency, s_1.account_id
+                           Filter: (count(*) <> (((SubPlan 5) - min(s_1.k)) + 1))
+                           ->  CTE Scan on stored s_1  (cost=0.00..48.48 rows=2424 width=72)
+                           SubPlan 4
+                             ->  Aggregate  (cost=1.76..1.77 rows=1 width=8)
+                                   ->  WindowAgg  (cost=1.41..1.61 rows=12 width=80)
+                                         Window: w1 AS (ORDER BY c_5.ends_at ROWS UNBOUNDED PRECEDING)
+                                         ->  Sort  (cost=1.40..1.43 rows=12 width=16)
+                                               Sort Key: c_5.ends_at
+                                               ->  Seq Scan on ledger_period_closes c_5  (cost=0.00..1.18 rows=12 width=16)
+                                                     Filter: ((tenant_id = s_1.tenant_id) AND (currency = s_1.currency))
+                           SubPlan 5
+                             ->  Aggregate  (cost=1.76..1.77 rows=1 width=8)
+                                   ->  WindowAgg  (cost=1.41..1.61 rows=12 width=80)
+                                         Window: w1 AS (ORDER BY c_6.ends_at ROWS UNBOUNDED PRECEDING)
+                                         ->  Sort  (cost=1.40..1.43 rows=12 width=16)
+                                               Sort Key: c_6.ends_at
+                                               ->  Seq Scan on ledger_period_closes c_6  (cost=0.00..1.18 rows=12 width=16)
+                                                     Filter: ((tenant_id = s_1.tenant_id) AND (currency = s_1.currency))
+                     SubPlan 3
+                       ->  Subquery Scan on k_2  (cost=1.41..1.76 rows=1 width=8)
+                             Filter: (k_2.k = sp.last_k)
+                             ->  WindowAgg  (cost=1.41..1.61 rows=12 width=56)
+                                   Window: w1 AS (ORDER BY c_4.ends_at ROWS UNBOUNDED PRECEDING)
+                                   Run Condition: (row_number() OVER w1 <= sp.last_k)
+                                   ->  Sort  (cost=1.40..1.43 rows=12 width=24)
+                                         Sort Key: c_4.ends_at
+                                         ->  Seq Scan on ledger_period_closes c_4  (cost=0.00..1.18 rows=12 width=24)
+                                               Filter: ((tenant_id = sp.tenant_id) AND (currency = sp.currency))
+(96 rows)
+

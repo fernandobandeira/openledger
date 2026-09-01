@@ -1,0 +1,30 @@
+ tenant_id |     kind     | status  | count 
+-----------+--------------+---------+-------
+ bk        | period_close | posted  |     4
+ bk        | posting      | pending |     6
+ bk        | posting      | posted  |    24
+ nc        | posting      | pending |     6
+ nc        | posting      | posted  |    24
+(5 rows)
+
+ tenant_id | period_code | currency | computed_at_xid |        ends_at         
+-----------+-------------+----------+-----------------+------------------------
+ bk        | 2026-01     | EUR      |           15622 | 2026-02-01 00:00:00+00
+ bk        | 2026-01     | USD      |           15621 | 2026-02-01 00:00:00+00
+ bk        | 2026-02     | USD      |           15639 | 2026-03-01 00:00:00+00
+ bk        | 2026-03     | USD      |           15648 | 2026-04-01 00:00:00+00
+(4 rows)
+
+ tenant_id | period_code | currency | checkpoint_rows | input | output 
+-----------+-------------+----------+-----------------+-------+--------
+ bk        | 2026-01     | EUR      |               5 | 10600 |  10600
+ bk        | 2026-01     | USD      |               5 | 10600 |  10600
+ bk        | 2026-02     | USD      |               7 | 12000 |  12000
+ bk        | 2026-03     | USD      |               8 | 13760 |  13760
+(4 rows)
+
+ close_disclosure_rows 
+-----------------------
+                    18
+(1 row)
+

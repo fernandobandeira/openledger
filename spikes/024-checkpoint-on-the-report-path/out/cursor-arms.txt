@@ -1,0 +1,128 @@
+############################################################################
+# SPIKE 024 -- the three arms of computed_at_xid.  PG18, localhost:5433.
+# PostgreSQL 18.6 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit
+############################################################################
+   horizon caught up after 1 polls
+--------------------------------------------------------------- xmin_strict / horizon caught up before the close
+-[ RECORD 1 ]--------------------+-----------------------------------------
+computed_at_xid                  | 16000
+close_txn_xact_id                | 16000
+relation                         | equal
+close_typing_breaks              | 0
+checkpoint_drift_breaks          | 0
+cursor_above_horizon_breaks      | 0
+checkpoint_rows                  | 3
+temporary_and_equity_rows        | fee_revenue=-500, paid_in_capital=-10000
+checkpoint_has_retained_earnings | f
+reader_disagreements             | 0
+total_reconciliation_breaks      | 0
+
+ purpose | inception_dr | reader_dr | inception_cr | reader_cr 
+---------+--------------+-----------+--------------+-----------
+(0 rows)
+
+   horizon caught up after 1 polls
+--------------------------------------------------------------- xmin_strict / CONCURRENT older writer committing after the close
+-[ RECORD 1 ]--------------------+-------------------------------------------
+computed_at_xid                  | 16024
+close_txn_xact_id                | 16025
+relation                         | BELOW the close (recon_close_breaks fires)
+close_typing_breaks              | 1
+checkpoint_drift_breaks          | 0
+cursor_above_horizon_breaks      | 0
+checkpoint_rows                  | 3
+temporary_and_equity_rows        | fee_revenue=-500, paid_in_capital=-10000
+checkpoint_has_retained_earnings | f
+reader_disagreements             | 0
+total_reconciliation_breaks      | 1
+
+ purpose | inception_dr | reader_dr | inception_cr | reader_cr 
+---------+--------------+-----------+--------------+-----------
+(0 rows)
+
+   horizon caught up after 1 polls
+--------------------------------------------------------------- own_xid / horizon caught up before the close
+-[ RECORD 1 ]--------------------+--------------------------------------------------------------
+computed_at_xid                  | 16058
+close_txn_xact_id                | 16058
+relation                         | equal
+close_typing_breaks              | 0
+checkpoint_drift_breaks          | 2
+cursor_above_horizon_breaks      | 0
+checkpoint_rows                  | 4
+temporary_and_equity_rows        | fee_revenue=0, paid_in_capital=-10000, retained_earnings=-500
+checkpoint_has_retained_earnings | t
+reader_disagreements             | 2
+total_reconciliation_breaks      | 2
+
+      purpose      | inception_dr | reader_dr | inception_cr | reader_cr 
+-------------------+--------------+-----------+--------------+-----------
+ retained_earnings |            0 |         0 |          500 |      1000
+ fee_revenue       |          500 |      1000 |          500 |       500
+(2 rows)
+
+   horizon caught up after 1 polls
+--------------------------------------------------------------- own_xid / CONCURRENT older writer committing after the close
+-[ RECORD 1 ]--------------------+--------------------------------------------------------------
+computed_at_xid                  | 16083
+close_txn_xact_id                | 16083
+relation                         | equal
+close_typing_breaks              | 0
+checkpoint_drift_breaks          | 4
+cursor_above_horizon_breaks      | 0
+checkpoint_rows                  | 4
+temporary_and_equity_rows        | fee_revenue=0, paid_in_capital=-10000, retained_earnings=-500
+checkpoint_has_retained_earnings | t
+reader_disagreements             | 4
+total_reconciliation_breaks      | 4
+
+       purpose       | inception_dr | reader_dr | inception_cr | reader_cr 
+---------------------+--------------+-----------+--------------+-----------
+ retained_earnings   |            0 |         0 |          500 |      1000
+ customer_receivable |        10570 |     10500 |            0 |         0
+ paid_in_capital     |            0 |         0 |        10070 |     10000
+ fee_revenue         |          500 |      1000 |          500 |       500
+(4 rows)
+
+   horizon caught up after 1 polls
+--------------------------------------------------------------- identity / horizon caught up before the close
+-[ RECORD 1 ]--------------------+--------------------------------------------------------------
+computed_at_xid                  | 16108
+close_txn_xact_id                | 16108
+relation                         | equal
+close_typing_breaks              | 0
+checkpoint_drift_breaks          | 2
+cursor_above_horizon_breaks      | 0
+checkpoint_rows                  | 4
+temporary_and_equity_rows        | fee_revenue=0, paid_in_capital=-10000, retained_earnings=-500
+checkpoint_has_retained_earnings | t
+reader_disagreements             | 0
+total_reconciliation_breaks      | 2
+
+ purpose | inception_dr | reader_dr | inception_cr | reader_cr 
+---------+--------------+-----------+--------------+-----------
+(0 rows)
+
+   horizon caught up after 1 polls
+--------------------------------------------------------------- identity / CONCURRENT older writer committing after the close
+-[ RECORD 1 ]--------------------+--------------------------------------------------------------
+computed_at_xid                  | 16132
+close_txn_xact_id                | 16134
+relation                         | BELOW the close (recon_close_breaks fires)
+close_typing_breaks              | 1
+checkpoint_drift_breaks          | 2
+cursor_above_horizon_breaks      | 0
+checkpoint_rows                  | 4
+temporary_and_equity_rows        | fee_revenue=0, paid_in_capital=-10000, retained_earnings=-500
+checkpoint_has_retained_earnings | t
+reader_disagreements             | 0
+total_reconciliation_breaks      | 3
+
+ purpose | inception_dr | reader_dr | inception_cr | reader_cr 
+---------+--------------+-----------+--------------+-----------
+(0 rows)
+
+
+############################################################################
+# done -- shapes and green/red above, no milliseconds anywhere.
+############################################################################

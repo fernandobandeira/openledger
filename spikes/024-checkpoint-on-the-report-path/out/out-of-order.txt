@@ -1,0 +1,57 @@
+############ the closes, in period order, with their cursors
+ period_code |        ends_at         | computed_at_xid | close_txn_xid |           closed_at           
+-------------+------------------------+-----------------+---------------+-------------------------------
+ 2026-01     | 2026-02-01 00:00:00+00 |           16512 |         16512 | 2026-09-01 15:08:10.963837+00
+ 2026-02     | 2026-03-01 00:00:00+00 |           16511 |         16511 | 2026-09-01 15:08:10.922008+00
+(2 rows)
+
+############ is it legal? -- the shipped sweep's verdict
+ check_name | breaks 
+------------+--------
+(0 rows)
+
+shipped sweep total breaks = 0
+############ the proposed close-order check
+ period_code | computed_at_xid | txn_xact_id | prev_cursor | prev_txn_xact_id |           reason            
+-------------+-----------------+-------------+-------------+------------------+-----------------------------
+ 2026-02     |           16511 |       16511 |       16512 |            16512 | cursor_not_monotone
+ 2026-02     |           16511 |       16511 |       16512 |            16512 | previous_close_above_cursor
+(2 rows)
+
+############ the AT-CLOSE claim for the LATER-closed period (2026-01)
+ period_code |      purpose      | input | output | dr_pos 
+-------------+-------------------+-------+--------+--------
+ 2026-01     | fee_revenue       |   500 |    500 |      0
+ 2026-01     | paid_in_capital   |     0 |  10000 | -10000
+ 2026-01     | retained_earnings |     0 |    500 |   -500
+ 2026-02     | fee_revenue       |  1200 |   1200 |      0
+ 2026-02     | paid_in_capital   |     0 |  10000 | -10000
+ 2026-02     | retained_earnings |     0 |   1200 |  -1200
+(6 rows)
+
+############ the bounded (difference) form against the level form
+ level_form | bounded_form | bounded_reasons 
+------------+--------------+-----------------
+          0 |            2 | value_drift
+(1 row)
+
+############ is close_disclosures' wide NOT EXISTS carve-out still dead?
+ with_wide_carveout | without_it | rows_only_without_it 
+--------------------+------------+----------------------
+                  0 |          2 |                    2
+(1 row)
+
+ this_close | other_close | entries 
+------------+-------------+---------
+ 2026-02    | 2026-01     |       2
+(1 row)
+
+############ and does the READER still agree with the from-inception form?
+         as_of          | disagreements 
+------------------------+---------------
+ 2026-02-01 00:00:00+00 |             0
+ 2026-02-15 00:00:00+00 |             0
+ 2026-03-01 00:00:00+00 |             0
+ infinity               |             0
+(4 rows)
+

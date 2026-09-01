@@ -1,0 +1,10 @@
+CREATE VIEW
+ with_wide_carveout | without_it | rows_only_without_it 
+--------------------+------------+----------------------
+                 18 |         18 |                    0
+(1 row)
+
+ this_close | other_close | entries 
+------------+-------------+---------
+(0 rows)
+

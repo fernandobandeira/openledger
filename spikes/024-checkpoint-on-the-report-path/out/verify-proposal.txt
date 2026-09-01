@@ -1,0 +1,98 @@
+=== 1. THE GATE ===
+       check_name        | breaks 
+-------------------------+--------
+ accounting_equation     |      0
+ balance_cache           |      0
+ chart_lint              |      0
+ checkpoint_drift        |      0
+ close_typing            |      0
+ cross_scope_mirror      |      0
+ cursor_forgery          |      0
+ journal_to_reports      |      0
+ orphan_entries          |      0
+ unbalanced_transactions |      0
+(10 rows)
+
+ total_breaks 
+--------------
+            0
+(1 row)
+
+
+=== 2. the checkpoint lives in partitions, and the rows are all there ===
+            lives_in             | count 
+---------------------------------+-------
+ ledger_period_balances_pdefault |    27
+(1 row)
+
+   partition_key    
+--------------------
+ LIST (period_code)
+(1 row)
+
+
+=== 3. the AT-CLOSE property, which is now what the comment claims ===
+ period_code |       purpose       | dr_pos 
+-------------+---------------------+--------
+ 2026-01     | credit_loss_expense |      0
+ 2026-01     | fee_revenue         |      0
+ 2026-01     | paid_in_capital     | -10000
+ 2026-01     | retained_earnings   |   -400
+ 2026-02     | credit_loss_expense |      0
+ 2026-02     | fee_revenue         |      0
+ 2026-02     | paid_in_capital     | -10000
+ 2026-02     | retained_earnings   |  -1200
+ 2026-03     | credit_loss_expense |      0
+ 2026-03     | fee_revenue         |      0
+ 2026-03     | interchange_revenue |      0
+ 2026-03     | paid_in_capital     | -10000
+ 2026-03     | retained_earnings   |  -2160
+(13 rows)
+
+
+=== 4. the differential, 60 points, shipped(checkpoint) vs _ref(from inception) ===
+CREATE FUNCTION
+CREATE FUNCTION
+ balance_sheet_disagreements 
+-----------------------------
+                           0
+(1 row)
+
+ tenant | cursor_name | label | currency | fs_line | checkpoint_form | inception_form 
+--------+-------------+-------+----------+---------+-----------------+----------------
+(0 rows)
+
+ trial_balance_disagreements 
+-----------------------------
+                           0
+(1 row)
+
+
+=== 5. the inverted window is now REFUSED rather than answered with negatives ===
+psql:sql/95_verify_proposal.sql:85: NOTICE:  inverted window refused, as designed: trial_balance_at: effective_from (2026-02-01 00:00:00+00) is after effective_to (2026-01-01 00:00:00+00)
+DO
+
+=== 6. the four close-order / forgery classes, and the empty-close carve-out ===
+ close_order_breaks 
+--------------------
+                  0
+(1 row)
+
+ level_form | bounded_form 
+------------+--------------
+          0 |            0
+(1 row)
+
+
+=== 7. the two new indexes exist and the old ones are untouched ===
+                                                        pg_get_indexdef                                                        
+-------------------------------------------------------------------------------------------------------------------------------
+ CREATE INDEX ix_entries__asof_commit ON public.ledger_entries USING btree (tenant_id, account_id, xact_id)
+ CREATE INDEX ix_entries__effective ON public.ledger_entries USING btree (tenant_id, account_id, effective_at, xact_id)
+ CREATE INDEX ix_entries__tenant_commit ON public.ledger_entries USING btree (tenant_id, xact_id, effective_at)
+ CREATE INDEX ix_entries__tenant_effective ON public.ledger_entries USING btree (tenant_id, effective_at, xact_id)
+ CREATE INDEX ix_entries__txn ON public.ledger_entries USING btree (tenant_id, transaction_id)
+ CREATE UNIQUE INDEX pk_entries ON public.ledger_entries USING btree (tenant_id, id)
+ CREATE UNIQUE INDEX uq_entries__account_seq ON public.ledger_entries USING btree (tenant_id, account_id, stripe, account_seq)
+(7 rows)
+

@@ -1,0 +1,9 @@
+=== plan costs on spike024plan (12 closes, 30,024 entries, 2,424 checkpoint rows) ===
+--- recon_checkpoint_breaks
+Aggregate  (cost=7199.07..7199.08 rows=1 width=8)
+  ->  Hash Full Join  (cost=7096.08..7168.77 rows=2424 width=208)
+        Hash Cond: ((s.tenant_id = c.tenant_id) AND (s.period_code = c.period_code) AND (s.currency = c.currency) AND (s.account_id = e.account_id))
+--- recon_checkpoint_breaks_bounded
+Aggregate  (cost=7363.11..7363.12 rows=1 width=8)
+  ->  Append  (cost=6293.29..6987.18 rows=30074 width=208)
+        CTE cl

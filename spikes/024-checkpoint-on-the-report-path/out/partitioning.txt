@@ -1,0 +1,245 @@
+############ 0. the book before the change
+ tenant_id | period_code | currency | rows 
+-----------+-------------+----------+------
+ t1        | 2026-01     | USD      |    3
+ t1        | 2026-02     | USD      |    4
+ t2        | FY2026Q1    | USD      |    3
+(3 rows)
+
+ check_name | breaks 
+------------+--------
+(0 rows)
+
+reconciliation breaks before = 0
+
+############ 1. there is NO in-place conversion -- the statement does not exist
+ERROR:  syntax error at or near "PARTITION"
+LINE 1: ALTER TABLE ledger_period_balances PARTITION BY LIST (period...
+                                           ^
+
+############ 2. ...and the table cannot even be dropped while its readers exist
+ERROR:  cannot drop table ledger_period_balances because other objects depend on it
+DETAIL:  view recon_checkpoint_breaks depends on table ledger_period_balances
+view reconciliation depends on view recon_checkpoint_breaks
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+
+############ 3. does the append-only / event-trigger perimeter permit a partition here?
+--- ledger_period_balances is NOT in refuse_journal_ddl's protected array:
+f
+--- and a child of a PROTECTED table is refused (the same pg_inherits state
+    assertion a PARTITION OF would trip), so a journal table is a different story:
+ERROR:  public.probe_child inherits from posted history: a child carries none of the parent's keys or triggers and is visible through it to every report
+CONTEXT:  PL/pgSQL function refuse_journal_ddl() line 51 at RAISE
+
+############ 4. apply the candidate DDL
+
+############ 5. what the catalog says now
+                               relation                                
+-----------------------------------------------------------------------
+ p ledger_period_balances rowsecurity=true ispartition=false
+ r ledger_period_balances_p2026_01 rowsecurity=false ispartition=true
+ r ledger_period_balances_p2026_02 rowsecurity=false ispartition=true
+ r ledger_period_balances_pdefault rowsecurity=false ispartition=true
+ r ledger_period_balances_pfy2026q1 rowsecurity=false ispartition=true
+(5 rows)
+
+   partition_key    
+--------------------
+ LIST (period_code)
+(1 row)
+
+             relname              |           bound            
+----------------------------------+----------------------------
+ ledger_period_balances_p2026_01  | FOR VALUES IN ('2026-01')
+ ledger_period_balances_p2026_02  | FOR VALUES IN ('2026-02')
+ ledger_period_balances_pdefault  | DEFAULT
+ ledger_period_balances_pfy2026q1 | FOR VALUES IN ('FY2026Q1')
+(4 rows)
+
+                   conname                   |                                                       def                                                        |             on_table             
+---------------------------------------------+------------------------------------------------------------------------------------------------------------------+----------------------------------
+ ck_period_balances__non_negative            | CHECK (((input >= 0) AND (output >= 0)))                                                                         | ledger_period_balances
+ ck_period_balances__tenant_non_empty        | CHECK ((btrim(tenant_id) <> ''::text))                                                                           | ledger_period_balances
+ fk_period_balances__account                 | FOREIGN KEY (tenant_id, account_id, currency) REFERENCES ledger_accounts(tenant_id, id, currency)                | ledger_period_balances
+ fk_period_balances__close                   | FOREIGN KEY (tenant_id, period_code, currency) REFERENCES ledger_period_closes(tenant_id, period_code, currency) | ledger_period_balances
+ ledger_period_balances_account_id_not_null  | NOT NULL account_id                                                                                              | ledger_period_balances
+ ledger_period_balances_currency_not_null    | NOT NULL currency                                                                                                | ledger_period_balances
+ ledger_period_balances_input_not_null       | NOT NULL input                                                                                                   | ledger_period_balances
+ ledger_period_balances_output_not_null      | NOT NULL output                                                                                                  | ledger_period_balances
+ ledger_period_balances_period_code_not_null | NOT NULL period_code                                                                                             | ledger_period_balances
+ ledger_period_balances_tenant_id_not_null   | NOT NULL tenant_id                                                                                               | ledger_period_balances
+ pk_period_balances                          | PRIMARY KEY (tenant_id, period_code, currency, account_id)                                                       | ledger_period_balances
+ ck_period_balances__non_negative            | CHECK (((input >= 0) AND (output >= 0)))                                                                         | ledger_period_balances_p2026_01
+ ck_period_balances__tenant_non_empty        | CHECK ((btrim(tenant_id) <> ''::text))                                                                           | ledger_period_balances_p2026_01
+ fk_period_balances__account                 | FOREIGN KEY (tenant_id, account_id, currency) REFERENCES ledger_accounts(tenant_id, id, currency)                | ledger_period_balances_p2026_01
+ fk_period_balances__close                   | FOREIGN KEY (tenant_id, period_code, currency) REFERENCES ledger_period_closes(tenant_id, period_code, currency) | ledger_period_balances_p2026_01
+ ledger_period_balances_account_id_not_null  | NOT NULL account_id                                                                                              | ledger_period_balances_p2026_01
+ ledger_period_balances_currency_not_null    | NOT NULL currency                                                                                                | ledger_period_balances_p2026_01
+ ledger_period_balances_input_not_null       | NOT NULL input                                                                                                   | ledger_period_balances_p2026_01
+ ledger_period_balances_output_not_null      | NOT NULL output                                                                                                  | ledger_period_balances_p2026_01
+ ledger_period_balances_p2026_01_pkey        | PRIMARY KEY (tenant_id, period_code, currency, account_id)                                                       | ledger_period_balances_p2026_01
+ ledger_period_balances_period_code_not_null | NOT NULL period_code                                                                                             | ledger_period_balances_p2026_01
+ ledger_period_balances_tenant_id_not_null   | NOT NULL tenant_id                                                                                               | ledger_period_balances_p2026_01
+ ck_period_balances__non_negative            | CHECK (((input >= 0) AND (output >= 0)))                                                                         | ledger_period_balances_p2026_02
+ ck_period_balances__tenant_non_empty        | CHECK ((btrim(tenant_id) <> ''::text))                                                                           | ledger_period_balances_p2026_02
+ fk_period_balances__account                 | FOREIGN KEY (tenant_id, account_id, currency) REFERENCES ledger_accounts(tenant_id, id, currency)                | ledger_period_balances_p2026_02
+ fk_period_balances__close                   | FOREIGN KEY (tenant_id, period_code, currency) REFERENCES ledger_period_closes(tenant_id, period_code, currency) | ledger_period_balances_p2026_02
+ ledger_period_balances_account_id_not_null  | NOT NULL account_id                                                                                              | ledger_period_balances_p2026_02
+ ledger_period_balances_currency_not_null    | NOT NULL currency                                                                                                | ledger_period_balances_p2026_02
+ ledger_period_balances_input_not_null       | NOT NULL input                                                                                                   | ledger_period_balances_p2026_02
+ ledger_period_balances_output_not_null      | NOT NULL output                                                                                                  | ledger_period_balances_p2026_02
+ ledger_period_balances_p2026_02_pkey        | PRIMARY KEY (tenant_id, period_code, currency, account_id)                                                       | ledger_period_balances_p2026_02
+ ledger_period_balances_period_code_not_null | NOT NULL period_code                                                                                             | ledger_period_balances_p2026_02
+ ledger_period_balances_tenant_id_not_null   | NOT NULL tenant_id                                                                                               | ledger_period_balances_p2026_02
+ ck_period_balances__non_negative            | CHECK (((input >= 0) AND (output >= 0)))                                                                         | ledger_period_balances_pdefault
+ ck_period_balances__tenant_non_empty        | CHECK ((btrim(tenant_id) <> ''::text))                                                                           | ledger_period_balances_pdefault
+ fk_period_balances__account                 | FOREIGN KEY (tenant_id, account_id, currency) REFERENCES ledger_accounts(tenant_id, id, currency)                | ledger_period_balances_pdefault
+ fk_period_balances__close                   | FOREIGN KEY (tenant_id, period_code, currency) REFERENCES ledger_period_closes(tenant_id, period_code, currency) | ledger_period_balances_pdefault
+ ledger_period_balances_account_id_not_null  | NOT NULL account_id                                                                                              | ledger_period_balances_pdefault
+ ledger_period_balances_currency_not_null    | NOT NULL currency                                                                                                | ledger_period_balances_pdefault
+ ledger_period_balances_input_not_null       | NOT NULL input                                                                                                   | ledger_period_balances_pdefault
+ ledger_period_balances_output_not_null      | NOT NULL output                                                                                                  | ledger_period_balances_pdefault
+ ledger_period_balances_pdefault_pkey        | PRIMARY KEY (tenant_id, period_code, currency, account_id)                                                       | ledger_period_balances_pdefault
+ ledger_period_balances_period_code_not_null | NOT NULL period_code                                                                                             | ledger_period_balances_pdefault
+ ledger_period_balances_tenant_id_not_null   | NOT NULL tenant_id                                                                                               | ledger_period_balances_pdefault
+ ck_period_balances__non_negative            | CHECK (((input >= 0) AND (output >= 0)))                                                                         | ledger_period_balances_pfy2026q1
+ ck_period_balances__tenant_non_empty        | CHECK ((btrim(tenant_id) <> ''::text))                                                                           | ledger_period_balances_pfy2026q1
+ fk_period_balances__account                 | FOREIGN KEY (tenant_id, account_id, currency) REFERENCES ledger_accounts(tenant_id, id, currency)                | ledger_period_balances_pfy2026q1
+ fk_period_balances__close                   | FOREIGN KEY (tenant_id, period_code, currency) REFERENCES ledger_period_closes(tenant_id, period_code, currency) | ledger_period_balances_pfy2026q1
+ ledger_period_balances_account_id_not_null  | NOT NULL account_id                                                                                              | ledger_period_balances_pfy2026q1
+ ledger_period_balances_currency_not_null    | NOT NULL currency                                                                                                | ledger_period_balances_pfy2026q1
+ ledger_period_balances_input_not_null       | NOT NULL input                                                                                                   | ledger_period_balances_pfy2026q1
+ ledger_period_balances_output_not_null      | NOT NULL output                                                                                                  | ledger_period_balances_pfy2026q1
+ ledger_period_balances_period_code_not_null | NOT NULL period_code                                                                                             | ledger_period_balances_pfy2026q1
+ ledger_period_balances_pfy2026q1_pkey       | PRIMARY KEY (tenant_id, period_code, currency, account_id)                                                       | ledger_period_balances_pfy2026q1
+ ledger_period_balances_tenant_id_not_null   | NOT NULL tenant_id                                                                                               | ledger_period_balances_pfy2026q1
+(55 rows)
+
+
+############ 6. do the FOREIGN KEYS still refuse a violation, through the parent?
+ERROR:  insert or update on table "ledger_period_balances_p2026_01" violates foreign key constraint "fk_period_balances__account"
+DETAIL:  Key (tenant_id, account_id, currency)=(t1, 00000000-0000-0000-0000-000000000000, USD) is not present in table "ledger_accounts".
+ERROR:  insert or update on table "ledger_period_balances_pdefault" violates foreign key constraint "fk_period_balances__close"
+DETAIL:  Key (tenant_id, period_code, currency)=(t1, 2026-99, USD) is not present in table "ledger_period_closes".
+
+############ 7. RLS: is a scoped reader still scoped, through the parent?
+        relname         |           polname           | polcmd |      roles       |                                       using_expr                                        
+------------------------+-----------------------------+--------+------------------+-----------------------------------------------------------------------------------------
+ ledger_period_balances | rls_period_balances__recon  | r      | openledger_recon | true
+ ledger_period_balances | rls_period_balances__tenant | r      | openledger_read  | (tenant_id = ( SELECT current_setting('app.tenant_id'::text, true) AS current_setting))
+ ledger_period_balances | rls_period_balances__writer | *      | openledger_app   | true
+(3 rows)
+
+--- as openledger_read scoped to t1, through the parent:
+ tenant_id | count 
+-----------+-------
+ t1        |     7
+(1 row)
+
+--- ...and scoped to t2:
+ tenant_id | count 
+-----------+-------
+ t2        |     3
+(1 row)
+
+--- ...and with NO app.tenant_id set at all (must fail closed, i.e. zero rows):
+ rows_when_unscoped 
+--------------------
+                  0
+(1 row)
+
+--- and a PARTITION addressed directly, which carries no policy of its own:
+psql:sql/75_partition_rls.sql:29: ERROR:  permission denied for table ledger_period_balances_p2026_01
+
+############ 8. grants: does parent-routed DML need anything on the partitions?
+--- the grant lists, parent and partitions:
+                   grant_line                    
+-------------------------------------------------
+ ledger_period_balances: openledger DELETE
+ ledger_period_balances: openledger INSERT
+ ledger_period_balances: openledger MAINTAIN
+ ledger_period_balances: openledger REFERENCES
+ ledger_period_balances: openledger SELECT
+ ledger_period_balances: openledger TRIGGER
+ ledger_period_balances: openledger TRUNCATE
+ ledger_period_balances: openledger UPDATE
+ ledger_period_balances: openledger_app INSERT
+ ledger_period_balances: openledger_app SELECT
+ ledger_period_balances: openledger_read SELECT
+ ledger_period_balances: openledger_recon SELECT
+(12 rows)
+
+--- as openledger_app: INSERT through the PARENT, routed into a partition it
+    holds no grant on. Must succeed.
+          result           
+---------------------------
+ insert through parent: OK
+(1 row)
+
+--- as openledger_app: UPDATE must still be refused (the REVOKE)
+psql:sql/76_partition_grants.sql:28: ERROR:  permission denied for table ledger_period_balances
+--- as openledger_app: DELETE must still be refused
+psql:sql/76_partition_grants.sql:34: ERROR:  permission denied for table ledger_period_balances
+--- as openledger_app: TRUNCATE must still be refused
+psql:sql/76_partition_grants.sql:40: ERROR:  permission denied for table ledger_period_balances
+--- as openledger_app: and a PARTITION addressed directly -- no grant there
+psql:sql/76_partition_grants.sql:46: ERROR:  permission denied for table ledger_period_balances_p2026_01
+--- as openledger_app: UPDATE on a partition directly, which the parent REVOKE
+    does NOT cover -- if this succeeds the REVOKE has a hole
+psql:sql/76_partition_grants.sql:53: ERROR:  permission denied for table ledger_period_balances_p2026_01
+
+############ 9. the gate: does the book still reconcile after the change?
+       check_name        | breaks 
+-------------------------+--------
+ accounting_equation     |      0
+ balance_cache           |      0
+ chart_lint              |      0
+ checkpoint_drift        |      0
+ close_typing            |      0
+ cross_scope_mirror      |      0
+ cursor_forgery          |      0
+ journal_to_reports      |      0
+ orphan_entries          |      0
+ unbalanced_transactions |      0
+(10 rows)
+
+reconciliation breaks after = 0
+ tenant_id | period_code | currency | rows |             lives_in             
+-----------+-------------+----------+------+----------------------------------
+ t1        | 2026-01     | USD      |    3 | ledger_period_balances_p2026_01
+ t1        | 2026-02     | USD      |    4 | ledger_period_balances_p2026_02
+ t2        | FY2026Q1    | USD      |    3 | ledger_period_balances_pfy2026q1
+(3 rows)
+
+
+############ 10. what the schema snapshot can and cannot see
+--- catalog names the dump would need, grepped from the test itself:
+    relpartbound             in schema_snapshot.rs: ABSENT
+    relispartition           in schema_snapshot.rs: ABSENT
+    pg_inherits              in schema_snapshot.rs: ABSENT
+    pg_partitioned_table     in schema_snapshot.rs: ABSENT
+    pg_get_partkeydef        in schema_snapshot.rs: ABSENT
+--- the two sections that DO move:
+p ledger_period_balances persistence=p rowsecurity=true forcerowsecurity=false options=[]
+r ledger_period_balances_p2026_01 persistence=p rowsecurity=false forcerowsecurity=false options=[]
+r ledger_period_balances_p2026_02 persistence=p rowsecurity=false forcerowsecurity=false options=[]
+r ledger_period_balances_pdefault persistence=p rowsecurity=false forcerowsecurity=false options=[]
+r ledger_period_balances_pfy2026q1 persistence=p rowsecurity=false forcerowsecurity=false options=[]
+CREATE UNIQUE INDEX pk_period_balances ON ONLY public.ledger_period_balances USING btree (tenant_id, period_code, currency, account_id) valid=true ready=true
+CREATE UNIQUE INDEX ledger_period_balances_p2026_01_pkey ON public.ledger_period_balances_p2026_01 USING btree (tenant_id, period_code, currency, account_id) valid=true ready=true
+CREATE UNIQUE INDEX ledger_period_balances_p2026_02_pkey ON public.ledger_period_balances_p2026_02 USING btree (tenant_id, period_code, currency, account_id) valid=true ready=true
+CREATE UNIQUE INDEX ledger_period_balances_pdefault_pkey ON public.ledger_period_balances_pdefault USING btree (tenant_id, period_code, currency, account_id) valid=true ready=true
+CREATE UNIQUE INDEX ledger_period_balances_pfy2026q1_pkey ON public.ledger_period_balances_pfy2026q1 USING btree (tenant_id, period_code, currency, account_id) valid=true ready=true
+
+############ 11. the accident the snapshot would MISS: one DETACH statement
+ALTER TABLE
+ rows_via_parent | rows_in_detached | checkpoint_drift_breaks | total_breaks 
+-----------------+------------------+-------------------------+--------------
+               7 |                3 |                       3 |            3
+(1 row)
+
+p ledger_period_balances rowsecurity=true
+r ledger_period_balances_p2026_01 rowsecurity=false
+r ledger_period_balances_p2026_02 rowsecurity=false
+r ledger_period_balances_pdefault rowsecurity=false
+r ledger_period_balances_pfy2026q1 rowsecurity=false

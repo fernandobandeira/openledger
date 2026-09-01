@@ -1,0 +1,189 @@
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE VIEW
+
+=== 1. BALANCE SHEET: shipped vs checkpoint+tails, 60 (tenant, cursor, as-of) points ===
+ tenant | cursor_name |              label              | shipped_rows | cand_rows | disagreements 
+--------+-------------+---------------------------------+--------------+-----------+---------------
+ bk     | P0          | before everything               |           20 |        20 |             0
+ bk     | P0          | mid 2026-01                     |           20 |        20 |             0
+ bk     | P0          | ON the 2026-01 close boundary   |           20 |        20 |             0
+ bk     | P0          | mid 2026-02                     |           20 |        20 |             0
+ bk     | P0          | ON the 2026-02 close boundary   |           20 |        20 |             0
+ bk     | P0          | mid 2026-03                     |           20 |        20 |             0
+ bk     | P0          | ON the 2026-03 close boundary   |           20 |        20 |             0
+ bk     | P0          | mid 2026-04, no close           |           20 |        20 |             0
+ bk     | P0          | past every entry                |           20 |        20 |             0
+ bk     | P0          | infinity -- what the sweep uses |           20 |        20 |             0
+ bk     | P1          | before everything               |           20 |        20 |             0
+ bk     | P1          | mid 2026-01                     |           20 |        20 |             0
+ bk     | P1          | ON the 2026-01 close boundary   |           20 |        20 |             0
+ bk     | P1          | mid 2026-02                     |           20 |        20 |             0
+ bk     | P1          | ON the 2026-02 close boundary   |           20 |        20 |             0
+ bk     | P1          | mid 2026-03                     |           20 |        20 |             0
+ bk     | P1          | ON the 2026-03 close boundary   |           20 |        20 |             0
+ bk     | P1          | mid 2026-04, no close           |           20 |        20 |             0
+ bk     | P1          | past every entry                |           20 |        20 |             0
+ bk     | P1          | infinity -- what the sweep uses |           20 |        20 |             0
+ bk     | P2          | before everything               |           20 |        20 |             0
+ bk     | P2          | mid 2026-01                     |           20 |        20 |             0
+ bk     | P2          | ON the 2026-01 close boundary   |           20 |        20 |             0
+ bk     | P2          | mid 2026-02                     |           20 |        20 |             0
+ bk     | P2          | ON the 2026-02 close boundary   |           20 |        20 |             0
+ bk     | P2          | mid 2026-03                     |           20 |        20 |             0
+ bk     | P2          | ON the 2026-03 close boundary   |           20 |        20 |             0
+ bk     | P2          | mid 2026-04, no close           |           20 |        20 |             0
+ bk     | P2          | past every entry                |           20 |        20 |             0
+ bk     | P2          | infinity -- what the sweep uses |           20 |        20 |             0
+ nc     | P0          | before everything               |           20 |        20 |             0
+ nc     | P0          | mid 2026-01                     |           20 |        20 |             0
+ nc     | P0          | ON the 2026-01 close boundary   |           20 |        20 |             0
+ nc     | P0          | mid 2026-02                     |           20 |        20 |             0
+ nc     | P0          | ON the 2026-02 close boundary   |           20 |        20 |             0
+ nc     | P0          | mid 2026-03                     |           20 |        20 |             0
+ nc     | P0          | ON the 2026-03 close boundary   |           20 |        20 |             0
+ nc     | P0          | mid 2026-04, no close           |           20 |        20 |             0
+ nc     | P0          | past every entry                |           20 |        20 |             0
+ nc     | P0          | infinity -- what the sweep uses |           20 |        20 |             0
+ nc     | P1          | before everything               |           20 |        20 |             0
+ nc     | P1          | mid 2026-01                     |           20 |        20 |             0
+ nc     | P1          | ON the 2026-01 close boundary   |           20 |        20 |             0
+ nc     | P1          | mid 2026-02                     |           20 |        20 |             0
+ nc     | P1          | ON the 2026-02 close boundary   |           20 |        20 |             0
+ nc     | P1          | mid 2026-03                     |           20 |        20 |             0
+ nc     | P1          | ON the 2026-03 close boundary   |           20 |        20 |             0
+ nc     | P1          | mid 2026-04, no close           |           20 |        20 |             0
+ nc     | P1          | past every entry                |           20 |        20 |             0
+ nc     | P1          | infinity -- what the sweep uses |           20 |        20 |             0
+ nc     | P2          | before everything               |           20 |        20 |             0
+ nc     | P2          | mid 2026-01                     |           20 |        20 |             0
+ nc     | P2          | ON the 2026-01 close boundary   |           20 |        20 |             0
+ nc     | P2          | mid 2026-02                     |           20 |        20 |             0
+ nc     | P2          | ON the 2026-02 close boundary   |           20 |        20 |             0
+ nc     | P2          | mid 2026-03                     |           20 |        20 |             0
+ nc     | P2          | ON the 2026-03 close boundary   |           20 |        20 |             0
+ nc     | P2          | mid 2026-04, no close           |           20 |        20 |             0
+ nc     | P2          | past every entry                |           20 |        20 |             0
+ nc     | P2          | infinity -- what the sweep uses |           20 |        20 |             0
+(60 rows)
+
+
+=== 2. the same, as one number. MUST be 0 ===
+ total_balance_sheet_disagreements 
+-----------------------------------
+                                 0
+(1 row)
+
+
+=== 3. every disagreeing line, if any ===
+ tenant | cursor_name | label | currency | fs_line | shipped | candidate 
+--------+-------------+-------+----------+---------+---------+-----------
+(0 rows)
+
+
+=== 4. TRIAL BALANCE: the position reading (-infinity, asof) and the period readings ===
+ tenant | cursor_name |              label              | disagreements_position | disagreements_from_feb 
+--------+-------------+---------------------------------+------------------------+------------------------
+ bk     | P0          | before everything               |                      0 |                     10
+ bk     | P0          | mid 2026-01                     |                      0 |                      0
+ bk     | P0          | ON the 2026-01 close boundary   |                      0 |                      0
+ bk     | P0          | mid 2026-02                     |                      0 |                      0
+ bk     | P0          | ON the 2026-02 close boundary   |                      0 |                      0
+ bk     | P0          | mid 2026-03                     |                      0 |                      0
+ bk     | P0          | ON the 2026-03 close boundary   |                      0 |                      0
+ bk     | P0          | mid 2026-04, no close           |                      0 |                      0
+ bk     | P0          | past every entry                |                      0 |                      0
+ bk     | P0          | infinity -- what the sweep uses |                      0 |                      0
+ bk     | P1          | before everything               |                      0 |                     14
+ bk     | P1          | mid 2026-01                     |                      0 |                      8
+ bk     | P1          | ON the 2026-01 close boundary   |                      0 |                      0
+ bk     | P1          | mid 2026-02                     |                      0 |                      0
+ bk     | P1          | ON the 2026-02 close boundary   |                      0 |                      0
+ bk     | P1          | mid 2026-03                     |                      0 |                      0
+ bk     | P1          | ON the 2026-03 close boundary   |                      0 |                      0
+ bk     | P1          | mid 2026-04, no close           |                      0 |                      0
+ bk     | P1          | past every entry                |                      0 |                      0
+ bk     | P1          | infinity -- what the sweep uses |                      0 |                      0
+ bk     | P2          | before everything               |                      0 |                     14
+ bk     | P2          | mid 2026-01                     |                      0 |                      8
+ bk     | P2          | ON the 2026-01 close boundary   |                      0 |                      0
+ bk     | P2          | mid 2026-02                     |                      0 |                      0
+ bk     | P2          | ON the 2026-02 close boundary   |                      0 |                      0
+ bk     | P2          | mid 2026-03                     |                      0 |                      0
+ bk     | P2          | ON the 2026-03 close boundary   |                      0 |                      0
+ bk     | P2          | mid 2026-04, no close           |                      0 |                      0
+ bk     | P2          | past every entry                |                      0 |                      0
+ bk     | P2          | infinity -- what the sweep uses |                      0 |                      0
+ nc     | P0          | before everything               |                      0 |                     10
+ nc     | P0          | mid 2026-01                     |                      0 |                      0
+ nc     | P0          | ON the 2026-01 close boundary   |                      0 |                      0
+ nc     | P0          | mid 2026-02                     |                      0 |                      0
+ nc     | P0          | ON the 2026-02 close boundary   |                      0 |                      0
+ nc     | P0          | mid 2026-03                     |                      0 |                      0
+ nc     | P0          | ON the 2026-03 close boundary   |                      0 |                      0
+ nc     | P0          | mid 2026-04, no close           |                      0 |                      0
+ nc     | P0          | past every entry                |                      0 |                      0
+ nc     | P0          | infinity -- what the sweep uses |                      0 |                      0
+ nc     | P1          | before everything               |                      0 |                     12
+ nc     | P1          | mid 2026-01                     |                      0 |                      4
+ nc     | P1          | ON the 2026-01 close boundary   |                      0 |                      0
+ nc     | P1          | mid 2026-02                     |                      0 |                      0
+ nc     | P1          | ON the 2026-02 close boundary   |                      0 |                      0
+ nc     | P1          | mid 2026-03                     |                      0 |                      0
+ nc     | P1          | ON the 2026-03 close boundary   |                      0 |                      0
+ nc     | P1          | mid 2026-04, no close           |                      0 |                      0
+ nc     | P1          | past every entry                |                      0 |                      0
+ nc     | P1          | infinity -- what the sweep uses |                      0 |                      0
+ nc     | P2          | before everything               |                      0 |                     12
+ nc     | P2          | mid 2026-01                     |                      0 |                      4
+ nc     | P2          | ON the 2026-01 close boundary   |                      0 |                      0
+ nc     | P2          | mid 2026-02                     |                      0 |                      0
+ nc     | P2          | ON the 2026-02 close boundary   |                      0 |                      0
+ nc     | P2          | mid 2026-03                     |                      0 |                      0
+ nc     | P2          | ON the 2026-03 close boundary   |                      0 |                      0
+ nc     | P2          | mid 2026-04, no close           |                      0 |                      0
+ nc     | P2          | past every entry                |                      0 |                      0
+ nc     | P2          | infinity -- what the sweep uses |                      0 |                      0
+(60 rows)
+
+
+=== 5. trial balance, as one number over both readings and every period window. MUST be 0 ===
+ total_trial_balance_disagreements 
+-----------------------------------
+                                 0
+(1 row)
+
+
+=== 6. every disagreeing trial-balance row, if any ===
+ tenant | cursor_name | f | t | account_id | currency | shipped_dr | cand_dr | shipped_cr | cand_cr 
+--------+-------------+---+---+------------+----------+------------+---------+------------+---------
+(0 rows)
+
+
+=== 7. a worked column, so the numbers are visible and not merely equal ===
+ currency |        fs_line        |                 caption                  | amount_minor |  side  
+----------+-----------------------+------------------------------------------+--------------+--------
+ EUR      | receivables           | Accounts receivable                      |        12290 | asset
+ EUR      | equity                | Shareholders equity                      |        10000 | equity
+ EUR      | retained_earnings     | Retained earnings                        |          400 | equity
+ EUR      | current_year_earnings | Undistributed earnings (since inception) |         1890 | equity
+ USD      | receivables           | Accounts receivable                      |        12290 | asset
+ USD      | equity                | Shareholders equity                      |        10000 | equity
+ USD      | retained_earnings     | Retained earnings                        |         2160 | equity
+ USD      | current_year_earnings | Undistributed earnings (since inception) |          130 | equity
+(8 rows)
+
+
+=== 8. the same statement, the shipped form, for the eyeball ===
+ currency |        fs_line        |                 caption                  | amount_minor |  side  
+----------+-----------------------+------------------------------------------+--------------+--------
+ EUR      | receivables           | Accounts receivable                      |        12290 | asset
+ EUR      | equity                | Shareholders equity                      |        10000 | equity
+ EUR      | retained_earnings     | Retained earnings                        |          400 | equity
+ EUR      | current_year_earnings | Undistributed earnings (since inception) |         1890 | equity
+ USD      | receivables           | Accounts receivable                      |        12290 | asset
+ USD      | equity                | Shareholders equity                      |        10000 | equity
+ USD      | retained_earnings     | Retained earnings                        |         2160 | equity
+ USD      | current_year_earnings | Undistributed earnings (since inception) |          130 | equity
+(8 rows)
+

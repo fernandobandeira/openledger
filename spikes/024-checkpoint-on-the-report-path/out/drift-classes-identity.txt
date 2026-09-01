@@ -1,0 +1,22 @@
+CREATE FUNCTION
+=== 0. NEGATIVE CONTROL -- the clean book. Both must be 0. ===
+    cell    | level_form | bounded_form | level_reasons | bounded_reasons 
+------------+------------+--------------+---------------+-----------------
+ clean book |          0 |            0 | -             | -
+(1 row)
+
+
+=== 1. VALUE DRIFT -- one stored input moved by one minor unit ===
+BEGIN
+UPDATE 1
+                cell                | level_form | bounded_form | level_reasons |     bounded_reasons      
+------------------------------------+------------+--------------+---------------+--------------------------
+ value_drift (+1 on a middle close) |          1 |            2 | value_drift   | spurious_row,value_drift
+(1 row)
+
+ROLLBACK
+
+=== 2. SPURIOUS ROW -- a checkpoint row for an account with no window entries ===
+BEGIN
+psql:sql/55_drift_classes.sql:46: ERROR:  duplicate key value violates unique constraint "pk_period_balances"
+DETAIL:  Key (tenant_id, period_code, currency, account_id)=(bk, 2026-01, USD, 75ddd9cb-6627-d6a1-83e4-22de4e15c1e8) already exists.

@@ -1,0 +1,9 @@
+CREATE VIEW
+BEGIN
+DELETE 1
+ level_form | bounded_with_span | bounded_without_span 
+------------+-------------------+----------------------
+          1 |                 1 |                    0
+(1 row)
+
+ROLLBACK

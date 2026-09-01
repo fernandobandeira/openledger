@@ -1,0 +1,29 @@
+NOTICE:  database "spike024empty" does not exist, skipping
+############ before the close -- a clean book
+breaks = 0
+
+############ after closing a period with nothing to sweep
+       check_name        | breaks 
+-------------------------+--------
+ unbalanced_transactions |      1
+(1 row)
+
+            transaction_id            |     kind     | status | leg_count |   reason   
+--------------------------------------+--------------+--------+-----------+------------
+ 01a05d7f-8c38-7f07-9429-846797e79a9e | period_close | posted |         0 | no_entries
+(1 row)
+
+--- the close itself is entirely well-formed otherwise:
+ period_code | currency | computed_at_xid | checkpoint_rows 
+-------------+----------+-----------------+-----------------
+ 2026-01     | USD      |           16266 |               2
+(1 row)
+
+openledger reconcile would exit 1
+
+############ the candidate carve-out, as a predicate over the same book
+ breaks_with_the_close_carve_out 
+---------------------------------
+                               0
+(1 row)
+

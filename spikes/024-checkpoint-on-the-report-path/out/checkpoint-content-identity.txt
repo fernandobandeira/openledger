@@ -1,0 +1,17 @@
+ period_code |       purpose       | input | output | dr_pos 
+-------------+---------------------+-------+--------+--------
+ 2026-01     | credit_loss_expense |   100 |    100 |      0
+ 2026-01     | fee_revenue         |   500 |    500 |      0
+ 2026-01     | paid_in_capital     |     0 |  10000 | -10000
+ 2026-01     | retained_earnings   |   100 |    500 |   -400
+ 2026-02     | credit_loss_expense |   200 |    200 |      0
+ 2026-02     | fee_revenue         |  1200 |   1200 |      0
+ 2026-02     | paid_in_capital     |     0 |  10000 | -10000
+ 2026-02     | retained_earnings   |   100 |   1300 |  -1200
+ 2026-03     | credit_loss_expense |   200 |    200 |      0
+ 2026-03     | fee_revenue         |  1260 |   1260 |      0
+ 2026-03     | interchange_revenue |   900 |    900 |      0
+ 2026-03     | paid_in_capital     |     0 |  10000 | -10000
+ 2026-03     | retained_earnings   |   100 |   2260 |  -2160
+(13 rows)
+

@@ -1,0 +1,30 @@
+############ A. recon_cursor_breaks against an honest entry under an older open transaction
+BEGIN
+ xmin_pinned_by_the_holder | xmax  | newest_committed_entry_xid 
+---------------------------+-------+----------------------------
+                     16164 | 16166 |                      16165
+(1 row)
+
+ shipped_above_horizon_breaks | xmax_bounded_breaks | sweep_would_exit_1 
+------------------------------+---------------------+--------------------
+                            2 |                   0 |                  1
+(1 row)
+
+ROLLBACK
+
+############ B and C
+=== B. computed_at_xid is bounded FROM BELOW ONLY ===
+    Forge the 2026-03/USD close cursor to 2^62 and ask every check.
+BEGIN
+ALTER TABLE
+UPDATE 1
+ALTER TABLE
+ shipped_close_typing_breaks | disclosures_for_that_period | checkpoint_drift_breaks | checkpoint_reasons | proposed_close_order_breaks |            proposed_reasons             
+-----------------------------+-----------------------------+-------------------------+--------------------+-----------------------------+-----------------------------------------
+                           0 |                           0 |                       4 | value_drift        |                           2 | cursor_above_close,cursor_above_horizon
+(1 row)
+
+ROLLBACK
+
+=== ...and the same cell with the cursor forged DOWNWARD to 1 ===
+BEGIN
