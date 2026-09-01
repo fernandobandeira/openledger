@@ -26,6 +26,15 @@ measurement ladder brackets from below only, about **39× the peak
 completion rather than on a timer. That
 gap — not a deployment — is the story now. Phase 1 is the ordered list of code to build to close it.
 
+**Since 2026-09-01 the read path has a decided contract and an audited substrate.**
+[ADR-0019](/decisions/0019-read-path) settles how a read reaches the database and what its cursor
+promises ([spike 019](/spikes/019-read-path-contract)), and an adversarial round against the
+reporting layer produced twelve findings, eleven of them reproduced on a real book
+([spike 021](/spikes/021-reporting-layer-defects)) — including a check the schema calls its
+highest-leverage one that **cannot fail**, and a forgotten `INSERT` that reports a period's revenue
+as 0.00 while the sweep exits 0. Neither the endpoints nor the fixes are built yet, and this page
+says which is which throughout.
+
 ---
 
 # Phase 1 — the core
@@ -58,7 +67,13 @@ gap — not a deployment — is the story now. Phase 1 is the ordered list of co
    [0007](/decisions/0007-schema-conventions-and-chart)'s highest-leverage guard against schema
    drift landed on 2026-08-31, closing [M1](#m1--schema-invariants-and-the-snapshot-test).)*
 4. **The as-of read path** ([M5](#m5--bitemporal-reads)) — a Rust read path over the report
-   functions, correct on both time axes.
+   functions, correct on both time axes. **Its contract is decided as of 2026-09-01**
+   ([ADR-0019](/decisions/0019-read-path), [spike 019](/spikes/019-read-path-contract)): a second
+   inbound port on its own pool and its own login, five GET routes, and the cursor validated in Rust
+   before it reaches SQL. What that spike found is why the contract is a decision and not a
+   detail — **a login that is a member of both the writer and reader roles reads every tenant**,
+   because RLS policies are permissive and OR'd and `pg_has_role` decides which apply. Building it
+   is what remains.
 
 The milestone numbers are stable identifiers carried over from the decision log; the list above is
 the order to build in. Cards and durable timers are Phase 2, deliberately later.
@@ -331,9 +346,42 @@ And the close's own cost is now measured: **linear in account count and per curr
 1,000,003 checkpoint rows / 135 MB to close 1 M accounts in one currency), and the **write dominates
 (~96%)** — one row per account plus PK/FK maintenance — not the aggregation (~4%).
 
+**The contract is decided, and the first of the three criteria below is already proven on the shipped
+SQL.** [ADR-0019](/decisions/0019-read-path) (ruled 2026-09-01,
+[spike 019](/spikes/019-read-path-contract)) settles how a read reaches the database, what the cursor
+promises, which five routes ship, and where the read path sits in the hexagon — and `report_cursor()`
+is **confirmed end to end**: the interleaving that refuted
+[ADR-0006](/decisions/0006-time-and-as-of)'s watermark left all three reports byte-identical, while
+`max(xact_id) + 1` moved 131,000 → 230,000 across the same commit. Three findings from that spike
+shape what gets built:
+
+- **A login that is a member of both `openledger_app` and `openledger_read` reads every tenant.** RLS
+  policies are permissive and OR'd, and `pg_has_role` — not equality — decides which apply, so the
+  writer's `USING (true)` unions with the reader's tenant qual and `app.tenant_id` becomes
+  decoration. The shipped tree cannot observe this: its one `DATABASE_URL` is the owner's, and the
+  owner is not subject to RLS. Hence a second pool on a second login.
+- **The cursor pins the amounts, not the row set.** `ledger_accounts`, `chart_versions`,
+  `chart_presentation`, `fs_lines`, `account_types` and `ledger_period_closes` carry **no `xact_id`
+  column at all**, so one new account added ten balance-sheet rows at a fixed cursor with every
+  pre-existing amount byte-identical. The contract promises reproducible amounts and says so.
+- **The read path must validate the cursor, because the database cannot.** `'-1'::xid8` silently
+  wraps to `18446744073709551615` and returns the entire unpinned book with today's correct numbers;
+  SQL `NULL` fabricates the complete face at 0.00, *balanced*, and `recon_equation_breaks(NULL, …)`
+  reports zero breaks on it. Both are legal `xid8`.
+
+**And the layer being read is defective in eleven reproduced ways** — [spike
+021](/spikes/021-reporting-layer-defects) built each one on a real book with a ten-zero control first.
+Two bear directly on this milestone: the three statement functions declare `bigint` in their
+`RETURNS TABLE` and cast a `numeric` total back down, so a legal book makes a report **raise** rather
+than answer — the inverse of the defect that was reported — and the worst finding needs no adversary
+at all: a genuine close whose `ledger_period_closes` row was never inserted reports **0.00 revenue on
+a period that earned**, with the balance sheet correct to the unit and `openledger reconcile` exiting
+0. Migration `00004` is where those fixes land; `FIX-NOTES.md` in that spike carries each one's cost.
+
 **Done when:** an as-of query at instant T returns the same answer when re-run under concurrent
-writes, the backdating case (insertion order ≠ effective order) is correct on both axes, and the
-statement functions read the checkpoint rather than scanning from inception.
+writes (**proven on the SQL as of 2026-09-01**; still to hold through the compiled binary), the
+backdating case (insertion order ≠ effective order) is correct on both axes, and the statement
+functions read the checkpoint rather than scanning from inception.
 
 ---
 
