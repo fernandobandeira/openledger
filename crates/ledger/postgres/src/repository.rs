@@ -138,11 +138,19 @@ fn columns_for_entries(legs: &[Leg]) -> (Vec<Uuid>, Vec<String>, Vec<i64>, Vec<S
 }
 
 /// The coalesced deltas, transposed into the parallel arrays the
-/// statement's delta `unnest` binds, in the map's account-id iteration
-/// order — the statement re-sorts anyway (its ORDER BY is what the lock
-/// order hangs on; that property is unpinned until M2's concurrency proof —
-/// see the ORDER BY's own note in [`CLAIM_AND_APPEND`]'s doc), but handing
-/// it ordered arrays keeps the wire form readable next to the plan.
+/// statement's delta `unnest` binds — and the arrays arrive **already
+/// sorted**, because `coalesce` returns a `BTreeMap` keyed
+/// `(account_id, currency)`. That is not presentation: on this path the sort
+/// is a compile-time guarantee of the Rust, and the statement's own
+/// `ORDER BY` is a **second** line of defence rather than the only one —
+/// removing it leaves the suite green here, where removing the batched
+/// statement's sort fails the concurrency test 4 of 4 with deadlocks
+/// reaching callers as 500s (ADR-0018; the roadmap's M2 records both halves).
+/// *(This read "that property is unpinned until M2's concurrency proof". The
+/// proof landed on 2026-09-01 with the batching it waited on, and what it
+/// pinned is a DISAGREEMENT over the order rather than the clause's absence
+/// — see the `ORDER BY`'s own note in [`CLAIM_AND_APPEND`]'s doc, which was
+/// updated in that commit while this one was not.)*
 struct DeltaColumns {
     account_ids: Vec<Uuid>,
     currencies: Vec<String>,
