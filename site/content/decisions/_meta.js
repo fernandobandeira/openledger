@@ -21,4 +21,5 @@ export default {
   '0018-batching-and-stripe-selection': '0018 · The stripe is keyed on the writer',
   '0019-read-path': '0019 · Reads get their own port, pool and login',
   '0020-checkpoint-on-the-report-path': '0020 · The checkpoint gets a reader',
+  '0021-accounts-over-http': '0021 · Accounts get an API',
 }

@@ -1,6 +1,6 @@
 # 0019 — The read path is a second port on a second pool, and the cursor is validated before it reaches SQL
 
-**Status:** accepted (ruled 2026-09-01)
+**Status:** accepted (ruled 2026-09-01); its blanket refusal of listing endpoints is **partially reversed for accounts** by [0021](/decisions/0021-accounts-over-http), and stands for transactions.
 **Evidence:** [spike 019](/spikes/019-read-path-contract) for every measurement and every refutation
 below; [spike 021](/spikes/021-reporting-layer-defects) for the reporting-layer defects the read path
 must not inherit.
@@ -219,7 +219,7 @@ tenant"*), so inventing the status means inventing the registry.
 | **Passing a caller's cursor straight through to SQL** | `-1` and `0` are legal `xid8`. One fabricates an all-zero balanced statement; the other returns the whole unpinned book looking correct. |
 | **Letting `chart_version` default** | It resolves at run time to a version whose content can still change. |
 | **Pagination** | At a million entries the three reports return **2, 10 and 4 rows**. There is nothing to page, and pagination would answer a cost question with an interface change. |
-| **Any listing, search or filter endpoint** | Each needs an ordering and a page key this spike did not design; shipping one under ADR-0014's machine-checked route table documents it forever. |
+| **Any listing, search or filter endpoint** | Each needs an ordering and a page key this spike did not design; shipping one under ADR-0014's machine-checked route table documents it forever. **Partially reversed 2026-09-01 by [0021](/decisions/0021-accounts-over-http)**: for *accounts* that ordering already existed — `pk_accounts` is `(tenant_id, id)` and `id` is `uuidv7` — so this row was scoped reasoning stated as a principle, and `GET /v1/accounts` ships keyset-paginated. It stands for **transactions**, which is where it was load-bearing: a transaction listing must choose between the recorded and the effective axis, and that is the one place a listing can be confidently wrong. |
 | **Exposing the reconciliation views or `close_disclosures` over HTTP** | Cross-tenant views on a deliberately unauthenticated service ([0017](/decisions/0017-no-authentication)), and a disclosure whose attestation feed does not exist. |
 | **A cursor-minting endpoint** | Every report already returns the cursor it used. |
 | **`plan_cache_mode = force_custom_plan`** | It pins the **slow** plan — see the costs. |
