@@ -241,6 +241,29 @@ export type AccountStatementRead = {
 };
 
 /**
+ * The body of `POST /v1/periods/{code}/close`.
+ *
+ * **There is no `idempotency_key` field, and its absence is the design**
+ * (ADR-0011 §2): the key is `tenant:close:period:currency`, derived by the
+ * writer, so `uq_events__idempotency` refuses a second attempt on its own
+ * rather than by a check anyone had to remember to write. A caller has
+ * nothing to vary here — a close is per `(tenant, period, currency)` because
+ * `pk_closes` is.
+ */
+export type ClosePeriodBody = {
+    /**
+     * ISO 4217 alphabetic code, three uppercase ASCII letters. One call
+     * closes one currency.
+     */
+    currency: string;
+    /**
+     * The book being closed. Named in the body by decision (ADR-0017): data
+     * scoping, never an identity claim.
+     */
+    tenant_id: string;
+};
+
+/**
  * The commit horizon, on its own.
  */
 export type CursorRead = {
@@ -296,6 +319,148 @@ export type ErrorBody = {
  * `owner_id`; the other three name one.
  */
 export type OwnerTypeBody = 'company' | 'platform' | 'bank_account' | 'house';
+
+/**
+ * The body of `POST /v1/periods`.
+ *
+ * **`starts_at` and `ends_at` are RESOLVED INSTANTS and `tz` is provenance,
+ * and that split is the whole design** (ADR-0011 §5, ADR-0024). The API never
+ * accepts a local date and a zone and resolves them itself, because that is
+ * measured to be wrong twice over: a local midnight is not always a real
+ * instant — `2018-11-04 00:00` in `America/Sao_Paulo` never happened, and
+ * PostgreSQL silently resolves it to 01:00 — and the same local date resolves
+ * an hour apart across a tzdata update. The caller resolves once, sends the
+ * instants, and names the zone so a reader can say *"February in
+ * America/New_York"*.
+ */
+export type PeriodBody = {
+    /**
+     * The period's label — `2026-08`, `FY2026Q1`. **A label, not a key of
+     * time**: nothing parses it, and the instants below are what every report
+     * filters on. It is unique per tenant (`pk_periods`) and it is the
+     * `{code}` the close route names.
+     */
+    code: string;
+    /**
+     * The first instant NOT in the period, RFC 3339 — the range is
+     * **half-open**, `[starts_at, ends_at)`. A close's own transaction is
+     * dated one microsecond below this, which `timestamptz`'s microsecond
+     * resolution makes exact rather than a `23:59:59` approximation.
+     */
+    ends_at: string;
+    /**
+     * Caller-supplied replay key, unique per tenant — and in the SAME
+     * namespace a posting's and an opening's key live in, because it is the
+     * same spine (`ledger_events`, ADR-0005). Sending the same key with the
+     * same body replays the stored result; with a different body it is
+     * refused as `idempotency_key_reused` (ADR-0013 §2).
+     */
+    idempotency_key: string;
+    /**
+     * The first instant IN the period, RFC 3339.
+     */
+    starts_at: string;
+    /**
+     * The book this period belongs to. Named in the body by decision
+     * (ADR-0017): data scoping, never an identity claim.
+     */
+    tenant_id: string;
+    /**
+     * The IANA zone whose business date this period is — `UTC`,
+     * `America/New_York`. **Provenance, never the boundary**: it is recorded
+     * and never re-resolved, and a name the server's tzdata does not carry is
+     * `period_zone_unknown`.
+     */
+    tz: string;
+};
+
+/**
+ * What a close wrote.
+ *
+ * **No `replayed` flag, and its absence is the contract** (ADR-0011 §2): the
+ * idempotency key is derived, so a second close of one period and currency is
+ * `period_already_closed` and there is no stored result to re-render.
+ */
+export type PeriodClosedRead = {
+    /**
+     * How many rows the checkpoint wrote — one per account with a posted
+     * entry in this currency effective before the period end, not only the
+     * swept ones. The checkpoint is the whole effective-axis position at the
+     * boundary, which is what `balance_sheet_at` reads.
+     */
+    checkpoint_rows: number;
+    /**
+     * The commit cursor the checkpoint was computed at, as a decimal STRING —
+     * an `xid8` is 64-bit, and every cursor on this surface travels as a
+     * string for the reason every amount does (ADR-0022).
+     *
+     * It is the value `ledger_period_closes.computed_at_xid` carries, and
+     * everything below it had committed: an entry backdated into this period
+     * afterwards arrives ABOVE it, so it is a tail term rather than an
+     * invalidation, and `close_disclosures` is where such arrivals are
+     * enumerated.
+     */
+    computed_at_xid: string;
+    currency: string;
+    /**
+     * The closing transaction's own date: `ends_at - 1 microsecond`, the last
+     * *representable* instant inside a half-open period.
+     */
+    effective_at: string;
+    /**
+     * The event row that claimed the derived key.
+     */
+    event_id: string;
+    period_code: string;
+    /**
+     * One entry per temporary account the close moved, in account order.
+     * **Empty is a legitimate close**, not a refusal: a period with no
+     * revenue or expense movement has nothing to sweep, and migration
+     * `00004` carved that case out of `recon_transaction_breaks` precisely so
+     * a quiet month is not an error (ADR-0020).
+     */
+    swept: Array<SweptRead>;
+    /**
+     * The closing transaction — an ordinary balanced transaction, posted
+     * through the same primitive as any other (ADR-0011 §2). It is readable
+     * on `GET /v1/transactions/{transaction_id}` like any other, and it
+     * cannot be reversed (ADR-0016).
+     */
+    transaction_id: string;
+};
+
+/**
+ * The stored result of an accepted definition: the event, and the period it
+ * caused.
+ *
+ * `event_id` is here for the reason it is on an opening's answer: defining a
+ * period writes an EVENT and no ledger transaction, which is the case
+ * ADR-0005 justified the event log by, and the spine is a fact a caller
+ * should be able to see.
+ */
+export type PeriodCreated = {
+    /**
+     * The event row this call claimed — or, on a replay, the one it found.
+     */
+    event_id: string;
+    period: PeriodRead;
+};
+
+/**
+ * One period as `ledger_periods` holds it, on the wire — read back from the
+ * insert, never re-rendered from the request, for the reason an account's
+ * answer is read back from the register: the instants the ROW carries are the
+ * ones every report will filter on.
+ */
+export type PeriodRead = {
+    code: string;
+    ends_at: string;
+    starts_at: string;
+    /**
+     * The zone as provenance, exactly as it was sent.
+     */
+    tz: string;
+};
 
 /**
  * One movement of money: `amount_minor` leaves `source` and arrives at
@@ -442,6 +607,25 @@ export type StatementRead = {
  * transaction naming it in `resolves_id`, never by an update (ADR-0016).
  */
 export type StatusBody = 'pending' | 'posted';
+
+/**
+ * One temporary account the close swept, and how much it moved.
+ */
+export type SweptRead = {
+    account_id: string;
+    /**
+     * The DEBIT-POSITIVE position moved into `retained_earnings`, as an
+     * exact-integer decimal STRING (ADR-0022): a revenue account reads
+     * negative and an expense account positive, which is this schema's one
+     * sign convention (ADR-0007 §15) and the same one a trial balance's
+     * `balance_debit_positive` publishes.
+     *
+     * A string and not a number because JSON has no integer type and a
+     * `bigint` position reaches past 2^53, where a consumer's parser rounds
+     * silently.
+     */
+    position_minor: string;
+};
 
 /**
  * The body of `POST /v1/transactions`.
@@ -918,6 +1102,97 @@ export type GetCursorResponses = {
 };
 
 export type GetCursorResponse = GetCursorResponses[keyof GetCursorResponses];
+
+export type DefinePeriodData = {
+    body: PeriodBody;
+    path?: never;
+    query?: never;
+    url: '/v1/periods';
+};
+
+export type DefinePeriodErrors = {
+    /**
+     * The request body is not syntactically valid JSON. `type` is `invalid_request`; `detail` carries the parser's message.
+     */
+    400: ErrorBody;
+    /**
+     * The request body exceeds the size limit. `type` is `invalid_request`.
+     */
+    413: ErrorBody;
+    /**
+     * The request's `Content-Type` is not `application/json`. `type` is `invalid_request`.
+     */
+    415: ErrorBody;
+    /**
+     * Refused, and nothing was written. `type` is one of: `invalid_request` (a precondition on the body failed — an `ends_at` not after `starts_at`, a blank tenant, code or zone — or a field failed to deserialize into its documented type, an instant that is not RFC 3339 included), `idempotency_key_reused` (same key, different body — send a new key, or resend the original request unchanged; the key namespace is shared with the other writes, deliberately, because it is the same spine), `period_overlaps` (`ex_periods__no_overlap` — this tenant already has a period covering part of this one; the API surfaces the exclusion constraint rather than re-checking it, because no read before the insert can see an uncommitted rival), `period_exists` (`pk_periods` — this book already holds a period under this code; it is checked BEFORE the exclusion index, so it is what redefining a code actually meets), `period_zone_unknown` (`ck_periods__tz_known` — the server's tzdata does not carry this zone name).
+     */
+    422: ErrorBody;
+    /**
+     * The write failed; nothing was committed. `type` is `internal`, and the caller gets no internals — the operator's log has the error.
+     */
+    500: ErrorBody;
+};
+
+export type DefinePeriodError = DefinePeriodErrors[keyof DefinePeriodErrors];
+
+export type DefinePeriodResponses = {
+    /**
+     * Replayed: this key was already accepted with this same body. The stored result is re-rendered — never a cached response body — and nothing was written (ADR-0013 §2).
+     */
+    200: PeriodCreated;
+    /**
+     * Defined: this call claimed the idempotency key and wrote the period and its event atomically. The answer carries the period as the register holds it — the resolved instants a report will filter on, read back from the insert (ADR-0024).
+     */
+    201: PeriodCreated;
+};
+
+export type DefinePeriodResponse = DefinePeriodResponses[keyof DefinePeriodResponses];
+
+export type ClosePeriodData = {
+    body: ClosePeriodBody;
+    path: {
+        /**
+         * The period's label, as `POST /v1/periods` defined it.
+         */
+        code: string;
+    };
+    query?: never;
+    url: '/v1/periods/{code}/close';
+};
+
+export type ClosePeriodErrors = {
+    /**
+     * The request body is not syntactically valid JSON. `type` is `invalid_request`; `detail` carries the parser's message.
+     */
+    400: ErrorBody;
+    /**
+     * The request body exceeds the size limit. `type` is `invalid_request`.
+     */
+    413: ErrorBody;
+    /**
+     * The request's `Content-Type` is not `application/json`. `type` is `invalid_request`.
+     */
+    415: ErrorBody;
+    /**
+     * Refused, and nothing was written — the transaction, its entries, every swept account's balance row, the close record and the checkpoint all roll back together. `type` is one of: `period_unknown` (`{code}` names no period on this tenant; refused before the derived key is claimed, which matters because a derived key burnt by a refusal could never be retried under another name), `period_already_closed` (`pk_closes` — this period and currency are closed, and a close happens once; correct one with a later posting, since reversing a close is refused by ADR-0016), `retained_earnings_unknown` (this book holds no `retained_earnings` house account in this currency, so the sweep has no destination — there is no Income Summary account to fall back on, ADR-0011 §2), `invalid_request` (a blank tenant or code, a currency that is not three uppercase letters), `idempotency_key_reused` (the derived key string is held by a request with a different body).
+     */
+    422: ErrorBody;
+    /**
+     * The close failed; nothing was committed. `type` is `internal`, and the caller gets no internals — the operator's log has the error.
+     */
+    500: ErrorBody;
+};
+
+export type ClosePeriodError = ClosePeriodErrors[keyof ClosePeriodErrors];
+
+export type ClosePeriodResponses = {
+    /**
+     * Closed. In ONE database transaction, in this order (ADR-0024): the deterministic idempotency key `tenant:close:period:currency` is claimed; the `period_close` transaction is written — one posting per temporary account holding a non-zero position, destination `retained_earnings`, dated `ends_at - 1 microsecond`; the close record naming that transaction and its cursor; and THEN the checkpoint, one row per account, because the closing entries must exist before they can be admitted to their own checkpoint by identity (ADR-0020). A period with nothing to sweep closes cleanly and answers an empty `swept`.
+     */
+    201: PeriodClosedRead;
+};
+
+export type ClosePeriodResponse = ClosePeriodResponses[keyof ClosePeriodResponses];
 
 export type GetBalanceSheetData = {
     body?: never;

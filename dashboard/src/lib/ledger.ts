@@ -23,6 +23,7 @@ import { createClient, createConfig } from "./api/client";
 import type {
   ErrorBody,
   GetAccountBalanceData,
+  GetAccountStatementData,
   GetBalanceSheetData,
   GetCursorData,
   GetIncomeStatementData,
@@ -39,10 +40,12 @@ export type {
   AccountCreated,
   AccountListRead,
   AccountRead,
+  AccountStatementRead,
   CursorRead,
   EntryRead,
   ErrorBody,
   PostingBody,
+  StatementEntryRead,
   StatementLineRead,
   StatementRead,
   TransactionBody,
@@ -63,6 +66,7 @@ export type Status = generated.StatusBody;
 export type ListAccountsQuery = ListAccountsData["query"];
 export type CursorQuery = GetCursorData["query"];
 export type AccountBalanceQuery = GetAccountBalanceData["query"];
+export type AccountStatementQuery = GetAccountStatementData["query"];
 export type TransactionQuery = GetTransactionData["query"];
 export type TrialBalanceQuery = GetTrialBalanceData["query"];
 export type BalanceSheetQuery = GetBalanceSheetData["query"];
@@ -204,7 +208,7 @@ export function replayedHeader(headers: Headers): boolean | null {
   return null;
 }
 
-/* ---- the nine routes ----------------------------------------------------- */
+/* ---- the ten routes ------------------------------------------------------ */
 
 export function openAccount(
   body: generated.AccountBody
@@ -229,6 +233,34 @@ export function readAccountBalance(
 ): Promise<Answer<generated.AccountBalanceRead>> {
   return answerFrom(
     generated.getAccountBalance({
+      client: throughTheProxy,
+      path: { account_id: accountId },
+      query: withoutBlanks(query),
+    })
+  );
+}
+
+/**
+ * One page of one account's entries, in one axis's order.
+ *
+ * `axis` is REQUIRED and this function will not default it either: the two
+ * axes answer the same set in different orders, and whichever one were chosen
+ * for a caller who named none is the axis they did not think about. The
+ * refusal the API gives for a missing `axis` is a good refusal, and hiding it
+ * behind a default here would be the dashboard undoing the decision.
+ *
+ * `after` is the previous page's `next_after` and belongs to ONE axis: sending
+ * a recorded key while paging the effective axis is refused rather than used
+ * as a bound of an order it does not name. The panel that calls this drops the
+ * page key whenever the axis changes, which is why that refusal is unreachable
+ * from the UI rather than merely handled.
+ */
+export function readAccountEntries(
+  accountId: string,
+  query: AccountStatementQuery
+): Promise<Answer<generated.AccountStatementRead>> {
+  return answerFrom(
+    generated.getAccountStatement({
       client: throughTheProxy,
       path: { account_id: accountId },
       query: withoutBlanks(query),

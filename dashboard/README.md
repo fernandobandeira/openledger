@@ -6,6 +6,50 @@ Next.js 16 (App Router), TypeScript strict, Tailwind v4, shadcn/ui on Base UI.
 Dark only, in the docs site's palette — Vesper has no light variant, so neither
 does this.
 
+## The shape of the page
+
+Accounts down the left, the walk and the selected account's entries in the
+middle, the composer underneath.
+
+* **The sidenav** is `GET /v1/accounts`, grouped by the chart's own roll-up
+  order, with one `GET /v1/accounts/{id}/balance` per row. That is N+1 and it
+  is the API's shape rather than an oversight in it: a balance is per currency
+  and per stripe, so a balance on every listing row would be the same N+1 one
+  level in and ambiguous besides. **Start a fresh book** switches `tenant_id`
+  to a new one — the book is per tenant, so a fresh one costs a state update
+  and destroys nothing.
+* **The main panel** is `GET /v1/accounts/{account_id}/entries`, with the axis
+  toggle on the table because it is the most interesting control on the page.
+  Flip it on a book carrying a backdated entry and the row moves: at the end of
+  the recorded order, in the middle of the effective one. The row that moved is
+  tagged where it sits — `dated back` on one axis, `recorded late` on the other
+  — and the tag is computed from the page in hand, not asserted. A transaction
+  id opens the rest of its legs, and any other leg's account is one click away.
+* **The composer** is the point, and it is unchanged: every route spelled out,
+  in the API's own field names, with nothing filled in that you did not fill in
+  on purpose.
+
+## The walk is data
+
+`src/lib/scenario/` is the card lifecycle from `site/content/card/index.md` as
+a **list of step definitions** — `{ id, label, teaches, requires, run(ctx) }` —
+and `ScenarioStrip` renders the list. A step never handles a refusal: it asks
+the context to post, and the context throws with the ledger's own answer, which
+the runner renders `type` and `detail` verbatim. **A new step is a record
+appended to `steps.ts` and nothing else** — no component changes to receive it,
+which is what the period-close steps are being built against.
+
+Two places the ledger argued with the document, and the copy says so rather
+than papering over it. **A hold has exactly one fate**: a pending transaction is
+superseded once, so the trace's two captures cannot both carry `resolves_id` —
+the first posts on its own and the last one resolves the hold. And **the
+customer's repayment is not on this walk**, so operating cash ends below zero;
+an overdrawn account is a legal state here, and the step says so.
+
+The idempotency keys are the document's own event names — `evt_clear_1:revshare`
+and the rest — which is what makes "send it twice" a replay of a real earlier
+write rather than a staged one.
+
 ## Running it
 
 ```sh

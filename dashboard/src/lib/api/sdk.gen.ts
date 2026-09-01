@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { GetAccountBalanceData, GetAccountBalanceErrors, GetAccountBalanceResponses, GetAccountStatementData, GetAccountStatementErrors, GetAccountStatementResponses, GetBalanceSheetData, GetBalanceSheetErrors, GetBalanceSheetResponses, GetCursorData, GetCursorErrors, GetCursorResponses, GetIncomeStatementData, GetIncomeStatementErrors, GetIncomeStatementResponses, GetTransactionData, GetTransactionErrors, GetTransactionResponses, GetTrialBalanceData, GetTrialBalanceErrors, GetTrialBalanceResponses, ListAccountsData, ListAccountsErrors, ListAccountsResponses, OpenAccountData, OpenAccountErrors, OpenAccountResponses, PostTransactionData, PostTransactionErrors, PostTransactionResponses } from './types.gen';
+import type { ClosePeriodData, ClosePeriodErrors, ClosePeriodResponses, DefinePeriodData, DefinePeriodErrors, DefinePeriodResponses, GetAccountBalanceData, GetAccountBalanceErrors, GetAccountBalanceResponses, GetAccountStatementData, GetAccountStatementErrors, GetAccountStatementResponses, GetBalanceSheetData, GetBalanceSheetErrors, GetBalanceSheetResponses, GetCursorData, GetCursorErrors, GetCursorResponses, GetIncomeStatementData, GetIncomeStatementErrors, GetIncomeStatementResponses, GetTransactionData, GetTransactionErrors, GetTransactionResponses, GetTrialBalanceData, GetTrialBalanceErrors, GetTrialBalanceResponses, ListAccountsData, ListAccountsErrors, ListAccountsResponses, OpenAccountData, OpenAccountErrors, OpenAccountResponses, PostTransactionData, PostTransactionErrors, PostTransactionResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -86,6 +86,46 @@ export const getAccountStatement = <ThrowOnError extends boolean = false>(option
  * the same value, on the same read path, under the same bracket.
  */
 export const getCursor = <ThrowOnError extends boolean = false>(options: Options<GetCursorData, ThrowOnError>): RequestResult<GetCursorResponses, GetCursorErrors, ThrowOnError> => (options.client ?? client).get<GetCursorResponses, GetCursorErrors, ThrowOnError>({ url: '/v1/cursor', ...options });
+
+/**
+ * Define a period.
+ *
+ * The response set below is this endpoint's real one, not a shared error
+ * enum's: the five 422 `type`s named are exactly the ones the writer can
+ * produce here. **`period_exists` is not in ADR-0024's refusal table**, and
+ * it is here because the table is incomplete rather than because this file
+ * invented a refusal: `pk_periods` is `(tenant_id, code)` and PostgreSQL
+ * checks it before `ex_periods__no_overlap`, so redefining a code — the same
+ * one with a corrected boundary, or the same request under a fresh key —
+ * reached the caller as an unnamed `23505`. It is the direct analogue of
+ * ADR-0021's `account_exists` one table over.
+ */
+export const definePeriod = <ThrowOnError extends boolean = false>(options: Options<DefinePeriodData, ThrowOnError>): RequestResult<DefinePeriodResponses, DefinePeriodErrors, ThrowOnError> => (options.client ?? client).post<DefinePeriodResponses, DefinePeriodErrors, ThrowOnError>({
+    url: '/v1/periods',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+/**
+ * Close a period, for one currency.
+ *
+ * **One call closes one currency, because `pk_closes` is per currency**
+ * (ADR-0024): closing a book that holds three is three calls. That is not a
+ * convenience gap — a close computes and stores a per-currency position, and
+ * one call that swept three would either succeed partially or need a
+ * transaction spanning three independent closes.
+ */
+export const closePeriod = <ThrowOnError extends boolean = false>(options: Options<ClosePeriodData, ThrowOnError>): RequestResult<ClosePeriodResponses, ClosePeriodErrors, ThrowOnError> => (options.client ?? client).post<ClosePeriodResponses, ClosePeriodErrors, ThrowOnError>({
+    url: '/v1/periods/{code}/close',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
 
 /**
  * Read the balance-sheet face as at one instant.

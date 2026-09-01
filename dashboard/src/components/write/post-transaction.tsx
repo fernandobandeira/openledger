@@ -94,7 +94,7 @@ export function PostTransaction({
         }
         if (leg.source.trim() === "" || leg.destination.trim() === "") {
           setRefusedHere(
-            `Leg ${index + 1}: both a source and a destination account are needed. Click an account in the register to fill one.`
+            `Leg ${index + 1}: both a source and a destination account are needed. Select an account in the sidenav and send it here from the panel above.`
           );
           return;
         }
@@ -175,7 +175,7 @@ export function PostTransaction({
               </span>
             ) : (
               <span>
-                — clicking an account in the register fills leg{" "}
+                — the selected account above fills leg{" "}
                 <Mono className="text-peach">{activeLeg + 1}</Mono>
               </span>
             )}

@@ -62,7 +62,7 @@ export function AccountBalance({
           label="account_id"
           value={accountId}
           onChange={setAccountId}
-          placeholder="click balance on a register row"
+          placeholder="pick an account above and send it here"
         />
         <TextField
           className="w-24"
