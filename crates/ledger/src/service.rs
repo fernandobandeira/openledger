@@ -31,6 +31,15 @@
 //! `READ COMMITTED` rather than inheriting it — is stated on
 //! [`Repository::begin`] and honored by the adapter's SQL.
 //!
+//! And since ADR-0021 the same bracket runs for a SECOND operation — opening
+//! an account ([`open_account`]) — which is the case ADR-0005 justified the
+//! event log by: accepted, recorded, and it moves no money. The shape is the
+//! posting path's with the append replaced by one insert: derive the chart
+//! triple, claim-and-open-or-replay, commit; every refusal is named after the
+//! constraint behind it and is made true by the rollback that precedes it. No
+//! new idempotency mechanism is designed for it, which is the whole argument
+//! ADR-0021 makes.
+//!
 //! And since ADR-0018 the same use-case exists for N independent commands at
 //! once ([`LedgerService::post_batch`]): the same bracket, one statement for
 //! the whole batch, one replay lookup for whichever members found their key
@@ -43,12 +52,13 @@ use std::collections::BTreeMap;
 
 use uuid::Uuid;
 
+use crate::accounts::{AccountOpened, ChartTriple, OpenAccount};
 use crate::domain::{PostTransaction, Posted};
-use crate::port::{Ledger, WriteError};
+use crate::port::{Ledger, OpenAccountError, WriteError};
 use crate::postings::{self, Append, Delta};
 use crate::repository::{
-    Appended, BatchMember, Claimed, MemberOutcome, Repository, StorageError, StoredResult,
-    SupersedeRefusal,
+    Appended, BatchMember, Claimed, MemberOutcome, OpenedAccount, Repository, StorageError,
+    StoredResult, SupersedeRefusal,
 };
 
 /// The writer behind the [`Ledger`] port, generic over the repository. One
@@ -88,6 +98,10 @@ impl<R: Repository> LedgerService<R> {
 impl<R: Repository> Ledger for LedgerService<R> {
     async fn post(&self, command: &PostTransaction) -> Result<Posted, WriteError> {
         post(&self.repository, command).await
+    }
+
+    async fn open_account(&self, command: &OpenAccount) -> Result<AccountOpened, OpenAccountError> {
+        open_account(&self.repository, command).await
     }
 }
 
@@ -635,6 +649,210 @@ fn answers_in_arrival_order(
         .collect()
 }
 
+// ----------------------------------------------------------------------
+// Opening an account (ADR-0021) — the same bracket, one insert instead of an
+// append, and a refusal named after every constraint behind it.
+
+/// The opening path's storage error, folded into its own port answer. A
+/// separate function from [`storage`] because it is a separate enum, which is
+/// the point of the second error type: the two paths cannot come to share a
+/// refusal by accident.
+fn storage_while_opening(e: StorageError) -> OpenAccountError {
+    OpenAccountError::Storage(e)
+}
+
+/// Open one account atomically, or return the stored result. One database
+/// transaction: the event claim and the account row commit together, so there
+/// is no in-flight state to report and no way to end up with a claimed key and
+/// no account (ADR-0021, inheriting ADR-0013 §2).
+///
+/// Four named steps, and the order is the design: the chart triple is derived
+/// FIRST, because two of the refusals need it and a refusal before the claim
+/// leaves the caller's idempotency key untouched — its retry is a fresh
+/// request rather than a burnt key.
+async fn open_account<R: Repository>(
+    repository: &R,
+    command: &OpenAccount,
+) -> Result<AccountOpened, OpenAccountError> {
+    let hash = command.idempotency_hash();
+    let payload = command.payload();
+
+    let mut tx = repository.begin().await.map_err(storage_while_opening)?;
+
+    let triple = match chart_triple_or_refuse_an_unknown_type(repository, &mut tx, command).await {
+        Ok(triple) => triple,
+        Err(refusal) => return refuse_the_opening_after_rollback(repository, tx, refusal).await,
+    };
+    if let Some(refusal) = the_owner_the_type_and_the_schema_disagree_about(command, &triple) {
+        return refuse_the_opening_after_rollback(repository, tx, refusal).await;
+    }
+
+    // Statement A: claim the idempotency key by inserting the event row, and
+    // from the claimed row, in the SAME statement, the account. Rows back
+    // mean the insert happened — nobody held this key. Nothing back means an
+    // earlier caller already claimed it, and the answer they stored is what
+    // this caller gets (ADR-0013 §2); the account insert never ran.
+    match repository
+        .claim_and_open_account(&mut tx, command, &hash, &payload, &triple)
+        .await
+        .map_err(storage_while_opening)?
+    {
+        // This caller is the first writer and the account is written,
+        // uncommitted, in this open transaction: close the bracket.
+        Some(OpenedAccount::Opened {
+            event_id,
+            account_id,
+        }) => commit_the_opened_account(repository, tx, event_id, account_id).await,
+        // This caller is the first writer and one of the two unique indexes
+        // already holds this account — the race ADR-0021 keeps a variant for.
+        // Refuse it by name, after the rollback that makes "nothing was
+        // written" true.
+        Some(OpenedAccount::AlreadyExists) => {
+            refuse_the_opening_after_rollback(
+                repository,
+                tx,
+                OpenAccountError::AccountExists {
+                    purpose: command.purpose().to_owned(),
+                    currency: command.currency().to_owned(),
+                },
+            )
+            .await
+        }
+        // The key belongs to an earlier opening: replay its stored result —
+        // never open a second account — or refuse the key if the body differs.
+        None => replay_the_opened_account_or_refuse_the_key(repository, tx, command, &hash).await,
+    }
+}
+
+/// The chart triple the account's three copied columns are filled from — the
+/// server's to derive and never the caller's to send (ADR-0021), so this read
+/// is where `account_type_unknown` is decided. `fk_accounts__type` would refuse
+/// the insert anyway; refusing here is what makes the answer the API's own
+/// sentence instead of the database's diagnostics.
+async fn chart_triple_or_refuse_an_unknown_type<R: Repository>(
+    repository: &R,
+    tx: &mut R::Tx,
+    command: &OpenAccount,
+) -> Result<ChartTriple, OpenAccountError> {
+    let purpose = command.purpose();
+    repository
+        .chart_triple_for_purpose(tx, purpose)
+        .await
+        .map_err(storage_while_opening)?
+        .ok_or_else(|| OpenAccountError::AccountTypeUnknown {
+            purpose: purpose.to_owned(),
+        })
+}
+
+/// The two owner rules the schema holds as CHECK constraints, asked before the
+/// insert so each one has a name on the wire rather than a constraint message:
+///
+/// - `ck_accounts__house_has_no_owner` — a house account has no owner and an
+///   owned account must have one. It reads only the request, so it could have
+///   lived in `OpenAccount::new`; it lives here because `Invalid` renders as
+///   `invalid_request` and ADR-0021 gives this refusal a `type` of its own;
+/// - `ck_accounts__per_shard_is_owned` — a type whose split key IS the
+///   counterparty may not be held in a house account, because
+///   `uq_accounts__house` is one row per purpose and currency, so such an
+///   account has already netted every counterparty at write time and no report
+///   can recover it (ADR-0012). It needs the chart, which is why it cannot
+///   live at the door at all.
+///
+/// `None` means the request, the type and the schema agree.
+fn the_owner_the_type_and_the_schema_disagree_about(
+    command: &OpenAccount,
+    triple: &ChartTriple,
+) -> Option<OpenAccountError> {
+    let owner_type = command.owner_type();
+    let owner_id_given = command.owner_id().is_some();
+    if owner_type.is_the_house() == owner_id_given {
+        return Some(OpenAccountError::AccountOwnerMismatched {
+            owner_type: owner_type.canonical(),
+            owner_id_given,
+        });
+    }
+    if triple.must_be_owned() && owner_type.is_the_house() {
+        return Some(OpenAccountError::AccountTypeRequiresAnOwner {
+            purpose: command.purpose().to_owned(),
+        });
+    }
+    None
+}
+
+/// The first writer's second half: the account already exists, uncommitted, in
+/// this transaction, so what is left is closing the bracket — the event claim
+/// and the account row become durable together.
+async fn commit_the_opened_account<R: Repository>(
+    repository: &R,
+    tx: R::Tx,
+    event_id: Uuid,
+    account_id: Uuid,
+) -> Result<AccountOpened, OpenAccountError> {
+    repository.commit(tx).await.map_err(storage_while_opening)?;
+    Ok(AccountOpened {
+        event_id,
+        account_id,
+        replayed: false,
+    })
+}
+
+/// Roll the bracket back, THEN refuse — the ordering that makes every
+/// refusal's "nothing was written" true, and the reason each one travels here
+/// as a value rather than being returned where it was discovered. A rollback
+/// that itself fails is what the caller hears about instead: the opening is
+/// refused either way, and the backend's own words are the more useful of the
+/// two.
+async fn refuse_the_opening_after_rollback<R: Repository>(
+    repository: &R,
+    tx: R::Tx,
+    refusal: OpenAccountError,
+) -> Result<AccountOpened, OpenAccountError> {
+    repository
+        .rollback(tx)
+        .await
+        .map_err(storage_while_opening)?;
+    Err(refusal)
+}
+
+/// The key was already claimed: answer the replay, or refuse the reuse.
+/// Statement B is a SEPARATE statement for the reason it is one on the posting
+/// path — folded into the claim it returns zero rows under the very race it
+/// exists to handle (ADR-0013 §2). A row back is the stored result; no row
+/// back means the key was reused with a different body. Either way this path
+/// only read, so the bracket closes by rollback before the answer leaves.
+///
+/// An event whose account the lookup cannot find is the one can't-happen state
+/// this operation has: the two rows commit together, so a matching hash with no
+/// account is the adapter and this service disagreeing about the statement —
+/// answered as `Internal`, never as a refusal the caller could act on.
+async fn replay_the_opened_account_or_refuse_the_key<R: Repository>(
+    repository: &R,
+    mut tx: R::Tx,
+    command: &OpenAccount,
+    hash: &[u8],
+) -> Result<AccountOpened, OpenAccountError> {
+    let stored = repository
+        .stored_account(&mut tx, command, hash)
+        .await
+        .map_err(storage_while_opening)?;
+    repository
+        .rollback(tx)
+        .await
+        .map_err(storage_while_opening)?;
+    match stored {
+        Some((event_id, Some(account_id))) => Ok(AccountOpened {
+            event_id,
+            account_id,
+            replayed: true,
+        }),
+        Some((event_id, None)) => Err(OpenAccountError::Internal(format!(
+            "event {event_id} claimed this key with this body and no account carries its \
+             natural key"
+        ))),
+        None => Err(OpenAccountError::KeyReused),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Orchestration tests over a fake repository — read top to bottom, the
@@ -654,13 +872,19 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::accounts::{AccountOwner, AccountOwnerType};
     use crate::domain::{Invalid, Posting, TransactionStatus};
-    use crate::repository::BalanceUpsert;
+    use crate::repository::{BalanceUpsert, StoredAccount};
 
     // Fixed ids: SOURCE < DESTINATION, so SOURCE leads the coalesced map —
     // and is the account an all-unknown refusal must name.
     const EVENT: Uuid = Uuid::from_u128(0xE0);
     const TRANSACTION: Uuid = Uuid::from_u128(0xF0);
+    // The account a first opening writes, and the one an earlier caller
+    // already wrote — different values, so a replay that answered the fresh
+    // id would fail instead of passing.
+    const OPENED_ACCOUNT: Uuid = Uuid::from_u128(0xA1);
+    const STORED_ACCOUNT: Uuid = Uuid::from_u128(0xA2);
     const SOURCE: Uuid = Uuid::from_u128(1);
     const DESTINATION: Uuid = Uuid::from_u128(2);
 
@@ -816,6 +1040,71 @@ mod tests {
         FindsTheKeyClaimed,
     }
 
+    /// What the ACCOUNT-OPENING statement answered — the test's way of
+    /// saying "the index refused it" or "someone else holds this key" with no
+    /// database in the room.
+    #[derive(Clone, Copy)]
+    enum Opens {
+        /// The key was claimed and the account is written, uncommitted.
+        TheAccount,
+        /// `uq_accounts__owned` or `uq_accounts__house` already holds this
+        /// account: `23505`, as the adapter classifies it.
+        RefusingAnExistingOne,
+        /// An earlier caller holds this key; nothing was inserted and the
+        /// answer is the replay lookup's.
+        FindingTheKeyClaimed,
+    }
+
+    /// One chart row, as `account_types` holds it. The scope is the axis the
+    /// tests vary, because it is the one the writer judges against the owner.
+    fn a_chart_triple(counterparty_scope: &str) -> ChartTriple {
+        ChartTriple {
+            category: "asset".to_owned(),
+            normal_balance: "debit".to_owned(),
+            counterparty_scope: counterparty_scope.to_owned(),
+        }
+    }
+
+    /// One valid opening: an owned account for a purpose the chart carries.
+    fn an_opening(owner: Option<&str>) -> Result<OpenAccount, Invalid> {
+        OpenAccount::new(
+            "acme".to_owned(),
+            "open-1".to_owned(),
+            "customer_receivable".to_owned(),
+            AccountOwner {
+                owner_type: match owner {
+                    Some(_) => AccountOwnerType::Company,
+                    None => AccountOwnerType::House,
+                },
+                owner_id: owner.map(str::to_owned),
+            },
+            "USD".to_owned(),
+            None,
+            None,
+        )
+    }
+
+    /// An opening whose owner disagrees with its owner type — the shape
+    /// `ck_accounts__house_has_no_owner` refuses, which `OpenAccount::new`
+    /// deliberately admits so the writer can refuse it BY NAME.
+    fn an_opening_whose_owner_disagrees(
+        owner_type: AccountOwnerType,
+        owner: Option<&str>,
+    ) -> Result<OpenAccount, Invalid> {
+        OpenAccount::new(
+            "acme".to_owned(),
+            "open-1".to_owned(),
+            "customer_receivable".to_owned(),
+            AccountOwner {
+                owner_type,
+                owner_id: owner.map(str::to_owned),
+            },
+            "USD".to_owned(),
+            None,
+            None,
+        )
+    }
+
     /// A repository of answers, no storage: each builder names the situation
     /// the real SQL would produce, and every method records its name so the
     /// tests can hold the order.
@@ -831,6 +1120,17 @@ mod tests {
         /// disagreement between adapter and service that neither statement
         /// can produce, and that neither may be committed on.
         answers_short: Option<&'static str>,
+        /// What `account_types` holds for the purpose asked about — `None`
+        /// is a purpose no chart row carries.
+        chart_triple: Option<ChartTriple>,
+        /// What the account-opening statement answers.
+        opens: Opens,
+        /// What the opening's replay lookup finds for an already-claimed key.
+        stored_account: Option<StoredAccount>,
+        /// The triple the statement was actually BOUND — recorded so a test
+        /// can hold that the writer bound the chart's answer and not the
+        /// caller's wish.
+        bound_triple: Arc<Mutex<Option<ChartTriple>>>,
         calls: Calls,
     }
 
@@ -845,6 +1145,10 @@ mod tests {
                 derived_upserts: None,
                 batch: Vec::new(),
                 answers_short: None,
+                chart_triple: Some(a_chart_triple("none")),
+                opens: Opens::TheAccount,
+                stored_account: None,
+                bound_triple: Arc::default(),
                 calls: Calls::default(),
             }
         }
@@ -930,8 +1234,71 @@ mod tests {
             fake
         }
 
+        /// The single call opens the account: the claim returned a row and
+        /// the insert rode on it.
+        fn opening_an_account() -> Self {
+            Self::first_writer()
+        }
+
+        /// The same, for a purpose whose chart row carries this
+        /// counterparty scope — `per_shard` is the one a house account may
+        /// not hold.
+        fn opening_an_account_of_scope(counterparty_scope: &str) -> Self {
+            let mut fake = Self::opening_an_account();
+            fake.chart_triple = Some(a_chart_triple(counterparty_scope));
+            fake
+        }
+
+        /// `account_types` carries no row for the purpose asked about.
+        fn without_the_account_type() -> Self {
+            let mut fake = Self::opening_an_account();
+            fake.chart_triple = None;
+            fake
+        }
+
+        /// The claim succeeded and one of the two unique indexes already
+        /// holds this account — the race, as the adapter classifies `23505`.
+        fn finding_the_account_already_exists() -> Self {
+            let mut fake = Self::opening_an_account();
+            fake.opens = Opens::RefusingAnExistingOne;
+            fake
+        }
+
+        /// The key is already claimed and the body matches: the single call
+        /// returns nothing and the replay lookup finds the stored account.
+        fn replaying_an_opened_account() -> Self {
+            let mut fake = Self::opening_an_account();
+            fake.opens = Opens::FindingTheKeyClaimed;
+            fake.stored_account = Some((EVENT, Some(STORED_ACCOUNT)));
+            fake
+        }
+
+        /// The key is already claimed with a DIFFERENT body: the lookup's
+        /// hash-in-WHERE finds nothing.
+        fn opening_over_a_poisoned_key() -> Self {
+            let mut fake = Self::opening_an_account();
+            fake.opens = Opens::FindingTheKeyClaimed;
+            fake.stored_account = None;
+            fake
+        }
+
+        /// The hash matched an event and no account carries the body's
+        /// natural key — the can't-happen state, since the two rows commit
+        /// together.
+        fn replaying_an_opening_whose_account_is_missing() -> Self {
+            let mut fake = Self::opening_an_account();
+            fake.opens = Opens::FindingTheKeyClaimed;
+            fake.stored_account = Some((EVENT, None));
+            fake
+        }
+
         fn calls(&self) -> Calls {
             Arc::clone(&self.calls)
+        }
+
+        /// The triple the opening statement was bound with.
+        fn bound_triple(&self) -> Arc<Mutex<Option<ChartTriple>>> {
+            Arc::clone(&self.bound_triple)
         }
 
         fn record(&self, name: &'static str) {
@@ -1082,6 +1449,48 @@ mod tests {
                 _ => members.len(),
             };
             Ok(members.iter().take(answered).map(|_| self.stored).collect())
+        }
+
+        async fn chart_triple_for_purpose(
+            &self,
+            _tx: &mut FakeTx,
+            _purpose: &str,
+        ) -> Result<Option<ChartTriple>, StorageError> {
+            self.record("chart_triple_for_purpose");
+            Ok(self.chart_triple.clone())
+        }
+
+        async fn claim_and_open_account(
+            &self,
+            _tx: &mut FakeTx,
+            _command: &OpenAccount,
+            _hash: &[u8],
+            _payload: &serde_json::Value,
+            triple: &ChartTriple,
+        ) -> Result<Option<OpenedAccount>, StorageError> {
+            self.record("claim_and_open_account");
+            *self
+                .bound_triple
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(triple.clone());
+            Ok(match self.opens {
+                Opens::TheAccount => Some(OpenedAccount::Opened {
+                    event_id: EVENT,
+                    account_id: OPENED_ACCOUNT,
+                }),
+                Opens::RefusingAnExistingOne => Some(OpenedAccount::AlreadyExists),
+                Opens::FindingTheKeyClaimed => None,
+            })
+        }
+
+        async fn stored_account(
+            &self,
+            _tx: &mut FakeTx,
+            _command: &OpenAccount,
+            _hash: &[u8],
+        ) -> Result<Option<StoredAccount>, StorageError> {
+            self.record("stored_account");
+            Ok(self.stored_account)
         }
 
         async fn commit(&self, _tx: FakeTx) -> Result<(), StorageError> {
@@ -1662,6 +2071,266 @@ mod tests {
         // No commit, and no rollback either: the open database transaction
         // dies with the connection, exactly as it does on the single path.
         assert_eq!(taken(&calls), ["begin", "claim_and_append_batch"]);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Opening an account (ADR-0021): the derivation, every refusal by name,
+    // and the replay.
+
+    #[test]
+    fn an_opening_writes_the_account_in_one_call_between_begin_and_commit() -> Result<(), Invalid> {
+        let repository = FakeRepository::opening_an_account();
+        let calls = repository.calls();
+        let service = LedgerService::new(repository);
+        let command = an_opening(Some("co_1"))?;
+
+        let opened = run(service.open_account(&command));
+
+        assert!(matches!(
+            opened,
+            Ok(AccountOpened {
+                event_id: e,
+                account_id: a,
+                replayed: false,
+            }) if e == EVENT && a == OPENED_ACCOUNT
+        ));
+        // Four repository calls, each one statement in the adapter: the
+        // chart read the derivation comes from, then the claim carrying the
+        // account insert, between the bracket's ends. The replay lookup
+        // never runs.
+        assert_eq!(
+            taken(&calls),
+            [
+                "begin",
+                "chart_triple_for_purpose",
+                "claim_and_open_account",
+                "commit"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_triple_the_statement_binds_is_the_chart_s_and_never_the_caller_s() -> Result<(), Invalid>
+    {
+        // The whole point of deriving it (ADR-0021): the caller sends a
+        // purpose and nothing else, so a body cannot state a triple that
+        // disagrees with the chart and earn a foreign-key error in place of
+        // an answer.
+        let repository = FakeRepository::opening_an_account_of_scope("shared");
+        let bound = repository.bound_triple();
+        let service = LedgerService::new(repository);
+        let command = an_opening(Some("co_1"))?;
+
+        let opened = run(service.open_account(&command));
+
+        assert!(opened.is_ok());
+        assert_eq!(
+            bound.lock().unwrap_or_else(PoisonError::into_inner).clone(),
+            Some(a_chart_triple("shared"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_purpose_the_chart_does_not_carry_is_refused_before_the_key_is_claimed()
+    -> Result<(), Invalid> {
+        let repository = FakeRepository::without_the_account_type();
+        let calls = repository.calls();
+        let service = LedgerService::new(repository);
+        let command = an_opening(Some("co_1"))?;
+
+        let opened = run(service.open_account(&command));
+
+        assert!(matches!(
+            opened,
+            Err(OpenAccountError::AccountTypeUnknown { purpose })
+                if purpose == "customer_receivable"
+        ));
+        // The claim never ran, so the caller's idempotency key is untouched
+        // and its retry — after fixing the purpose — is a fresh request
+        // rather than a burnt key.
+        assert_eq!(
+            taken(&calls),
+            ["begin", "chart_triple_for_purpose", "rollback"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_owner_that_disagrees_with_its_owner_type_is_refused_by_name() -> Result<(), Invalid> {
+        // Both halves of `ck_accounts__house_has_no_owner`, under one name:
+        // a house account has no owner and an owned account must have one.
+        // A dropped arm here hands the caller a check-constraint message
+        // instead of an instruction.
+        let cases = [
+            (AccountOwnerType::House, Some("co_1"), "house", true),
+            (AccountOwnerType::Company, None, "company", false),
+        ];
+
+        for (owner_type, owner, named, given) in cases {
+            let repository = FakeRepository::opening_an_account();
+            let calls = repository.calls();
+            let service = LedgerService::new(repository);
+            let command = an_opening_whose_owner_disagrees(owner_type, owner)?;
+
+            let opened = run(service.open_account(&command));
+
+            assert!(
+                matches!(
+                    opened,
+                    Err(OpenAccountError::AccountOwnerMismatched {
+                        owner_type,
+                        owner_id_given,
+                    }) if owner_type == named && owner_id_given == given
+                ),
+                "a {named} account with owner {owner:?} must be refused as a mismatch"
+            );
+            assert_eq!(
+                taken(&calls),
+                ["begin", "chart_triple_for_purpose", "rollback"]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_per_shard_type_in_a_house_account_is_refused_before_the_key_is_claimed()
+    -> Result<(), Invalid> {
+        // `ck_accounts__per_shard_is_owned`: `uq_accounts__house` is one row
+        // per purpose and currency, so a house account of a per_shard type
+        // has already netted every counterparty at write time and no report
+        // can recover it (ADR-0012). It needs the CHART to be judged, which
+        // is why it cannot be refused at the door.
+        let repository = FakeRepository::opening_an_account_of_scope("per_shard");
+        let calls = repository.calls();
+        let service = LedgerService::new(repository);
+        let command = an_opening(None)?;
+
+        let opened = run(service.open_account(&command));
+
+        assert!(matches!(
+            opened,
+            Err(OpenAccountError::AccountTypeRequiresAnOwner { purpose })
+                if purpose == "customer_receivable"
+        ));
+        assert_eq!(
+            taken(&calls),
+            ["begin", "chart_triple_for_purpose", "rollback"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_account_one_of_the_unique_indexes_already_holds_is_refused_after_rollback()
+    -> Result<(), Invalid> {
+        let repository = FakeRepository::finding_the_account_already_exists();
+        let calls = repository.calls();
+        let service = LedgerService::new(repository);
+        let command = an_opening(Some("co_1"))?;
+
+        let opened = run(service.open_account(&command));
+
+        // It names the purpose and the currency and NOT the owner: within one
+        // tenant a collision on `uq_accounts__owned` is always the caller's
+        // own account, and the refusal deliberately says no more (ADR-0021).
+        assert!(matches!(
+            opened,
+            Err(OpenAccountError::AccountExists { purpose, currency })
+                if purpose == "customer_receivable" && currency == "USD"
+        ));
+        assert_eq!(
+            taken(&calls),
+            [
+                "begin",
+                "chart_triple_for_purpose",
+                "claim_and_open_account",
+                "rollback"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_replayed_opening_answers_the_stored_account_and_opens_no_second_one() -> Result<(), Invalid>
+    {
+        let repository = FakeRepository::replaying_an_opened_account();
+        let calls = repository.calls();
+        let service = LedgerService::new(repository);
+        let command = an_opening(Some("co_1"))?;
+
+        let opened = run(service.open_account(&command));
+
+        // The STORED account, not the one a fresh open would have written —
+        // the two ids differ, so a replay that answered the fresh one fails
+        // here instead of passing. And `replayed` is what tells the caller
+        // which of the two happened.
+        assert!(matches!(
+            opened,
+            Ok(AccountOpened {
+                event_id: e,
+                account_id: a,
+                replayed: true,
+            }) if e == EVENT && a == STORED_ACCOUNT
+        ));
+        // The replay lookup, then out — the claim inserted nothing and the
+        // bracket closes by rollback: a replay writes nothing.
+        assert_eq!(
+            taken(&calls),
+            [
+                "begin",
+                "chart_triple_for_purpose",
+                "claim_and_open_account",
+                "stored_account",
+                "rollback"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_reused_key_with_a_different_body_is_refused_when_opening_an_account() -> Result<(), Invalid>
+    {
+        // The same refusal the posting endpoint answers, under the same name
+        // and on the same spine — deliberately, because it is the same
+        // contract (ADR-0013 §2, ADR-0021).
+        let repository = FakeRepository::opening_over_a_poisoned_key();
+        let calls = repository.calls();
+        let service = LedgerService::new(repository);
+        let command = an_opening(Some("co_1"))?;
+
+        let opened = run(service.open_account(&command));
+
+        assert!(matches!(opened, Err(OpenAccountError::KeyReused)));
+        assert_eq!(
+            taken(&calls),
+            [
+                "begin",
+                "chart_triple_for_purpose",
+                "claim_and_open_account",
+                "stored_account",
+                "rollback"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_claimed_key_whose_account_cannot_be_found_is_internal_and_not_a_refusal()
+    -> Result<(), Invalid> {
+        // The claim and the insert commit together, so a matching hash with
+        // no account is the adapter and this service disagreeing about the
+        // statement. It is answered as the can't-happen state it is — never
+        // dressed up as a refusal the caller could act on, and never as an
+        // opening that succeeded with no account.
+        let repository = FakeRepository::replaying_an_opening_whose_account_is_missing();
+        let service = LedgerService::new(repository);
+        let command = an_opening(Some("co_1"))?;
+
+        let opened = run(service.open_account(&command));
+
+        assert!(matches!(opened, Err(OpenAccountError::Internal(_))));
         Ok(())
     }
 }

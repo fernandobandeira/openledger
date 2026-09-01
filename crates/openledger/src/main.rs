@@ -169,7 +169,7 @@ async fn serve_the_api(
         .map_err(Failure::Failed)?;
     let writers = one_writer_per_dispatcher(&database);
     api::run(
-        batching::BatchingLedger::dispatching_over(writers),
+        batching::BatchingLedger::dispatching_over(writers, the_account_opener(&database)),
         the_reader(&read_database),
         bind,
         dashboard,
@@ -192,6 +192,27 @@ fn the_reader(
 ) -> ledger::ReportService<ledger_postgres::PgReportStore> {
     ledger::ReportService::new(ledger_postgres::PgReportStore::over_the_read_pool(
         read_database,
+    ))
+}
+
+/// The writer an account opening runs on (ADR-0021). One more
+/// `LedgerService` over one more `PgRepository`, and NOT a member of the
+/// dispatcher pool: an opening writes no entries and upserts no balance row,
+/// so it has nothing to coalesce with a batch-mate and no reason to wait
+/// behind one — the accumulator's queue is for postings.
+///
+/// It takes a stripe affinity it will never use, because
+/// `PgRepository::for_writer` has no index-free constructor and should not: a
+/// writer without a writer identity is what striping exists to end. The index
+/// handed over is one past the pool's, so it collides with no dispatcher's —
+/// which matters not at all here (no balance row is ever locked by this
+/// writer) and costs nothing to get right.
+fn the_account_opener(
+    database: &db::Database,
+) -> ledger::LedgerService<ledger_postgres::PgRepository> {
+    ledger::LedgerService::new(ledger_postgres::PgRepository::for_writer(
+        database,
+        batching::DISPATCHERS as u32,
     ))
 }
 

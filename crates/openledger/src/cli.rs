@@ -47,14 +47,17 @@ anyone who can read the process table.";
 const SERVE_ABOUT: &str = "\
 Serve the ledger API until stopped.
 
-Six endpoints: POST /v1/transactions and the posting engine
-behind it (M3), plus the five reads of M5 — one account balance,
-the trial balance, the balance sheet, the income statement and a
-transaction read-back. Run `openledger migrate` first: serve
-checks that the schema is current before it listens, and an
-unmigrated or behind database is exit 1 naming that command. The
-check takes no locks — the serving process never migrates
-(ADR-0003).";
+Eight endpoints. Two writes: POST /v1/transactions and the
+posting engine behind it (M3), and POST /v1/accounts, which
+opens an account through the same idempotency spine (ADR-0021).
+Six reads: one account balance, the trial balance, the balance
+sheet, the income statement, a transaction read-back (M5) and
+the keyset-paginated account listing.
+
+Run `openledger migrate` first: serve checks that the schema is
+current before it listens, and an unmigrated or behind database
+is exit 1 naming that command. The check takes no locks — the
+serving process never migrates (ADR-0003).";
 
 const READ_DATABASE_URL_HELP: &str = "\
 PostgreSQL connection string for the READ path.

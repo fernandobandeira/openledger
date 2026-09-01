@@ -142,7 +142,11 @@ pub struct PostTransaction {
 /// the refusal would arrive from the driver, as a 500 with the reason
 /// buried in an encoding error instead of named here), and the byte cap
 /// (MAX_IDENTITY_BYTES' comment carries the index-row arithmetic).
-fn validate_identity(
+///
+/// `pub(crate)` since ADR-0021: the account-opening command carries the same
+/// two strings into the same index, so it holds the same contract through the
+/// same function rather than through a second copy of this reasoning.
+pub(crate) fn validate_identity(
     value: &str,
     nul_bytes: &'static str,
     too_long: &'static str,

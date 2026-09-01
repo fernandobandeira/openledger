@@ -7,6 +7,13 @@
 //! service's (`ledger::LedgerService`, in the core crate above), not this
 //! file's.
 //!
+//! Since ADR-0021 the file carries a SECOND operation's statements below the
+//! posting ones — the chart read an opening derives its triple from, the
+//! claim that carries the account insert, and that operation's own replay
+//! lookup. Same rule, same bracket, one more `INSERT … ON CONFLICT DO
+//! NOTHING` in the same index: nothing about the idempotency spine is new,
+//! which is the whole argument the ADR makes for putting an opening on it.
+//!
 //! Since single-call posting (roadmap M3), "one statement per method" also
 //! means "one statement per POSTING" on the first-writer path:
 //! [`claim_and_append`](ledger::Repository::claim_and_append) is a CTE
@@ -21,8 +28,9 @@
 use std::collections::BTreeMap;
 
 use ledger::{
-    Append, Appended, BalanceUpsert, BatchMember, Claimed, Delta, Direction, Leg, MemberOutcome,
-    PostTransaction, Repository, StorageError, StoredResult, SupersedeRefusal, TransactionStatus,
+    AccountOwnerType, Append, Appended, BalanceUpsert, BatchMember, ChartTriple, Claimed, Delta,
+    Direction, Leg, MemberOutcome, OpenAccount, OpenedAccount, PostTransaction, Repository,
+    StorageError, StoredAccount, StoredResult, SupersedeRefusal, TransactionStatus,
 };
 use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
@@ -851,6 +859,103 @@ const STORED_RESULT_BATCH: &str = "SELECT e.id AS event_id, t.id AS transaction_
             ON t.tenant_id = e.tenant_id AND t.event_id = e.id
      ORDER BY m.ord";
 
+/// The chart's own row for one purpose (ADR-0021) — the three columns
+/// `ledger_accounts` copies, read so the writer can bind them rather than
+/// letting a caller state them.
+///
+/// `account_types` is deployment-global and carries no `tenant_id`, so it has
+/// no policy and the tenant fence does not reach it — the same standing
+/// `chart_versions` has on the read path. No row back is
+/// `account_type_unknown`, which the service names.
+const CHART_TRIPLE: &str = "SELECT t.category::text AS category,
+            t.normal_balance::text AS normal_balance,
+            t.counterparty_scope AS counterparty_scope
+         FROM account_types t
+        WHERE t.code = $1";
+
+/// Statement A for an opening: the claim, with the account insert riding on
+/// it — the same shape [`CLAIM_AND_APPEND`] has, one insert instead of an
+/// append, and ADR-0021's *"in the same database transaction"* held as ONE
+/// statement rather than as two the caller must remember to pair.
+///
+/// - `claimed` claims the idempotency key (`ON CONFLICT DO NOTHING`) in the
+///   same index a posting claims in, and the account insert selects `FROM`
+///   it — so when the key is already held, zero rows come back and NOTHING
+///   here ran. The key space is shared with postings deliberately (one
+///   `uq_events__key` per tenant): the same key used for both operations is
+///   `idempotency_key_reused`, because the two canonical byte forms carry
+///   different version tags and so hash differently — never a posting
+///   replayed as an account;
+/// - `effective_at` is `now()`, and it is the one value here the caller does
+///   not supply. An opening has no effective date to claim: it moves no
+///   money, so there is no instant for it to be *deemed to have happened* at,
+///   and the column is `NOT NULL`. The RECORDED axis is what an opening has,
+///   and `recorded_at` and `xact_id` are its defaults;
+/// - `opened` inserts the account. The three chart columns are BOUND from
+///   [`CHART_TRIPLE`]'s answer rather than joined here: the derivation is the
+///   writer's decision and `fk_accounts__type` / `fk_accounts__scope` are
+///   what verify it, so a join would be a second opinion on a question
+///   already asked — and one taken at a different instant than the check;
+/// - `stripe_count` and `metadata` coalesce their absences. The literals
+///   restate the column defaults, which a `SELECT`-fed `INSERT` has no
+///   `DEFAULT` keyword to reach; the schema is still the authority and this
+///   is the one place the two are written twice;
+/// - `owner_id_key` is never named: it is `GENERATED ALWAYS`, and naming a
+///   generated column is a refused insert;
+/// - the final `SELECT` anchors on the CLAIMED row, exactly as the posting
+///   statement's does, so zero rows means "the key was already held" and
+///   nothing else.
+///
+/// What arrives as an ERROR rather than as rows is the uniqueness race —
+/// `23505` on `uq_accounts__owned` or `uq_accounts__house`, classified by
+/// [`refusal_from_the_account_race`].
+const CLAIM_AND_OPEN_ACCOUNT: &str = "WITH claimed AS (
+         INSERT INTO ledger_events
+                (tenant_id, kind, source, idempotency_key, idempotency_hash,
+                 payload, effective_at)
+         VALUES ($1, 'account_opened', 'api', $2, $3, $4, now())
+         ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
+         RETURNING id
+     ),
+     opened AS (
+         INSERT INTO ledger_accounts
+                (tenant_id, owner_type, owner_id, purpose, category, normal_balance,
+                 counterparty_scope, currency, stripe_count, metadata)
+         SELECT $1, $5::account_owner_type, $6, $7, $8::ledger_category,
+                $9::ledger_normal_balance, $10, $11,
+                COALESCE($12::smallint, 1), COALESCE($13::jsonb, '{}'::jsonb)
+         FROM claimed c
+         RETURNING id
+     )
+     SELECT c.id AS event_id, o.id AS account_id
+     FROM claimed c
+     LEFT JOIN opened o ON true";
+
+/// Statement B for an opening: the stored result of the claimed key, with the
+/// hash in the WHERE for the reason [`Repository::stored_result`]'s has it
+/// there (ADR-0013 §2) — a same-key/different-body replay must return NO row.
+///
+/// The account is found by the NATURAL KEY the replayed body names, because
+/// `ledger_accounts` carries no `event_id` column: `uq_accounts__owned` and
+/// `uq_accounts__house` are the two keys that refuse a second such account,
+/// and this reads them from the other side. `owner_id_key` rather than
+/// `owner_id` is what makes one join serve both — it is the NULL-free
+/// generated copy the schema keeps for exactly this kind of composite match,
+/// and a house account's is the empty string.
+///
+/// A `NULL` account id is therefore not a legitimate shape but a
+/// disagreement: the two rows commit together, so a matching hash with no
+/// account is a can't-happen state, and the service answers it as one.
+const STORED_ACCOUNT: &str = "SELECT e.id AS event_id, a.id AS account_id
+         FROM ledger_events e
+         LEFT JOIN ledger_accounts a
+                ON a.tenant_id = e.tenant_id
+               AND a.owner_type = $4::account_owner_type
+               AND a.owner_id_key = COALESCE($5, '')
+               AND a.purpose = $6
+               AND a.currency = $7
+        WHERE e.tenant_id = $1 AND e.idempotency_key = $2 AND e.idempotency_hash = $3";
+
 /// One row of [`CLAIM_AND_APPEND`]'s answer, named so the matches downstream
 /// read: the claim, the transaction (`None` when the supersede gate withheld
 /// it), one delta's upsert counter (`account_id`/`currency` are `None` on a
@@ -901,6 +1006,70 @@ fn status_as_stored(status: TransactionStatus) -> &'static str {
     match status {
         TransactionStatus::Pending => "pending",
         TransactionStatus::Posted => "posted",
+    }
+}
+
+/// The domain's owner type as the `account_owner_type` column stores it,
+/// rendered at the bind site, exhaustively — the same rule as `Direction` and
+/// `TransactionStatus` above, and the reason the words appear twice in this
+/// workspace: the CANONICAL spelling the idempotency hash covers is the
+/// domain's, and the STORED spelling is this dialect's, so a rename on either
+/// side cannot silently move the other.
+fn owner_type_as_stored(owner_type: AccountOwnerType) -> &'static str {
+    match owner_type {
+        AccountOwnerType::Company => "company",
+        AccountOwnerType::Platform => "platform",
+        AccountOwnerType::BankAccount => "bank_account",
+        AccountOwnerType::House => "house",
+    }
+}
+
+/// [`CLAIM_AND_OPEN_ACCOUNT`]'s answer, read. No row is the one fact the
+/// statement's anchor makes unambiguous: an earlier caller holds this key, and
+/// nothing here ran. A row is this caller's claim and the account it wrote.
+///
+/// A row whose account id is `NULL` is a disagreement between this adapter and
+/// the writer service about the statement — `opened` inserts one row per
+/// claimed row, so the join cannot miss — and is answered as storage rather
+/// than as an opening that succeeded with no account. Never a caller error.
+fn opened_from_the_row(
+    claimed: Option<(Uuid, Option<Uuid>)>,
+) -> Result<Option<OpenedAccount>, StorageError> {
+    let Some((event_id, account_id)) = claimed else {
+        return Ok(None);
+    };
+    let Some(account_id) = account_id else {
+        return Err("the opening statement claimed a key and wrote no account row".into());
+    };
+    Ok(Some(OpenedAccount::Opened {
+        event_id,
+        account_id,
+    }))
+}
+
+/// Two callers raced one account — the loser blocked on the winner's
+/// uncommitted tuple in `uq_accounts__owned` or `uq_accounts__house` and lost
+/// when it committed. **This is the only detection of `account_exists` there
+/// is on the concurrent path**, and it has to be: the sequential case could
+/// be diagnosed by a read before the insert, but two concurrent creates of one
+/// account are real and no read can see the rival's uncommitted row
+/// (ADR-0021). The refusal is named by the service; the database transaction
+/// is aborted, and the rollback it performs is what makes "nothing was
+/// written" true.
+///
+/// Only the two ACCOUNT indexes are read here. Anything else `23505` could
+/// name is a state this statement's own construction rules out, and is
+/// answered as storage rather than dressed up as a refusal the caller could
+/// act on.
+fn refusal_from_the_account_race(error: &sqlx::Error) -> Option<OpenedAccount> {
+    match error {
+        sqlx::Error::Database(db)
+            if db.constraint() == Some("uq_accounts__owned")
+                || db.constraint() == Some("uq_accounts__house") =>
+        {
+            Some(OpenedAccount::AlreadyExists)
+        }
+        _ => None,
     }
 }
 
@@ -1261,6 +1430,92 @@ impl Repository for PgRepository {
             .into_iter()
             .map(|(event_id, transaction_id)| event_id.map(|event_id| (event_id, transaction_id)))
             .collect())
+    }
+
+    /// The chart's own row for a purpose — one statement, inside the opening's
+    /// own database transaction, so the triple the writer binds is the triple
+    /// that was there when the composite foreign keys check it.
+    async fn chart_triple_for_purpose(
+        &self,
+        tx: &mut Self::Tx,
+        purpose: &str,
+    ) -> Result<Option<ChartTriple>, StorageError> {
+        let found: Option<(String, String, String)> = sqlx::query_as(CHART_TRIPLE)
+            .bind(purpose)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(storage)?;
+        Ok(found.map(
+            |(category, normal_balance, counterparty_scope)| ChartTriple {
+                category,
+                normal_balance,
+                counterparty_scope,
+            },
+        ))
+    }
+
+    /// Statement A for an opening: bind the command and the derived triple
+    /// into [`CLAIM_AND_OPEN_ACCOUNT`], run the one statement, and read its
+    /// answer — except the one answer that arrives as an ERROR rather than as
+    /// rows: a unique violation on either account index is the race's
+    /// refusal ([`refusal_from_the_account_race`]), classified here where the
+    /// `sqlx::Error` is.
+    async fn claim_and_open_account(
+        &self,
+        tx: &mut Self::Tx,
+        command: &OpenAccount,
+        hash: &[u8],
+        payload: &serde_json::Value,
+        triple: &ChartTriple,
+    ) -> Result<Option<OpenedAccount>, StorageError> {
+        let outcome: Result<Option<(Uuid, Option<Uuid>)>, sqlx::Error> =
+            sqlx::query_as(CLAIM_AND_OPEN_ACCOUNT)
+                .bind(command.tenant_id())
+                .bind(command.idempotency_key())
+                .bind(hash)
+                .bind(payload)
+                .bind(owner_type_as_stored(command.owner_type()))
+                .bind(command.owner_id())
+                .bind(command.purpose())
+                .bind(&triple.category)
+                .bind(&triple.normal_balance)
+                .bind(&triple.counterparty_scope)
+                .bind(command.currency())
+                .bind(command.stripe_count())
+                .bind(command.metadata())
+                .fetch_optional(&mut **tx)
+                .await;
+        let claimed = match outcome {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                return match refusal_from_the_account_race(&error) {
+                    Some(refused) => Ok(Some(refused)),
+                    None => Err(storage(error)),
+                };
+            }
+        };
+        opened_from_the_row(claimed)
+    }
+
+    /// Statement B for an opening: the stored result of the claimed key
+    /// ([`STORED_ACCOUNT`]).
+    async fn stored_account(
+        &self,
+        tx: &mut Self::Tx,
+        command: &OpenAccount,
+        hash: &[u8],
+    ) -> Result<Option<StoredAccount>, StorageError> {
+        sqlx::query_as(STORED_ACCOUNT)
+            .bind(command.tenant_id())
+            .bind(command.idempotency_key())
+            .bind(hash)
+            .bind(owner_type_as_stored(command.owner_type()))
+            .bind(command.owner_id())
+            .bind(command.purpose())
+            .bind(command.currency())
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(storage)
     }
 
     /// Commit the bracket: the event claim and everything it caused become

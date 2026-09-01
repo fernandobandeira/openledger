@@ -23,10 +23,16 @@
 //!   endpoint is precisely how an integrator is stopped from writing the
 //!   single-row read that under-reports.
 //!
-//! And one absence: **no listing, search or filter endpoint**, and no
-//! pagination. At a million entries the three reports return 2, 10 and 4
-//! rows, so there is nothing to page; a listing endpoint needs an ordering
-//! and a page key ADR-0019 did not design, and under ADR-0014's
+//! And one absence that is now PARTLY filled, stated as it stands: **none of
+//! the four endpoints in this file pages, searches or filters**, and at a
+//! million entries the three reports return 2, 10 and 4 rows, so there is
+//! nothing here to page. ADR-0019 refused a listing outright on the ground
+//! that one *"needs an ordering and a page key this spike did not design"*;
+//! ADR-0021 withdrew that for ACCOUNTS, whose ordering already exists
+//! (`pk_accounts` is `(tenant_id, id)` and `id` is `uuidv7()`), and the
+//! keyset-paginated register lives in `accounts.rs` next door. What is not
+//! withdrawn is the refusal of a TRANSACTION listing, which would have to
+//! choose between the recorded and the effective axis — and under ADR-0014's
 //! machine-checked route table a route that ships is documented forever.
 
 use axum::extract::State;

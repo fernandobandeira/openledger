@@ -10,6 +10,229 @@
     "version": "0.0.0"
   },
   "paths": {
+    "/v1/accounts": {
+      "get": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "List the accounts on one book.",
+        "description": "**ADR-0019 refused every listing; ADR-0021 withdraws that for accounts and\nkeeps it for transactions.** ADR-0019's ground was that a listing *\"needs\nan ordering and a page key this spike did not design\"* — a *not yet*, not a\n*never* — and for accounts the ordering already exists: `pk_accounts` is\n`(tenant_id, id)` and `id` is `uuidv7()`, which is time-ordered and total.\nA TRANSACTION listing would still have to choose between the recorded and\nthe effective axis, which is the one place a listing can be confidently\nwrong.",
+        "operationId": "listAccounts",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "description": "The book to read.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "t1"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "How many accounts at most, 1–1000. Omitted means 100. A value outside\nthe window is REFUSED rather than clamped: a clamped page is an answer\nto a question the caller did not ask, and nothing on the wire would\nsay so.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "maximum": 1000,
+              "minimum": 1
+            },
+            "example": 100
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "The last `account_id` of the previous page — send back the\n`next_after` an earlier page answered with. Keyset, never an offset\n(ADR-0021): an offset shifts under concurrent inserts, so a caller\npaging a growing book silently skips rows.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "purpose",
+            "in": "query",
+            "description": "Equality on the chart code. **Equality, not search**: no pattern\nmatching and no free text.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "customer_receivable"
+          },
+          {
+            "name": "owner_id",
+            "in": "query",
+            "description": "Equality on the owner. It selects no house accounts, which have no\nowner at all.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "co_1"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page of the account register, in creation order. An unknown tenant answers 200 with an empty list, never 404: there is no tenant registry to consult, so inventing the status would mean inventing the registry (ADR-0019).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountListRead"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A required query parameter is missing, or a value would not deserialize into its documented type — including an `after` that is not a UUID. `type` is `invalid_request`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Refused. `type` is one of: `invalid_request` (a `limit` outside 1–1000, zero or negative included — refused rather than clamped) or `tenant_mismatch`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The read failed. `type` is `internal`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The read exceeded this deployment's `statement_timeout` (`57014`). `type` is `report_timed_out`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "Open an account.",
+        "description": "The response set below is this endpoint's real one, not a shared error\nenum's: the six 422 `type`s named are exactly the ones the writer can\nproduce here. `account_exists` never appears on the posting endpoint and\n`account_unknown` never appears here, which is precisely why opening\ncarries its own error type in the core (ADR-0021).",
+        "operationId": "openAccount",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccountBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Replayed: this key was already accepted with this same body. The stored result is re-rendered — never a cached response body — and nothing was written (ADR-0013 §2).",
+            "headers": {
+              "Idempotency-Replayed": {
+                "schema": {
+                  "type": "boolean"
+                },
+                "description": "`true`: this response re-renders a previously stored result."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountCreated"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Opened: this call claimed the idempotency key and wrote the account and its event atomically.",
+            "headers": {
+              "Idempotency-Replayed": {
+                "schema": {
+                  "type": "boolean"
+                },
+                "description": "`false`: this response is the first for its idempotency key."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request body is not syntactically valid JSON. `type` is `invalid_request`; `detail` carries the parser's message.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The request body exceeds the size limit. `type` is `invalid_request`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The request's `Content-Type` is not `application/json`. `type` is `invalid_request`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Refused, and nothing was written. Every `type` below is a constraint the schema already holds, refused by name rather than surfaced as a database error (ADR-0021). `type` is one of: `invalid_request` (a precondition on the body failed — a `stripe_count` outside 1–1024, a currency that is not three uppercase letters, a blank tenant, metadata that is not an object — or a field failed to deserialize into its documented type), `idempotency_key_reused` (same key, different body — send a new key, or resend the original request unchanged; the key namespace is shared with `POST /v1/transactions`, deliberately, because it is the same spine), `account_type_unknown` (`purpose` names no row in this deployment's chart), `account_exists` (`uq_accounts__owned` or `uq_accounts__house` already holds this account; the refusal does not say whose, because within one tenant a collision is always the caller's own), `account_owner_mismatched` (`ck_accounts__house_has_no_owner` — a house account has no owner and an owned account must have one), `account_type_requires_an_owner` (`ck_accounts__per_shard_is_owned` — a type whose split key IS the counterparty cannot be held in a house account, because such an account nets every counterparty at write time and no report can recover it).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The write failed; nothing was committed. `type` is `internal`, and the caller gets no internals — the operator's log has the error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/accounts/{account_id}/balance": {
       "get": {
         "tags": [
@@ -663,6 +886,175 @@
           }
         }
       },
+      "AccountBody": {
+        "type": "object",
+        "description": "The body of `POST /v1/accounts`.\n\n**What is NOT here is the design** (ADR-0021): there is no `category`, no\n`normal_balance` and no `counterparty_scope`. `ledger_accounts` carries all\nthree as COPIES of the chart row, held honest by `fk_accounts__type` and\n`fk_accounts__scope` — so a body that stated them could disagree with the\nchart, and the caller would be handed a foreign-key error rather than an\nanswer. The caller names a `purpose` and the server reads the rest, which\nmakes a whole class of refusals unreachable rather than merely reported.",
+        "required": [
+          "tenant_id",
+          "idempotency_key",
+          "purpose",
+          "owner_type",
+          "currency"
+        ],
+        "properties": {
+          "currency": {
+            "type": "string",
+            "description": "ISO 4217 alphabetic code, three uppercase ASCII letters. One account\nholds one currency.",
+            "example": "USD",
+            "maxLength": 3,
+            "minLength": 3
+          },
+          "idempotency_key": {
+            "type": "string",
+            "description": "Caller-supplied replay key, unique per tenant — and in the SAME\nnamespace a posting's key lives in, because it is the same spine\n(`ledger_events`, ADR-0005). Sending the same key with the same body\nreplays the stored result; with a different body it is refused as\n`idempotency_key_reused` (ADR-0013 §2), and that includes a key an\nearlier POSTING claimed.",
+            "example": "open-co-1-receivable",
+            "minLength": 1
+          },
+          "metadata": {
+            "description": "Caller's own JSON object, stored as given. It must BE an object:\n`jsonb` would store a bare number as happily, and a metadata field\nthat is sometimes a scalar is a shape every reader has to defend\nagainst."
+          },
+          "owner_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who owns it. Required for every `owner_type` except `house`, and\nrefused for `house` — `ck_accounts__house_has_no_owner`, answered as\n`account_owner_mismatched`.",
+            "example": "co_1"
+          },
+          "owner_type": {
+            "$ref": "#/components/schemas/OwnerTypeBody"
+          },
+          "purpose": {
+            "type": "string",
+            "description": "The account type, by its chart code — `customer_receivable`,\n`fee_revenue`, and whatever else this deployment's chart carries. A\ncode `account_types` does not hold is `account_type_unknown`.",
+            "example": "customer_receivable"
+          },
+          "stripe_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How many stripes the writer spreads this account's balance row across,\n1–1024. Omitted means one. **A hint, not an invariant** (ADR-0013 §4):\na reader sums the stripe rows that exist, never the range `0..n-1`, so\nnothing is stranded by getting it wrong — but no stripe ever appears\nin a response, so this is the only place the number is spoken.",
+            "example": 64,
+            "maximum": 1024,
+            "minimum": 1
+          },
+          "tenant_id": {
+            "type": "string",
+            "description": "The book this account belongs to. Named in the body by decision\n(ADR-0017): data scoping, never an identity claim.",
+            "example": "t1"
+          }
+        }
+      },
+      "AccountCreated": {
+        "type": "object",
+        "description": "The stored result of an accepted opening: the event, and the account it\ncaused.",
+        "required": [
+          "event_id",
+          "account_id"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The account. Never null, unlike a posting's `transaction_id`: an\naccepted opening always wrote one, and a replay finds it by the\nnatural key its own body names."
+          },
+          "event_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The event row this call claimed — or, on a replay, the one it found.\nOpening an account writes an EVENT and no ledger transaction, which is\nthe case ADR-0005 justified the event log by."
+          }
+        }
+      },
+      "AccountListRead": {
+        "type": "object",
+        "description": "One page of the account register.",
+        "required": [
+          "accounts",
+          "next_after"
+        ],
+        "properties": {
+          "accounts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccountRead"
+            },
+            "description": "The page, in creation order — `id` is `uuidv7()`, so ordering by it\norders by when each account was opened.\n\n**An empty list is a legitimate answer** and never a 404: it is what\nan unknown tenant, a typo'd tenant, a tenant with no accounts and a\nreader scoped elsewhere all produce, and two of those are the\nfail-closed path working correctly (ADR-0019)."
+          },
+          "next_after": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The `after` to send for the next page, or `null` when this page did\nnot fill. **A full page means \"there may be more\", never \"there is\"**:\nthe alternative is reading one row past every page to be certain, and\na caller that follows this key to an empty page has learnt the same\nthing one request later."
+          }
+        }
+      },
+      "AccountRead": {
+        "type": "object",
+        "description": "One account, as the register holds it.\n\n**No balance, and that is contract** (ADR-0021): balances are per currency\nand per stripe, so a balance per row would be N+1, and\n`GET /v1/accounts/{account_id}/balance` answers that question one account\nat a time and exactly.",
+        "required": [
+          "account_id",
+          "owner_type",
+          "owner_id",
+          "purpose",
+          "category",
+          "normal_balance",
+          "counterparty_scope",
+          "currency",
+          "stripe_count",
+          "created_at"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "category": {
+            "type": "string",
+            "description": "`asset`, `liability`, `equity`, `revenue` or `expense` — the chart's,\ncopied onto the account and held honest by `fk_accounts__type`."
+          },
+          "counterparty_scope": {
+            "type": "string",
+            "description": "`none`, `shared` or `per_shard` — whether this type's positions may be\nsummed for reporting, and the reason a `per_shard` type cannot live in\na house account (ADR-0012)."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the account was opened — the database's clock."
+          },
+          "currency": {
+            "type": "string"
+          },
+          "normal_balance": {
+            "type": "string",
+            "description": "`debit` or `credit`. **Not derivable from `category`**: a loss\nallowance is an asset with a credit normal balance, which is why the\nschema stores both."
+          },
+          "owner_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`null` on a house account, which is the ledger's own side and has no\nowner."
+          },
+          "owner_type": {
+            "type": "string",
+            "description": "`company`, `platform`, `bank_account` or `house`."
+          },
+          "purpose": {
+            "type": "string",
+            "description": "The account type, by its chart code."
+          },
+          "stripe_count": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many stripes the writer spreads this account's balance row across.\n**The one place a stripe count is spoken** — no stripe VALUE appears\nin any response (ADR-0013 §4), and this is the hint, not a position.",
+            "example": 64
+          }
+        }
+      },
       "EntryRead": {
         "type": "object",
         "description": "One leg. `amount_minor` is a JSON number here and a decimal STRING on\nevery report, and the asymmetry is deliberate (ADR-0019): a single posting\nis bounded by its column, and only an aggregate can exceed what a JSON\nnumber carries exactly.",
@@ -715,6 +1107,16 @@
             "example": "invalid_request"
           }
         }
+      },
+      "OwnerTypeBody": {
+        "type": "string",
+        "description": "Who an account belongs to — the schema's `account_owner_type`. `house` is\nthe ledger's own side of a movement and is the one value that carries NO\n`owner_id`; the other three name one.",
+        "enum": [
+          "company",
+          "platform",
+          "bank_account",
+          "house"
+        ]
       },
       "PostingBody": {
         "type": "object",
@@ -1054,7 +1456,7 @@
     },
     {
       "name": "accounts",
-      "description": "The posted balance of one account, now."
+      "description": "Open an account, list them, and read one's posted balance."
     },
     {
       "name": "reports",

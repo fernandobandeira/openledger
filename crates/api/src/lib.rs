@@ -6,12 +6,16 @@
 //! response, and no invented 409 — a concurrent duplicate blocks on the key
 //! claim and finds a durable result, so there is no in-flight state to name.
 //!
-//! Six endpoints: one write, and the five reads ADR-0019 rules on — a
-//! balance, three reports and a transaction read-back. No authentication by
-//! decision, not omission (ADR-0017): the ledger deploys internally only, the
-//! trust story is the deployment perimeter's, and the tenant named in the body
-//! (on a read, in the query string) is data scoping — which book — never an
-//! identity claim.
+//! Eight endpoints: two writes, and the six reads — a balance, three reports,
+//! a transaction read-back (ADR-0019) and one account listing (ADR-0021). The
+//! second write is `POST /v1/accounts`, the operation that had no API at all
+//! until ADR-0021: accounts were seeded by SQL, which made `psql` a required
+//! part of onboarding a ledger whose whole adoption surface is this crate.
+//!
+//! No authentication by decision, not omission (ADR-0017): the ledger deploys
+//! internally only, the trust story is the deployment perimeter's, and the
+//! tenant named in the body (on a read, in the query string) is data scoping —
+//! which book — never an identity claim.
 //!
 //! **The read half is a mapping too, and its judgement lives one ring in.**
 //! The cursor rule — pin an absent cursor server-side, refuse a plausible-
@@ -38,6 +42,7 @@
 use axum::Router;
 use ledger::{Ledger, Reports};
 
+mod accounts;
 mod dashboard;
 mod reports;
 mod serve;
@@ -100,6 +105,8 @@ macro_rules! route_table {
 route_table! { L, R =>
     post "/v1/transactions" transactions::post_transaction::<L, R>,
     get "/v1/transactions/{transaction_id}" transactions::get_transaction::<L, R>,
+    post "/v1/accounts" accounts::open_account::<L, R>,
+    get "/v1/accounts" accounts::list_accounts::<L, R>,
     get "/v1/accounts/{account_id}/balance" reports::get_account_balance::<L, R>,
     get "/v1/reports/trial-balance" reports::get_trial_balance::<L, R>,
     get "/v1/reports/balance-sheet" reports::get_balance_sheet::<L, R>,

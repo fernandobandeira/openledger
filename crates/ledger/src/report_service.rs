@@ -32,13 +32,16 @@
 //! direction that matters: `pg_snapshot_xmin` is non-decreasing, so a cursor
 //! valid when it was stored never rises above a later horizon.
 
+use uuid::Uuid;
+
 use crate::report_store::{
-    BalanceSheetRead, IncomeStatementRead, ReadBounds, ReportRefusal, ReportStore, Scoped,
-    TrialBalanceRead,
+    AccountListingRead, BalanceSheetRead, IncomeStatementRead, ReadBounds, ReportRefusal,
+    ReportStore, Scoped, TrialBalanceRead,
 };
 use crate::reports::{
-    AccountBalance, AccountBalanceQuery, BalanceSheetQuery, Cursor, IncomeStatementQuery,
-    ReadError, Reports, Statement, Transaction, TransactionQuery, TrialBalance, TrialBalanceQuery,
+    AccountBalance, AccountBalanceQuery, AccountListing, AccountListingQuery, BalanceSheetQuery,
+    Cursor, IncomeStatementQuery, ListedAccount, ReadError, Reports, Statement, Transaction,
+    TransactionQuery, TrialBalance, TrialBalanceQuery,
 };
 
 /// The reader behind the [`Reports`] port, generic over the store. One
@@ -77,6 +80,10 @@ impl<S: ReportStore> Reports for ReportService<S> {
 
     async fn transaction(&self, query: &TransactionQuery) -> Result<Transaction, ReadError> {
         transaction(&self.store, query).await
+    }
+
+    async fn accounts(&self, query: &AccountListingQuery) -> Result<AccountListing, ReadError> {
+        accounts(&self.store, query).await
     }
 }
 
@@ -193,6 +200,85 @@ async fn transaction<S: ReportStore>(
     found.ok_or(ReadError::TransactionUnknown {
         transaction_id: query.transaction_id,
     })
+}
+
+/// The page size a caller who named none gets. Chosen, not measured — no book
+/// here has enough accounts for a number to have been earned by evidence, and
+/// ADR-0021 records that as a cost rather than hiding it. It is a page a human
+/// can read and a client can render without paging twice for a small book.
+const ACCOUNTS_PER_PAGE: i64 = 100;
+
+/// The largest page this listing will answer. Same standing: chosen. It exists
+/// because a listing without a ceiling is a caller-controlled table scan, and
+/// the read pool's `statement_timeout` is a worse way to find that out than a
+/// refusal naming the number.
+const MOST_ACCOUNTS_PER_PAGE: i64 = 1_000;
+
+/// One page of the account register (ADR-0021). The judgement here is the page
+/// size, and it is the same KIND of judgement the cursor rule is: a value the
+/// caller may supply, refused outside a stated window rather than silently
+/// clamped — a clamped page is an answer to a question the caller did not ask,
+/// and nothing on the wire would say so.
+///
+/// The page key is keyset, not an offset: the statement orders by `id`, which
+/// is `uuidv7()` and therefore creation-ordered, and takes everything strictly
+/// above the last id the caller saw.
+async fn accounts<S: ReportStore>(
+    store: &S,
+    query: &AccountListingQuery,
+) -> Result<AccountListing, ReadError> {
+    let limit = page_size_or_refuse_one_outside_the_window(query.limit)?;
+    let scoped = store
+        .accounts(&AccountListingRead {
+            tenant_id: &query.tenant_id,
+            limit,
+            after: query.after,
+            purpose: query.purpose.as_deref(),
+            owner_id: query.owner_id.as_deref(),
+        })
+        .await
+        .map_err(refused)?;
+    let accounts = answered_for_the_tenant_that_asked(&query.tenant_id, scoped)?;
+    Ok(AccountListing {
+        next_after: the_key_of_the_next_page(&accounts, limit),
+        accounts,
+    })
+}
+
+/// The page size to read at: the caller's, the default, or a refusal naming
+/// the window. Zero and negatives are refused here rather than sent to a
+/// `LIMIT`, where zero would answer an empty page that looks exactly like the
+/// end of the register.
+fn page_size_or_refuse_one_outside_the_window(asked_for: Option<i64>) -> Result<i64, ReadError> {
+    let Some(limit) = asked_for else {
+        return Ok(ACCOUNTS_PER_PAGE);
+    };
+    if !(1..=MOST_ACCOUNTS_PER_PAGE).contains(&limit) {
+        return Err(ReadError::InvalidRequest(format!(
+            "limit {limit} is outside 1..={MOST_ACCOUNTS_PER_PAGE}; omit it for \
+             {ACCOUNTS_PER_PAGE}"
+        )));
+    }
+    Ok(limit)
+}
+
+/// The `after` the caller should send for the next page — the last id of a
+/// FULL page, and nothing at all otherwise.
+///
+/// A full page means "there may be more", never "there is": the alternative is
+/// reading one row past the page to be sure, which costs every page a row to
+/// spare the last one a request. A caller that follows this key to an empty
+/// page has learnt the same thing one request later.
+fn the_key_of_the_next_page(accounts: &[ListedAccount], limit: i64) -> Option<Uuid> {
+    // `limit` came through the window check above, so it sits between 1 and
+    // the ceiling and this conversion cannot fail; one that somehow did would
+    // answer "no next page", which is the safe end of this question rather
+    // than a wrong key.
+    let page_is_full = usize::try_from(limit).is_ok_and(|limit| accounts.len() >= limit);
+    if !page_is_full {
+        return None;
+    }
+    accounts.last().map(|last| last.account_id)
 }
 
 /// The horizon, the floor and the book's chart version — one statement in one
@@ -398,6 +484,18 @@ mod tests {
         }
     }
 
+    /// One page of the register, unfiltered — the listing tests vary the
+    /// page size, which is the only value this service judges.
+    fn an_account_listing_query(limit: Option<i64>) -> AccountListingQuery {
+        AccountListingQuery {
+            tenant_id: "acme".to_owned(),
+            limit,
+            after: None,
+            purpose: None,
+            owner_id: None,
+        }
+    }
+
     /// The fake's futures are always immediately ready, so one poll with a
     /// no-op waker is a complete executor; the loop never observes `Pending`.
     fn run<F: Future>(future: F) -> F::Output {
@@ -438,6 +536,10 @@ mod tests {
         refuses_reports_with: Option<Diagnosis>,
         /// Whether the account and the transaction asked about exist.
         holds_the_row: bool,
+        /// How many accounts the register hands back, whatever page size it
+        /// is asked for — the listing tests set it to make a page FULL or
+        /// short without a database deciding.
+        accounts_on_the_register: usize,
         calls: Calls,
     }
 
@@ -451,6 +553,7 @@ mod tests {
                 scopes_to: None,
                 refuses_reports_with: None,
                 holds_the_row: true,
+                accounts_on_the_register: 0,
                 calls: Calls::default(),
             })
         }
@@ -492,6 +595,15 @@ mod tests {
         fn a_book_without_the_row() -> Result<Self, CursorUnparseable> {
             let mut fake = Self::a_book()?;
             fake.holds_the_row = false;
+            Ok(fake)
+        }
+
+        /// A register the listing statement answers this many accounts from,
+        /// whatever page size it is handed — enough to make a page full, or
+        /// short, without a database deciding which.
+        fn a_book_of(accounts: usize) -> Result<Self, CursorUnparseable> {
+            let mut fake = Self::a_book()?;
+            fake.accounts_on_the_register = accounts;
             Ok(fake)
         }
 
@@ -626,6 +738,34 @@ mod tests {
                 }],
             });
             Ok(self.scoped(&query.tenant_id, found))
+        }
+
+        async fn accounts(
+            &self,
+            read: &AccountListingRead<'_>,
+        ) -> Result<Scoped<Vec<ListedAccount>>, ReportRefusal> {
+            self.record(format!("accounts limit {}", read.limit));
+            let listed = (0..self.accounts_on_the_register)
+                .map(a_listed_account)
+                .collect();
+            Ok(self.scoped(read.tenant_id, listed))
+        }
+    }
+
+    /// One account of a fake register, its id derived from its position so a
+    /// page key can be traced back to the row that earned it.
+    fn a_listed_account(position: usize) -> ListedAccount {
+        ListedAccount {
+            account_id: Uuid::from_u128(0xA00 + position as u128),
+            owner_type: "company".to_owned(),
+            owner_id: Some("co_1".to_owned()),
+            purpose: "customer_receivable".to_owned(),
+            category: "asset".to_owned(),
+            normal_balance: "debit".to_owned(),
+            counterparty_scope: "per_shard".to_owned(),
+            currency: "USD".to_owned(),
+            stripe_count: 1,
+            created_at: an_instant(),
         }
     }
 
@@ -995,9 +1135,10 @@ mod tests {
             )),
             spoken(&run(service.account_balance(&an_account_balance_query()))),
             spoken(&run(service.transaction(&a_transaction_query()))),
+            spoken(&run(service.accounts(&an_account_listing_query(None)))),
         ];
 
-        assert_eq!(refused, ["tenant_mismatch"; 5]);
+        assert_eq!(refused, ["tenant_mismatch"; 6]);
         Ok(())
     }
 
@@ -1019,6 +1160,82 @@ mod tests {
                 .and_then(|face| face.lines.first().map(|line| line.amount_minor.clone())),
             Some("18446744073709551616".to_owned())
         );
+        Ok(())
+    }
+
+    /// The listing's page size, which is this service's second piece of
+    /// judgement (ADR-0021) — and the only one it has that the cursor rule
+    /// does not cover.
+    #[test]
+    fn a_listing_with_no_limit_reads_the_default_page() -> Result<(), CursorUnparseable> {
+        let store = FakeStore::a_book_of(3)?;
+        let calls = store.calls();
+        let service = ReportService::new(store);
+        let query = an_account_listing_query(None);
+
+        let answered = run(service.accounts(&query));
+
+        assert_eq!(spoken(&answered), "answered");
+        // The statement is bound with a number, never with an absence — the
+        // outbound port's `limit` is not an `Option`, so forgetting to choose
+        // is unrepresentable rather than remembered.
+        assert_eq!(taken(&calls), ["accounts limit 100"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_limit_outside_the_window_is_refused_rather_than_clamped() -> Result<(), CursorUnparseable>
+    {
+        // A clamped page is an answer to a question the caller did not ask,
+        // and nothing on the wire would say so — so 0, a negative and a
+        // value above the ceiling are all refusals naming the window, and
+        // none of them reaches a statement.
+        for limit in [0, -1, 1_001] {
+            let store = FakeStore::a_book_of(3)?;
+            let calls = store.calls();
+            let service = ReportService::new(store);
+            let query = an_account_listing_query(Some(limit));
+
+            let answered = run(service.accounts(&query));
+
+            assert_eq!(spoken(&answered), "invalid_request", "limit {limit}");
+            assert!(
+                taken(&calls).is_empty(),
+                "limit {limit} reached a statement"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_full_page_hands_back_the_key_of_the_next_one() -> Result<(), CursorUnparseable> {
+        let store = FakeStore::a_book_of(2)?;
+        let service = ReportService::new(store);
+        let query = an_account_listing_query(Some(2));
+
+        let answered = run(service.accounts(&query));
+
+        // The last id of the page, which is what a caller sends as `after` —
+        // keyset, so the next page starts strictly above this row and no
+        // concurrent insert can shift it (ADR-0021).
+        assert_eq!(
+            answered.ok().map(|page| page.next_after),
+            Some(Some(Uuid::from_u128(0xA01)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_that_did_not_fill_hands_back_no_key() -> Result<(), CursorUnparseable> {
+        let store = FakeStore::a_book_of(1)?;
+        let service = ReportService::new(store);
+        let query = an_account_listing_query(Some(2));
+
+        let answered = run(service.accounts(&query));
+
+        // A short page is the end of the register, and a key here would send
+        // the caller after a page that cannot exist.
+        assert_eq!(answered.ok().map(|page| page.next_after), Some(None));
         Ok(())
     }
 }

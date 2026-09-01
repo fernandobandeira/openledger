@@ -45,7 +45,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use ledger::{
-    Ledger, LedgerService, PostTransaction, Posted, Repository, TransactionStatus, WriteError,
+    AccountOpened, Ledger, LedgerService, OpenAccount, OpenAccountError, PostTransaction, Posted,
+    Repository, TransactionStatus, WriteError,
 };
 use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinSet;
@@ -282,12 +283,30 @@ fn rides_with_the_batch(batch: &[Submission], tenant: &str, waiter: &Submission)
 /// wire contract, the same error grammar — a caller cannot tell whether its
 /// posting shared a statement. It is not a decorator over another `Ledger`,
 /// because a batch is ONE call for N commands rather than N calls.
+///
+/// **Only the posting half is batched, and the other half says so by holding
+/// a writer of its own.** Opening an account (ADR-0021) never joins a batch:
+/// there is nothing to share — it writes no entries and upserts no balance
+/// row, so it has no accounts to overlap with anyone and no lock to order —
+/// and it is rare where a posting is hot. So it takes the writer below
+/// directly, out of the queue's way entirely, and a burst of openings cannot
+/// occupy a dispatcher that postings are waiting on.
+///
+/// Generic in the repository, where the posting half is not, and that is the
+/// cost of the second method: the queue hands its members to whichever
+/// dispatcher takes them and needs no type, while this call runs the writer
+/// service HERE, on the request's own task.
 #[derive(Clone)]
-pub struct BatchingLedger {
+pub struct BatchingLedger<R> {
     queue: Arc<Queue>,
+    /// The writer an opening runs on. A `LedgerService` like every dispatcher
+    /// holds, and it carries a stripe affinity it will never use — a stripe
+    /// is a row of `ledger_account_balances`, and opening an account writes
+    /// none.
+    opener: LedgerService<R>,
 }
 
-impl BatchingLedger {
+impl<R: Repository + Clone + 'static> BatchingLedger<R> {
     /// Start the pool: one task per writer, each owning its writer — and
     /// therefore the stripe affinity that writer holds for its lifetime — for
     /// as long as the process serves. That ownership is the point of the
@@ -308,10 +327,11 @@ impl BatchingLedger {
     /// `oneshot` whose sender is still sitting in the queue: the request
     /// hangs instead of failing. So the handles are kept and watched
     /// ([`end_the_process_when_a_dispatcher_stops`]).
-    pub fn dispatching_over<R>(writers: Vec<LedgerService<R>>) -> Self
-    where
-        R: Repository + 'static,
-    {
+    ///
+    /// `opener` is the writer the un-batched half runs on — see the struct's
+    /// own doc for why opening an account has one of its own rather than a
+    /// place in the queue.
+    pub fn dispatching_over(writers: Vec<LedgerService<R>>, opener: LedgerService<R>) -> Self {
         let queue = Arc::new(Queue::default());
         let mut pool = JoinSet::new();
         for writer in writers {
@@ -321,7 +341,7 @@ impl BatchingLedger {
             ));
         }
         tokio::spawn(end_the_process_when_a_dispatcher_stops(pool));
-        Self { queue }
+        Self { queue, opener }
     }
 }
 
@@ -350,7 +370,7 @@ async fn end_the_process_when_a_dispatcher_stops(mut pool: JoinSet<()>) {
     std::process::exit(1);
 }
 
-impl Ledger for BatchingLedger {
+impl<R: Repository> Ledger for BatchingLedger<R> {
     /// Queue the command and wait for the dispatcher that takes it. The
     /// command is CLONED because the port hands out a borrow and the caller's
     /// answer is produced on another task: one clone per post, of a few
@@ -369,6 +389,15 @@ impl Ledger for BatchingLedger {
                 "the dispatcher holding this posting stopped before answering it".to_owned(),
             ))
         })
+    }
+
+    /// Open the account on this request's own task, through the writer this
+    /// value holds. No queue, no dispatcher, no clone of the command: an
+    /// opening has nothing to share with a batch-mate (it writes no entries
+    /// and no balance row), and routing it through the queue would put it
+    /// behind postings and put postings behind it.
+    async fn open_account(&self, command: &OpenAccount) -> Result<AccountOpened, OpenAccountError> {
+        self.opener.open_account(command).await
     }
 }
 
@@ -584,6 +613,39 @@ mod tests {
             _hash: &[u8],
         ) -> Result<Option<ledger::StoredResult>, ledger::StorageError> {
             Ok(None)
+        }
+
+        // The three opening statements, refused rather than faked. Nothing in
+        // this module's tests opens an account — an opening never joins a
+        // batch and never reaches a dispatcher (ADR-0021) — so a call landing
+        // here would mean the routing this file owns had changed underneath
+        // the tests, and it should say so instead of answering.
+        async fn chart_triple_for_purpose(
+            &self,
+            _tx: &mut NoTransaction,
+            _purpose: &str,
+        ) -> Result<Option<ledger::ChartTriple>, ledger::StorageError> {
+            Err("the dispatcher's repository was asked to read the chart".into())
+        }
+
+        async fn claim_and_open_account(
+            &self,
+            _tx: &mut NoTransaction,
+            _command: &OpenAccount,
+            _hash: &[u8],
+            _payload: &serde_json::Value,
+            _triple: &ledger::ChartTriple,
+        ) -> Result<Option<ledger::OpenedAccount>, ledger::StorageError> {
+            Err("the dispatcher's repository was asked to open an account".into())
+        }
+
+        async fn stored_account(
+            &self,
+            _tx: &mut NoTransaction,
+            _command: &OpenAccount,
+            _hash: &[u8],
+        ) -> Result<Option<ledger::StoredAccount>, ledger::StorageError> {
+            Err("the dispatcher's repository was asked for a stored account".into())
         }
 
         async fn stored_result_batch(

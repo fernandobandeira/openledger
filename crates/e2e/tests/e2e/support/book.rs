@@ -139,6 +139,16 @@ pub fn trial_balance_path(tenant: &str, from: &str, to: &str, and: &[(&str, &str
     )
 }
 
+/// The account resource's collection path — the one both of ADR-0021's verbs
+/// hang off.
+pub const ACCOUNTS_PATH: &str = "/v1/accounts";
+
+/// `GET /v1/accounts` with its book, and whatever page or filter this call is
+/// varying.
+pub fn accounts_path(tenant: &str, and: &[(&str, &str)]) -> String {
+    with_parameters(&format!("{ACCOUNTS_PATH}?tenant_id={tenant}"), and)
+}
+
 /// `GET /v1/accounts/{account_id}/balance` as a path. `currency` is required:
 /// the balance row's key includes it.
 pub fn account_balance_path(tenant: &str, account: Uuid, currency: &str) -> String {
@@ -532,11 +542,51 @@ impl TestBook {
         &self,
         body: &serde_json::Value,
     ) -> Result<reqwest::Response, reqwest::Error> {
+        self.post_to("/v1/transactions", body).await
+    }
+
+    /// One POST at any path this book serves. There are two write routes
+    /// since ADR-0021 — the posting endpoint and the account one — and they
+    /// are the same call with a different path, so `post` above is this at
+    /// `/v1/transactions` and [`open_account`](Self::open_account) is this at
+    /// `/v1/accounts`.
+    pub async fn post_to(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response, reqwest::Error> {
         self.client
-            .post(format!("{}/v1/transactions", self.base))
+            .post(format!("{}{path}", self.base))
             .json(body)
             .send()
             .await
+    }
+
+    /// One POST to `/v1/accounts` — the write ADR-0021 added, and the reason
+    /// the suite's own fixtures no longer have to be the only way an account
+    /// comes to exist.
+    pub async fn open_account(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        self.post_to(ACCOUNTS_PATH, body).await
+    }
+
+    /// The account register as the DATABASE holds it, for one tenant, in the
+    /// listing's own order — the oracle a listing test holds its page
+    /// against, read over the admin connection rather than through the
+    /// endpoint under test.
+    pub async fn accounts_on_the_register(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<(Uuid, String, Option<String>)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT id, purpose, owner_id FROM ledger_accounts
+              WHERE tenant_id = $1 ORDER BY id",
+        )
+        .bind(tenant)
+        .fetch_all(&self.pool)
+        .await
     }
 
     /// One POST as a spawned task, for the concurrent-duplicate test: the

@@ -31,7 +31,12 @@
 //!   not smoothed into one** (ADR-0011 §4): a position takes one instant, a
 //!   flow takes a range, and the trial balance takes BOTH axes by parameter —
 //!   never by a mode flag (ADR-0019: two resources for two parameters of one
-//!   function is Formance's `pit`-resolves-to-six-columns mistake).
+//!   function is Formance's `pit`-resolves-to-six-columns mistake);
+//! - **the one listing here pages by KEYSET and carries no balance**
+//!   (ADR-0021). An offset shifts under concurrent inserts, so a caller
+//!   paging a growing book silently skips rows; and a balance is per currency
+//!   and per stripe, so one per row would be N+1 and a second definition of a
+//!   question `AccountBalance` already answers exactly.
 //!
 //! Nothing here names an sqlx type, a runtime or a clock: as-of instants come
 //! from the caller and cursors come from the database, so `deny.toml`'s
@@ -151,6 +156,78 @@ pub struct IncomeStatementQuery {
     pub effective_to: OffsetDateTime,
     pub cursor: Option<String>,
     pub chart_version: Option<i32>,
+}
+
+/// `GET /v1/accounts` — the account register of one book, keyset-paginated.
+///
+/// **A listing, and ADR-0019 refused those.** ADR-0021 withdraws that refusal
+/// for accounts and keeps it for transactions, and the distinction is the
+/// whole reason it can: ADR-0019's stated ground was that a listing *"needs an
+/// ordering and a page key this spike did not design"*, and for accounts the
+/// ordering already exists — `pk_accounts` is `(tenant_id, id)` and `id` is
+/// `uuidv7()`, which is time-ordered and total. A TRANSACTION listing would
+/// still have to choose between the recorded and effective axes, which is the
+/// bitemporal trap ADR-0006 exists to document; accounts have one axis.
+///
+/// **The filters are EQUALITY and nothing else** (ADR-0021): no pattern
+/// matching, no free text, nothing that needs an index this schema does not
+/// have.
+pub struct AccountListingQuery {
+    pub tenant_id: String,
+    /// How many accounts at most. `None` takes the read path's default; a
+    /// value outside its window is refused rather than clamped, because a
+    /// clamped page is an answer to a question the caller did not ask and
+    /// nothing on the wire says so. The number arrives as a signed integer so
+    /// that zero and negatives are refused HERE, by name, rather than by a
+    /// deserializer naming a serde path.
+    pub limit: Option<i64>,
+    /// The last `id` of the previous page — the page key. Keyset, never an
+    /// offset: an offset shifts under concurrent inserts, so a caller paging
+    /// through a growing book silently skips rows (ADR-0021).
+    pub after: Option<Uuid>,
+    /// Equality on the chart code, or nothing.
+    pub purpose: Option<String>,
+    /// Equality on the owner, or nothing. It does not select house accounts:
+    /// a house account has no owner at all.
+    pub owner_id: Option<String>,
+}
+
+/// One page of the account register.
+pub struct AccountListing {
+    pub accounts: Vec<ListedAccount>,
+    /// The `after` a caller should send for the next page, or `None` when this
+    /// page is the last one this listing can promise. `Some` exactly when the
+    /// page came back FULL — which is a "there may be more", never a "there
+    /// is": the alternative is reading one row past the page to be sure, and
+    /// a caller that follows a cursor to an empty page has learnt the same
+    /// thing one request later.
+    pub next_after: Option<Uuid>,
+}
+
+/// One account as the register holds it: its identity, and its stripe count.
+///
+/// **No balance**, and that is contract rather than omission (ADR-0021):
+/// balances are per currency and per stripe, a balance per row would be N+1,
+/// and `GET /v1/accounts/{id}/balance` already answers that question one
+/// account at a time.
+pub struct ListedAccount {
+    pub account_id: Uuid,
+    pub owner_type: String,
+    /// `None` on a house account, which is the ledger's own side and has no
+    /// owner (`ck_accounts__house_has_no_owner`).
+    pub owner_id: Option<String>,
+    pub purpose: String,
+    pub category: String,
+    pub normal_balance: String,
+    pub counterparty_scope: String,
+    pub currency: String,
+    /// How many stripes the writer spreads this account's balance row across
+    /// — a HINT and not an invariant (ADR-0013 §4). It is the one operational
+    /// number on this answer, and it is here because it is the one a caller
+    /// can act on: a hot account is re-opened with more stripes, never
+    /// re-striped by an update.
+    pub stripe_count: i16,
+    pub created_at: OffsetDateTime,
 }
 
 /// `GET /v1/transactions/{transaction_id}` — pinned by nothing, because the
@@ -312,11 +389,12 @@ pub enum ReadError {
 
 /// The read path's inbound port: *tell me what the book says*.
 ///
-/// Five methods for five routes, and `transaction` is one of them rather than
-/// a third port's — a manifest's worth of ceremony for one method buys a
+/// Six methods for six routes, and neither `transaction` nor `accounts` got a
+/// port of its own — a manifest's worth of ceremony for one method buys a
 /// boundary nothing crosses (ADR-0015's own reason for refusing a `ports`
-/// crate), and from the caller's side reading a transaction back and reading
-/// a report are the same capability (ADR-0019).
+/// crate), and from the caller's side reading a transaction back, listing the
+/// register and reading a report are the same capability: *tell me what the
+/// book says* (ADR-0019, ADR-0021).
 ///
 /// Stated as RPITIT with an explicit `+ Send`, exactly as [`Ledger`] is and
 /// for the same reason: an axum handler's future must be `Send`, and a bare
@@ -357,4 +435,14 @@ pub trait Reports: Send + Sync {
         &self,
         query: &TransactionQuery,
     ) -> impl Future<Output = Result<Transaction, ReadError>> + Send;
+
+    /// One page of the account register (ADR-0021). A listing is a READ, so
+    /// it is here and not on [`Ledger`]: from the caller's side it is the
+    /// same capability every other method on this port is — *tell me what the
+    /// book says* — and it runs on the same read pool, the same read login
+    /// and the same scoped bracket.
+    fn accounts(
+        &self,
+        query: &AccountListingQuery,
+    ) -> impl Future<Output = Result<AccountListing, ReadError>> + Send;
 }

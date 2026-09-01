@@ -31,7 +31,16 @@
 //! promises *"nothing was written"* and a read cannot say that; `report_store`
 //! is its outbound port; and `report_service` is the reader, whose one piece of
 //! judgement is the cursor rule.
+//!
+//! ADR-0021 added a second WRITE to the first ring rather than a third ring:
+//! `accounts` is the account-opening command — its validation, its canonical
+//! hash and its stored payload, the same four things `domain` owns for a
+//! posting — and the port, the repository and the service each grew for it
+//! where they already were. It is a module of its own because a posting and
+//! an opening share nothing but the idempotency spine, and the spine is
+//! `ledger_events`, not a Rust type.
 
+mod accounts;
 mod domain;
 mod port;
 mod postings;
@@ -47,21 +56,23 @@ mod service;
 // `Repository` port's signatures name them; the functions are `pub(crate)`,
 // called by the writer service alone, so the math's order of operations
 // cannot be re-orchestrated outside this crate.
+pub use accounts::{AccountOpened, AccountOwner, AccountOwnerType, ChartTriple, OpenAccount};
 pub use domain::{Invalid, PostTransaction, Posted, Posting, TransactionStatus};
-pub use port::{Ledger, WriteError};
+pub use port::{Ledger, OpenAccountError, WriteError};
 pub use postings::{Append, Delta, Direction, Leg};
 pub use report_service::ReportService;
 pub use report_store::{
-    BalanceSheetRead, IncomeStatementRead, ReadBounds, ReportRefusal, ReportStore, Scoped,
-    TrialBalanceRead,
+    AccountListingRead, BalanceSheetRead, IncomeStatementRead, ReadBounds, ReportRefusal,
+    ReportStore, Scoped, TrialBalanceRead,
 };
 pub use reports::{
-    AccountBalance, AccountBalanceQuery, BalanceSheetQuery, Cursor, CursorUnparseable,
-    IncomeStatementQuery, ReadError, Reports, Statement, StatementLine, Transaction,
-    TransactionEntry, TransactionQuery, TrialBalance, TrialBalanceQuery, TrialBalanceRow,
+    AccountBalance, AccountBalanceQuery, AccountListing, AccountListingQuery, BalanceSheetQuery,
+    Cursor, CursorUnparseable, IncomeStatementQuery, ListedAccount, ReadError, Reports, Statement,
+    StatementLine, Transaction, TransactionEntry, TransactionQuery, TrialBalance,
+    TrialBalanceQuery, TrialBalanceRow,
 };
 pub use repository::{
-    Appended, BalanceUpsert, BatchMember, Claimed, MemberOutcome, Repository, StorageError,
-    StoredResult, SupersedeRefusal,
+    Appended, BalanceUpsert, BatchMember, Claimed, MemberOutcome, OpenedAccount, Repository,
+    StorageError, StoredAccount, StoredResult, SupersedeRefusal,
 };
 pub use service::LedgerService;

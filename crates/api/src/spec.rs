@@ -40,6 +40,8 @@ pub fn openapi_json() -> Result<String, serde_json::Error> {
     paths(
         crate::transactions::post_transaction,
         crate::transactions::get_transaction,
+        crate::accounts::open_account,
+        crate::accounts::list_accounts,
         crate::reports::get_account_balance,
         crate::reports::get_trial_balance,
         crate::reports::get_balance_sheet,
@@ -47,7 +49,8 @@ pub fn openapi_json() -> Result<String, serde_json::Error> {
     ),
     tags(
         (name = "transactions", description = "Post a transaction, and read one back."),
-        (name = "accounts", description = "The posted balance of one account, now."),
+        (name = "accounts", description = "Open an account, list them, and read one's posted \
+                                           balance."),
         (name = "reports", description = "The pinned reports: both time axes, by parameter."),
     ),
 )]

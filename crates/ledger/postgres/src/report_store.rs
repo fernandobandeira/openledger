@@ -57,9 +57,10 @@
 //! pretend a report total fits in 64 bits.
 
 use ledger::{
-    AccountBalance, AccountBalanceQuery, BalanceSheetRead, Cursor, IncomeStatementRead, ReadBounds,
-    ReportRefusal, ReportStore, Scoped, StatementLine, Transaction, TransactionEntry,
-    TransactionQuery, TrialBalanceRead, TrialBalanceRow,
+    AccountBalance, AccountBalanceQuery, AccountListingRead, BalanceSheetRead, Cursor,
+    IncomeStatementRead, ListedAccount, ReadBounds, ReportRefusal, ReportStore, Scoped,
+    StatementLine, Transaction, TransactionEntry, TransactionQuery, TrialBalanceRead,
+    TrialBalanceRow,
 };
 use sqlx::{PgPool, Postgres, Row as _};
 use time::OffsetDateTime;
@@ -270,6 +271,47 @@ const TRANSACTION: &str = "SELECT x.id AS transaction_id,
         WHERE x.tenant_id = $1 AND x.id = $2
         ORDER BY e.account_id, e.account_seq";
 
+/// One page of the account register (ADR-0021) — the first listing on this
+/// surface, and the only statement in this file that is not a report.
+///
+/// **Keyset, never an offset.** The page starts strictly above the last `id`
+/// the caller saw, and `id` is `uuidv7()`, so the order is creation order and
+/// it is total. An offset would shift under concurrent inserts and a caller
+/// paging a growing book would silently skip rows; a keyset on the primary
+/// key has neither problem, and `pk_accounts` is `(tenant_id, id)`, so the
+/// walk is an index scan of exactly this shape.
+///
+/// **The two filters are EQUALITY** (ADR-0021): no `LIKE`, no `ILIKE`, no
+/// full-text — nothing that would need an index this schema does not have.
+/// Each is written as `$n IS NULL OR column = $n` so that one statement
+/// serves all four combinations; the alternative is four statements, or a
+/// string built at run time from caller-supplied text.
+///
+/// The explicit `tenant_id` predicate is here for the INDEX, as it is on
+/// [`READ_BOUNDS`]: the RLS qual already scopes the read, and the leading
+/// key column is what makes this a range scan rather than a filter.
+///
+/// **No balance column, at any depth** (ADR-0021): balances are per currency
+/// and per stripe, a balance per row would be N+1, and the balance route
+/// answers that question one account at a time.
+const ACCOUNTS: &str = "SELECT a.id AS account_id,
+            a.owner_type::text AS owner_type,
+            a.owner_id AS owner_id,
+            a.purpose AS purpose,
+            a.category::text AS category,
+            a.normal_balance::text AS normal_balance,
+            a.counterparty_scope AS counterparty_scope,
+            a.currency::text AS currency,
+            a.stripe_count AS stripe_count,
+            a.created_at AS created_at
+         FROM ledger_accounts a
+        WHERE a.tenant_id = $1
+          AND ($2::uuid IS NULL OR a.id > $2::uuid)
+          AND ($3::text IS NULL OR a.purpose = $3::text)
+          AND ($4::text IS NULL OR a.owner_id = $4::text)
+        ORDER BY a.id
+        LIMIT $5";
+
 /// The SQLSTATE this connection's `statement_timeout` fires as.
 const STATEMENT_TIMEOUT: &str = "57014";
 
@@ -403,6 +445,39 @@ fn transaction_from(rows: Vec<TransactionSqlRow>) -> Option<Transaction> {
     })
 }
 
+/// One row of [`ACCOUNTS`]'s answer.
+#[derive(sqlx::FromRow)]
+struct AccountSqlRow {
+    account_id: Uuid,
+    owner_type: String,
+    owner_id: Option<String>,
+    purpose: String,
+    category: String,
+    normal_balance: String,
+    counterparty_scope: String,
+    currency: String,
+    stripe_count: i16,
+    created_at: OffsetDateTime,
+}
+
+/// The page, in the port's own shape.
+fn register_page_from(rows: Vec<AccountSqlRow>) -> Vec<ListedAccount> {
+    rows.into_iter()
+        .map(|row| ListedAccount {
+            account_id: row.account_id,
+            owner_type: row.owner_type,
+            owner_id: row.owner_id,
+            purpose: row.purpose,
+            category: row.category,
+            normal_balance: row.normal_balance,
+            counterparty_scope: row.counterparty_scope,
+            currency: row.currency,
+            stripe_count: row.stripe_count,
+            created_at: row.created_at,
+        })
+        .collect()
+}
+
 /// One statement face, from whichever of the two functions was asked.
 fn face_from(rows: Vec<StatementSqlRow>) -> Vec<StatementLine> {
     rows.into_iter()
@@ -531,6 +606,23 @@ impl ReportStore for PgReportStore {
             .await
             .map_err(refusal)?;
         scope.end_with(transaction_from(rows)).await
+    }
+
+    async fn accounts(
+        &self,
+        read: &AccountListingRead<'_>,
+    ) -> Result<Scoped<Vec<ListedAccount>>, ReportRefusal> {
+        let mut scope = self.begin_the_scoped_read(read.tenant_id).await?;
+        let rows: Vec<AccountSqlRow> = sqlx::query_as(ACCOUNTS)
+            .bind(read.tenant_id)
+            .bind(read.after)
+            .bind(read.purpose)
+            .bind(read.owner_id)
+            .bind(read.limit)
+            .fetch_all(&mut *scope.tx)
+            .await
+            .map_err(refusal)?;
+        scope.end_with(register_page_from(rows)).await
     }
 }
 

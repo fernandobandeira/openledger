@@ -3,7 +3,7 @@
 //! Its own port rather than a method on [`Repository`](crate::Repository),
 //! for the reason that port's own doc gives: it is *"what the **writer**
 //! service asks of storage"*, and the rule that comes with it — **one method
-//! per statement** — carries over here unchanged. Six methods, six
+//! per statement** — carries over here unchanged. Seven methods, seven
 //! statements, each one a scoped read transaction of its own in the adapter.
 //!
 //! **The bracket is the adapter's** (ADR-0019, ADR-0004): `BEGIN … READ
@@ -27,10 +27,11 @@
 //! resolves them; this is what makes forgetting unrepresentable.
 
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::reports::{
-    AccountBalance, AccountBalanceQuery, Cursor, StatementLine, Transaction, TransactionQuery,
-    TrialBalanceRow,
+    AccountBalance, AccountBalanceQuery, Cursor, ListedAccount, StatementLine, Transaction,
+    TransactionQuery, TrialBalanceRow,
 };
 use crate::repository::StorageError;
 
@@ -98,6 +99,23 @@ pub struct IncomeStatementRead<'a> {
     pub effective_to: OffsetDateTime,
     pub cursor: Cursor,
     pub chart_version: i32,
+}
+
+/// One page of the account register, with every value resolved — the shape a
+/// statement can be bound from, with no absence left to interpret. `limit` is
+/// a plain number here and an `Option` on the query, because choosing the page
+/// size is the read path's judgement (the same place the cursor rule lives)
+/// and this port is where forgetting to choose is made unrepresentable.
+///
+/// `after`, `purpose` and `owner_id` stay `Option`s, and that is not the same
+/// thing: each is a FILTER whose absence means "do not filter", which is a
+/// question the statement answers rather than a decision the service owes it.
+pub struct AccountListingRead<'a> {
+    pub tenant_id: &'a str,
+    pub limit: i64,
+    pub after: Option<Uuid>,
+    pub purpose: Option<&'a str>,
+    pub owner_id: Option<&'a str>,
 }
 
 /// Why storage refused a read — the adapter's classification of what the
@@ -171,4 +189,14 @@ pub trait ReportStore: Send + Sync {
         &self,
         query: &TransactionQuery,
     ) -> impl Future<Output = Result<Scoped<Option<Transaction>>, ReportRefusal>> + Send;
+
+    /// One page of the account register, ordered by `id` and keyed off the
+    /// last one seen (ADR-0021). No report function is involved and no cursor
+    /// is pinned: the rows carry no commit position to pin against, which is
+    /// the cost ADR-0019 already records for an issued report's ROW SET and
+    /// which this endpoint widens the door to.
+    fn accounts(
+        &self,
+        read: &AccountListingRead<'_>,
+    ) -> impl Future<Output = Result<Scoped<Vec<ListedAccount>>, ReportRefusal>> + Send;
 }

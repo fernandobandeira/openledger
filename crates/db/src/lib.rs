@@ -58,8 +58,18 @@ pub const POOL_CONNECTIONS: u32 = 38;
 /// The headroom above the dispatcher pool, and the reason this crate can
 /// state the coupling as an assertion rather than a sentence: every
 /// dispatcher needs a connection of its own, and these six are what keep the
-/// startup schema gate from waiting behind a pool of writers that is full by
+/// non-dispatcher work off the back of a pool of writers that is full by
 /// design.
+///
+/// **Two things draw on the six, and naming them is the point of this
+/// comment.** The startup schema gate is one. The other arrived with
+/// [ADR-0021](https://openledger.dev/decisions/0021-accounts-over-http):
+/// opening an account is a write that is deliberately **not** batched — it has
+/// no entries, no balance upsert and nothing to coalesce — so it runs on its
+/// own writer rather than occupying a dispatcher that postings are queued
+/// behind. That writer takes its connection from here. Six covers both today;
+/// a third consumer is a reason to re-derive this number rather than to
+/// assume it still fits.
 ///
 /// **The "and any future reader" clause this comment used to carry is
 /// withdrawn** (ADR-0019 A6). That reader has arrived — it is

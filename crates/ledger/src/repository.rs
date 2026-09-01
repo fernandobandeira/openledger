@@ -5,7 +5,10 @@
 //! with the whole append riding on it, and the replay lookup — each in a
 //! single-command form and an N-command form, because a batch is ONE
 //! statement for N callers rather than N calls (ADR-0018 §5), and a method
-//! per statement is what that costs.
+//! per statement is what that costs. Since ADR-0021 there are three more,
+//! all for opening an account: the chart read the derived triple comes from,
+//! the claim that carries the account insert, and that operation's own replay
+//! lookup — one method per statement, again.
 //!
 //! This seam is NOT storage-agnosticism. There is one adapter
 //! (`crates/ledger/postgres`, a nested workspace member) and no swappability
@@ -19,6 +22,7 @@
 
 use uuid::Uuid;
 
+use crate::accounts::{ChartTriple, OpenAccount};
 use crate::domain::PostTransaction;
 use crate::postings::Append;
 
@@ -159,6 +163,40 @@ pub enum MemberOutcome {
 /// whole pair is a different fact: the key was reused with a different body.
 pub type StoredResult = (Uuid, Option<Uuid>);
 
+/// What the account-opening statement answered after claiming the key: the
+/// account it wrote, or the unique index's refusal.
+///
+/// `AlreadyExists` arrives as an ERROR from the backend rather than as rows —
+/// `23505` on `uq_accounts__owned` or `uq_accounts__house` — and the adapter
+/// classifies it by constraint name, the same shape
+/// [`SupersedeRefusal::TargetAlreadySuperseded`] is classified in on the
+/// posting path. The service names the refusal and rolls back; nothing is
+/// written.
+pub enum OpenedAccount {
+    Opened {
+        event_id: Uuid,
+        account_id: Uuid,
+    },
+    /// `uq_accounts__owned` or `uq_accounts__house` already holds this
+    /// account. Which of the two is not carried: the refusal says the account
+    /// exists and deliberately says no more (ADR-0021), so the caller gets
+    /// one sentence and the index that produced it stays the adapter's
+    /// business.
+    AlreadyExists,
+}
+
+/// What an already-claimed OPENING stored, as its replay lookup answers it:
+/// the event, and the account it caused.
+///
+/// `None` in the inner position is a can't-happen state and not a legitimate
+/// shape — an accepted opening always wrote an account, and the lookup finds
+/// it by the natural key the replayed body itself names
+/// (`uq_accounts__owned` / `uq_accounts__house`, the same two indexes that
+/// refuse a second one). The service answers it as `Internal`. `None` for the
+/// whole pair is the different fact [`StoredResult`]'s is: the key was reused
+/// with a different body.
+pub type StoredAccount = (Uuid, Option<Uuid>);
+
 /// The opaque storage failure. The port names no backend error type — the
 /// Postgres error stays inside the adapter crate, boxed at exactly one
 /// function — and the service forwards it unread into
@@ -296,6 +334,69 @@ pub trait Repository: Send + Sync {
         tx: &mut Self::Tx,
         members: &[BatchMember<'_>],
     ) -> impl Future<Output = Result<Vec<Option<StoredResult>>, StorageError>> + Send;
+
+    /// The chart's own row for a purpose — the three columns
+    /// `ledger_accounts` copies and `fk_accounts__type` /
+    /// `fk_accounts__scope` hold honest (ADR-0021). `None` means
+    /// `account_types` has no such code, which the service answers as
+    /// `account_type_unknown`.
+    ///
+    /// It runs INSIDE the opening's own database transaction, and that is not
+    /// incidental: the triple this read answers with is the triple the insert
+    /// binds, so a chart edit between the two would be a foreign-key error
+    /// where a named refusal belongs. One statement, one method, like every
+    /// other on this port.
+    fn chart_triple_for_purpose(
+        &self,
+        tx: &mut Self::Tx,
+        purpose: &str,
+    ) -> impl Future<Output = Result<Option<ChartTriple>, StorageError>> + Send;
+
+    /// Statement A for an opening: claim the idempotency key, storing the
+    /// command's hash and `payload` beside it, and — only when the claim
+    /// returns a row — insert the account, in this ONE statement (ADR-0021's
+    /// *"in the same database transaction"*, held as one statement rather
+    /// than two for the same reason posting is).
+    ///
+    /// `triple` is what [`chart_triple_for_purpose`](Repository::chart_triple_for_purpose)
+    /// answered. The statement binds it rather than joining `account_types`
+    /// again: the derivation is the writer's decision and the composite
+    /// foreign keys are what verify it, so the join would be a second opinion
+    /// on a question already asked.
+    ///
+    /// `Some` means this caller is the first writer — either the account is
+    /// written, uncommitted, or the unique index refused it
+    /// ([`OpenedAccount::AlreadyExists`]). `None` means an earlier caller
+    /// claimed the key and NOTHING here ran; the replay half stays the
+    /// separate [`stored_account`](Repository::stored_account), because
+    /// folding the two is the one-statement hole ADR-0013 §2 reproduced.
+    fn claim_and_open_account(
+        &self,
+        tx: &mut Self::Tx,
+        command: &OpenAccount,
+        hash: &[u8],
+        payload: &serde_json::Value,
+        triple: &ChartTriple,
+    ) -> impl Future<Output = Result<Option<OpenedAccount>, StorageError>> + Send;
+
+    /// Statement B for an opening: the [`StoredAccount`] of the already
+    /// claimed key — with the hash in the lookup's WHERE, never compared by
+    /// the caller, exactly as [`stored_result`](Repository::stored_result)
+    /// does it (ADR-0013 §2: a same-key/different-body replay must find NO
+    /// row, so a caller that forgets to compare gets nothing rather than the
+    /// wrong stored result).
+    ///
+    /// The account is found by the natural key the REPLAYED BODY names, since
+    /// `ledger_accounts` carries no `event_id` column — the same
+    /// `uq_accounts__owned` / `uq_accounts__house` keys that refuse a second
+    /// one, read from the other side. The body is the one whose hash matched,
+    /// so the key it names is the key the first writer used.
+    fn stored_account(
+        &self,
+        tx: &mut Self::Tx,
+        command: &OpenAccount,
+        hash: &[u8],
+    ) -> impl Future<Output = Result<Option<StoredAccount>, StorageError>> + Send;
 
     /// Commit the bracket: the event claim and everything it caused become
     /// durable together.
