@@ -334,8 +334,10 @@ in the schema — `xact_id xid8` on every journal row, pinned at
 checkpoints (measured at ~40–230× at a close boundary, ~8–9× mid-period, neither decaying with
 history), so a business-date query could read "prior close + entries since". **But that benefit is real
 and not yet wired in**: the shipped `balance_sheet_at` / `income_statement_for` / `trial_balance_at`
-never read `ledger_period_balances` — proven from `pg_get_functiondef` — so they scan `ledger_entries`
-from inception, and the checkpoint's only reader is `recon_checkpoint_breaks` ([spike 020](/spikes/016-close-cost-at-scale)
+never read `ledger_period_balances` — proven from `pg_get_functiondef` — and the checkpoint's only
+reader is `recon_checkpoint_breaks`. **Only `balance_sheet_at` scans from inception**, though:
+[ADR-0020](/decisions/0020-checkpoint-on-the-report-path) withdrew the wider claim, because the other
+two carry `effective_at >= p_from` ([spike 020](/spikes/016-close-cost-at-scale)
 — this site's spike 016; the spike directories carry their own numbering).
 
 **Make the checkpoint pay for itself** (moved here from the decision log): teach `balance_sheet_at` to
@@ -380,8 +382,11 @@ a period that earned**, with the balance sheet correct to the unit and `openledg
 
 **Done when:** an as-of query at instant T returns the same answer when re-run under concurrent
 writes (**proven on the SQL as of 2026-09-01**; still to hold through the compiled binary), the
-backdating case (insertion order ≠ effective order) is correct on both axes, and the statement
-functions read the checkpoint rather than scanning from inception.
+backdating case (insertion order ≠ effective order) is correct on both axes, and
+**`balance_sheet_at` reads** the checkpoint rather than scanning from inception — one function, not
+three ([ADR-0020](/decisions/0020-checkpoint-on-the-report-path)); `income_statement_for` is refused
+it structurally and `trial_balance_at` is proven able to take it and left unadopted pending a
+measurement.
 
 ---
 
