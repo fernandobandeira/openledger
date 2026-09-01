@@ -1,0 +1,146 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+/* The docs site is dark-only — Vesper has no light variant — and so is this.
+   `<html>` carries `class="dark"` unconditionally so the shadcn components'
+   own `dark:` utilities resolve against the palette below rather than against
+   a light one that does not exist here. */
+@custom-variant dark (&:is(.dark *));
+
+/* ---- the palette ----------------------------------------------------------
+   Read off site/app/theme.css, not invented. Vesper's near-black ground, its
+   peach accent (`focusBorder`), its `invalid` red and its `string` mint. Every
+   shadcn token below is one of those eleven values, so a component inherits
+   the palette instead of being overridden at the call site.
+
+   `--border` is the RULE (#262626) rather than the heavier #333333: this
+   layout is hairlines, and #333333 is reserved for the things a hand touches
+   — inputs and the rail's own frame — where an edge has to be findable. */
+:root {
+  --ground: #101010;
+  --surface: #181818;
+  --rule: #262626;
+  --edge: #333333;
+  --ink: #e6e6e6;
+  --dim: #8b8b8b;
+  --line: #5c5c5c;
+  --peach: #ffc799;
+  --credit: #ff8080;
+  --credit-bg: #1c1210;
+  --ok: #99ffe4;
+  --ok-bg: #0e1a17;
+
+  --background: var(--ground);
+  --foreground: var(--ink);
+  --card: var(--surface);
+  --card-foreground: var(--ink);
+  --popover: var(--surface);
+  --popover-foreground: var(--ink);
+  --primary: var(--peach);
+  --primary-foreground: var(--ground);
+  --secondary: var(--rule);
+  --secondary-foreground: var(--ink);
+  --muted: var(--surface);
+  --muted-foreground: var(--dim);
+  --accent: var(--rule);
+  --accent-foreground: var(--peach);
+  --destructive: var(--credit);
+  --border: var(--rule);
+  --input: var(--edge);
+  --ring: var(--peach);
+
+  /* Flat, not rounded: the boldness in this design is the rail, not the
+     corners. */
+  --radius: 0.25rem;
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo,
+    Consolas, monospace;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  /* The ledger's own five, so a credit column or an accepted write is named in
+     a class rather than spelled as a hex value in a component. */
+  --color-rule: var(--rule);
+  --color-edge: var(--edge);
+  --color-line: var(--line);
+  --color-dim: var(--dim);
+  --color-peach: var(--peach);
+  --color-credit: var(--credit);
+  --color-credit-bg: var(--credit-bg);
+  --color-ok: var(--ok);
+  --color-ok-bg: var(--ok-bg);
+  --color-surface: var(--surface);
+  --color-ground: var(--ground);
+
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+  --font-heading: var(--font-sans);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply font-sans;
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  /* Monospace-forward: this inverts the usual hierarchy on purpose. Sans is
+     for headings and prose; every amount, id, cursor and instant is mono with
+     tabular figures so a column of them lines up on the decimal point. */
+  code,
+  kbd,
+  samp,
+  pre {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+  /* Keyboard focus must be visible on every control, including the ones that
+     are plain elements rather than shadcn components. */
+  :focus-visible {
+    outline: 2px solid var(--peach);
+    outline-offset: 1px;
+  }
+}
+
+/* The one animation in the design — the rail's marks sliding as the horizon
+   advances — and the one place motion has to be answerable to the reader. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

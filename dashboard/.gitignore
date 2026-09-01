@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Next.js build output
+.next/
+out/
+next-env.d.ts
+
+# Environment overrides — OPENLEDGER_API_ORIGIN belongs here, not in the repo
+.env
+.env.local
+
+# Editor / OS noise
+.DS_Store
+*.tsbuildinfo
+
+# NOTE: src/lib/api-types.ts is NOT ignored. It is generated from
+# crates/api/openapi.json and committed on purpose — see README.md.
