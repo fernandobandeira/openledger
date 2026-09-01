@@ -23,4 +23,5 @@ export default {
   '0020-checkpoint-on-the-report-path': '0020 · The checkpoint gets a reader',
   '0021-accounts-over-http': '0021 · Accounts get an API',
   '0022-amounts-are-strings': '0022 · Amounts are strings on the wire',
+  '0023-account-statement': '0023 · An account has a statement',
 }

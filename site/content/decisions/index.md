@@ -47,7 +47,7 @@ the ADRs don't each stop to re-explain them.
 
 ## The decisions
 
-Twenty-two, each one file, each stating the decision first and then its evidence, its alternatives and
+Twenty-three, each one file, each stating the decision first and then its evidence, its alternatives and
 what it costs. Each decision shows its `Status` — the decision itself — and, where useful, an
 `Artifact:` line for what is actually in the tree, with build status tracked on the [roadmap](/roadmap).
 The card rail's own two live under [the card decisions](/card). There is no separate
@@ -78,6 +78,7 @@ decision accepted lives in that ADR's own *"What it costs"*.
 | [0020](/decisions/0020-checkpoint-on-the-report-path) | **One function reads the checkpoint, not three; the close is admitted to it by transaction identity rather than by a cursor; and the bounded drift check ships with a close-ordering invariant** | At-close and a reproducible cursor are **mutually exclusive in one transaction** — equality breaks under any concurrent writer and `pg_snapshot_xmin` silently loses a real posting — so 0011 §3's at-close sentence was unsatisfiable, not merely unbuilt. And "they scan from inception" was true of `balance_sheet_at` alone: the other two are already window-bounded, and the flow statement reports exactly the accounts a close zeroes | accepted (ruled 2026-09-01) |
 | [0021](/decisions/0021-accounts-over-http) | **An account is opened over HTTP and accounts are listed** — creation is an *event* on the existing idempotency spine, the server derives the chart triple from `purpose`, and the listing is keyset-paginated on a `uuidv7` primary key | There was no way to open an account over HTTP at all, which is the same hole 0014 refuses for a Rust-only writer: the adoption surface was one operation short of usable. And 0019's blanket refusal of listings was scoped reasoning stated as a principle — accounts already have a total order. **A *transaction* listing stays refused**, because it must choose between the recorded and effective axes | accepted (ruled 2026-09-01), partially reversing [0019](/decisions/0019-read-path) |
 | [0022](/decisions/0022-amounts-are-strings) | **Every amount on the wire is an exact-integer string, in both directions** — plus `POST /v1/accounts` returning the account it derived, and a `GET /v1/cursor` that answers the horizon without running a report | `bigint` reaches three orders of magnitude past 2⁵³ and JSON has no integer type, so 0019's aggregates-only rule left a reachable hole: a posting of `9007199254740993` is **accepted** and reads back through `JSON.parse` as `…992`. All three defects were found by building a client, none by re-reading the spec | accepted (ruled 2026-09-01), completing [0019](/decisions/0019-read-path) |
+| [0023](/decisions/0023-account-statement) | **An account has a statement — its entries, in order, at a cursor — and it takes its time axis as a parameter rather than choosing one** | 0019 refused a listing because one "must choose between the recorded axis and the effective axis". Naming the axis removes that objection instead of dodging it, which is what 0019 itself already ruled for the trial balance. A **global** transaction listing stays refused: across accounts there is a second open question — which of a transaction's legs places it | accepted (ruled 2026-09-01) |
 
 ## Non-negotiable
 
