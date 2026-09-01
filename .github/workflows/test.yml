@@ -1,5 +1,7 @@
-# CI. Four jobs: the Rust one, the one that puts DDL into a real PostgreSQL 18,
-# the dependency policy (cargo deny), and the migrations-immutability guard.
+# CI. Five jobs: the Rust one, the one that puts DDL into a real PostgreSQL 18,
+# the one that regenerates the dashboard's HTTP client from the committed spec
+# and diffs it, the dependency policy (cargo deny), and the migrations-
+# immutability guard.
 #
 # This file was deleted once already, with the SQL conformance suite it ran
 # (ADR-0004). What it must not become is the thing this project keeps citing as
@@ -243,6 +245,50 @@ jobs:
           # The file is 4 tables. Asserting the delta rather than just the exit
           # status is what makes a silently-shrinking parked file fail here.
           test "$after" = "$((before + 4))" || { echo "::error::expected 4 card tables, got $((after - before))"; exit 1; }
+
+  api-client:
+    name: the dashboard client matches the spec
+    runs-on: ubuntu-latest
+    # No database, no Rust: this job reads the committed crates/api/openapi.json
+    # as a file and regenerates TypeScript from it. Two minutes of npm install
+    # is the whole cost.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node is in none of the Rust jobs above, so this check gets a job of its
+      # own rather than a toolchain bolted onto one that does not need it.
+      # Pinned to the major that produced the committed output.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Record what actually ran
+        run: node --version && npm --version
+
+      - name: npm ci
+        working-directory: dashboard
+        run: npm ci
+
+      # The third generated-artifact gate, beside `make openapi-check` (the
+      # spec against the annotations) and the schema snapshot (the catalog
+      # against the migrations): the dashboard's generated HTTP client against
+      # the spec. It regenerates into a throwaway directory and diffs the whole
+      # tree byte for byte -- it never writes into the committed one, because a
+      # check that repairs the drift it was built to catch reports a green run
+      # for a repository that is still wrong. Regenerating is `make api-client`,
+      # typed on purpose.
+      #
+      # What this catches that TypeScript alone does not: `src/lib/ledger.ts`
+      # states no URL and no wire shape of its own, so a renamed field is a
+      # compile error -- but only once the client is regenerated. Committing a
+      # spec change WITHOUT regenerating leaves an app that compiles against
+      # yesterday's wire, and this step is the only thing that fails on it.
+      - name: dashboard/src/lib/api is what the spec generates
+        working-directory: dashboard
+        run: npm run check:api-client
 
   deny:
     name: cargo deny

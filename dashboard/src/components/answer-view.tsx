@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 
 import { Mono } from "@/components/mono";
-import type { Answer } from "@/lib/api";
+import type { Answer } from "@/lib/ledger";
 
 /**
  * A refusal is rendered VERBATIM: the status code, the API's own stable `type`

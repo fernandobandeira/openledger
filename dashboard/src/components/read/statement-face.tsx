@@ -4,7 +4,7 @@ import { Amount } from "@/components/amount";
 import { Mono } from "@/components/mono";
 import { Empty } from "@/components/panel";
 import { sumMinor, toMinorBigInt } from "@/lib/amount";
-import type { StatementLineRead } from "@/lib/api";
+import type { StatementLineRead } from "@/lib/ledger";
 
 /**
  * A face: the chart's own lines, in the chart's own `sort_order`, grouped by

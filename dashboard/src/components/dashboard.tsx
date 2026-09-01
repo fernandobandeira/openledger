@@ -18,7 +18,7 @@ import {
 import { ReadTransaction } from "@/components/write/read-transaction";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { runTrialBalance } from "@/lib/api";
+import { runTrialBalance } from "@/lib/ledger";
 import { isBehind } from "@/lib/cursor";
 import { EARLIEST, LATEST } from "@/lib/time";
 

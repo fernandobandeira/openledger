@@ -7,7 +7,7 @@ import {
   type AccountListRead,
   type AccountRead,
   type Answer,
-} from "@/lib/api";
+} from "@/lib/ledger";
 
 export interface AccountRegister {
   accounts: AccountRead[];

@@ -75,6 +75,22 @@ schema-snapshot-check: ## Fail if schema/snapshot.txt drifted from the migration
 	cargo build -p openledger
 	cargo test -p e2e --test e2e schema_snapshot
 
+.PHONY: api-client
+api-client: ## Regenerate dashboard/src/lib/api/ from crates/api/openapi.json
+	@# Needs Node, never a database: the generator reads the committed spec
+	@# file and writes TypeScript. Same contract as `openapi` and
+	@# `schema-snapshot` — writing is a command you type on purpose, and the
+	@# check below only ever compares.
+	cd dashboard && npm install --silent && npm run generate:api-client
+
+.PHONY: api-client-check
+api-client-check: ## Fail if dashboard/src/lib/api/ drifted from crates/api/openapi.json
+	@# `openapi-check` holds the spec to the annotations; this holds the
+	@# dashboard's generated client to the spec. It regenerates into a
+	@# throwaway directory and diffs, so a failing run leaves the committed
+	@# files exactly as it found them. No database.
+	cd dashboard && npm install --silent && npm run check:api-client
+
 .PHONY: build
 build: ## Build the binary
 	cargo build --release

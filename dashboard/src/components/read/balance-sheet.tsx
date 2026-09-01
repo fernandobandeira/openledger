@@ -13,7 +13,7 @@ import {
   RunRow,
 } from "@/components/report-frame";
 import { StatementFace } from "@/components/read/statement-face";
-import { runBalanceSheet, type Answer, type StatementRead } from "@/lib/api";
+import { runBalanceSheet, type Answer, type StatementRead } from "@/lib/ledger";
 import { nowLocal, toInstant } from "@/lib/time";
 
 /**

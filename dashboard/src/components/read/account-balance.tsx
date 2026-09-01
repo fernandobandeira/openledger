@@ -14,7 +14,7 @@ import {
   readAccountBalance,
   type AccountBalanceRead,
   type Answer,
-} from "@/lib/api";
+} from "@/lib/ledger";
 
 /**
  * Posted, now. This route takes no cursor and that is the contract: it reads

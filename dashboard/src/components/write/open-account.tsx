@@ -17,7 +17,7 @@ import {
   type AccountRead,
   type Answer,
   type OwnerType,
-} from "@/lib/api";
+} from "@/lib/ledger";
 
 const OWNER_TYPES: { value: OwnerType; label: string }[] = [
   { value: "company", label: "company" },

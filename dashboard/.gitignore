@@ -14,5 +14,7 @@ next-env.d.ts
 .DS_Store
 *.tsbuildinfo
 
-# NOTE: src/lib/api-types.ts is NOT ignored. It is generated from
-# crates/api/openapi.json and committed on purpose — see README.md.
+# NOTE: src/lib/api/ is NOT ignored. It is generated from
+# crates/api/openapi.json and committed on purpose, and
+# `npm run check:api-client` fails if what is committed is not what the spec
+# generates — see README.md.

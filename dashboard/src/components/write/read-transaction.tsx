@@ -13,7 +13,7 @@ import {
   readTransaction,
   type Answer,
   type TransactionRead,
-} from "@/lib/api";
+} from "@/lib/ledger";
 import { minorFromEntry, sumMinor } from "@/lib/amount";
 
 /**

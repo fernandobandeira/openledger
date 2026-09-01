@@ -14,7 +14,7 @@ import {
   RunRow,
 } from "@/components/report-frame";
 import { sumMinor } from "@/lib/amount";
-import { runTrialBalance, type Answer, type TrialBalanceRead } from "@/lib/api";
+import { runTrialBalance, type Answer, type TrialBalanceRead } from "@/lib/ledger";
 import { startOfThisYear, toInstant, tomorrow } from "@/lib/time";
 
 /**

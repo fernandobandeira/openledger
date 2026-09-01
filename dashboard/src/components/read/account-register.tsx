@@ -8,7 +8,7 @@ import { Identifier, Mono } from "@/components/mono";
 import { Empty, Panel, PanelNote } from "@/components/panel";
 import { Button } from "@/components/ui/button";
 import type { AccountRegister } from "@/components/read/use-account-register";
-import type { AccountRead } from "@/lib/api";
+import type { AccountRead } from "@/lib/ledger";
 
 /**
  * The register is a READ — it runs on the read pool, like every other read —

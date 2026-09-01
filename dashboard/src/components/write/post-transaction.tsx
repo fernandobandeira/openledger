@@ -16,7 +16,7 @@ import {
   type Status,
   type TransactionBody,
   type TransactionCreated,
-} from "@/lib/api";
+} from "@/lib/ledger";
 import { toInstant } from "@/lib/time";
 
 export interface Leg {
