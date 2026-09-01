@@ -20,5 +20,6 @@ export default {
   '017-openapi-tooling': '017 · aide or utoipa for the OpenAPI spec',
   '018-batching-and-stripe-selection': '018 · Do batching and striping compose?',
   '019-read-path-contract': '019 · What a read path must honour',
+  '020-checkpoint-on-the-report-path': '020 · Can the report path read the checkpoint?',
   '021-reporting-layer-defects': '021 · Which reporting defects are real?'
 }

@@ -127,7 +127,8 @@ show drift. Those nine are the protected journal set, which is why this matters 
 and not for them. The five catalogs above go into the dump **in the same migration that first
 partitions anything**, and they go in whether or not partitioning is adopted.
 
-**Four defects found while looking for something else, all going into the same migration.**
+**Five defects found while looking for something else. Four go into the same migration; the fifth
+ships unfixed and written down.**
 
 | | |
 | --- | --- |
@@ -135,6 +136,7 @@ partitions anything**, and they go in whether or not partitioning is adopted.
 | **A period with no revenue or expense cannot be closed** | The close writes an entryless transaction and `recon_transaction_breaks` flags it `no_entries`. It wants the same shape of narrow carve-out migration 00003 gave the void |
 | **`computed_at_xid` is bounded from below only** | Forged to `2^62` it is green in `recon_close_breaks` and silences `close_disclosures` for that period entirely. It sits under a **table-wide** `INSERT` grant where `xact_id` is withheld by a column-level one — **and that remedy does not transfer**: the close must *write* `computed_at_xid`, so the column cannot be withheld from the writer. The fix is the upper bound, not the grant. The bound is **`pg_snapshot_xmin`** (reasoned, not measured), and the honest limit is that on this book the forgery surfaced only as a mislabelled `value_drift`, so on a book with no arrivals above the true cursor it is **undetectable in general** |
 | **The close blocks behind any open writer** | It upserts the balance cache of every account it sweeps, so one uncommitted posting on one of those rows holds the whole close |
+| **`cursor_precedes_close` is itself a false positive — and it ships unfixed** | A deployment that stores `pg_snapshot_xmin` as its close cursor trips it on an **honest** close whenever an older writer commits after the close: `16024 < 16025`, measured. It is not fixed in `00004` because nothing in this repository writes a close yet, this decision did not rule on that predicate, and inverting the only bound that catches `computed_at_xid = 1` deserved its own ruling rather than a silent change. The exposure is written into the migration beside the predicate |
 
 ## What we considered
 
