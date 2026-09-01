@@ -194,6 +194,18 @@ equation at any column: after 05, assets `500 + 0`, liabilities `0 + 425 + 2.70`
 `fbo_cash`, `customer_wallet`, `allowance_for_credit_losses`, `fee_revenue`, `credit_loss_expense`,
 `due_from_treasury`, `due_to_tenants`, `paid_in_capital`, `retained_earnings`.
 
+*(**A note added 2026-09-01, after someone tried to replay this trace against the shipped core.**
+The hold in this walkthrough is the **card module's** hold — `parked/card/schema.sql`, unbuilt, M7 —
+and it tracks *partial consumption*: 500 held, then 300 cleared with 200 still reserved. The core's
+own `pending` transaction does not work that way. `uq_txn__one_supersession` gives a pending
+transaction **exactly one fate** ([ADR-0016](/decisions/0016-pending-to-posted)), so a second
+resolution of the same pending is refused with `target_already_superseded` — measured against the
+running binary. Both models are correct for what they are, and neither is a defect: a hold is a
+card-network construct with its own lifecycle, while a pending transaction is a claim about money
+that resolves once. But steps 02 and 03 below **cannot be posted as two resolutions of one pending
+transaction**, and anyone mapping this trace onto core primitives has to decide which capture
+carries the `resolves_id`.)*
+
 **01 · Authorization** — *processor, synchronous, ~1s deadline.* A hold row is written for 500,
 unconsumed, approved. **The ledger records nothing**: an authorization creates no obligation.
 Nothing is owed until it clears, and it may never clear. **available 9,500** = 10,000 − 0 posted −
