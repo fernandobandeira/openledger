@@ -6,11 +6,16 @@
 //! response, and no invented 409 — a concurrent duplicate blocks on the key
 //! claim and finds a durable result, so there is no in-flight state to name.
 //!
-//! Eight endpoints: two writes, and the six reads — a balance, three reports,
-//! a transaction read-back (ADR-0019) and one account listing (ADR-0021). The
-//! second write is `POST /v1/accounts`, the operation that had no API at all
-//! until ADR-0021: accounts were seeded by SQL, which made `psql` a required
-//! part of onboarding a ledger whose whole adoption surface is this crate.
+//! Nine endpoints: two writes, and the seven reads — a balance, three
+//! reports, a transaction read-back (ADR-0019), one account listing
+//! (ADR-0021) and the commit horizon on its own. The second write is
+//! `POST /v1/accounts`, the operation that had no API at all until ADR-0021:
+//! accounts were seeded by SQL, which made `psql` a required part of
+//! onboarding a ledger whose whole adoption surface is this crate. The
+//! horizon route is the youngest, and it is ADR-0019's refusal of a
+//! cursor-minting endpoint qualified rather than overturned: every report
+//! does return its cursor, and that made asking for the horizon alone cost a
+//! whole report.
 //!
 //! No authentication by decision, not omission (ADR-0017): the ledger deploys
 //! internally only, the trust story is the deployment perimeter's, and the
@@ -106,6 +111,7 @@ route_table! { L, R =>
     post "/v1/accounts" accounts::open_account::<L, R>,
     get "/v1/accounts" accounts::list_accounts::<L, R>,
     get "/v1/accounts/{account_id}/balance" reports::get_account_balance::<L, R>,
+    get "/v1/cursor" reports::get_cursor::<L, R>,
     get "/v1/reports/trial-balance" reports::get_trial_balance::<L, R>,
     get "/v1/reports/balance-sheet" reports::get_balance_sheet::<L, R>,
     get "/v1/reports/income-statement" reports::get_income_statement::<L, R>,

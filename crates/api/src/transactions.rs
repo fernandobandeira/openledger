@@ -23,7 +23,7 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::reports::refusal_for_read;
-use crate::wire::{Body, ErrorBody, Params, Segment, refuse};
+use crate::wire::{Body, ErrorBody, Params, Refusal, Segment, refuse};
 
 const IDEMPOTENCY_REPLAYED: HeaderName = HeaderName::from_static("idempotency-replayed");
 
@@ -35,9 +35,19 @@ pub(crate) struct PostingBody {
     source: Uuid,
     /// Account the amount arrives at.
     destination: Uuid,
-    /// Minor units of `currency`. Strictly positive.
-    #[schema(minimum = 1, example = 2500)]
-    amount_minor: i64,
+    /// Minor units of `currency`, strictly positive, as an exact-integer
+    /// decimal STRING — never a JSON number.
+    ///
+    /// **The column is exact and the wire was not.** `ledger_entries.amount_minor`
+    /// is a `bigint`, which reaches far past 2⁵³, and JSON has no integer type
+    /// at all: RFC 8259 leaves precision beyond an IEEE-754 double to the
+    /// implementation, and JavaScript's parser is one that loses it.
+    /// Demonstrated against this API rather than reasoned — a posting of
+    /// 9007199254740993 was accepted and `JSON.parse` read it back as
+    /// 9007199254740992, silently off by one in both directions. So a single
+    /// amount travels the way every report total already does.
+    #[schema(pattern = r"^-?[0-9]+$", example = "2500")]
+    amount_minor: String,
     /// ISO 4217 alphabetic code, three uppercase ASCII letters.
     #[schema(min_length = 3, max_length = 3, example = "USD")]
     currency: String,
@@ -210,13 +220,7 @@ where
 {
     let command = match to_command(body) {
         Ok(command) => command,
-        Err(invalid) => {
-            return refuse(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid_request",
-                invalid.detail().to_owned(),
-            );
-        }
+        Err(refused) => return refused.into_response(),
     };
     match state.ledger.post(&command).await {
         Ok(posted) => answer_the_stored_result(posted),
@@ -334,19 +338,67 @@ fn refusal_for(error: ledger::WriteError) -> Response {
     }
 }
 
-fn to_command(body: TransactionBody) -> Result<ledger::PostTransaction, ledger::Invalid> {
+/// The one value this endpoint PARSES: a posting amount, which arrives as
+/// text so that no JSON parser between here and the caller can round it
+/// (ADR-0019's hole, found by building a client).
+///
+/// The grammar is deliberately narrower than `i64::from_str`'s, and each
+/// narrowing is a value that would otherwise be accepted quietly:
+///
+/// - **a leading `+`** — `"+2500"` parses in Rust and is not what a
+///   database, a spreadsheet or another client would render, so accepting it
+///   would make two spellings of one amount, hashing differently under the
+///   idempotency key that covers the request bytes;
+/// - **surrounding whitespace** — `" 2500"` is refused rather than trimmed,
+///   for the same reason a clamped page size is refused rather than clamped:
+///   the caller's request is answered or named, never quietly rewritten;
+/// - **anything that is not digits** — a float (`"25.00"`), an exponent
+///   (`"2.5e3"`), an empty string, a thousands separator;
+/// - **a value outside 64-bit minor units**, which is the column's own range
+///   and is named as its own sentence, because "too large" and "not a number"
+///   are different things for a caller to fix.
+///
+/// What it does NOT judge is the sign: `"0"` and `"-1"` parse here and are
+/// refused by `Posting::new`'s strictly-positive rule, which is the domain's
+/// and stays there.
+fn minor_units(text: &str) -> Result<i64, Refusal> {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_request(format!(
+            "amount_minor {text:?} is not an exact integer: send minor units as a decimal \
+             string of digits, optionally signed, with no leading plus, no whitespace, no \
+             decimal point and no exponent"
+        )));
+    }
+    text.parse::<i64>().map_err(|_| {
+        invalid_request(format!(
+            "amount_minor {text:?} is outside the range of 64-bit minor units, which is what \
+             ledger_entries.amount_minor holds"
+        ))
+    })
+}
+
+/// A body refusal in the one shape every refusal on this surface wears —
+/// 422, because the caller must CHANGE the request to escape (ADR-0013 §2).
+fn invalid_request(detail: String) -> Refusal {
+    Refusal::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_request", detail)
+}
+
+fn to_command(body: TransactionBody) -> Result<ledger::PostTransaction, Refusal> {
     let postings = body
         .postings
         .into_iter()
         .map(|posting| {
+            let amount_minor = minor_units(&posting.amount_minor)?;
             ledger::Posting::new(
                 posting.source,
                 posting.destination,
-                posting.amount_minor,
+                amount_minor,
                 posting.currency,
             )
+            .map_err(refusing_the_body)
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, Refusal>>()?;
     // Omitted means posted — the wire's default is decided here, at the
     // boundary, so the domain constructor never sees an absence.
     let status = match body.status.unwrap_or(StatusBody::Posted) {
@@ -362,6 +414,14 @@ fn to_command(body: TransactionBody) -> Result<ledger::PostTransaction, ledger::
         body.reverses_id,
         postings,
     )
+    .map_err(refusing_the_body)
+}
+
+/// A domain refusal on the wire. The domain says what is wrong in one
+/// sentence and this layer says with what status and under which `type`,
+/// which is the division of labour every handler here keeps.
+fn refusing_the_body(invalid: ledger::Invalid) -> Refusal {
+    invalid_request(invalid.detail().to_owned())
 }
 
 /// The query half of `GET /v1/transactions/{transaction_id}` — which book to
@@ -406,17 +466,18 @@ pub(crate) struct TransactionRead {
     entries: Vec<EntryRead>,
 }
 
-/// One leg. `amount_minor` is a JSON number here and a decimal STRING on
-/// every report, and the asymmetry is deliberate (ADR-0019): a single posting
-/// is bounded by its column, and only an aggregate can exceed what a JSON
-/// number carries exactly.
+/// One leg. `amount_minor` is an exact-integer decimal STRING, the same shape
+/// the request sends and every report total already carried: a `bigint`
+/// reaches far past 2⁵³ and a JSON number does not carry it exactly, so the
+/// read-back of a large posting was silently one lower than what was written
+/// (ADR-0019's asymmetry, corrected by building a client against it).
 #[derive(Serialize, ToSchema)]
 pub(crate) struct EntryRead {
     account_id: Uuid,
     /// `debit` or `credit`. Direction carries the sign; the amount never does.
     direction: String,
-    #[schema(example = 2500)]
-    amount_minor: i64,
+    #[schema(example = "2500")]
+    amount_minor: String,
     currency: String,
     /// The account's own gapless sequence number for this leg. The counter is
     /// per `(account, stripe)` — documented, never exposed: no stripe appears
@@ -522,11 +583,117 @@ fn answer_the_transaction(found: ledger::Transaction) -> Response {
             .map(|entry| EntryRead {
                 account_id: entry.account_id,
                 direction: entry.direction,
-                amount_minor: entry.amount_minor,
+                amount_minor: entry.amount_minor.to_string(),
                 currency: entry.currency,
                 account_seq: entry.account_seq,
             })
             .collect(),
     })
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    //! The one parse this endpoint owns, held hard — because it is the fix
+    //! for a defect that was SILENT: a posting of 2⁵³+1 was accepted and read
+    //! back one lower, with nothing on the wire to say so. What these hold is
+    //! the grammar and the round trip; what a real posting does with the
+    //! number is the domain's and the e2e suite's.
+
+    use super::*;
+
+    /// 2⁵³+1 — the smallest integer an IEEE-754 double cannot represent, and
+    /// the value the defect was demonstrated with.
+    const BEYOND_A_DOUBLE: i64 = 9_007_199_254_740_993;
+
+    /// The refusal's prose, or the value it declined to refuse.
+    fn spoken(parsed: &Result<i64, Refusal>) -> String {
+        match parsed {
+            Ok(minor) => format!("answered {minor}"),
+            Err(refusal) => refusal.detail().to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_smallest_integer_a_double_cannot_hold_survives_the_parse_and_the_rendering() {
+        let sent = "9007199254740993";
+
+        let parsed = minor_units(sent);
+
+        // In: the exact i64, not the double's nearest neighbour. Out: the
+        // same digits, byte for byte — which is the whole point of the string.
+        assert_eq!(parsed.ok(), Some(BEYOND_A_DOUBLE));
+        assert_eq!(BEYOND_A_DOUBLE.to_string(), sent);
+    }
+
+    #[test]
+    fn the_range_the_column_holds_is_the_range_the_wire_accepts() {
+        let cases = [
+            ("9223372036854775807", Some(i64::MAX)),
+            ("-9223372036854775808", Some(i64::MIN)),
+            ("0", Some(0)),
+            ("-1", Some(-1)),
+            ("2500", Some(2500)),
+        ];
+
+        for (sent, expected) in cases {
+            let parsed = minor_units(sent);
+
+            assert_eq!(parsed.ok(), expected, "for {sent:?}");
+        }
+    }
+
+    /// Zero and a negative PARSE and are refused one layer in, by
+    /// `Posting::new`'s strictly-positive rule — the domain's judgement, which
+    /// this parse deliberately does not duplicate: a second opinion on the
+    /// same question is a second place for it to change.
+    #[test]
+    fn the_sign_is_the_domains_question_and_not_this_parses() {
+        let zero = minor_units("0");
+        let negative = minor_units("-2500");
+
+        let refused =
+            ledger::Posting::new(Uuid::from_u128(1), Uuid::from_u128(2), 0, "USD".to_owned());
+
+        assert_eq!(zero.ok(), Some(0));
+        assert_eq!(negative.ok(), Some(-2500));
+        assert_eq!(
+            refused.err().map(|invalid| invalid.detail()),
+            Some("amount_minor must be positive")
+        );
+    }
+
+    #[test]
+    fn a_value_past_sixty_four_bits_is_refused_as_out_of_range_and_never_wrapped() {
+        // One past `i64::MAX`, and one past `u64::MAX` for good measure: a
+        // wrap here would post a large positive amount as a negative one.
+        for sent in ["9223372036854775808", "18446744073709551616"] {
+            let parsed = minor_units(sent);
+
+            assert!(
+                spoken(&parsed).contains("outside the range of 64-bit minor units"),
+                "{sent:?} was answered {:?}",
+                spoken(&parsed)
+            );
+        }
+    }
+
+    #[test]
+    fn everything_that_is_not_an_exact_integer_in_digits_is_refused_by_name() {
+        // The float and the exponent are the dangerous two: both are what a
+        // consumer that lost precision would send BACK, and both would parse
+        // in a language that accepts them.
+        for sent in [
+            "+2500", " 2500", "2500 ", "\t2500", "25.00", "2.5e3", "", "-", "abc", "12x", "2_500",
+            "2,500", "٢٥", "0x10",
+        ] {
+            let parsed = minor_units(sent);
+
+            assert!(
+                spoken(&parsed).contains("is not an exact integer"),
+                "{sent:?} was answered {:?}",
+                spoken(&parsed)
+            );
+        }
+    }
 }

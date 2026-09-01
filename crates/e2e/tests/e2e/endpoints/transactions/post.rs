@@ -27,7 +27,7 @@ async fn a_single_posting_lands_on_both_accounts() -> TestResult {
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 2500, "currency": "USD"
+                "amount_minor": "2500", "currency": "USD"
             }],
         }))
         .await?;
@@ -66,8 +66,8 @@ async fn two_postings_over_one_pair_coalesce_into_one_balance_row() -> TestResul
             "idempotency_key": "charge-1",
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [
-                { "source": revenue, "destination": receivable, "amount_minor": 1000, "currency": "USD" },
-                { "source": revenue, "destination": receivable, "amount_minor": 500,  "currency": "USD" },
+                { "source": revenue, "destination": receivable, "amount_minor": "1000", "currency": "USD" },
+                { "source": revenue, "destination": receivable, "amount_minor": "500",  "currency": "USD" },
             ],
         }))
         .await?;
@@ -118,7 +118,7 @@ async fn an_unknown_account_is_refused_and_nothing_is_written() -> TestResult {
             "postings": [{
                 "source": Uuid::from_u128(0xDEAD_BEEF_DEAD_BEEF_DEAD_BEEF_DEAD_BEEF),
                 "destination": receivable,
-                "amount_minor": 100, "currency": "USD"
+                "amount_minor": "100", "currency": "USD"
             }],
         }))
         .await?;
@@ -156,7 +156,7 @@ async fn a_currency_the_account_does_not_hold_is_refused_as_an_unknown_account()
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 100, "currency": "EUR"
+                "amount_minor": "100", "currency": "EUR"
             }],
         }))
         .await?;
@@ -192,7 +192,7 @@ async fn a_posting_with_no_effective_at_is_refused() -> TestResult {
             "idempotency_key": "undated-charge",
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 100, "currency": "USD"
+                "amount_minor": "100", "currency": "USD"
             }],
         }))
         .await?;
@@ -214,6 +214,62 @@ async fn a_posting_with_no_effective_at_is_refused() -> TestResult {
 }
 
 #[tokio::test]
+async fn an_amount_that_is_not_an_exact_integer_string_never_reaches_the_database() -> TestResult {
+    // The wire form of an amount is a decimal STRING, and its grammar is
+    // narrower than a language's integer parse: no JSON number (which is what
+    // a consumer that lost precision would send back), no leading plus, no
+    // whitespace, no decimal point, no exponent, and nothing past 64 bits.
+    // Each of these would otherwise be accepted quietly by one parser or
+    // another.
+    let book = TestBook::new("posting_amount_grammar").await?;
+    let (receivable, revenue) = book.fixture_accounts().await?;
+    let amounts = [
+        serde_json::json!(2500),
+        serde_json::json!("+2500"),
+        serde_json::json!(" 2500"),
+        serde_json::json!("25.00"),
+        serde_json::json!("2.5e3"),
+        serde_json::json!(""),
+        serde_json::json!("2,500"),
+        serde_json::json!("9223372036854775808"),
+    ];
+
+    for (n, amount) in amounts.iter().enumerate() {
+        let refused = book
+            .post(&serde_json::json!({
+                "tenant_id": "t1",
+                "idempotency_key": format!("bad-amount-{n}"),
+                "effective_at": "2026-08-27T12:00:00Z",
+                "postings": [{
+                    "source": revenue, "destination": receivable,
+                    "amount_minor": amount, "currency": "USD"
+                }],
+            }))
+            .await?;
+
+        assert_eq!(refused.status(), 422, "for amount_minor {amount}");
+        let error: serde_json::Value = refused.json().await?;
+        assert_eq!(
+            crate::support::refusal_type(&error),
+            Some("invalid_request"),
+            "for amount_minor {amount}: {error}"
+        );
+        assert!(
+            crate::support::refusal_detail(&error).contains("amount_minor"),
+            "the refusal must name the field; for {amount} it said {:?}",
+            crate::support::refusal_detail(&error)
+        );
+    }
+    assert_eq!(
+        book.write_counts().await?,
+        (0, 0, 0),
+        "a malformed amount reached the database"
+    );
+
+    book.assert_reconciled().await
+}
+
+#[tokio::test]
 async fn an_invalid_request_never_reaches_the_database() -> TestResult {
     let book = TestBook::new("invalid_request").await?;
     let (receivable, revenue) = book.fixture_accounts().await?;
@@ -228,7 +284,7 @@ async fn an_invalid_request_never_reaches_the_database() -> TestResult {
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [{
                 "source": receivable, "destination": receivable,
-                "amount_minor": 100, "currency": "USD"
+                "amount_minor": "100", "currency": "USD"
             }],
         }),
         serde_json::json!({
@@ -237,7 +293,7 @@ async fn an_invalid_request_never_reaches_the_database() -> TestResult {
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 0, "currency": "USD"
+                "amount_minor": "0", "currency": "USD"
             }],
         }),
         serde_json::json!({
@@ -246,7 +302,7 @@ async fn an_invalid_request_never_reaches_the_database() -> TestResult {
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 100, "currency": "usd"
+                "amount_minor": "100", "currency": "usd"
             }],
         }),
     ];
@@ -281,7 +337,7 @@ async fn a_replay_returns_the_stored_result() -> TestResult {
         "effective_at": "2026-08-27T12:00:00Z",
         "postings": [{
             "source": revenue, "destination": receivable,
-            "amount_minor": 2500, "currency": "USD"
+            "amount_minor": "2500", "currency": "USD"
         }],
     });
 
@@ -307,7 +363,7 @@ async fn a_replay_returns_the_stored_result() -> TestResult {
         "effective_at": "2026-08-27T14:00:00+02:00",
         "postings": [{
             "source": revenue, "destination": receivable,
-            "amount_minor": 2500, "currency": "USD"
+            "amount_minor": "2500", "currency": "USD"
         }],
     });
     let canonicalized = book.post(&shifted).await?;
@@ -343,7 +399,7 @@ async fn a_reused_key_with_a_different_body_is_refused() -> TestResult {
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 2500, "currency": "USD"
+                "amount_minor": "2500", "currency": "USD"
             }],
         }))
         .await?;
@@ -357,7 +413,7 @@ async fn a_reused_key_with_a_different_body_is_refused() -> TestResult {
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 9999, "currency": "USD"
+                "amount_minor": "9999", "currency": "USD"
             }],
         }))
         .await?;
@@ -405,7 +461,7 @@ async fn concurrent_identical_posts_produce_one_write_and_replays_never_conflict
         "effective_at": "2026-08-27T12:00:00Z",
         "postings": [{
             "source": revenue, "destination": receivable,
-            "amount_minor": 2500, "currency": "USD"
+            "amount_minor": "2500", "currency": "USD"
         }],
     });
 
@@ -476,7 +532,7 @@ async fn a_storage_failure_is_a_500_that_commits_nothing_and_names_no_internals(
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 100, "currency": "USD"
+                "amount_minor": "100", "currency": "USD"
             }],
         }))
         .await?;
@@ -551,7 +607,7 @@ async fn a_tenant_reusing_another_tenants_key_gets_its_own_fresh_write() -> Test
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [{
                 "source": t1_revenue, "destination": t1_receivable,
-                "amount_minor": 2500, "currency": "USD"
+                "amount_minor": "2500", "currency": "USD"
             }],
         }))
         .await?;
@@ -566,7 +622,7 @@ async fn a_tenant_reusing_another_tenants_key_gets_its_own_fresh_write() -> Test
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [{
                 "source": t2_revenue, "destination": t2_receivable,
-                "amount_minor": 2500, "currency": "USD"
+                "amount_minor": "2500", "currency": "USD"
             }],
         }))
         .await?;

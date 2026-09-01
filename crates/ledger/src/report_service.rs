@@ -34,13 +34,14 @@
 
 use uuid::Uuid;
 
+use crate::accounts::Account;
 use crate::report_store::{
     AccountListingRead, BalanceSheetRead, IncomeStatementRead, ReadBounds, ReportRefusal,
     ReportStore, Scoped, TrialBalanceRead,
 };
 use crate::reports::{
     AccountBalance, AccountBalanceQuery, AccountListing, AccountListingQuery, BalanceSheetQuery,
-    Cursor, IncomeStatementQuery, ListedAccount, ReadError, Reports, Statement, Transaction,
+    Cursor, CursorQuery, IncomeStatementQuery, ReadError, Reports, Statement, Transaction,
     TransactionQuery, TrialBalance, TrialBalanceQuery,
 };
 
@@ -76,6 +77,10 @@ impl<S: ReportStore> Reports for ReportService<S> {
 
     async fn income_statement(&self, query: &IncomeStatementQuery) -> Result<Statement, ReadError> {
         income_statement(&self.store, query).await
+    }
+
+    async fn cursor(&self, query: &CursorQuery) -> Result<Cursor, ReadError> {
+        cursor(&self.store, query).await
     }
 
     async fn transaction(&self, query: &TransactionQuery) -> Result<Transaction, ReadError> {
@@ -189,6 +194,22 @@ async fn income_statement<S: ReportStore>(
     })
 }
 
+/// The commit horizon alone — the one read whose ANSWER is a cursor rather
+/// than a report pinned at one, so the cursor rule has nothing to say about
+/// it: there is no supplied value to refuse and nothing to pin. What it does
+/// keep is the scoping every other read has, because the horizon is answered
+/// through the same fenced bracket rather than through a second, unscoped way
+/// into the database (ADR-0019, qualified: the refusal of a cursor-minting
+/// endpoint stood on every report already returning its cursor, which made
+/// asking for the horizon alone cost a whole report).
+async fn cursor<S: ReportStore>(store: &S, query: &CursorQuery) -> Result<Cursor, ReadError> {
+    let scoped = store
+        .report_cursor(&query.tenant_id)
+        .await
+        .map_err(refused)?;
+    answered_for_the_tenant_that_asked(&query.tenant_id, scoped)
+}
+
 /// One transaction and its entries — pinned by nothing, because the rows are
 /// immutable (ADR-0019 C3), so this read has no cursor rule to apply either.
 async fn transaction<S: ReportStore>(
@@ -269,7 +290,7 @@ fn page_size_or_refuse_one_outside_the_window(asked_for: Option<i64>) -> Result<
 /// reading one row past the page to be sure, which costs every page a row to
 /// spare the last one a request. A caller that follows this key to an empty
 /// page has learnt the same thing one request later.
-fn the_key_of_the_next_page(accounts: &[ListedAccount], limit: i64) -> Option<Uuid> {
+fn the_key_of_the_next_page(accounts: &[Account], limit: i64) -> Option<Uuid> {
     // `limit` came through the window check above, so it sits between 1 and
     // the ceiling and this conversion cannot fail; one that somehow did would
     // answer "no next page", which is the safe end of this question rather
@@ -484,6 +505,12 @@ mod tests {
         }
     }
 
+    fn a_cursor_query() -> CursorQuery {
+        CursorQuery {
+            tenant_id: "acme".to_owned(),
+        }
+    }
+
     /// One page of the register, unfiltered — the listing tests vary the
     /// page size, which is the only value this service judges.
     fn an_account_listing_query(limit: Option<i64>) -> AccountListingQuery {
@@ -643,6 +670,11 @@ mod tests {
     }
 
     impl ReportStore for FakeStore {
+        async fn report_cursor(&self, tenant_id: &str) -> Result<Scoped<Cursor>, ReportRefusal> {
+            self.record("report_cursor".to_owned());
+            Ok(self.scoped(tenant_id, self.horizon))
+        }
+
         async fn read_bounds(&self, tenant_id: &str) -> Result<Scoped<ReadBounds>, ReportRefusal> {
             self.record("read_bounds".to_owned());
             Ok(self.scoped(
@@ -743,7 +775,7 @@ mod tests {
         async fn accounts(
             &self,
             read: &AccountListingRead<'_>,
-        ) -> Result<Scoped<Vec<ListedAccount>>, ReportRefusal> {
+        ) -> Result<Scoped<Vec<Account>>, ReportRefusal> {
             self.record(format!("accounts limit {}", read.limit));
             let listed = (0..self.accounts_on_the_register)
                 .map(a_listed_account)
@@ -754,8 +786,8 @@ mod tests {
 
     /// One account of a fake register, its id derived from its position so a
     /// page key can be traced back to the row that earned it.
-    fn a_listed_account(position: usize) -> ListedAccount {
-        ListedAccount {
+    fn a_listed_account(position: usize) -> Account {
+        Account {
             account_id: Uuid::from_u128(0xA00 + position as u128),
             owner_type: "company".to_owned(),
             owner_id: Some("co_1".to_owned()),
@@ -765,6 +797,7 @@ mod tests {
             counterparty_scope: "per_shard".to_owned(),
             currency: "USD".to_owned(),
             stripe_count: 1,
+            metadata: serde_json::json!({}),
             created_at: an_instant(),
         }
     }
@@ -1136,9 +1169,32 @@ mod tests {
             spoken(&run(service.account_balance(&an_account_balance_query()))),
             spoken(&run(service.transaction(&a_transaction_query()))),
             spoken(&run(service.accounts(&an_account_listing_query(None)))),
+            spoken(&run(service.cursor(&a_cursor_query()))),
         ];
 
-        assert_eq!(refused, ["tenant_mismatch"; 6]);
+        assert_eq!(refused, ["tenant_mismatch"; 7]);
+        Ok(())
+    }
+
+    /// The horizon on its own: one statement, the same value a report with no
+    /// cursor would have pinned itself at, and NOT the bounds read — a caller
+    /// who asked for the horizon does not pay for the floor aggregate as well
+    /// (ADR-0019's refusal of a cursor-minting endpoint, qualified).
+    #[test]
+    fn the_horizon_is_answered_by_one_statement_that_is_not_the_bounds_read()
+    -> Result<(), CursorUnparseable> {
+        let store = FakeStore::a_book()?;
+        let calls = store.calls();
+        let service = ReportService::new(store);
+        let query = a_cursor_query();
+
+        let answered = run(service.cursor(&query));
+
+        assert_eq!(
+            answered.map(|cursor| cursor.to_string()).ok(),
+            Some(HORIZON.to_owned())
+        );
+        assert_eq!(taken(&calls), ["report_cursor".to_owned()]);
         Ok(())
     }
 

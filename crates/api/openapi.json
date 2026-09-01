@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "OpenLedger API",
-    "description": "OpenLedger, an open-source double-entry ledger on PostgreSQL. The write path is one endpoint under the idempotent replay contract of ADR-0013 — the same key with the same body returns the stored result, marked by the `Idempotency-Replayed` header. The read path is five, and three things about it are contract rather than presentation (ADR-0019): every report answers with the `pinned_cursor` it ran at, including when the caller supplied none, and that value is what re-runs the report; every report AMOUNT is an exact-integer decimal STRING, because a total above 2^53 would be silently rounded by a JSON parser while a posting amount, bounded by its own column, stays a number; and an unknown tenant is answered 200-with-nothing rather than 404, because nothing in the schema declares a tenant and inventing the status would mean inventing the registry.",
+    "description": "OpenLedger, an open-source double-entry ledger on PostgreSQL. The write path is one endpoint under the idempotent replay contract of ADR-0013 — the same key with the same body returns the stored result, marked by the `Idempotency-Replayed` header. The read path is seven, and three things about it are contract rather than presentation (ADR-0019): every report answers with the `pinned_cursor` it ran at, including when the caller supplied none, and that value is what re-runs the report — `GET /v1/cursor` answers the same horizon on its own, for a caller that wants it without paying for a report; EVERY amount on this surface is an exact-integer decimal STRING, single postings and entries included, because JSON has no integer type and both a `numeric` total and a `bigint` posting reach past 2^53, where a consumer's parser rounds silently; and an unknown tenant is answered 200-with-nothing rather than 404, because nothing in the schema declares a tenant and inventing the status would mean inventing the registry.",
     "license": {
       "name": "MIT",
       "identifier": "MIT"
@@ -75,7 +75,7 @@
         ],
         "responses": {
           "200": {
-            "description": "One page of the account register, in creation order. An unknown tenant answers 200 with an empty list, never 404: there is no tenant registry to consult, so inventing the status would mean inventing the registry (ADR-0019).",
+            "description": "One page of the account register, in creation order — identity, the derived chart triple, the stripe count and the caller's own `metadata`, and no balances (ADR-0021). An unknown tenant answers 200 with an empty list, never 404: there is no tenant registry to consult, so inventing the status would mean inventing the registry (ADR-0019).",
             "content": {
               "application/json": {
                 "schema": {
@@ -145,7 +145,7 @@
         },
         "responses": {
           "200": {
-            "description": "Replayed: this key was already accepted with this same body. The stored result is re-rendered — never a cached response body — and nothing was written (ADR-0013 §2).",
+            "description": "Replayed: this key was already accepted with this same body. The stored result is re-rendered — never a cached response body — and nothing was written (ADR-0013 §2). It carries the same full account the 201 did, read back from the register.",
             "headers": {
               "Idempotency-Replayed": {
                 "schema": {
@@ -163,7 +163,7 @@
             }
           },
           "201": {
-            "description": "Opened: this call claimed the idempotency key and wrote the account and its event atomically.",
+            "description": "Opened: this call claimed the idempotency key and wrote the account and its event atomically. The answer carries the whole account, including the `category`, `normal_balance` and `counterparty_scope` the server DERIVED from `purpose` — the same representation `GET /v1/accounts` answers per row (ADR-0021).",
             "headers": {
               "Idempotency-Replayed": {
                 "schema": {
@@ -306,6 +306,80 @@
           },
           "422": {
             "description": "Refused. `type` is `tenant_mismatch`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The read failed. `type` is `internal`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The read exceeded this deployment's `statement_timeout` (`57014`). `type` is `report_timed_out`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/cursor": {
+      "get": {
+        "tags": [
+          "reports"
+        ],
+        "summary": "Read the commit horizon.",
+        "description": "**ADR-0019 refused a cursor-minting endpoint** — *\"every report already\nreturns the cursor it used\"* — and that refusal is qualified rather than\ncontradicted here: it is true, and it is what made asking for the horizon\nALONE cost a whole report. A dashboard refreshing it issues a trial balance\nover `0001-01-01`…`9999-12-31` for one scalar, which on a large book is the\n~28-second query ADR-0019's own cost list records. One statement answers\nthe same value, on the same read path, under the same bracket.",
+        "operationId": "getCursor",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "description": "The book to read. **The horizon is the CLUSTER's**, not this book's —\n`report_cursor()` is `pg_snapshot_xmin` — so two tenants are answered\nthe same number. It is required anyway so that this route runs the\nidentical scoped read bracket every other read runs, rather than being\nthe one read that reaches the database unscoped.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "t1"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The current commit horizon — one `SELECT report_cursor()`, no report. Store it and send it back as `cursor` to pin a report here. **It is the cluster's horizon and not this tenant's**: `report_cursor()` is `pg_snapshot_xmin`, so every tenant is answered the same number, and `tenant_id` is required for the scoping every other read has rather than because the answer depends on it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CursorRead"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The `tenant_id` query parameter is missing, or would not deserialize into its documented type. `type` is `invalid_request`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Refused. `type` is `tenant_mismatch` — the `tenant_id` asked about is not the scope the read path set on the session. Vacuous today by construction and declared anyway (ADR-0019).",
             "content": {
               "application/json": {
                 "schema": {
@@ -949,21 +1023,20 @@
       },
       "AccountCreated": {
         "type": "object",
-        "description": "The stored result of an accepted opening: the event, and the account it\ncaused.",
+        "description": "The stored result of an accepted opening: the event, and the account it\ncaused — **the whole account**, not its id.\n\n**Two UUIDs undercut ADR-0021's own design.** The decision's centre is\nthat the caller names a `purpose` and the server DERIVES `category`,\n`normal_balance` and `counterparty_scope`; answering with an id meant the\nderived triple could only be seen by a second call to `GET /v1/accounts`\nplus a client-side scan, because there is no `GET /v1/accounts/{id}` and\nthe listing filters on `purpose` and `owner_id` but not on the account.\n\"Show me the account I just opened\" was a paged search. It is one field\nnow, and it is the SAME [`AccountRead`] a listing row is — one type, so\nthe two cannot come to disagree about what an account looks like.\n\n`event_id` stays beside it: opening an account writes an EVENT and no\nledger transaction, which is the case ADR-0005 justified the event log by,\nand the spine is a fact a caller should still be able to see.",
         "required": [
           "event_id",
-          "account_id"
+          "account"
         ],
         "properties": {
-          "account_id": {
-            "type": "string",
-            "format": "uuid",
-            "description": "The account. Never null, unlike a posting's `transaction_id`: an\naccepted opening always wrote one, and a replay finds it by the\nnatural key its own body names."
+          "account": {
+            "$ref": "#/components/schemas/AccountRead",
+            "description": "The account, as the register holds it. Never null, unlike a posting's\n`transaction_id`: an accepted opening always wrote one, and a replay\nfinds it by the natural key its own body names."
           },
           "event_id": {
             "type": "string",
             "format": "uuid",
-            "description": "The event row this call claimed — or, on a replay, the one it found.\nOpening an account writes an EVENT and no ledger transaction, which is\nthe case ADR-0005 justified the event log by."
+            "description": "The event row this call claimed — or, on a replay, the one it found."
           }
         }
       },
@@ -994,7 +1067,7 @@
       },
       "AccountRead": {
         "type": "object",
-        "description": "One account, as the register holds it.\n\n**No balance, and that is contract** (ADR-0021): balances are per currency\nand per stripe, so a balance per row would be N+1, and\n`GET /v1/accounts/{account_id}/balance` answers that question one account\nat a time and exactly.",
+        "description": "One account, as the register holds it — the representation BOTH of this\nresource's verbs answer with: a row of the listing, and the whole of an\naccepted opening's `account`.\n\n**No balance, and that is contract** (ADR-0021): balances are per currency\nand per stripe, so a balance per row would be N+1, and\n`GET /v1/accounts/{account_id}/balance` answers that question one account\nat a time and exactly. `metadata` is here and a balance is not, and the\ntwo are different questions: metadata is the caller's own object, written\nat the opening and readable on no other route.",
         "required": [
           "account_id",
           "owner_type",
@@ -1005,6 +1078,7 @@
           "counterparty_scope",
           "currency",
           "stripe_count",
+          "metadata",
           "created_at"
         ],
         "properties": {
@@ -1027,6 +1101,9 @@
           },
           "currency": {
             "type": "string"
+          },
+          "metadata": {
+            "description": "The caller's own object, as the opening set it — `{}` when it named\nnone, because the column is `NOT NULL DEFAULT '{}'`.\n\nIt is here because until now a caller could WRITE metadata and had no\nroute that read it back, which is a hole rather than a missing\nfeature. ADR-0021's \"identity plus `stripe_count`\" is extended by this\none field and by nothing else: the part of that sentence that was\nload-bearing is the absence of BALANCES, and they are still absent."
           },
           "normal_balance": {
             "type": "string",
@@ -1055,9 +1132,23 @@
           }
         }
       },
+      "CursorRead": {
+        "type": "object",
+        "description": "The commit horizon, on its own.",
+        "required": [
+          "cursor"
+        ],
+        "properties": {
+          "cursor": {
+            "type": "string",
+            "description": "The current horizon, as a decimal string — an `xid8` is a 64-bit\nunsigned value and JSON numbers are not. Send it back as `cursor` on\nany report route to pin that report here; everything strictly below it\nhas finished committing and can never grow.",
+            "example": "231000"
+          }
+        }
+      },
       "EntryRead": {
         "type": "object",
-        "description": "One leg. `amount_minor` is a JSON number here and a decimal STRING on\nevery report, and the asymmetry is deliberate (ADR-0019): a single posting\nis bounded by its column, and only an aggregate can exceed what a JSON\nnumber carries exactly.",
+        "description": "One leg. `amount_minor` is an exact-integer decimal STRING, the same shape\nthe request sends and every report total already carried: a `bigint`\nreaches far past 2⁵³ and a JSON number does not carry it exactly, so the\nread-back of a large posting was silently one lower than what was written\n(ADR-0019's asymmetry, corrected by building a client against it).",
         "required": [
           "account_id",
           "direction",
@@ -1076,9 +1167,8 @@
             "description": "The account's own gapless sequence number for this leg. The counter is\nper `(account, stripe)` — documented, never exposed: no stripe appears\nin any response (ADR-0013 §4)."
           },
           "amount_minor": {
-            "type": "integer",
-            "format": "int64",
-            "example": 2500
+            "type": "string",
+            "example": "2500"
           },
           "currency": {
             "type": "string"
@@ -1129,11 +1219,10 @@
         ],
         "properties": {
           "amount_minor": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Minor units of `currency`. Strictly positive.",
-            "example": 2500,
-            "minimum": 1
+            "type": "string",
+            "description": "Minor units of `currency`, strictly positive, as an exact-integer\ndecimal STRING — never a JSON number.\n\n**The column is exact and the wire was not.** `ledger_entries.amount_minor`\nis a `bigint`, which reaches far past 2⁵³, and JSON has no integer type\nat all: RFC 8259 leaves precision beyond an IEEE-754 double to the\nimplementation, and JavaScript's parser is one that loses it.\nDemonstrated against this API rather than reasoned — a posting of\n9007199254740993 was accepted and `JSON.parse` read it back as\n9007199254740992, silently off by one in both directions. So a single\namount travels the way every report total already does.",
+            "example": "2500",
+            "pattern": "^-?[0-9]+$"
           },
           "currency": {
             "type": "string",
@@ -1460,7 +1549,7 @@
     },
     {
       "name": "reports",
-      "description": "The pinned reports: both time axes, by parameter."
+      "description": "The pinned reports: both time axes, by parameter — and the horizon they pin at, on its own."
     }
   ]
 }

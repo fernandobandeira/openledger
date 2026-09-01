@@ -56,7 +56,9 @@ mod service;
 // `Repository` port's signatures name them; the functions are `pub(crate)`,
 // called by the writer service alone, so the math's order of operations
 // cannot be re-orchestrated outside this crate.
-pub use accounts::{AccountOpened, AccountOwner, AccountOwnerType, ChartTriple, OpenAccount};
+pub use accounts::{
+    Account, AccountOpened, AccountOwner, AccountOwnerType, ChartTriple, OpenAccount,
+};
 pub use domain::{Invalid, PostTransaction, Posted, Posting, TransactionStatus};
 pub use port::{Ledger, OpenAccountError, WriteError};
 pub use postings::{Append, Delta, Direction, Leg};
@@ -67,7 +69,7 @@ pub use report_store::{
 };
 pub use reports::{
     AccountBalance, AccountBalanceQuery, AccountListing, AccountListingQuery, BalanceSheetQuery,
-    Cursor, CursorUnparseable, IncomeStatementQuery, ListedAccount, ReadError, Reports, Statement,
+    Cursor, CursorQuery, CursorUnparseable, IncomeStatementQuery, ReadError, Reports, Statement,
     StatementLine, Transaction, TransactionEntry, TransactionQuery, TrialBalance,
     TrialBalanceQuery, TrialBalanceRow,
 };

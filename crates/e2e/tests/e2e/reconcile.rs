@@ -65,7 +65,7 @@ async fn post_one_charge(
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 2500, "currency": "USD"
+                "amount_minor": "2500", "currency": "USD"
             }],
         }))
         .await?;
@@ -252,7 +252,7 @@ async fn a_pending_transaction_is_a_named_population_not_a_break() -> TestResult
             "status": "pending",
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 500, "currency": "USD"
+                "amount_minor": "500", "currency": "USD"
             }],
         }))
         .await?;
@@ -467,7 +467,7 @@ async fn a_one_sided_cross_scope_booking_is_a_cross_scope_mirror_break() -> Test
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [{
                 "source": revenue, "destination": claim,
-                "amount_minor": 40000, "currency": "USD"
+                "amount_minor": "40000", "currency": "USD"
             }],
         }))
         .await?;
@@ -973,7 +973,7 @@ async fn an_unattested_perimeter_account_is_a_chart_lint_break() -> TestResult {
             "effective_at": "2026-08-27T14:00:00Z",
             "postings": [{
                 "source": revenue, "destination": cash,
-                "amount_minor": 300, "currency": "USD"
+                "amount_minor": "300", "currency": "USD"
             }],
         }))
         .await?;
@@ -1256,7 +1256,7 @@ async fn spawn_eight_posts_and_sweep_beside_them(
                 "effective_at": "2026-08-27T12:00:00Z",
                 "postings": [{
                     "source": revenue, "destination": receivable,
-                    "amount_minor": 100 + i, "currency": "USD"
+                    "amount_minor": (100 + i).to_string(), "currency": "USD"
                 }],
             }))
         })

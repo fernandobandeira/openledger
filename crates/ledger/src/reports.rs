@@ -15,9 +15,11 @@
 //!   JSON's own numeric type loses precision above 2⁵³ — so a total large
 //!   enough to have needed the widening would be silently rounded by the
 //!   consumer's parser, trading a loud refusal for a quiet wrong answer. A
-//!   single POSTING amount stays an `i64` ([`TransactionEntry`]): it is
-//!   bounded by `ledger_entries.amount_minor`, and only an aggregate can
-//!   exceed it;
+//!   single ENTRY amount is an `i64` here ([`TransactionEntry`]) and a string
+//!   on the wire, and the difference is not a disagreement: `bigint` is exact
+//!   in 64 bits and reaches far past what a JSON number carries, so the type
+//!   that holds it is exact and the encoding that ships it must be too —
+//!   ADR-0019's asymmetry, corrected by building a client against it;
 //! - **every report answer carries the cursor the read path pinned**, always,
 //!   including when the caller supplied none — it is the only way a caller
 //!   can notice that the cluster horizon is lagging, which it does for
@@ -36,7 +38,11 @@
 //!   (ADR-0021). An offset shifts under concurrent inserts, so a caller
 //!   paging a growing book silently skips rows; and a balance is per currency
 //!   and per stripe, so one per row would be N+1 and a second definition of a
-//!   question `AccountBalance` already answers exactly.
+//!   question `AccountBalance` already answers exactly. What it does carry is
+//!   the whole register row ([`Account`](crate::Account)) — the derived chart
+//!   triple, the stripe count and the caller's own `metadata` — which is the
+//!   same value an accepted opening answers with, so the two verbs of that
+//!   resource cannot come to describe an account differently.
 //!
 //! Nothing here names an sqlx type, a runtime or a clock: as-of instants come
 //! from the caller and cursors come from the database, so `deny.toml`'s
@@ -45,6 +51,8 @@
 
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+use crate::accounts::Account;
 
 /// A commit-order cursor — PostgreSQL's `xid8`, which is what
 /// `report_cursor()` returns and what every report filters `xact_id <` by
@@ -194,7 +202,7 @@ pub struct AccountListingQuery {
 
 /// One page of the account register.
 pub struct AccountListing {
-    pub accounts: Vec<ListedAccount>,
+    pub accounts: Vec<Account>,
     /// The `after` a caller should send for the next page, or `None` when this
     /// page is the last one this listing can promise. `Some` exactly when the
     /// page came back FULL — which is a "there may be more", never a "there
@@ -204,30 +212,23 @@ pub struct AccountListing {
     pub next_after: Option<Uuid>,
 }
 
-/// One account as the register holds it: its identity, and its stripe count.
+/// `GET /v1/cursor` — the commit horizon on its own, and nothing else.
 ///
-/// **No balance**, and that is contract rather than omission (ADR-0021):
-/// balances are per currency and per stripe, a balance per row would be N+1,
-/// and `GET /v1/accounts/{id}/balance` already answers that question one
-/// account at a time.
-pub struct ListedAccount {
-    pub account_id: Uuid,
-    pub owner_type: String,
-    /// `None` on a house account, which is the ledger's own side and has no
-    /// owner (`ck_accounts__house_has_no_owner`).
-    pub owner_id: Option<String>,
-    pub purpose: String,
-    pub category: String,
-    pub normal_balance: String,
-    pub counterparty_scope: String,
-    pub currency: String,
-    /// How many stripes the writer spreads this account's balance row across
-    /// — a HINT and not an invariant (ADR-0013 §4). It is the one operational
-    /// number on this answer, and it is here because it is the one a caller
-    /// can act on: a hot account is re-opened with more stripes, never
-    /// re-striped by an update.
-    pub stripe_count: i16,
-    pub created_at: OffsetDateTime,
+/// **ADR-0019 refused a cursor-minting endpoint** on the ground that *"every
+/// report already returns the cursor it used"*. True, and it makes asking for
+/// the horizon ALONE cost a whole report: a dashboard refreshing it issues a
+/// trial balance over `0001-01-01`…`9999-12-31` for one scalar, which on a
+/// large book is the ~28-second query ADR-0019's own cost list records. One
+/// statement answers the same value.
+///
+/// **`tenant_id` is here for the scoping every other read has and not because
+/// the horizon is one book's**: `report_cursor()` is `pg_snapshot_xmin`, which
+/// is the CLUSTER's, so two tenants are answered the same number. It is taken
+/// anyway so that this route runs the identical `BEGIN … READ ONLY` /
+/// `SET LOCAL ROLE` / `set_config` bracket every other read runs, rather than
+/// being the one read that reaches the database unscoped.
+pub struct CursorQuery {
+    pub tenant_id: String,
 }
 
 /// `GET /v1/transactions/{transaction_id}` — pinned by nothing, because the
@@ -321,9 +322,12 @@ pub struct Transaction {
     pub entries: Vec<TransactionEntry>,
 }
 
-/// One leg. `amount_minor` is a JSON number here and a string on every
-/// report, and the asymmetry is deliberate (ADR-0019): a single posting is
-/// bounded by its column, and only an aggregate can exceed 2⁵³.
+/// One leg. `amount_minor` is an `i64` here — `ledger_entries.amount_minor`
+/// is a `bigint` and 64 bits hold it exactly — and an exact-integer decimal
+/// STRING on the wire, for the reason every report amount is one: JSON has no
+/// integer type, and a `bigint` reaches far past what an IEEE-754 double
+/// carries. Demonstrated rather than reasoned: a posting of 2⁵³+1 was accepted
+/// and read back one lower by `JSON.parse`.
 pub struct TransactionEntry {
     pub account_id: Uuid,
     pub direction: String,
@@ -389,12 +393,12 @@ pub enum ReadError {
 
 /// The read path's inbound port: *tell me what the book says*.
 ///
-/// Six methods for six routes, and neither `transaction` nor `accounts` got a
-/// port of its own — a manifest's worth of ceremony for one method buys a
-/// boundary nothing crosses (ADR-0015's own reason for refusing a `ports`
-/// crate), and from the caller's side reading a transaction back, listing the
-/// register and reading a report are the same capability: *tell me what the
-/// book says* (ADR-0019, ADR-0021).
+/// Seven methods for seven routes, and none of `transaction`, `accounts` or
+/// `cursor` got a port of its own — a manifest's worth of ceremony for one
+/// method buys a boundary nothing crosses (ADR-0015's own reason for refusing
+/// a `ports` crate), and from the caller's side reading a transaction back,
+/// listing the register, asking for the horizon and reading a report are the
+/// same capability: *tell me what the book says* (ADR-0019, ADR-0021).
 ///
 /// Stated as RPITIT with an explicit `+ Send`, exactly as [`Ledger`] is and
 /// for the same reason: an axum handler's future must be `Send`, and a bare
@@ -429,6 +433,12 @@ pub trait Reports: Send + Sync {
         &self,
         query: &IncomeStatementQuery,
     ) -> impl Future<Output = Result<Statement, ReadError>> + Send;
+
+    /// The commit horizon on its own — `report_cursor()`, one statement, no
+    /// report (ADR-0019's refusal of a cursor-minting endpoint, qualified by
+    /// what building a client against it cost).
+    fn cursor(&self, query: &CursorQuery)
+    -> impl Future<Output = Result<Cursor, ReadError>> + Send;
 
     /// One transaction and its entries.
     fn transaction(

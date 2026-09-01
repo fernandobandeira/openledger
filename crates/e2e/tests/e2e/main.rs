@@ -21,7 +21,9 @@
 //! ADR-0019 refuses before it reaches SQL, `tenant_fence` for the answer
 //! holding one tenant's book on each credential a deployment can wear, and
 //! `checkpoint` for migration `00004`'s reader against the journal — and
-//! `endpoints/accounts/balance` is the one read that is not a report.
+//! `endpoints/accounts/balance` is the one read that is not a report;
+//! `endpoints/cursor` is the horizon on its own, which is a resource rather
+//! than a report and has neither a range nor a chart version to name.
 //! Suite-wide checks live at the top level.
 //! Today those are `conformance` (whether the committed OpenAPI document and
 //! the running router still describe the same surface), `startup` (whether

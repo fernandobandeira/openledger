@@ -28,8 +28,8 @@
 use std::collections::BTreeMap;
 
 use ledger::{
-    AccountOwnerType, Append, Appended, BalanceUpsert, BatchMember, ChartTriple, Claimed, Delta,
-    Direction, Leg, MemberOutcome, OpenAccount, OpenedAccount, PostTransaction, Repository,
+    Account, AccountOwnerType, Append, Appended, BalanceUpsert, BatchMember, ChartTriple, Claimed,
+    Delta, Direction, Leg, MemberOutcome, OpenAccount, OpenedAccount, PostTransaction, Repository,
     StorageError, StoredAccount, StoredResult, SupersedeRefusal, TransactionStatus,
 };
 use sqlx::{PgPool, Postgres, Transaction};
@@ -902,6 +902,13 @@ const CHART_TRIPLE: &str = "SELECT t.category::text AS category,
 ///   is the one place the two are written twice;
 /// - `owner_id_key` is never named: it is `GENERATED ALWAYS`, and naming a
 ///   generated column is a refused insert;
+/// - **the insert RETURNS the whole row**, and the outer `SELECT` carries it
+///   out. The endpoint answers with what the server DERIVED — the chart
+///   triple, the resolved stripe count, the stored metadata, the register's
+///   own `created_at` — and reading it back from the insert is what makes
+///   that answer the row rather than a reconstruction of the request
+///   (ADR-0021's cost list: a 201 of two UUIDs made the derivation reachable
+///   only by a second call and a client-side scan);
 /// - the final `SELECT` anchors on the CLAIMED row, exactly as the posting
 ///   statement's does, so zero rows means "the key was already held" and
 ///   nothing else.
@@ -925,9 +932,21 @@ const CLAIM_AND_OPEN_ACCOUNT: &str = "WITH claimed AS (
                 $9::ledger_normal_balance, $10, $11,
                 COALESCE($12::smallint, 1), COALESCE($13::jsonb, '{}'::jsonb)
          FROM claimed c
-         RETURNING id
+         RETURNING id, owner_type, owner_id, purpose, category, normal_balance,
+                   counterparty_scope, currency, stripe_count, metadata, created_at
      )
-     SELECT c.id AS event_id, o.id AS account_id
+     SELECT c.id AS event_id,
+            o.id AS account_id,
+            o.owner_type::text AS owner_type,
+            o.owner_id AS owner_id,
+            o.purpose AS purpose,
+            o.category::text AS category,
+            o.normal_balance::text AS normal_balance,
+            o.counterparty_scope AS counterparty_scope,
+            o.currency::text AS currency,
+            o.stripe_count AS stripe_count,
+            o.metadata AS metadata,
+            o.created_at AS created_at
      FROM claimed c
      LEFT JOIN opened o ON true";
 
@@ -946,7 +965,18 @@ const CLAIM_AND_OPEN_ACCOUNT: &str = "WITH claimed AS (
 /// A `NULL` account id is therefore not a legitimate shape but a
 /// disagreement: the two rows commit together, so a matching hash with no
 /// account is a can't-happen state, and the service answers it as one.
-const STORED_ACCOUNT: &str = "SELECT e.id AS event_id, a.id AS account_id
+const STORED_ACCOUNT: &str = "SELECT e.id AS event_id,
+            a.id AS account_id,
+            a.owner_type::text AS owner_type,
+            a.owner_id AS owner_id,
+            a.purpose AS purpose,
+            a.category::text AS category,
+            a.normal_balance::text AS normal_balance,
+            a.counterparty_scope AS counterparty_scope,
+            a.currency::text AS currency,
+            a.stripe_count AS stripe_count,
+            a.metadata AS metadata,
+            a.created_at AS created_at
          FROM ledger_events e
          LEFT JOIN ledger_accounts a
                 ON a.tenant_id = e.tenant_id
@@ -1032,19 +1062,62 @@ fn owner_type_as_stored(owner_type: AccountOwnerType) -> &'static str {
 /// the writer service about the statement — `opened` inserts one row per
 /// claimed row, so the join cannot miss — and is answered as storage rather
 /// than as an opening that succeeded with no account. Never a caller error.
-fn opened_from_the_row(
-    claimed: Option<(Uuid, Option<Uuid>)>,
-) -> Result<Option<OpenedAccount>, StorageError> {
-    let Some((event_id, account_id)) = claimed else {
+fn opened_from_the_row(claimed: Option<OpenedRow>) -> Result<Option<OpenedAccount>, StorageError> {
+    let Some(row) = claimed else {
         return Ok(None);
     };
-    let Some(account_id) = account_id else {
+    let event_id = row.event_id;
+    let Some(account) = account_from(row) else {
         return Err("the opening statement claimed a key and wrote no account row".into());
     };
-    Ok(Some(OpenedAccount::Opened {
-        event_id,
-        account_id,
-    }))
+    Ok(Some(OpenedAccount::Opened { event_id, account }))
+}
+
+/// One row of [`CLAIM_AND_OPEN_ACCOUNT`]'s answer and of [`STORED_ACCOUNT`]'s:
+/// the event, and the account half — every column of it `NULL` together when
+/// the `LEFT JOIN` found no row at all. One struct for both statements
+/// because they select the same columns on purpose: a claim's answer and a
+/// replay's must be the same account, and two readings could disagree about
+/// what an account is.
+#[derive(sqlx::FromRow)]
+struct OpenedRow {
+    event_id: Uuid,
+    account_id: Option<Uuid>,
+    owner_type: Option<String>,
+    owner_id: Option<String>,
+    purpose: Option<String>,
+    category: Option<String>,
+    normal_balance: Option<String>,
+    counterparty_scope: Option<String>,
+    currency: Option<String>,
+    stripe_count: Option<i16>,
+    metadata: Option<serde_json::Value>,
+    created_at: Option<OffsetDateTime>,
+}
+
+/// The register's row out of a claim's answer or a replay's lookup — the
+/// eleven account columns each statement selects beside its event, read once
+/// for both.
+///
+/// `None` means the account half was absent: on the claim that is the
+/// can't-happen disagreement, and on the replay it is the equally
+/// can't-happen event-without-an-account. `owner_id` is the one column that is
+/// legitimately `NULL` on a real row — a house account has no owner — so it
+/// is read off the row rather than required.
+fn account_from(row: OpenedRow) -> Option<Account> {
+    Some(Account {
+        account_id: row.account_id?,
+        owner_type: row.owner_type?,
+        owner_id: row.owner_id,
+        purpose: row.purpose?,
+        category: row.category?,
+        normal_balance: row.normal_balance?,
+        counterparty_scope: row.counterparty_scope?,
+        currency: row.currency?,
+        stripe_count: row.stripe_count?,
+        metadata: row.metadata?,
+        created_at: row.created_at?,
+    })
 }
 
 /// Two callers raced one account — the loser blocked on the winner's
@@ -1468,7 +1541,7 @@ impl Repository for PgRepository {
         payload: &serde_json::Value,
         triple: &ChartTriple,
     ) -> Result<Option<OpenedAccount>, StorageError> {
-        let outcome: Result<Option<(Uuid, Option<Uuid>)>, sqlx::Error> =
+        let outcome: Result<Option<OpenedRow>, sqlx::Error> =
             sqlx::query_as(CLAIM_AND_OPEN_ACCOUNT)
                 .bind(command.tenant_id())
                 .bind(command.idempotency_key())
@@ -1505,7 +1578,7 @@ impl Repository for PgRepository {
         command: &OpenAccount,
         hash: &[u8],
     ) -> Result<Option<StoredAccount>, StorageError> {
-        sqlx::query_as(STORED_ACCOUNT)
+        let found: Option<OpenedRow> = sqlx::query_as(STORED_ACCOUNT)
             .bind(command.tenant_id())
             .bind(command.idempotency_key())
             .bind(hash)
@@ -1515,7 +1588,8 @@ impl Repository for PgRepository {
             .bind(command.currency())
             .fetch_optional(&mut **tx)
             .await
-            .map_err(storage)
+            .map_err(storage)?;
+        Ok(found.map(|row| (row.event_id, account_from(row))))
     }
 
     /// Commit the bracket: the event claim and everything it caused become

@@ -91,7 +91,7 @@ async fn a_resolution_is_a_new_posted_transaction_and_only_then_the_cache_moves(
             "resolves_id": pending,
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 500, "currency": "USD"
+                "amount_minor": "500", "currency": "USD"
             }],
         }))
         .await?;
@@ -150,7 +150,7 @@ async fn a_resolution_may_capture_less_than_the_pending_amounts() -> TestResult 
             "resolves_id": pending,
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 300, "currency": "USD"
+                "amount_minor": "300", "currency": "USD"
             }],
         }))
         .await?;
@@ -183,7 +183,7 @@ async fn a_pending_key_and_a_resolving_key_each_replay_their_own_stored_result()
         "status": "pending",
         "postings": [{
             "source": revenue, "destination": receivable,
-            "amount_minor": 500, "currency": "USD"
+            "amount_minor": "500", "currency": "USD"
         }],
     });
     let held = book.post(&hold).await?;
@@ -200,7 +200,7 @@ async fn a_pending_key_and_a_resolving_key_each_replay_their_own_stored_result()
         "resolves_id": pending,
         "postings": [{
             "source": revenue, "destination": receivable,
-            "amount_minor": 500, "currency": "USD"
+            "amount_minor": "500", "currency": "USD"
         }],
     });
     let captured = book.post(&capture).await?;
@@ -251,7 +251,7 @@ async fn a_reused_key_differing_only_in_status_or_resolves_id_is_refused() -> Te
             "resolves_id": pending,
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 500, "currency": "USD"
+                "amount_minor": "500", "currency": "USD"
             }],
         }))
         .await?;
@@ -267,7 +267,7 @@ async fn a_reused_key_differing_only_in_status_or_resolves_id_is_refused() -> Te
             "effective_at": "2026-08-28T00:00:00Z",
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 500, "currency": "USD"
+                "amount_minor": "500", "currency": "USD"
             }],
         }))
         .await?;
@@ -278,7 +278,7 @@ async fn a_reused_key_differing_only_in_status_or_resolves_id_is_refused() -> Te
             "effective_at": "2026-08-29T00:00:00Z",
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 500, "currency": "USD"
+                "amount_minor": "500", "currency": "USD"
             }],
         }))
         .await?;
@@ -290,7 +290,7 @@ async fn a_reused_key_differing_only_in_status_or_resolves_id_is_refused() -> Te
             "resolves_id": uuid::Uuid::from_u128(0xBAD_1DEA),
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 500, "currency": "USD"
+                "amount_minor": "500", "currency": "USD"
             }],
         }))
         .await?;
@@ -335,7 +335,7 @@ async fn resolving_a_transaction_that_does_not_exist_is_refused() -> TestResult 
             "status": "pending",
             "postings": [{
                 "source": t2_revenue, "destination": t2_receivable,
-                "amount_minor": 500, "currency": "USD"
+                "amount_minor": "500", "currency": "USD"
             }],
         }))
         .await?;
@@ -350,7 +350,7 @@ async fn resolving_a_transaction_that_does_not_exist_is_refused() -> TestResult 
             "resolves_id": Uuid::from_u128(0xDEAD_BEEF),
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 500, "currency": "USD"
+                "amount_minor": "500", "currency": "USD"
             }],
         }))
         .await?;
@@ -362,7 +362,7 @@ async fn resolving_a_transaction_that_does_not_exist_is_refused() -> TestResult 
             "resolves_id": t2_hold.get("transaction_id"),
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 500, "currency": "USD"
+                "amount_minor": "500", "currency": "USD"
             }],
         }))
         .await?;
@@ -405,7 +405,7 @@ async fn resolving_a_posted_transaction_is_refused() -> TestResult {
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 2500, "currency": "USD"
+                "amount_minor": "2500", "currency": "USD"
             }],
         }))
         .await?;
@@ -420,7 +420,7 @@ async fn resolving_a_posted_transaction_is_refused() -> TestResult {
             "resolves_id": charge.get("transaction_id"),
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 2500, "currency": "USD"
+                "amount_minor": "2500", "currency": "USD"
             }],
         }))
         .await?;
@@ -450,7 +450,7 @@ async fn a_second_resolution_of_one_pending_is_refused() -> TestResult {
             "resolves_id": pending,
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 500, "currency": "USD"
+                "amount_minor": "500", "currency": "USD"
             }],
         }))
         .await?;
@@ -465,7 +465,7 @@ async fn a_second_resolution_of_one_pending_is_refused() -> TestResult {
             "resolves_id": pending,
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 500, "currency": "USD"
+                "amount_minor": "500", "currency": "USD"
             }],
         }))
         .await?;
@@ -506,7 +506,7 @@ async fn concurrent_resolutions_of_one_pending_produce_exactly_one() -> TestResu
                 "resolves_id": pending,
                 "postings": [{
                     "source": revenue, "destination": receivable,
-                    "amount_minor": 500, "currency": "USD"
+                    "amount_minor": "500", "currency": "USD"
                 }],
             })
         })
@@ -569,7 +569,7 @@ async fn a_resolution_racing_an_uncommitted_rival_is_refused_not_a_500() -> Test
         "resolves_id": pending,
         "postings": [{
             "source": revenue, "destination": receivable,
-            "amount_minor": 500, "currency": "USD"
+            "amount_minor": "500", "currency": "USD"
         }],
     }));
     // ...and waited for AT THE LOCK, never with a bare sleep (the shared
@@ -613,7 +613,7 @@ async fn a_pending_resolution_is_refused_before_the_database() -> TestResult {
             "resolves_id": pending,
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 500, "currency": "USD"
+                "amount_minor": "500", "currency": "USD"
             }],
         }))
         .await?;

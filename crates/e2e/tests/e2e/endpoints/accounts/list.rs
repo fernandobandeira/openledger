@@ -95,7 +95,11 @@ async fn the_listing_carries_identity_and_a_stripe_count_and_no_balance() -> Tes
     // ADR-0021's shape ruling, both halves: the identity a caller needs to
     // find an account it already knows about, and NOT its balance — per
     // currency and per stripe, so a balance per row would be N+1 and
-    // `GET /v1/accounts/{id}/balance` answers it exactly.
+    // `GET /v1/accounts/{id}/balance` answers it exactly. `metadata` joined
+    // the identity half, and that is the hole rather than the feature: a
+    // caller could set it at the opening and no route read it back. The
+    // load-bearing half of "identity plus `stripe_count`" is the absence of
+    // BALANCES, and it is still absent below.
     let book = TestBook::new("list_accounts_shape").await?;
     let created = book.open_account(&an_opening("open-1", "co_1")).await?;
     assert_eq!(created.status(), 201, "opening the account");
@@ -126,6 +130,7 @@ async fn the_listing_carries_identity_and_a_stripe_count_and_no_balance() -> Tes
             "counterparty_scope",
             "created_at",
             "currency",
+            "metadata",
             "normal_balance",
             "owner_id",
             "owner_type",

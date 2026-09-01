@@ -57,10 +57,9 @@
 //! pretend a report total fits in 64 bits.
 
 use ledger::{
-    AccountBalance, AccountBalanceQuery, AccountListingRead, BalanceSheetRead, Cursor,
-    IncomeStatementRead, ListedAccount, ReadBounds, ReportRefusal, ReportStore, Scoped,
-    StatementLine, Transaction, TransactionEntry, TransactionQuery, TrialBalanceRead,
-    TrialBalanceRow,
+    Account, AccountBalance, AccountBalanceQuery, AccountListingRead, BalanceSheetRead, Cursor,
+    IncomeStatementRead, ReadBounds, ReportRefusal, ReportStore, Scoped, StatementLine,
+    Transaction, TransactionEntry, TransactionQuery, TrialBalanceRead, TrialBalanceRow,
 };
 use sqlx::{PgPool, Postgres, Row as _};
 use time::OffsetDateTime;
@@ -145,6 +144,21 @@ const ASSUME_THE_READ_ROLE: &str = "SET LOCAL ROLE openledger_read";
 /// The tenant fence, as data. The `true` is `is_local`: the scope dies with
 /// the transaction, which is what makes a pooled connection safe to hand on.
 const SCOPE_TO_ONE_TENANT: &str = "SELECT set_config('app.tenant_id', $1, true)";
+
+/// The cluster's horizon, alone — `report_cursor()` is `pg_snapshot_xmin`,
+/// everything strictly below which has committed or aborted and can never
+/// grow.
+///
+/// It is a statement of its own rather than a column of [`READ_BOUNDS`]
+/// because that one also aggregates `min(xact_id)` over this tenant's entries,
+/// and a caller who asked only for the horizon should not pay for a floor they
+/// did not ask about. `::text` for the reason every cursor crosses this seam as
+/// text: there is no sqlx mapping for `xid8`.
+///
+/// It takes no tenant and needs none — the horizon is the CLUSTER's — but it
+/// still runs inside the same scoped bracket every other read runs in, so
+/// there is one way into this database from the read path and not two.
+const REPORT_CURSOR: &str = "SELECT report_cursor()::text AS horizon";
 
 /// The cursor's two bounds and the book's chart version, in ONE statement.
 ///
@@ -293,7 +307,9 @@ const TRANSACTION: &str = "SELECT x.id AS transaction_id,
 ///
 /// **No balance column, at any depth** (ADR-0021): balances are per currency
 /// and per stripe, a balance per row would be N+1, and the balance route
-/// answers that question one account at a time.
+/// answers that question one account at a time. `metadata` IS selected, and
+/// that is not a balance by another name: it is the caller's own object, set
+/// at the opening and readable nowhere else on this surface until now.
 const ACCOUNTS: &str = "SELECT a.id AS account_id,
             a.owner_type::text AS owner_type,
             a.owner_id AS owner_id,
@@ -303,6 +319,7 @@ const ACCOUNTS: &str = "SELECT a.id AS account_id,
             a.counterparty_scope AS counterparty_scope,
             a.currency::text AS currency,
             a.stripe_count AS stripe_count,
+            a.metadata AS metadata,
             a.created_at AS created_at
          FROM ledger_accounts a
         WHERE a.tenant_id = $1
@@ -457,13 +474,14 @@ struct AccountSqlRow {
     counterparty_scope: String,
     currency: String,
     stripe_count: i16,
+    metadata: serde_json::Value,
     created_at: OffsetDateTime,
 }
 
 /// The page, in the port's own shape.
-fn register_page_from(rows: Vec<AccountSqlRow>) -> Vec<ListedAccount> {
+fn register_page_from(rows: Vec<AccountSqlRow>) -> Vec<Account> {
     rows.into_iter()
-        .map(|row| ListedAccount {
+        .map(|row| Account {
             account_id: row.account_id,
             owner_type: row.owner_type,
             owner_id: row.owner_id,
@@ -473,6 +491,7 @@ fn register_page_from(rows: Vec<AccountSqlRow>) -> Vec<ListedAccount> {
             counterparty_scope: row.counterparty_scope,
             currency: row.currency,
             stripe_count: row.stripe_count,
+            metadata: row.metadata,
             created_at: row.created_at,
         })
         .collect()
@@ -493,6 +512,16 @@ fn face_from(rows: Vec<StatementSqlRow>) -> Vec<StatementLine> {
 }
 
 impl ReportStore for PgReportStore {
+    async fn report_cursor(&self, tenant_id: &str) -> Result<Scoped<Cursor>, ReportRefusal> {
+        let mut scope = self.begin_the_scoped_read(tenant_id).await?;
+        let horizon: String = sqlx::query_scalar(REPORT_CURSOR)
+            .fetch_one(&mut *scope.tx)
+            .await
+            .map_err(refusal)?;
+        let horizon = cursor_from("report_cursor()", &horizon)?;
+        scope.end_with(horizon).await
+    }
+
     async fn read_bounds(&self, tenant_id: &str) -> Result<Scoped<ReadBounds>, ReportRefusal> {
         let mut scope = self.begin_the_scoped_read(tenant_id).await?;
         let row = sqlx::query(READ_BOUNDS)
@@ -611,7 +640,7 @@ impl ReportStore for PgReportStore {
     async fn accounts(
         &self,
         read: &AccountListingRead<'_>,
-    ) -> Result<Scoped<Vec<ListedAccount>>, ReportRefusal> {
+    ) -> Result<Scoped<Vec<Account>>, ReportRefusal> {
         let mut scope = self.begin_the_scoped_read(read.tenant_id).await?;
         let rows: Vec<AccountSqlRow> = sqlx::query_as(ACCOUNTS)
             .bind(read.tenant_id)

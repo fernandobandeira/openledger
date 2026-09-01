@@ -107,17 +107,29 @@ pub(crate) struct AccountBody {
 }
 
 /// The stored result of an accepted opening: the event, and the account it
-/// caused.
+/// caused — **the whole account**, not its id.
+///
+/// **Two UUIDs undercut ADR-0021's own design.** The decision's centre is
+/// that the caller names a `purpose` and the server DERIVES `category`,
+/// `normal_balance` and `counterparty_scope`; answering with an id meant the
+/// derived triple could only be seen by a second call to `GET /v1/accounts`
+/// plus a client-side scan, because there is no `GET /v1/accounts/{id}` and
+/// the listing filters on `purpose` and `owner_id` but not on the account.
+/// "Show me the account I just opened" was a paged search. It is one field
+/// now, and it is the SAME [`AccountRead`] a listing row is — one type, so
+/// the two cannot come to disagree about what an account looks like.
+///
+/// `event_id` stays beside it: opening an account writes an EVENT and no
+/// ledger transaction, which is the case ADR-0005 justified the event log by,
+/// and the spine is a fact a caller should still be able to see.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct AccountCreated {
     /// The event row this call claimed — or, on a replay, the one it found.
-    /// Opening an account writes an EVENT and no ledger transaction, which is
-    /// the case ADR-0005 justified the event log by.
     event_id: Uuid,
-    /// The account. Never null, unlike a posting's `transaction_id`: an
-    /// accepted opening always wrote one, and a replay finds it by the
-    /// natural key its own body names.
-    account_id: Uuid,
+    /// The account, as the register holds it. Never null, unlike a posting's
+    /// `transaction_id`: an accepted opening always wrote one, and a replay
+    /// finds it by the natural key its own body names.
+    account: AccountRead,
 }
 
 /// Open an account.
@@ -137,7 +149,10 @@ pub(crate) struct AccountCreated {
         (
             status = 201,
             description = "Opened: this call claimed the idempotency key and wrote the account \
-                           and its event atomically.",
+                           and its event atomically. The answer carries the whole account, \
+                           including the `category`, `normal_balance` and `counterparty_scope` \
+                           the server DERIVED from `purpose` — the same representation \
+                           `GET /v1/accounts` answers per row (ADR-0021).",
             body = AccountCreated,
             headers(
                 ("Idempotency-Replayed" = bool,
@@ -148,7 +163,8 @@ pub(crate) struct AccountCreated {
             status = 200,
             description = "Replayed: this key was already accepted with this same body. The \
                            stored result is re-rendered — never a cached response body — and \
-                           nothing was written (ADR-0013 §2).",
+                           nothing was written (ADR-0013 §2). It carries the same full account \
+                           the 201 did, read back from the register.",
             body = AccountCreated,
             headers(
                 ("Idempotency-Replayed" = bool,
@@ -246,7 +262,7 @@ fn answer_the_stored_account(opened: ledger::AccountOpened) -> Response {
         [(IDEMPOTENCY_REPLAYED, replayed)],
         axum::Json(AccountCreated {
             event_id: opened.event_id,
-            account_id: opened.account_id,
+            account: account_on_the_wire(opened.account),
         }),
     )
         .into_response()
@@ -408,12 +424,16 @@ pub(crate) struct AccountListRead {
     next_after: Option<Uuid>,
 }
 
-/// One account, as the register holds it.
+/// One account, as the register holds it — the representation BOTH of this
+/// resource's verbs answer with: a row of the listing, and the whole of an
+/// accepted opening's `account`.
 ///
 /// **No balance, and that is contract** (ADR-0021): balances are per currency
 /// and per stripe, so a balance per row would be N+1, and
 /// `GET /v1/accounts/{account_id}/balance` answers that question one account
-/// at a time and exactly.
+/// at a time and exactly. `metadata` is here and a balance is not, and the
+/// two are different questions: metadata is the caller's own object, written
+/// at the opening and readable on no other route.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct AccountRead {
     account_id: Uuid,
@@ -442,9 +462,38 @@ pub(crate) struct AccountRead {
     /// in any response (ADR-0013 §4), and this is the hint, not a position.
     #[schema(example = 64)]
     stripe_count: i16,
+    /// The caller's own object, as the opening set it — `{}` when it named
+    /// none, because the column is `NOT NULL DEFAULT '{}'`.
+    ///
+    /// It is here because until now a caller could WRITE metadata and had no
+    /// route that read it back, which is a hole rather than a missing
+    /// feature. ADR-0021's "identity plus `stripe_count`" is extended by this
+    /// one field and by nothing else: the part of that sentence that was
+    /// load-bearing is the absence of BALANCES, and they are still absent.
+    metadata: serde_json::Value,
     /// When the account was opened — the database's clock.
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
+}
+
+/// One account as the register holds it, on the wire. One renderer for both
+/// verbs — the listing's rows and the opening's answer — because ADR-0021's
+/// fix is that the two ARE the same representation, and two renderings could
+/// disagree about which fields that is.
+fn account_on_the_wire(account: ledger::Account) -> AccountRead {
+    AccountRead {
+        account_id: account.account_id,
+        owner_type: account.owner_type,
+        owner_id: account.owner_id,
+        purpose: account.purpose,
+        category: account.category,
+        normal_balance: account.normal_balance,
+        counterparty_scope: account.counterparty_scope,
+        currency: account.currency,
+        stripe_count: account.stripe_count,
+        metadata: account.metadata,
+        created_at: account.created_at,
+    }
 }
 
 /// List the accounts on one book.
@@ -466,10 +515,12 @@ pub(crate) struct AccountRead {
     responses(
         (
             status = 200,
-            description = "One page of the account register, in creation order. An unknown \
-                           tenant answers 200 with an empty list, never 404: there is no \
-                           tenant registry to consult, so inventing the status would mean \
-                           inventing the registry (ADR-0019).",
+            description = "One page of the account register, in creation order — identity, \
+                           the derived chart triple, the stripe count and the caller's own \
+                           `metadata`, and no balances (ADR-0021). An unknown tenant answers \
+                           200 with an empty list, never 404: there is no tenant registry to \
+                           consult, so inventing the status would mean inventing the registry \
+                           (ADR-0019).",
             body = AccountListRead
         ),
         (
@@ -527,18 +578,7 @@ fn answer_the_register_page(listing: ledger::AccountListing) -> Response {
         accounts: listing
             .accounts
             .into_iter()
-            .map(|account| AccountRead {
-                account_id: account.account_id,
-                owner_type: account.owner_type,
-                owner_id: account.owner_id,
-                purpose: account.purpose,
-                category: account.category,
-                normal_balance: account.normal_balance,
-                counterparty_scope: account.counterparty_scope,
-                currency: account.currency,
-                stripe_count: account.stripe_count,
-                created_at: account.created_at,
-            })
+            .map(account_on_the_wire)
             .collect(),
     })
     .into_response()

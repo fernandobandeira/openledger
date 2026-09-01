@@ -21,6 +21,11 @@ use crate::support::{
     transaction_path,
 };
 
+/// 2⁵³+1 — the smallest integer an IEEE-754 double cannot represent, a legal
+/// `bigint`, and the value the wire defect was demonstrated with: posted as a
+/// JSON number it came back as 9007199254740992.
+const BEYOND_A_DOUBLE: &str = "9007199254740993";
+
 const HOLD_MINOR: i64 = 500;
 const CHARGE_MINOR: i64 = 2500;
 const CHARGE_DATE: &str = "2026-08-27T12:00:00Z";
@@ -78,10 +83,11 @@ async fn a_pending_hold_reads_back_as_pending_and_names_no_supersession() -> Tes
         Some(hold.to_string().as_str()),
         "the read-back is a different transaction: {read}"
     );
-    // A posting amount stays a JSON NUMBER here, against every report's
-    // decimal string: a single leg is bounded by its column and only an
-    // aggregate can exceed what a JSON number carries exactly (ADR-0019).
-    let leg_amounts: Vec<Option<i64>> = read
+    // A leg's amount is a decimal STRING, exactly as every report total is:
+    // `bigint` reaches far past 2⁵³ and JSON has no integer type, so a JSON
+    // number here was silently rounded by the consumer's parser. Nothing in
+    // this suite parses one.
+    let leg_amounts: Vec<Option<&str>> = read
         .get("entries")
         .and_then(serde_json::Value::as_array)
         .ok_or("no entries")?
@@ -89,10 +95,15 @@ async fn a_pending_hold_reads_back_as_pending_and_names_no_supersession() -> Tes
         .map(|entry| {
             entry
                 .get("amount_minor")
-                .and_then(serde_json::Value::as_i64)
+                .and_then(serde_json::Value::as_str)
         })
         .collect();
-    assert_eq!(leg_amounts, [Some(HOLD_MINOR), Some(HOLD_MINOR)], "{read}");
+    let hold = HOLD_MINOR.to_string();
+    assert_eq!(
+        leg_amounts,
+        [Some(hold.as_str()), Some(hold.as_str())],
+        "{read}"
+    );
 
     book.assert_reconciled().await
 }
@@ -113,7 +124,7 @@ async fn a_resolution_reads_back_as_posted_and_names_the_hold_it_retired() -> Te
             "resolves_id": hold,
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": HOLD_MINOR, "currency": "USD"
+                "amount_minor": HOLD_MINOR.to_string(), "currency": "USD"
             }],
         }))
         .await?;
@@ -179,8 +190,10 @@ async fn a_reversal_reads_back_as_posted_and_names_the_transaction_it_mirrored()
         "{read}"
     );
     // The mirror, leg by leg: the account that took the debit takes the credit
-    // back, at the same amount. Nothing about the reversal's request said so.
-    let mirrored: Vec<(Option<&str>, Option<i64>)> = read
+    // back, at the same amount — compared as the STRING the wire carries,
+    // never parsed, because parsing is the step that lost a digit.
+    let charge_minor = CHARGE_MINOR.to_string();
+    let mirrored: Vec<(Option<&str>, Option<&str>)> = read
         .get("entries")
         .and_then(serde_json::Value::as_array)
         .ok_or("no entries")?
@@ -190,14 +203,14 @@ async fn a_reversal_reads_back_as_posted_and_names_the_transaction_it_mirrored()
                 entry.get("direction").and_then(serde_json::Value::as_str),
                 entry
                     .get("amount_minor")
-                    .and_then(serde_json::Value::as_i64),
+                    .and_then(serde_json::Value::as_str),
             )
         })
         .collect();
     assert_eq!(
         mirrored
             .iter()
-            .filter(|(_, minor)| *minor == Some(CHARGE_MINOR))
+            .filter(|(_, minor)| *minor == Some(charge_minor.as_str()))
             .count(),
         2,
         "a mirror must carry the target's amount on both legs: {read}"
@@ -232,6 +245,68 @@ async fn a_transaction_nothing_ever_wrote_is_a_404_naming_it() -> TestResult {
         "the refusal must name the transaction; detail was {:?}",
         refusal_detail(&body)
     );
+
+    book.assert_reconciled().await
+}
+
+#[tokio::test]
+async fn an_amount_above_two_to_the_fifty_third_reads_back_byte_identical() -> TestResult {
+    // The defect this endpoint's wire form was changed for, held as a round
+    // trip: 2⁵³+1 is a legal `bigint` and the smallest integer an IEEE-754
+    // double cannot represent, so as a JSON number it was accepted and read
+    // back one LOWER — silently, with nothing on the wire to say so. As a
+    // string it is the same bytes going in and coming out, and this test
+    // compares the bytes rather than parsing them, because parsing is the
+    // step that lost the digit.
+    let book = TestBook::new("read_back_beyond_a_double").await?;
+    let (receivable, revenue) = book.fixture_accounts().await?;
+    let created = book
+        .post(&serde_json::json!({
+            "tenant_id": "t1",
+            "idempotency_key": "whale-1",
+            "effective_at": CHARGE_DATE,
+            "postings": [{
+                "source": revenue, "destination": receivable,
+                "amount_minor": BEYOND_A_DOUBLE, "currency": "USD"
+            }],
+        }))
+        .await?;
+    assert_eq!(created.status(), 201, "{:?}", created.text().await);
+    let body: serde_json::Value = created.json().await?;
+    let charge: Uuid = body
+        .get("transaction_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("no transaction_id on the whale's 201")?
+        .parse()?;
+
+    let (status, read) = book.read(&transaction_path("t1", charge)).await?;
+
+    assert_eq!(status.as_u16(), 200, "{read}");
+    let leg_amounts: Vec<Option<&str>> = read
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("no entries")?
+        .iter()
+        .map(|entry| {
+            entry
+                .get("amount_minor")
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect();
+    assert_eq!(
+        leg_amounts,
+        [Some(BEYOND_A_DOUBLE), Some(BEYOND_A_DOUBLE)],
+        "{read}"
+    );
+    // And the column agrees with the wire, so this is the ledger's number and
+    // not a string the API carried around unexamined.
+    let (stored,): (i64,) = sqlx::query_as(
+        "SELECT DISTINCT e.amount_minor FROM ledger_entries e WHERE e.transaction_id = $1",
+    )
+    .bind(charge)
+    .fetch_one(&book.pool)
+    .await?;
+    assert_eq!(stored.to_string(), BEYOND_A_DOUBLE);
 
     book.assert_reconciled().await
 }

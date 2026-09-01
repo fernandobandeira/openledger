@@ -22,6 +22,7 @@
 //! Nothing here imports `sqlx`, for the reason the whole crate does not.
 
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::domain::{Invalid, validate_identity};
@@ -361,18 +362,62 @@ impl OpenAccount {
     }
 }
 
+/// One account as the register holds it — the whole row, and the shape both
+/// verbs answer with: the listing renders it per row, and an accepted opening
+/// renders exactly one.
+///
+/// **It carries the DERIVED triple, and that is the point of returning it at
+/// all.** ADR-0021's central design is that the caller names a `purpose` and
+/// the server reads `category`, `normal_balance` and `counterparty_scope` from
+/// the chart — so an opening that answered two UUIDs made the one thing the
+/// design is for reachable only by a second call plus a client-side scan.
+/// The record is read back from the register in BOTH paths, the insert's own
+/// `RETURNING` and the replay's lookup, so nothing here is this crate's
+/// reconstruction of what it thinks it asked for.
+///
+/// **No balance**, and that is contract rather than omission (ADR-0021):
+/// balances are per currency and per stripe, one per row would be N+1, and
+/// `GET /v1/accounts/{id}/balance` answers that question one account at a
+/// time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Account {
+    pub account_id: Uuid,
+    pub owner_type: String,
+    /// `None` on a house account, which is the ledger's own side and has no
+    /// owner (`ck_accounts__house_has_no_owner`).
+    pub owner_id: Option<String>,
+    pub purpose: String,
+    pub category: String,
+    pub normal_balance: String,
+    pub counterparty_scope: String,
+    pub currency: String,
+    /// How many stripes the writer spreads this account's balance row across
+    /// — a HINT and not an invariant (ADR-0013 §4). It is the one operational
+    /// number on this answer, and it is here because it is the one a caller
+    /// can act on: a hot account is re-opened with more stripes, never
+    /// re-striped by an update.
+    pub stripe_count: i16,
+    /// The caller's own object, as the column holds it — `{}` when the
+    /// opening named none, because the column is `NOT NULL DEFAULT '{}'`.
+    /// Never an `Option`: an absent metadata and an empty one are the same
+    /// row, and a reader that had to tell them apart would be defending
+    /// against a distinction the schema does not make.
+    pub metadata: serde_json::Value,
+    pub created_at: OffsetDateTime,
+}
+
 /// The stored result of an accepted opening, ADR-0013's replay contract in
 /// this operation's own shape: the event that claimed the key, and the account
 /// it caused. Re-rendered by the caller on a replay — never a cached response
 /// body.
 ///
-/// `account_id` is NOT an `Option`, where a posting's `transaction_id` is: an
+/// `account` is NOT an `Option`, where a posting's `transaction_id` is: an
 /// accepted opening always wrote an account, and a replay finds it by the
 /// natural key its own body names. An event whose account cannot be found is
 /// a can't-happen state the writer answers as one.
 pub struct AccountOpened {
     pub event_id: Uuid,
-    pub account_id: Uuid,
+    pub account: Account,
     pub replayed: bool,
 }
 

@@ -110,7 +110,7 @@ async fn two_tenants_on_one_book(
             "effective_at": CHARGE_DATE,
             "postings": [{
                 "source": t2_revenue, "destination": t2_receivable,
-                "amount_minor": T2_MINOR, "currency": "USD"
+                "amount_minor": T2_MINOR.to_string(), "currency": "USD"
             }],
         }))
         .await?;

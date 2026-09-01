@@ -52,10 +52,42 @@ fn with(
     opening
 }
 
+/// The account an accepted opening answered with — the whole
+/// representation, which is what the 201 carries since the `account_id` it
+/// used to answer with left the DERIVED triple reachable only by a second
+/// call and a client-side scan (ADR-0021's cost list).
+fn account_in(body: &serde_json::Value) -> Option<&serde_json::Value> {
+    body.get("account")
+}
+
 /// The account id off an accepted opening.
 fn account_of(body: &serde_json::Value) -> Option<&str> {
-    body.get("account_id").and_then(serde_json::Value::as_str)
+    account_in(body)?
+        .get("account_id")
+        .and_then(serde_json::Value::as_str)
 }
+
+/// One field of the account an opening answered with, as text.
+fn field_of(body: &serde_json::Value, field: &str) -> Option<String> {
+    account_in(body)?
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The chart triple the server derived, as the ANSWER states it — the three
+/// values a caller never sent and could not previously read back.
+fn derived_triple(body: &serde_json::Value) -> Option<(String, String, String)> {
+    Some((
+        field_of(body, "category")?,
+        field_of(body, "normal_balance")?,
+        field_of(body, "counterparty_scope")?,
+    ))
+}
+
+/// What the published chart holds for `customer_receivable` — an asset with a
+/// debit normal balance, split by counterparty.
+const RECEIVABLE_TRIPLE: (&str, &str, &str) = ("asset", "debit", "per_shard");
 
 /// How many accounts this book holds — a refused opening must not move it.
 async fn accounts_on(book: &TestBook) -> Result<i64, sqlx::Error> {
@@ -108,13 +140,144 @@ async fn the_server_derives_the_chart_triple_the_caller_never_sends() -> TestRes
     // Exactly what `account_types` holds for `customer_receivable` in the
     // published chart — read off the account, so a writer that bound the
     // wrong row fails here rather than at the next reclassification.
+    let (category, normal_balance, counterparty_scope) = RECEIVABLE_TRIPLE;
     assert_eq!(
         derived,
         (
-            "asset".to_owned(),
-            "debit".to_owned(),
-            "per_shard".to_owned()
+            category.to_owned(),
+            normal_balance.to_owned(),
+            counterparty_scope.to_owned()
         )
+    );
+
+    book.assert_reconciled().await
+}
+
+#[tokio::test]
+async fn the_opening_answers_with_the_triple_it_derived_and_not_only_an_id() -> TestResult {
+    // ADR-0021's cost list, closed: the derived triple is the REASON the
+    // server derives it, and a 201 of two UUIDs meant seeing it took a second
+    // call to `GET /v1/accounts` plus a client-side scan for the id — there is
+    // no `GET /v1/accounts/{id}` and the listing filters on `purpose` and
+    // `owner_id` but not on the account. "Show me the account I just opened"
+    // was a paged search.
+    let book = TestBook::new("open_account_answers_the_triple").await?;
+
+    let created = book.open_account(&an_opening("open-1", "co_1")).await?;
+
+    assert_eq!(created.status(), 201);
+    let body: serde_json::Value = created.json().await?;
+    let (category, normal_balance, counterparty_scope) = RECEIVABLE_TRIPLE;
+    assert_eq!(
+        derived_triple(&body),
+        Some((
+            category.to_owned(),
+            normal_balance.to_owned(),
+            counterparty_scope.to_owned()
+        )),
+        "{body}"
+    );
+    // And the spine is still visible beside it: opening an account writes an
+    // EVENT and no ledger transaction, which is the case ADR-0005 justified
+    // the event log by.
+    assert!(
+        body.get("event_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "the answer dropped its event_id: {body}"
+    );
+
+    book.assert_reconciled().await
+}
+
+#[tokio::test]
+async fn a_replay_answers_the_same_account_the_first_call_did_field_for_field() -> TestResult {
+    // A replay re-renders the STORED result (ADR-0013 §2), and now that the
+    // result is the whole account the replay has to carry the whole account:
+    // a 200 that answered less than its 201 would make the header the only
+    // honest part of it.
+    let book = TestBook::new("open_account_replay_answers_the_same").await?;
+    let first = book.open_account(&an_opening("open-1", "co_1")).await?;
+    assert_eq!(first.status(), 201, "the first opening");
+    let first: serde_json::Value = first.json().await?;
+
+    let replayed = book.open_account(&an_opening("open-1", "co_1")).await?;
+
+    assert_eq!(replayed.status(), 200);
+    assert_eq!(header(&replayed, "idempotency-replayed")?, "true");
+    let replayed: serde_json::Value = replayed.json().await?;
+    // The whole representation, not only the id — and the same one, read back
+    // from the register rather than rebuilt from the request.
+    assert_eq!(account_in(&replayed), account_in(&first), "{replayed}");
+    let (category, normal_balance, counterparty_scope) = RECEIVABLE_TRIPLE;
+    assert_eq!(
+        derived_triple(&replayed),
+        Some((
+            category.to_owned(),
+            normal_balance.to_owned(),
+            counterparty_scope.to_owned()
+        )),
+        "{replayed}"
+    );
+
+    book.assert_reconciled().await
+}
+
+#[tokio::test]
+async fn the_metadata_an_opening_set_is_readable_back_on_both_of_this_resources_verbs() -> TestResult
+{
+    // A caller could WRITE metadata and had no route that read it back, which
+    // is a hole rather than a missing feature: the opening's answer and the
+    // listing both carry it now, and an opening that named none reads back the
+    // column's own `{}` rather than a null.
+    let book = TestBook::new("open_account_metadata").await?;
+    let annotated = with(
+        "metadata",
+        serde_json::json!({"ledger": "receivables", "region": "eu"}),
+        an_opening("open-1", "co_1"),
+    );
+
+    let created = book.open_account(&annotated).await?;
+
+    assert_eq!(created.status(), 201);
+    let body: serde_json::Value = created.json().await?;
+    assert_eq!(
+        account_in(&body).and_then(|account| account.get("metadata")),
+        Some(&serde_json::json!({"ledger": "receivables", "region": "eu"})),
+        "{body}"
+    );
+    // And the same object off the listing, which is the only other route that
+    // speaks it.
+    let (status, page) = book.read(&crate::support::accounts_path("t1", &[])).await?;
+    assert_eq!(status.as_u16(), 200, "{page}");
+    let listed = page
+        .get("accounts")
+        .and_then(|accounts| accounts.get(0))
+        .and_then(|account| account.get("metadata"));
+    assert_eq!(
+        listed,
+        Some(&serde_json::json!({"ledger": "receivables", "region": "eu"})),
+        "{page}"
+    );
+
+    book.assert_reconciled().await
+}
+
+#[tokio::test]
+async fn an_opening_that_named_no_metadata_reads_back_the_columns_empty_object() -> TestResult {
+    // `NOT NULL DEFAULT '{}'`: an absent metadata and an empty one are the
+    // same row, so the answer says `{}` and never `null` — a reader never has
+    // to defend against a distinction the schema does not make.
+    let book = TestBook::new("open_account_no_metadata").await?;
+
+    let created = book.open_account(&an_opening("open-1", "co_1")).await?;
+
+    assert_eq!(created.status(), 201);
+    let body: serde_json::Value = created.json().await?;
+    assert_eq!(
+        account_in(&body).and_then(|account| account.get("metadata")),
+        Some(&serde_json::json!({})),
+        "{body}"
     );
 
     book.assert_reconciled().await
@@ -140,7 +303,7 @@ async fn an_account_opened_over_http_is_a_posting_target_immediately() -> TestRe
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [{
                 "source": revenue, "destination": opened,
-                "amount_minor": 2500, "currency": "USD"
+                "amount_minor": "2500", "currency": "USD"
             }],
         }))
         .await?;

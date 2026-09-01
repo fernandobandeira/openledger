@@ -268,7 +268,7 @@ async fn raising_stripe_count_on_an_account_with_history_opens_a_new_stripe_lazi
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": OPENING, "currency": "USD"
+                "amount_minor": OPENING.to_string(), "currency": "USD"
             }],
         }))
         .await?;

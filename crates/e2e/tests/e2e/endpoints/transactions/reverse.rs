@@ -41,7 +41,7 @@ async fn post_one_charge(
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 2500, "currency": "USD"
+                "amount_minor": "2500", "currency": "USD"
             }],
         }))
         .await?;
@@ -333,7 +333,7 @@ async fn a_reversal_carrying_postings_or_posted_as_pending_is_refused() -> TestR
             "reverses_id": charge,
             "postings": [{
                 "source": receivable, "destination": revenue,
-                "amount_minor": 2500, "currency": "USD"
+                "amount_minor": "2500", "currency": "USD"
             }],
         }))
         .await?;
@@ -391,7 +391,7 @@ async fn reversing_a_missing_or_foreign_target_is_refused() -> TestResult {
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [{
                 "source": t2_revenue, "destination": t2_receivable,
-                "amount_minor": 2500, "currency": "USD"
+                "amount_minor": "2500", "currency": "USD"
             }],
         }))
         .await?;
@@ -455,7 +455,7 @@ async fn reversing_a_resolution_or_a_reversal_is_refused() -> TestResult {
             "resolves_id": pending,
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 500, "currency": "USD"
+                "amount_minor": "500", "currency": "USD"
             }],
         }))
         .await?;
@@ -608,7 +608,7 @@ async fn a_resolved_pending_cannot_be_voided_nor_a_voided_one_resolved() -> Test
             "resolves_id": resolved_hold,
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 500, "currency": "USD"
+                "amount_minor": "500", "currency": "USD"
             }],
         }))
         .await?;
@@ -621,7 +621,7 @@ async fn a_resolved_pending_cannot_be_voided_nor_a_voided_one_resolved() -> Test
             "status": "pending",
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 700, "currency": "USD"
+                "amount_minor": "700", "currency": "USD"
             }],
         }))
         .await?;
@@ -657,7 +657,7 @@ async fn a_resolved_pending_cannot_be_voided_nor_a_voided_one_resolved() -> Test
             "resolves_id": voided_hold,
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 700, "currency": "USD"
+                "amount_minor": "700", "currency": "USD"
             }],
         }))
         .await?;
@@ -756,7 +756,7 @@ async fn a_resolution_racing_an_uncommitted_void_is_refused_not_a_500() -> TestR
         "resolves_id": pending,
         "postings": [{
             "source": revenue, "destination": receivable,
-            "amount_minor": 500, "currency": "USD"
+            "amount_minor": "500", "currency": "USD"
         }],
     }));
     let blocked = book.wait_until_a_backend_blocks_on_a_lock().await?;
@@ -796,7 +796,7 @@ async fn a_reused_key_differing_only_in_reverses_id_or_its_date_is_refused() -> 
             "effective_at": "2026-08-27T12:00:00Z",
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 900, "currency": "USD"
+                "amount_minor": "900", "currency": "USD"
             }],
         }))
         .await?;

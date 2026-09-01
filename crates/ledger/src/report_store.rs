@@ -3,7 +3,7 @@
 //! Its own port rather than a method on [`Repository`](crate::Repository),
 //! for the reason that port's own doc gives: it is *"what the **writer**
 //! service asks of storage"*, and the rule that comes with it — **one method
-//! per statement** — carries over here unchanged. Seven methods, seven
+//! per statement** — carries over here unchanged. Eight methods, eight
 //! statements, each one a scoped read transaction of its own in the adapter.
 //!
 //! **The bracket is the adapter's** (ADR-0019, ADR-0004): `BEGIN … READ
@@ -29,9 +29,10 @@
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::accounts::Account;
 use crate::reports::{
-    AccountBalance, AccountBalanceQuery, Cursor, ListedAccount, StatementLine, Transaction,
-    TransactionQuery, TrialBalanceRow,
+    AccountBalance, AccountBalanceQuery, Cursor, StatementLine, Transaction, TransactionQuery,
+    TrialBalanceRow,
 };
 use crate::repository::StorageError;
 
@@ -147,6 +148,19 @@ pub enum ReportRefusal {
 /// transaction. Implemented once, by `PgReportStore`; the generic is the
 /// seam's cost, not a plug-in system.
 pub trait ReportStore: Send + Sync {
+    /// `report_cursor()` alone — the cluster's horizon, one statement, no
+    /// report and no bounds.
+    ///
+    /// It is a method of its own rather than a reading of
+    /// [`read_bounds`](ReportStore::read_bounds) because that statement also
+    /// takes `min(xact_id)` over this tenant's entries, and a caller who asked
+    /// only for the horizon should not pay for an aggregate they did not ask
+    /// about. One method per statement, as everywhere on this port.
+    fn report_cursor(
+        &self,
+        tenant_id: &str,
+    ) -> impl Future<Output = Result<Scoped<Cursor>, ReportRefusal>> + Send;
+
     /// The cursor's two bounds and the book's chart version, read inside a
     /// scoped read transaction so the floor is this tenant's.
     fn read_bounds(
@@ -198,5 +212,5 @@ pub trait ReportStore: Send + Sync {
     fn accounts(
         &self,
         read: &AccountListingRead<'_>,
-    ) -> impl Future<Output = Result<Scoped<Vec<ListedAccount>>, ReportRefusal>> + Send;
+    ) -> impl Future<Output = Result<Scoped<Vec<Account>>, ReportRefusal>> + Send;
 }

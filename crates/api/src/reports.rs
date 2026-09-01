@@ -1,6 +1,7 @@
-//! The four read endpoints that are not a transaction read-back: one balance
-//! and three reports, their wire types, and the `#[utoipa::path]` annotations
-//! the committed spec is generated from.
+//! The five read endpoints that are not a transaction read-back or an account
+//! listing: one balance, three reports, and the commit horizon on its own —
+//! their wire types, and the `#[utoipa::path]` annotations the committed spec
+//! is generated from.
 //!
 //! This layer is a mapping and grows no judgement of its own — the cursor
 //! rule, the chart version and the tenant check are all `ledger::ReportService`'s
@@ -10,10 +11,13 @@
 //! - **instants and cursors arrive as text and are parsed here**, so a
 //!   malformed one is a `422 invalid_request` naming the parameter rather
 //!   than a 400 naming a serde path;
-//! - **every amount is a decimal STRING**, on every report row (ADR-0019). A
-//!   `numeric` total above 2⁵³ would be silently rounded by the consumer's
-//!   JSON parser, which is trading a loud refusal for a quiet wrong answer.
-//!   The write path's posting amounts stay JSON numbers and are untouched;
+//! - **every amount is a decimal STRING**, on every report row (ADR-0019) —
+//!   and, since a client was built against this surface, on every single
+//!   entry and posting too (`transactions.rs`). A `numeric` total above 2⁵³
+//!   would be silently rounded by the consumer's JSON parser, which is
+//!   trading a loud refusal for a quiet wrong answer; a `bigint` posting
+//!   above 2⁵³ was, and the demonstration was a posting of 9007199254740993
+//!   read back one lower;
 //! - **`pinned_cursor` is on every report answer**, always, including when
 //!   the caller supplied no cursor: it is the only way a caller can notice
 //!   that the cluster horizon is lagging, and it is the value they should
@@ -24,7 +28,7 @@
 //!   single-row read that under-reports.
 //!
 //! And one absence that is now PARTLY filled, stated as it stands: **none of
-//! the four endpoints in this file pages, searches or filters**, and at a
+//! the five endpoints in this file pages, searches or filters**, and at a
 //! million entries the three reports return 2, 10 and 4 rows, so there is
 //! nothing here to page. ADR-0019 refused a listing outright on the ground
 //! that one *"needs an ordering and a page key this spike did not design"*;
@@ -121,6 +125,31 @@ pub(crate) struct IncomeStatementParams {
     cursor: Option<String>,
     #[param(example = 1)]
     chart_version: Option<i32>,
+}
+
+/// `GET /v1/cursor` — the query half, which is one parameter and is here for
+/// consistency rather than for correctness.
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct CursorParams {
+    /// The book to read. **The horizon is the CLUSTER's**, not this book's —
+    /// `report_cursor()` is `pg_snapshot_xmin` — so two tenants are answered
+    /// the same number. It is required anyway so that this route runs the
+    /// identical scoped read bracket every other read runs, rather than being
+    /// the one read that reaches the database unscoped.
+    #[param(example = "t1")]
+    tenant_id: String,
+}
+
+/// The commit horizon, on its own.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CursorRead {
+    /// The current horizon, as a decimal string — an `xid8` is a 64-bit
+    /// unsigned value and JSON numbers are not. Send it back as `cursor` on
+    /// any report route to pin that report here; everything strictly below it
+    /// has finished committing and can never grow.
+    #[schema(example = "231000")]
+    cursor: String,
 }
 
 /// One account's posted balance.
@@ -318,6 +347,85 @@ pub(crate) fn refusal_for_read(error: ledger::ReadError) -> Response {
             )
         }
     }
+}
+
+/// Read the commit horizon.
+///
+/// **ADR-0019 refused a cursor-minting endpoint** — *"every report already
+/// returns the cursor it used"* — and that refusal is qualified rather than
+/// contradicted here: it is true, and it is what made asking for the horizon
+/// ALONE cost a whole report. A dashboard refreshing it issues a trial balance
+/// over `0001-01-01`…`9999-12-31` for one scalar, which on a large book is the
+/// ~28-second query ADR-0019's own cost list records. One statement answers
+/// the same value, on the same read path, under the same bracket.
+#[utoipa::path(
+    get,
+    path = "/v1/cursor",
+    operation_id = "getCursor",
+    tag = "reports",
+    params(CursorParams),
+    responses(
+        (
+            status = 200,
+            description = "The current commit horizon — one `SELECT report_cursor()`, no \
+                           report. Store it and send it back as `cursor` to pin a report \
+                           here. **It is the cluster's horizon and not this tenant's**: \
+                           `report_cursor()` is `pg_snapshot_xmin`, so every tenant is \
+                           answered the same number, and `tenant_id` is required for the \
+                           scoping every other read has rather than because the answer \
+                           depends on it.",
+            body = CursorRead
+        ),
+        (
+            status = 422,
+            description = "Refused. `type` is `tenant_mismatch` — the `tenant_id` asked about \
+                           is not the scope the read path set on the session. Vacuous today by \
+                           construction and declared anyway (ADR-0019).",
+            body = ErrorBody
+        ),
+        (
+            status = 400,
+            description = "The `tenant_id` query parameter is missing, or would not \
+                           deserialize into its documented type. `type` is `invalid_request`.",
+            body = ErrorBody
+        ),
+        (
+            status = 503,
+            description = "The read exceeded this deployment's `statement_timeout` (`57014`). \
+                           `type` is `report_timed_out`.",
+            body = ErrorBody
+        ),
+        (
+            status = 500,
+            description = "The read failed. `type` is `internal`.",
+            body = ErrorBody
+        ),
+    ),
+)]
+pub(crate) async fn get_cursor<L, R>(
+    State(state): State<crate::AppState<L, R>>,
+    Params(params): Params<CursorParams>,
+) -> Response
+where
+    L: Ledger,
+    R: Reports,
+{
+    let query = ledger::CursorQuery {
+        tenant_id: params.tenant_id,
+    };
+    match state.reports.cursor(&query).await {
+        Ok(horizon) => answer_the_horizon(horizon),
+        Err(refused) => refusal_for_read(refused),
+    }
+}
+
+/// The horizon on the wire — the same decimal rendering `pinned_cursor`
+/// carries on every report, because it is the same value in the same form.
+fn answer_the_horizon(horizon: ledger::Cursor) -> Response {
+    axum::Json(CursorRead {
+        cursor: horizon.to_string(),
+    })
+    .into_response()
 }
 
 /// Read one account's posted balance.

@@ -60,6 +60,16 @@ impl Refusal {
             detail,
         }
     }
+
+    /// The prose this refusal carries, for a unit test that holds WHICH
+    /// refusal a parse produced. `#[cfg(test)]` because nothing in the
+    /// shipped surface reads a refusal back — a refusal is rendered once and
+    /// travels no further — and an accessor nobody calls is dead code the
+    /// workspace's lints would rightly complain about.
+    #[cfg(test)]
+    pub(crate) fn detail(&self) -> &str {
+        &self.detail
+    }
 }
 
 impl IntoResponse for Refusal {
@@ -133,9 +143,9 @@ where
     }
 }
 
-/// `axum::extract::Path`, wearing the same shape: two of the five read routes
-/// name their subject in the path, and a segment that is not a UUID is a
-/// refusal a caller should be able to parse like any other.
+/// `axum::extract::Path`, wearing the same shape: two read routes name their
+/// subject in the path, and a segment that is not a UUID is a refusal a
+/// caller should be able to parse like any other.
 pub(crate) struct Segment<T>(pub(crate) T);
 
 impl<S, T> FromRequestParts<S> for Segment<T>

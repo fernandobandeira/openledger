@@ -52,7 +52,7 @@ use std::collections::BTreeMap;
 
 use uuid::Uuid;
 
-use crate::accounts::{AccountOpened, ChartTriple, OpenAccount};
+use crate::accounts::{Account, AccountOpened, ChartTriple, OpenAccount};
 use crate::domain::{PostTransaction, Posted};
 use crate::port::{Ledger, OpenAccountError, WriteError};
 use crate::postings::{self, Append, Delta};
@@ -699,10 +699,9 @@ async fn open_account<R: Repository>(
     {
         // This caller is the first writer and the account is written,
         // uncommitted, in this open transaction: close the bracket.
-        Some(OpenedAccount::Opened {
-            event_id,
-            account_id,
-        }) => commit_the_opened_account(repository, tx, event_id, account_id).await,
+        Some(OpenedAccount::Opened { event_id, account }) => {
+            commit_the_opened_account(repository, tx, event_id, account).await
+        }
         // This caller is the first writer and one of the two unique indexes
         // already holds this account — the race ADR-0021 keeps a variant for.
         // Refuse it by name, after the rollback that makes "nothing was
@@ -786,12 +785,12 @@ async fn commit_the_opened_account<R: Repository>(
     repository: &R,
     tx: R::Tx,
     event_id: Uuid,
-    account_id: Uuid,
+    account: Account,
 ) -> Result<AccountOpened, OpenAccountError> {
     repository.commit(tx).await.map_err(storage_while_opening)?;
     Ok(AccountOpened {
         event_id,
-        account_id,
+        account,
         replayed: false,
     })
 }
@@ -840,9 +839,9 @@ async fn replay_the_opened_account_or_refuse_the_key<R: Repository>(
         .await
         .map_err(storage_while_opening)?;
     match stored {
-        Some((event_id, Some(account_id))) => Ok(AccountOpened {
+        Some((event_id, Some(account))) => Ok(AccountOpened {
             event_id,
-            account_id,
+            account,
             replayed: true,
         }),
         Some((event_id, None)) => Err(OpenAccountError::Internal(format!(
@@ -1053,6 +1052,26 @@ mod tests {
         /// An earlier caller holds this key; nothing was inserted and the
         /// answer is the replay lookup's.
         FindingTheKeyClaimed,
+    }
+
+    /// One account as the register would hand it back — the whole row, since
+    /// ADR-0021's cost list was closed by answering with what the server
+    /// derived rather than with two UUIDs. The id is the axis the tests vary:
+    /// a fresh opening and a replay must answer different ones.
+    fn an_account_row(account_id: Uuid) -> Account {
+        Account {
+            account_id,
+            owner_type: "company".to_owned(),
+            owner_id: Some("co_1".to_owned()),
+            purpose: "customer_receivable".to_owned(),
+            category: "asset".to_owned(),
+            normal_balance: "debit".to_owned(),
+            counterparty_scope: "per_shard".to_owned(),
+            currency: "USD".to_owned(),
+            stripe_count: 1,
+            metadata: serde_json::json!({}),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        }
     }
 
     /// One chart row, as `account_types` holds it. The scope is the axis the
@@ -1269,7 +1288,7 @@ mod tests {
         fn replaying_an_opened_account() -> Self {
             let mut fake = Self::opening_an_account();
             fake.opens = Opens::FindingTheKeyClaimed;
-            fake.stored_account = Some((EVENT, Some(STORED_ACCOUNT)));
+            fake.stored_account = Some((EVENT, Some(an_account_row(STORED_ACCOUNT))));
             fake
         }
 
@@ -1476,7 +1495,7 @@ mod tests {
             Ok(match self.opens {
                 Opens::TheAccount => Some(OpenedAccount::Opened {
                     event_id: EVENT,
-                    account_id: OPENED_ACCOUNT,
+                    account: an_account_row(OPENED_ACCOUNT),
                 }),
                 Opens::RefusingAnExistingOne => Some(OpenedAccount::AlreadyExists),
                 Opens::FindingTheKeyClaimed => None,
@@ -1490,7 +1509,7 @@ mod tests {
             _hash: &[u8],
         ) -> Result<Option<StoredAccount>, StorageError> {
             self.record("stored_account");
-            Ok(self.stored_account)
+            Ok(self.stored_account.clone())
         }
 
         async fn commit(&self, _tx: FakeTx) -> Result<(), StorageError> {
@@ -2091,7 +2110,7 @@ mod tests {
             opened,
             Ok(AccountOpened {
                 event_id: e,
-                account_id: a,
+                account: Account { account_id: a, .. },
                 replayed: false,
             }) if e == EVENT && a == OPENED_ACCOUNT
         ));
@@ -2270,7 +2289,7 @@ mod tests {
             opened,
             Ok(AccountOpened {
                 event_id: e,
-                account_id: a,
+                account: Account { account_id: a, .. },
                 replayed: true,
             }) if e == EVENT && a == STORED_ACCOUNT
         ));

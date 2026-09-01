@@ -171,7 +171,7 @@ fn a_transaction_touching_a_rotating_subset(
             serde_json::json!({
                 "source": revenues[(n + leg) % REVENUES],
                 "destination": receivables[(n + step) % RECEIVABLES],
-                "amount_minor": 100 + leg as i64,
+                "amount_minor": (100 + leg as i64).to_string(),
                 "currency": "USD",
             })
         })

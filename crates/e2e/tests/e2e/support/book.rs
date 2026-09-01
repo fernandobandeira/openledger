@@ -21,8 +21,8 @@ pub type PostAnswer = (reqwest::StatusCode, Option<String>, serde_json::Value);
 pub type PostOutcome = Result<PostAnswer, reqwest::Error>;
 
 /// One GET, read to the end: status and body. No header travels with it — the
-/// five read routes carry `Idempotency-Replayed` on none of them, because
-/// nothing they do is a write.
+/// read routes carry `Idempotency-Replayed` on none of them, because nothing
+/// they do is a write.
 pub type ReadAnswer = (reqwest::StatusCode, serde_json::Value);
 
 /// One charge of 100 between a pair, under `t1` — the body every concurrent
@@ -38,7 +38,7 @@ pub fn charge(key: &str, source: Uuid, destination: Uuid) -> serde_json::Value {
         "effective_at": "2026-08-27T12:00:00Z",
         "postings": [{
             "source": source, "destination": destination,
-            "amount_minor": 100, "currency": "USD"
+            "amount_minor": "100", "currency": "USD"
         }],
     })
 }
@@ -65,7 +65,7 @@ pub async fn post_a_pending_hold(
             "status": "pending",
             "postings": [{
                 "source": revenue, "destination": receivable,
-                "amount_minor": 500, "currency": "USD"
+                "amount_minor": "500", "currency": "USD"
             }],
         }))
         .await?;
@@ -99,7 +99,7 @@ pub async fn post_a_charge_dated(
             "effective_at": effective_at,
             "postings": [{
                 "source": source, "destination": destination,
-                "amount_minor": minor, "currency": "USD"
+                "amount_minor": minor.to_string(), "currency": "USD"
             }],
         }))
         .await?;
@@ -158,6 +158,13 @@ pub fn account_balance_path(tenant: &str, account: Uuid, currency: &str) -> Stri
 /// `GET /v1/transactions/{transaction_id}` as a path.
 pub fn transaction_path(tenant: &str, transaction: Uuid) -> String {
     format!("/v1/transactions/{transaction}?tenant_id={tenant}")
+}
+
+/// `GET /v1/cursor` as a path. It takes a `tenant_id` like every other read,
+/// for the scoping rather than because the answer depends on it: the horizon
+/// is `pg_snapshot_xmin`, which is the cluster's.
+pub fn cursor_path(tenant: &str) -> String {
+    format!("/v1/cursor?tenant_id={tenant}")
 }
 
 fn with_parameters(path: &str, and: &[(&str, &str)]) -> String {

@@ -29,7 +29,7 @@ async fn the_full_happy_path_works_when_serve_runs_as_the_app_role() -> TestResu
         "effective_at": "2026-08-27T12:00:00Z",
         "postings": [{
             "source": revenue, "destination": receivable,
-            "amount_minor": 2500, "currency": "USD"
+            "amount_minor": "2500", "currency": "USD"
         }],
     });
 
@@ -67,7 +67,7 @@ async fn the_read_role_sees_one_tenant_when_scoped_and_none_when_not() -> TestRe
                 "effective_at": "2026-08-27T12:00:00Z",
                 "postings": [{
                     "source": source, "destination": destination,
-                    "amount_minor": 2500, "currency": "USD"
+                    "amount_minor": "2500", "currency": "USD"
                 }],
             }))
             .await?;

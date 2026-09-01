@@ -25,16 +25,18 @@ pub fn openapi_json() -> Result<String, serde_json::Error> {
         description = "OpenLedger, an open-source double-entry ledger on PostgreSQL. \
                        The write path is one endpoint under the idempotent replay contract of \
                        ADR-0013 — the same key with the same body returns the stored result, \
-                       marked by the `Idempotency-Replayed` header. The read path is five, and \
+                       marked by the `Idempotency-Replayed` header. The read path is seven, and \
                        three things about it are contract rather than presentation (ADR-0019): \
                        every report answers with the `pinned_cursor` it ran at, including when \
-                       the caller supplied none, and that value is what re-runs the report; \
-                       every report AMOUNT is an exact-integer decimal STRING, because a total \
-                       above 2^53 would be silently rounded by a JSON parser while a posting \
-                       amount, bounded by its own column, stays a number; and an unknown tenant \
-                       is answered 200-with-nothing rather than 404, because nothing in the \
-                       schema declares a tenant and inventing the status would mean inventing \
-                       the registry.",
+                       the caller supplied none, and that value is what re-runs the report — \
+                       `GET /v1/cursor` answers the same horizon on its own, for a caller that \
+                       wants it without paying for a report; EVERY amount on this surface is \
+                       an exact-integer decimal STRING, single postings and entries included, \
+                       because JSON has no integer type and both a `numeric` total and a \
+                       `bigint` posting reach past 2^53, where a consumer's parser rounds \
+                       silently; and an unknown tenant is answered 200-with-nothing rather \
+                       than 404, because nothing in the schema declares a tenant and inventing \
+                       the status would mean inventing the registry.",
         license(name = "MIT", identifier = "MIT"),
     ),
     paths(
@@ -43,6 +45,7 @@ pub fn openapi_json() -> Result<String, serde_json::Error> {
         crate::accounts::open_account,
         crate::accounts::list_accounts,
         crate::reports::get_account_balance,
+        crate::reports::get_cursor,
         crate::reports::get_trial_balance,
         crate::reports::get_balance_sheet,
         crate::reports::get_income_statement,
@@ -51,7 +54,8 @@ pub fn openapi_json() -> Result<String, serde_json::Error> {
         (name = "transactions", description = "Post a transaction, and read one back."),
         (name = "accounts", description = "Open an account, list them, and read one's posted \
                                            balance."),
-        (name = "reports", description = "The pinned reports: both time axes, by parameter."),
+        (name = "reports", description = "The pinned reports: both time axes, by parameter — \
+                                          and the horizon they pin at, on its own."),
     ),
 )]
 struct ApiDoc;

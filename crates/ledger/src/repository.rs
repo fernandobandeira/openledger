@@ -22,7 +22,7 @@
 
 use uuid::Uuid;
 
-use crate::accounts::{ChartTriple, OpenAccount};
+use crate::accounts::{Account, ChartTriple, OpenAccount};
 use crate::domain::PostTransaction;
 use crate::postings::Append;
 
@@ -172,10 +172,23 @@ pub type StoredResult = (Uuid, Option<Uuid>);
 /// [`SupersedeRefusal::TargetAlreadySuperseded`] is classified in on the
 /// posting path. The service names the refusal and rolls back; nothing is
 /// written.
+// One value per opening, constructed by the adapter and destructured by the
+// service on the next line — never stored, never collected, never sent across
+// a channel. Boxing it would put an allocation on the write path to satisfy a
+// heuristic about enums held in bulk, and there is no bulk here.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per opening, destructured immediately; the account row is the answer"
+)]
 pub enum OpenedAccount {
     Opened {
         event_id: Uuid,
-        account_id: Uuid,
+        /// The register's own row, read back from the insert's `RETURNING` —
+        /// never this crate's reconstruction of what it asked for. The
+        /// derived chart triple, the resolved `stripe_count` and the stored
+        /// `metadata` are all in it, which is what lets the endpoint answer
+        /// with what it derived (ADR-0021's cost list, closed).
+        account: Account,
     },
     /// `uq_accounts__owned` or `uq_accounts__house` already holds this
     /// account. Which of the two is not carried: the refusal says the account
@@ -195,7 +208,11 @@ pub enum OpenedAccount {
 /// refuse a second one). The service answers it as `Internal`. `None` for the
 /// whole pair is the different fact [`StoredResult`]'s is: the key was reused
 /// with a different body.
-pub type StoredAccount = (Uuid, Option<Uuid>);
+///
+/// The account is the whole row rather than its id, so a replay re-renders
+/// exactly what the first call answered — a replay that carried less than the
+/// 201 would make the header the only honest part of it.
+pub type StoredAccount = (Uuid, Option<Account>);
 
 /// The opaque storage failure. The port names no backend error type — the
 /// Postgres error stays inside the adapter crate, boxed at exactly one
