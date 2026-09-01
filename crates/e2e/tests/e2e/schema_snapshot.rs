@@ -77,7 +77,7 @@ pinned image everywhere this runs); every ORDER BY collates in \"C\".
 /// dump is the concatenation of catalog queries and nothing computed here
 /// can drift from what the database says. Each query ends in ORDER BY over
 /// its whole visible key, COLLATE "C" on text, and never selects an OID.
-const SECTIONS: [(&str, &str); 19] = [
+const SECTIONS: [(&str, &str); 21] = [
     (
         "extensions",
         r#"SELECT extname FROM pg_extension ORDER BY extname COLLATE "C""#,
@@ -109,6 +109,52 @@ const SECTIONS: [(&str, &str); 19] = [
            JOIN pg_namespace n ON n.oid = c.relnamespace
            WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
            ORDER BY c.relname COLLATE "C""#,
+    ),
+    (
+        // THE PARTITION KEY, EVERY ATTACHMENT AND EVERY BOUND (ADR-0020, which
+        // rules these three catalogs into the dump whether or not anything is
+        // partitioned yet — the hole exists today for any table).
+        //
+        // What it catches that no section above can: `ALTER TABLE ... DETACH
+        // PARTITION` is one statement, and a detached child is still an `r`
+        // relation of the same name in the same schema with the same columns,
+        // constraints, indexes, policies and grants. So a DETACH removes rows
+        // from every reader — the statement functions, the recon views, the
+        // sweep — with the rest of this dump BYTE-IDENTICAL (measured on the
+        // checkpoint table: 7 rows visible through the parent against 10
+        // stored). The `relations` section records relkind, so CONVERTING a
+        // table to partitioned shows as r → p and each partition appears as its
+        // own relation line; neither says which parent a child is attached to,
+        // for what values, or whether it is attached at all. That is exactly the
+        // owner-accident class ADR-0009 widened this test's charge for.
+        //
+        // relispartition separates a partition from a plain INHERITS child,
+        // which is the other way a pg_inherits row appears — and the one
+        // ck_journal__no_inherit refuses on a protected table.
+        //
+        // "(none)" is the assertion, as it is for the NOT VALID section: nothing
+        // in this schema is partitioned and nothing inherits.
+        // The ORDER BY is on the WRAPPED expression, not on `1`: an ordinal
+        // reference is an integer and `COLLATE "C"` on it is a hard error
+        // ("collations are not supported by type integer"), so the union is
+        // wrapped to give the text a name to collate.
+        "partitioning (key, attachment, bound)",
+        r#"SELECT line FROM (
+               SELECT p.relname || ' PARTITION BY ' || pg_get_partkeydef(p.oid) AS line
+               FROM pg_class p
+               JOIN pg_namespace n ON n.oid = p.relnamespace
+               WHERE n.nspname = 'public' AND p.relkind = 'p'
+               UNION ALL
+               SELECT c.relname || ' CHILD OF ' || pt.relname
+                      || ' ispartition=' || c.relispartition
+                      || ' bound=' || coalesce(pg_get_expr(c.relpartbound, c.oid), '(none)')
+               FROM pg_inherits i
+               JOIN pg_class c  ON c.oid = i.inhrelid
+               JOIN pg_class pt ON pt.oid = i.inhparent
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public'
+           ) q
+           ORDER BY line COLLATE "C""#,
     ),
     (
         // attnum order, not name order: column position is real schema (a
@@ -315,6 +361,47 @@ const SECTIONS: [(&str, &str); 19] = [
              AND (r.rolname LIKE 'openledger\_%' OR r.rolname IS NULL)
            ORDER BY c.relname COLLATE "C", a.attname COLLATE "C",
                     coalesce(r.rolname, 'PUBLIC') COLLATE "C", x.privilege_type COLLATE "C""#,
+    ),
+    (
+        // ROUTINE grants, which the relation-grant section above cannot see:
+        // `pg_get_functiondef` does not render an ACL, so every EXECUTE
+        // privilege in this schema was invisible to this dump. That mattered
+        // the moment migration 00004 REVOKEd `EXECUTE ON FUNCTION
+        // recon_equation_breaks FROM PUBLIC` — an RLS-scoped reader running
+        // that check gets zero rows over zero tenants, which is a green check
+        // that did not execute, and a later `GRANT EXECUTE ON ALL FUNCTIONS`
+        // is one statement that would put it back with nothing to notice.
+        // Same shape, same argument and same filtering as the relation-grant
+        // section: the owner's implicit entry names whichever role migrated
+        // this particular database, so only the migration-created roles and
+        // PUBLIC are recorded.
+        //
+        // WHAT IT CANNOT SEE, and it is the same limit the relation-grant
+        // section carries: a DEFAULT acl is NULL, and `aclexplode(NULL)`
+        // returns no rows — so a function nobody has granted or revoked
+        // anything on appears here not at all, and its implicit PUBLIC EXECUTE
+        // is invisible. What the section pins is every EXPLICIT decision: a
+        // grant appearing, and — the one this migration cares about — the
+        // `recon_equation_breaks` line DISAPPEARING if its revoke is ever
+        // undone by a blanket `GRANT EXECUTE ON ALL FUNCTIONS`.
+        "routine grants (to openledger_* and PUBLIC)",
+        r#"SELECT p.proname || '(' || pg_get_function_identity_arguments(p.oid) || '): '
+                  || g.grantee_name || ' ' || g.privilege_type
+           FROM pg_proc p
+           JOIN pg_namespace n ON n.oid = p.pronamespace
+           CROSS JOIN LATERAL (
+               SELECT coalesce(r.rolname, 'PUBLIC') AS grantee_name, x.privilege_type
+               FROM aclexplode(p.proacl) x
+               LEFT JOIN pg_roles r ON r.oid = x.grantee
+           ) g
+           WHERE n.nspname = 'public'
+             AND NOT EXISTS (SELECT 1 FROM pg_depend dep
+                             WHERE dep.classid = 'pg_proc'::regclass
+                               AND dep.objid = p.oid AND dep.deptype = 'e')
+             AND (g.grantee_name LIKE 'openledger\_%' OR g.grantee_name = 'PUBLIC')
+           ORDER BY p.proname COLLATE "C",
+                    pg_get_function_identity_arguments(p.oid) COLLATE "C",
+                    g.grantee_name COLLATE "C", g.privilege_type COLLATE "C""#,
     ),
     (
         // The one charged DATA exception (ADR-0007 §2): an identity UPDATE

@@ -506,34 +506,41 @@ async fn reversing_a_resolution_or_a_reversal_is_refused() -> TestResult {
 
 /// The kind arm of the gate: a `period_close` transaction cannot be
 /// reversed — un-closing retained earnings while the close's checkpoint and
-/// cursor stand would contradict the period record (ADR-0016). Injected the
-/// way reconcile.rs injects closes: a real event, a posted `period_close`
-/// transaction, balanced entries, the cache advanced — a clean book.
+/// cursor stand would contradict the period record (ADR-0016).
+///
+/// A COMPLETE close, not just a labelled transaction, and since ADR-0020 it
+/// has to be: `recon_close_breaks.close_orphan` reports a posted
+/// `kind='period_close'` transaction that no `ledger_period_closes` row names,
+/// so the period and the close row below are what keep this book's
+/// `assert_reconciled` honest rather than decoration. It closes JULY, which
+/// this book has nothing in — so the close is legitimately ENTRYLESS (nothing
+/// to sweep) and its checkpoint legitimately empty (nothing is effective
+/// before the period end), which also exercises ADR-0020's empty-close
+/// carve-out end to end.
 #[tokio::test]
 async fn reversing_a_period_close_is_refused() -> TestResult {
     let book = TestBook::new("reverse_close").await?;
     let (receivable, revenue) = book.fixture_accounts().await?;
     post_one_charge(&book, revenue, receivable).await?;
-    sqlx::raw_sql(AssertSqlSafe(format!(
-        "INSERT INTO ledger_events (tenant_id, id, kind, source, idempotency_key,
+    sqlx::raw_sql(AssertSqlSafe(
+        "INSERT INTO ledger_periods (tenant_id, code, starts_at, ends_at, tz)
+         VALUES ('t1', '2026-07', '2026-07-01T00:00:00Z', '2026-08-01T00:00:00Z', 'UTC');
+         INSERT INTO ledger_events (tenant_id, id, kind, source, idempotency_key,
                                     idempotency_hash, payload, effective_at)
          VALUES ('t1', '0e2e0000-0000-7000-8000-000000000080', 'period_close', 'internal',
-                 'close-2026-08', decode('00', 'hex'), '{{}}'::jsonb, '2026-08-31T00:00:00Z');
+                 'close-2026-07', decode('00', 'hex'), '{}'::jsonb, '2026-07-31T00:00:00Z');
          INSERT INTO ledger_transactions (tenant_id, id, event_id, kind, status, effective_at)
          VALUES ('t1', '0e2e0000-0000-7000-8000-000000000081',
                  '0e2e0000-0000-7000-8000-000000000080', 'period_close', 'posted',
-                 '2026-08-31T00:00:00Z');
-         INSERT INTO ledger_entries (tenant_id, transaction_id, account_id, direction,
-                                     amount_minor, currency, account_seq, effective_at)
-         VALUES ('t1', '0e2e0000-0000-7000-8000-000000000081', '{receivable}',
-                 'debit', 100, 'USD', 2, '2026-08-31T00:00:00Z'),
-                ('t1', '0e2e0000-0000-7000-8000-000000000081', '{revenue}',
-                 'credit', 100, 'USD', 2, '2026-08-31T00:00:00Z');
-         UPDATE ledger_account_balances SET input = input + 100, last_seq = 2
-         WHERE tenant_id = 't1' AND account_id = '{receivable}';
-         UPDATE ledger_account_balances SET output = output + 100, last_seq = 2
-         WHERE tenant_id = 't1' AND account_id = '{revenue}'"
-    )))
+                 '2026-07-31T00:00:00Z');
+         INSERT INTO ledger_period_closes (tenant_id, period_code, currency, starts_at,
+                                           ends_at, transaction_id, txn_effective_at,
+                                           computed_at_xid)
+         VALUES ('t1', '2026-07', 'USD', '2026-07-01T00:00:00Z', '2026-08-01T00:00:00Z',
+                 '0e2e0000-0000-7000-8000-000000000081', '2026-07-31T00:00:00Z',
+                 pg_current_xact_id())"
+            .to_owned(),
+    ))
     .execute(&book.pool)
     .await?;
 
@@ -551,7 +558,9 @@ async fn reversing_a_period_close_is_refused() -> TestResult {
         error.get("type"),
         Some(&"reverse_target_not_reversible".into())
     );
-    assert_eq!(book.write_counts().await?, (2, 2, 4));
+    // Two events, two transactions, and only the charge's two entries: the
+    // close of an empty period posts no legs.
+    assert_eq!(book.write_counts().await?, (2, 2, 2));
     book.assert_reconciled().await
 }
 

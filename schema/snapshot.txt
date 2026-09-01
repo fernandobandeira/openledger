@@ -63,6 +63,9 @@ v recon_transaction_breaks persistence=p rowsecurity=false forcerowsecurity=fals
 v reconciliation persistence=p rowsecurity=false forcerowsecurity=false options=[]
 v trial_balance persistence=p rowsecurity=false forcerowsecurity=false options=[security_invoker=true]
 
+== partitioning (key, attachment, bound) ==
+(none)
+
 == columns ==
 _sqlx_migrations.version: bigint NOT NULL
 _sqlx_migrations.description: text NOT NULL
@@ -258,10 +261,12 @@ recon_checkpoint_breaks.recomputed_output: numeric
 recon_checkpoint_breaks.reason: text
 recon_close_breaks.tenant_id: text
 recon_close_breaks.period_code: text
-recon_close_breaks.currency: character(3)
+recon_close_breaks.currency: bpchar
 recon_close_breaks.transaction_id: uuid
 recon_close_breaks.computed_at_xid: xid8
 recon_close_breaks.txn_xact_id: xid8
+recon_close_breaks.prev_cursor: xid8
+recon_close_breaks.prev_txn_xact_id: xid8
 recon_close_breaks.reason: text
 recon_cursor_breaks.tenant_id: text
 recon_cursor_breaks.entry_id: uuid
@@ -796,7 +801,47 @@ UNION ALL
            FROM account_types m
           WHERE m.mirror_type = t.code)) AND (EXISTS ( SELECT 1
            FROM ledger_accounts a
-          WHERE a.purpose = t.code AND a.owner_type <> 'house'::account_owner_type));
+          WHERE a.purpose = t.code AND a.owner_type <> 'house'::account_owner_type))
+UNION ALL
+ SELECT 'line_mixes_counterparty_scopes'::text AS rule,
+    'warn'::text AS severity,
+    (r.fs_line || ' @ v'::text) || r.chart_version AS subject,
+    ((('fs_line receives types of '::text || count(DISTINCT r.counterparty_scope)) || ' counterparty_scopes ('::text) || string_agg(DISTINCT r.counterparty_scope, ', '::text)) || '): one caption, more than one counterparty grain'::text AS detail
+   FROM ( SELECT p.chart_version,
+            p.fs_line,
+            p.counterparty_scope,
+            p.type_code
+           FROM chart_presentation p
+        UNION ALL
+         SELECT p.chart_version,
+            p.fs_line_contra,
+            p.counterparty_scope,
+            p.type_code
+           FROM chart_presentation p
+          WHERE p.fs_line_contra IS NOT NULL) r
+  GROUP BY r.chart_version, r.fs_line
+ HAVING count(DISTINCT r.counterparty_scope) > 1
+UNION ALL
+ SELECT 'restricted_shares_a_line'::text AS rule,
+    'warn'::text AS severity,
+    (r.fs_line || ' @ v'::text) || r.chart_version AS subject,
+    ((('fs_line receives restricted or counterparty-facing types ('::text || string_agg(DISTINCT r.type_code, ', '::text) FILTER (WHERE r.facing)) || ') and unencumbered ones ('::text) || string_agg(DISTINCT r.type_code, ', '::text) FILTER (WHERE NOT r.facing)) || ') under one caption'::text AS detail
+   FROM ( SELECT p.chart_version,
+            p.fs_line,
+            p.type_code,
+            t.is_perimeter OR p.counterparty_scope <> 'none'::text AS facing
+           FROM chart_presentation p
+             JOIN account_types t ON t.code = p.type_code
+        UNION ALL
+         SELECT p.chart_version,
+            p.fs_line_contra,
+            p.type_code,
+            t.is_perimeter OR p.counterparty_scope <> 'none'::text
+           FROM chart_presentation p
+             JOIN account_types t ON t.code = p.type_code
+          WHERE p.fs_line_contra IS NOT NULL) r
+  GROUP BY r.chart_version, r.fs_line
+ HAVING bool_or(r.facing) AND bool_or(NOT r.facing);
 chart_version_current:
  SELECT max(version) AS chart_version
    FROM chart_versions;
@@ -814,7 +859,7 @@ close_disclosures:
     e.xact_id,
     e.recorded_at
    FROM ledger_period_closes c
-     JOIN ledger_entries e ON e.tenant_id = c.tenant_id AND e.currency = c.currency AND e.effective_at < c.ends_at AND e.xact_id >= c.computed_at_xid
+     JOIN ledger_entries e ON e.tenant_id = c.tenant_id AND e.currency = c.currency AND e.effective_at < c.ends_at AND e.xact_id >= c.computed_at_xid AND e.transaction_id <> c.transaction_id
      JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id AND x.status = 'posted'::ledger_txn_status
   WHERE NOT (EXISTS ( SELECT 1
            FROM ledger_period_closes c2
@@ -920,45 +965,194 @@ recon_balance_breaks:
    FROM joined
   WHERE cache_input::numeric <> posted_input OR cache_output::numeric <> posted_output OR cache_missing OR NOT cache_missing AND cache_last_seq <> max_seq OR entry_count <> max_seq OR journal_empty AND (cache_input <> 0 OR cache_output <> 0 OR cache_last_seq <> 0);
 recon_checkpoint_breaks:
- WITH recomputed AS (
+ WITH cl AS MATERIALIZED (
          SELECT c.tenant_id,
-            c.period_code,
             c.currency,
-            e.account_id,
-            COALESCE(sum(e.amount_minor) FILTER (WHERE e.direction = 'debit'::ledger_direction), 0::numeric) AS input,
-            COALESCE(sum(e.amount_minor) FILTER (WHERE e.direction = 'credit'::ledger_direction), 0::numeric) AS output
+            c.period_code,
+            c.ends_at,
+            c.computed_at_xid,
+            c.transaction_id,
+            row_number() OVER (PARTITION BY c.tenant_id, c.currency ORDER BY c.ends_at) AS k
            FROM ledger_period_closes c
-             JOIN ledger_entries e ON e.tenant_id = c.tenant_id AND e.currency = c.currency AND e.effective_at < c.ends_at AND e.xact_id < c.computed_at_xid
+        ), arr AS MATERIALIZED (
+         SELECT cl.tenant_id,
+            cl.currency,
+            count(*)::integer AS n,
+            array_agg(cl.ends_at ORDER BY cl.k) AS ends,
+            array_agg(cl.computed_at_xid ORDER BY cl.k) AS curs
+           FROM cl
+          GROUP BY cl.tenant_id, cl.currency
+        ), last_k AS MATERIALIZED (
+         SELECT cl.tenant_id,
+            cl.currency,
+            max(cl.k) AS last_k
+           FROM cl
+          GROUP BY cl.tenant_id, cl.currency
+        ), banded AS (
+         SELECT e.tenant_id,
+            e.currency,
+            e.account_id,
+                CASE
+                    WHEN e.direction = 'debit'::ledger_direction THEN e.amount_minor
+                    ELSE 0::bigint
+                END AS dr,
+                CASE
+                    WHEN e.direction = 'credit'::ledger_direction THEN e.amount_minor
+                    ELSE 0::bigint
+                END AS cr,
+            LEAST(NULLIF(GREATEST(width_bucket(e.effective_at, a.ends)::bigint + 1, width_bucket(e.xact_id, a.curs)::bigint + 1), a.n::bigint + 1), ci.k) AS j
+           FROM ledger_entries e
              JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id AND x.status = 'posted'::ledger_txn_status
-          GROUP BY c.tenant_id, c.period_code, c.currency, e.account_id
+             JOIN arr a ON a.tenant_id = e.tenant_id AND a.currency = e.currency
+             LEFT JOIN cl ci ON ci.tenant_id = e.tenant_id AND ci.currency = e.currency AND ci.transaction_id = e.transaction_id
+        ), arrivals AS (
+         SELECT banded.tenant_id,
+            banded.currency,
+            banded.account_id,
+            banded.j,
+            sum(banded.dr) AS dr,
+            sum(banded.cr) AS cr
+           FROM banded
+          WHERE banded.j IS NOT NULL
+          GROUP BY banded.tenant_id, banded.currency, banded.account_id, banded.j
+        ), stored AS (
+         SELECT b.tenant_id,
+            b.currency,
+            b.account_id,
+            b.period_code,
+            k.k,
+            b.input - COALESCE(lag(b.input) OVER w, 0::bigint) AS d_in,
+            b.output - COALESCE(lag(b.output) OVER w, 0::bigint) AS d_out
+           FROM ledger_period_balances b
+             JOIN cl k ON k.tenant_id = b.tenant_id AND k.currency = b.currency AND k.period_code = b.period_code
+          WINDOW w AS (PARTITION BY b.tenant_id, b.currency, b.account_id ORDER BY k.k)
+        ), span AS (
+         SELECT s.tenant_id,
+            s.currency,
+            s.account_id,
+            min(s.k) AS first_k,
+            count(*) AS rows_present,
+            max(lk.last_k) AS last_k
+           FROM stored s
+             JOIN last_k lk ON lk.tenant_id = s.tenant_id AND lk.currency = s.currency
+          GROUP BY s.tenant_id, s.currency, s.account_id
         )
  SELECT COALESCE(s.tenant_id, r.tenant_id) AS tenant_id,
-    COALESCE(s.period_code, r.period_code) AS period_code,
+    COALESCE(s.period_code, rk.period_code) AS period_code,
     COALESCE(s.currency, r.currency) AS currency,
     COALESCE(s.account_id, r.account_id) AS account_id,
-    COALESCE(s.input, 0::bigint) AS stored_input,
-    COALESCE(s.output, 0::bigint) AS stored_output,
-    COALESCE(r.input, 0::numeric) AS recomputed_input,
-    COALESCE(r.output, 0::numeric) AS recomputed_output,
+    COALESCE(s.d_in, 0::bigint) AS stored_input,
+    COALESCE(s.d_out, 0::bigint) AS stored_output,
+    COALESCE(r.dr, 0::numeric) AS recomputed_input,
+    COALESCE(r.cr, 0::numeric) AS recomputed_output,
         CASE
             WHEN s.account_id IS NULL THEN 'missing_row'::text
             WHEN r.account_id IS NULL THEN 'spurious_row'::text
             ELSE 'value_drift'::text
         END AS reason
-   FROM ledger_period_balances s
-     FULL JOIN recomputed r ON r.tenant_id = s.tenant_id AND r.period_code = s.period_code AND r.currency = s.currency AND r.account_id = s.account_id
-  WHERE COALESCE(s.input, 0::bigint)::numeric <> COALESCE(r.input, 0::numeric) OR COALESCE(s.output, 0::bigint)::numeric <> COALESCE(r.output, 0::numeric);
+   FROM stored s
+     FULL JOIN arrivals r ON r.tenant_id = s.tenant_id AND r.currency = s.currency AND r.account_id = s.account_id AND r.j = s.k
+     LEFT JOIN cl rk ON rk.tenant_id = r.tenant_id AND rk.currency = r.currency AND rk.k = r.j
+  WHERE COALESCE(s.d_in, 0::bigint)::numeric <> COALESCE(r.dr, 0::numeric) OR COALESCE(s.d_out, 0::bigint)::numeric <> COALESCE(r.cr, 0::numeric)
+UNION ALL
+ SELECT sp.tenant_id,
+    spk.period_code,
+    sp.currency,
+    sp.account_id,
+    sp.rows_present AS stored_input,
+    sp.last_k - sp.first_k + 1 AS stored_output,
+    0::numeric AS recomputed_input,
+    0::numeric AS recomputed_output,
+    'row_span'::text AS reason
+   FROM span sp
+     LEFT JOIN cl spk ON spk.tenant_id = sp.tenant_id AND spk.currency = sp.currency AND spk.k = sp.last_k
+  WHERE sp.rows_present <> (sp.last_k - sp.first_k + 1);
 recon_close_breaks:
- SELECT c.tenant_id,
-    c.period_code,
-    c.currency,
-    c.transaction_id,
-    c.computed_at_xid,
+ WITH indexed AS (
+         SELECT c.tenant_id,
+            c.currency,
+            c.period_code,
+            c.ends_at,
+            c.computed_at_xid,
+            c.transaction_id,
+            row_number() OVER (PARTITION BY c.tenant_id, c.currency ORDER BY c.ends_at) AS k
+           FROM ledger_period_closes c
+        ), seq AS (
+         SELECT i.tenant_id,
+            i.currency,
+            i.period_code,
+            i.ends_at,
+            i.computed_at_xid,
+            i.transaction_id,
+            i.k,
+            x.xact_id AS txn_xact_id,
+            lag(i.computed_at_xid) OVER w AS prev_cursor,
+            lag(i.period_code) OVER w AS prev_period
+           FROM indexed i
+             JOIN ledger_transactions x ON x.tenant_id = i.tenant_id AND x.id = i.transaction_id
+          WINDOW w AS (PARTITION BY i.tenant_id, i.currency ORDER BY i.k)
+        ), paired AS (
+         SELECT s.tenant_id,
+            s.currency,
+            s.period_code,
+            s.ends_at,
+            s.computed_at_xid,
+            s.transaction_id,
+            s.k,
+            s.txn_xact_id,
+            s.prev_cursor,
+            s.prev_period,
+            px.xact_id AS prev_txn_xact_id
+           FROM seq s
+             LEFT JOIN indexed p ON p.tenant_id = s.tenant_id AND p.currency = s.currency AND p.period_code = s.prev_period
+             LEFT JOIN ledger_transactions px ON px.tenant_id = p.tenant_id AND px.id = p.transaction_id
+        )
+ SELECT p.tenant_id,
+    p.period_code,
+    p.currency,
+    p.transaction_id,
+    p.computed_at_xid,
+    p.txn_xact_id,
+    p.prev_cursor,
+    p.prev_txn_xact_id,
+    b.reason
+   FROM paired p,
+    LATERAL ( SELECT r.r
+           FROM unnest(ARRAY[
+                CASE
+                    WHEN p.computed_at_xid < p.txn_xact_id THEN 'cursor_precedes_close'::text
+                    ELSE NULL::text
+                END,
+                CASE
+                    WHEN p.computed_at_xid >= pg_snapshot_xmax(pg_current_snapshot()) THEN 'cursor_above_assigned'::text
+                    ELSE NULL::text
+                END,
+                CASE
+                    WHEN p.prev_cursor IS NOT NULL AND p.computed_at_xid < p.prev_cursor OR p.prev_txn_xact_id IS NOT NULL AND p.prev_txn_xact_id >= p.computed_at_xid THEN 'recon_close_order'::text
+                    ELSE NULL::text
+                END,
+                CASE
+                    WHEN (EXISTS ( SELECT 1
+                       FROM ledger_period_balances s
+                         JOIN ledger_accounts a ON a.tenant_id = s.tenant_id AND a.id = s.account_id AND a.currency = s.currency
+                      WHERE s.tenant_id = p.tenant_id AND s.period_code = p.period_code AND s.currency = p.currency AND (a.category = ANY (ARRAY['revenue'::ledger_category, 'expense'::ledger_category])) AND s.input <> s.output)) THEN 'close_does_not_sweep'::text
+                    ELSE NULL::text
+                END]) r(r)
+          WHERE r.r IS NOT NULL) b(reason)
+UNION ALL
+ SELECT x.tenant_id,
+    NULL::text AS period_code,
+    NULL::bpchar AS currency,
+    x.id AS transaction_id,
+    NULL::xid8 AS computed_at_xid,
     x.xact_id AS txn_xact_id,
-    'cursor_precedes_close'::text AS reason
-   FROM ledger_period_closes c
-     JOIN ledger_transactions x ON x.tenant_id = c.tenant_id AND x.id = c.transaction_id
-  WHERE c.computed_at_xid < x.xact_id;
+    NULL::xid8 AS prev_cursor,
+    NULL::xid8 AS prev_txn_xact_id,
+    'close_orphan'::text AS reason
+   FROM ledger_transactions x
+  WHERE x.kind = 'period_close'::text AND x.status = 'posted'::ledger_txn_status AND NOT (EXISTS ( SELECT 1
+           FROM ledger_period_closes c
+          WHERE c.tenant_id = x.tenant_id AND c.transaction_id = x.id));
 recon_cursor_breaks:
  SELECT e.tenant_id,
     e.id AS entry_id,
@@ -966,13 +1160,13 @@ recon_cursor_breaks:
     e.xact_id,
     x.xact_id AS txn_xact_id,
         CASE
-            WHEN e.xact_id > pg_snapshot_xmin(pg_current_snapshot()) THEN 'above_horizon'::text
+            WHEN e.xact_id >= pg_snapshot_xmax(pg_current_snapshot()) THEN 'above_horizon'::text
             WHEN e.xact_id < x.xact_id THEN 'predates_txn'::text
             ELSE NULL::text
         END AS reason
    FROM ledger_entries e
      JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
-  WHERE e.xact_id > pg_snapshot_xmin(pg_current_snapshot()) OR e.xact_id < x.xact_id;
+  WHERE e.xact_id >= pg_snapshot_xmax(pg_current_snapshot()) OR e.xact_id < x.xact_id;
 recon_entry_breaks:
  SELECT e.tenant_id,
     e.id AS entry_id,
@@ -1170,7 +1364,9 @@ recon_transaction_breaks:
      LEFT JOIN legs g ON g.tenant_id = x.tenant_id AND g.transaction_id = x.id
   WHERE (g.transaction_id IS NULL OR g.debits <> g.credits) AND NOT (g.transaction_id IS NULL AND x.reverses_id IS NOT NULL AND (EXISTS ( SELECT 1
            FROM ledger_transactions v
-          WHERE v.tenant_id = x.tenant_id AND v.id = x.reverses_id AND v.status = 'pending'::ledger_txn_status)));
+          WHERE v.tenant_id = x.tenant_id AND v.id = x.reverses_id AND v.status = 'pending'::ledger_txn_status))) AND NOT (g.transaction_id IS NULL AND x.kind = 'period_close'::text AND (EXISTS ( SELECT 1
+           FROM ledger_period_closes c
+          WHERE c.tenant_id = x.tenant_id AND c.transaction_id = x.id)));
 reconciliation:
  SELECT 'balance_cache'::text AS check_name,
     count(*) AS breaks
@@ -1248,13 +1444,18 @@ trial_balance:
 
 == functions (pg_get_functiondef, migration-owned only) ==
 CREATE OR REPLACE FUNCTION public.balance_sheet_at(p_tenant text, p_asof timestamp with time zone, p_cursor xid8, p_chart_version integer DEFAULT NULL::integer)
- RETURNS TABLE(tenant_id text, currency character, chart_version integer, fs_line text, caption text, sort_order integer, amount_minor bigint, side text, pinned_cursor xid8)
+ RETURNS TABLE(tenant_id text, currency character, chart_version integer, fs_line text, caption text, sort_order integer, amount_minor numeric, side text, pinned_cursor xid8)
  LANGUAGE plpgsql
  STABLE
 AS $function$
 DECLARE
     v_cv int;
 BEGIN
+    IF p_tenant IS NULL OR p_asof IS NULL OR p_cursor IS NULL THEN
+        RAISE EXCEPTION
+          'balance_sheet_at requires a tenant, an as-of instant and a cursor; a NULL argument returns a complete, all-zero, perfectly balanced face'
+            USING ERRCODE = '22004';
+    END IF;
     v_cv := COALESCE(p_chart_version, (SELECT max(cvx.version) FROM chart_versions cvx));
     IF v_cv IS NULL THEN
         RAISE EXCEPTION 'no chart version exists: seed a chart before running a statement'
@@ -1265,14 +1466,10 @@ BEGIN
     END IF;
     IF EXISTS (
         SELECT 1
-        FROM ledger_entries e
-        JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
-                                  AND x.status = 'posted'
-        JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
-                              AND a.currency = e.currency
-        WHERE e.tenant_id = p_tenant
-          AND e.effective_at < p_asof
-          AND e.xact_id < p_cursor
+        FROM checkpoint_position(p_tenant, p_asof, p_cursor) q
+        JOIN ledger_accounts a ON a.tenant_id = p_tenant AND a.id = q.account_id
+                              AND a.currency = q.currency
+        WHERE q.debits + q.credits > 0
           AND NOT EXISTS (SELECT 1 FROM chart_presentation p
                           WHERE p.chart_version = v_cv AND p.type_code = a.purpose)
     ) THEN
@@ -1283,37 +1480,17 @@ BEGIN
 
     RETURN QUERY
     WITH scopes AS (
-        -- Enumerated from the ACCOUNTS, not from the entries. A scope that has been
-        -- opened but has not yet posted anything is still a scope, and a report that
-        -- cannot name it cannot claim completeness over it. HONEST LIMIT: this is
-        -- still enumeration from data, one level further out -- there is no tenant
-        -- registry, so a scope with no accounts at all remains invisible.
         SELECT DISTINCT l.tenant_id, l.currency FROM ledger_accounts l
         WHERE l.tenant_id = p_tenant
     ), pos AS (
-        -- HALF-OPEN (effective_at < p_asof), to match the period model and the
-        -- income statement: a balance sheet "as at ends_at" is the period's closing
-        -- position, [starts_at, ends_at) (ADR-0011).
-        SELECT e.tenant_id, e.currency, e.account_id,
+        SELECT p_tenant AS tenant_id, q.currency, q.account_id,
                p.category, p.counterparty_scope, p.fs_line, p.fs_line_contra,
-               SUM(CASE WHEN e.direction='debit' THEN e.amount_minor::numeric
-                        ELSE -e.amount_minor::numeric END) AS v
-        FROM ledger_entries e
-        JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
-                                  AND x.status = 'posted'
-        JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
-                              AND a.currency  = e.currency
+               q.debits - q.credits AS v
+        FROM checkpoint_position(p_tenant, p_asof, p_cursor) q
+        JOIN ledger_accounts a ON a.tenant_id = p_tenant AND a.id = q.account_id
+                              AND a.currency = q.currency
         JOIN chart_presentation p ON p.chart_version = v_cv AND p.type_code = a.purpose
-        WHERE e.tenant_id = p_tenant AND e.effective_at < p_asof AND e.xact_id < p_cursor
-        GROUP BY e.tenant_id, e.currency, e.account_id,
-                 p.category, p.counterparty_scope, p.fs_line, p.fs_line_contra
     ), dp AS (
-        -- ROUTE ON POSITION SIGN (ADR-0012, amended by A10). A position that has
-        -- swung to the opposite side of its normal presents on its declared CONTRA
-        -- line -- for ANY balance-sheet type that declares one, not only per_shard.
-        -- Sign-swing is orthogonal to sharding: a `shared` payable that has gone
-        -- into a receivable position must present gross under its contra line, not
-        -- net to zero against another payable on the same line.
         SELECT pos.tenant_id, pos.currency, pos.category,
                CASE WHEN pos.fs_line_contra IS NOT NULL
                          AND ((pos.category = 'asset'     AND pos.v < 0)
@@ -1324,7 +1501,7 @@ BEGIN
     ), lines AS (
         SELECT s.tenant_id, s.currency,
                f.code AS fs_line, f.caption, f.sort_order, f.side,
-               COALESCE(SUM(CASE WHEN f.side = 'asset' THEN d.v ELSE -d.v END), 0)::bigint
+               COALESCE(SUM(CASE WHEN f.side = 'asset' THEN d.v ELSE -d.v END), 0)
                    AS amount_minor
         FROM scopes s
         JOIN fs_lines f ON f.chart_version = v_cv
@@ -1333,38 +1510,18 @@ BEGIN
         WHERE f.statement = 'balance_sheet'
         GROUP BY s.tenant_id, s.currency, f.code, f.caption, f.sort_order, f.side
     ), plug AS (
-        -- THE UN-CLOSED-EARNINGS PLUG (A3, replacing the max(ends_at) watermark).
-        -- The net of ALL temporary (revenue/expense) positions at the cursor,
-        -- INCLUDING closing entries. A closed period's operational entries and its
-        -- closing reversal cancel, so what remains is exactly earnings not yet
-        -- closed at this cursor: no watermark to walk, no ledger_period_closes read,
-        -- and a caption that cannot move under a fixed cursor (a caption that moves
-        -- under a fixed cursor is itself a reproducibility break). A backdated
-        -- arrival above a close cursor is un-closed until a later close sweeps it,
-        -- and shows here rather than dropping from equity forever.
         SELECT s.tenant_id, s.currency,
-               (-COALESCE((
-                   SELECT SUM(CASE WHEN e.direction='debit' THEN e.amount_minor::numeric
-                                   ELSE -e.amount_minor::numeric END)
-                   FROM ledger_entries e
-                   JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
-                                             AND x.status = 'posted'
-                   JOIN ledger_accounts a ON a.tenant_id = e.tenant_id AND a.id = e.account_id
-                                         AND a.currency = e.currency
-                   JOIN chart_presentation p ON p.chart_version = v_cv AND p.type_code = a.purpose
-                   WHERE e.tenant_id = s.tenant_id AND e.currency = s.currency
-                     AND e.effective_at < p_asof AND e.xact_id < p_cursor
-                     AND p.category IN ('revenue','expense')
-               ), 0))::bigint AS amount_minor
+               -COALESCE((
+                   SELECT SUM(pp.v) FROM pos pp
+                   WHERE pp.tenant_id = s.tenant_id AND pp.currency = s.currency
+                     AND pp.category IN ('revenue','expense')
+               ), 0) AS amount_minor
         FROM scopes s
     )
     SELECT l.tenant_id, l.currency, v_cv, l.fs_line, l.caption, l.sort_order,
            l.amount_minor, l.side, p_cursor
     FROM lines l
     UNION ALL
-    -- The synthesised un-closed-earnings plug. Its side is 'equity'. The caption is
-    -- CONSTANT (A3): the plug always means "earnings not yet closed to retained
-    -- earnings", so it does not change with whether a close has happened.
     SELECT g.tenant_id, g.currency, v_cv, 'current_year_earnings',
            'Undistributed earnings (since inception)', 9000,
            g.amount_minor, 'equity', p_cursor
@@ -1372,14 +1529,103 @@ BEGIN
     ORDER BY 1, 2, 6;
 END $function$
 
+CREATE OR REPLACE FUNCTION public.checkpoint_anchor(p_tenant text, p_asof timestamp with time zone, p_cursor xid8)
+ RETURNS TABLE(currency character, period_code text, boundary timestamp with time zone, ckpt_cursor xid8, close_txn uuid)
+ LANGUAGE sql
+ STABLE
+AS $function$
+    SELECT s.currency, c.period_code,
+           -- NO CLOSE: boundary '-infinity' and cursor 0. The form then degrades
+           -- to the from-inception behaviour with no special case -- tail B is
+           -- empty because ck_entries__effective_finite forbids an entry at
+           -- -infinity, tail A is everything, and the checkpoint term joins
+           -- nothing.
+           COALESCE(c.ends_at, '-infinity'::timestamptz),
+           COALESCE(c.computed_at_xid, '0'::xid8),
+           c.transaction_id
+    FROM (SELECT DISTINCT l.currency FROM ledger_accounts l WHERE l.tenant_id = p_tenant) s
+    LEFT JOIN LATERAL (
+        SELECT k.period_code, k.ends_at, k.computed_at_xid, k.transaction_id
+        FROM ledger_period_closes k
+        JOIN ledger_transactions kx
+          ON kx.tenant_id = k.tenant_id AND kx.id = k.transaction_id
+        WHERE k.tenant_id = p_tenant
+          AND k.currency = s.currency
+          -- half-open, so a close AT the as-of instant leaves tail A empty and the
+          -- checkpoint exact. One microsecond either way is a wrong balance sheet.
+          AND k.ends_at <= p_asof
+          AND k.computed_at_xid <= p_cursor
+          AND kx.xact_id < p_cursor
+        ORDER BY k.ends_at DESC
+        LIMIT 1
+    ) c ON true;
+$function$
+
+CREATE OR REPLACE FUNCTION public.checkpoint_position(p_tenant text, p_asof timestamp with time zone, p_cursor xid8)
+ RETURNS TABLE(currency character, account_id uuid, debits numeric, credits numeric)
+ LANGUAGE sql
+ STABLE
+AS $function$
+    WITH a AS (SELECT * FROM checkpoint_anchor(p_tenant, p_asof, p_cursor)),
+    terms AS (
+        -- 1. the checkpoint. input = debit legs, output = credit legs, posted
+        -- only -- the same convention as ledger_account_balances.
+        SELECT b.currency, b.account_id, b.input::numeric AS dr, b.output::numeric AS cr
+        FROM a
+        JOIN ledger_period_balances b
+          ON b.tenant_id = p_tenant AND b.currency = a.currency
+         AND b.period_code = a.period_code
+        UNION ALL
+        -- 2. tail A -- effective at or after the boundary, before the as-of.
+        -- WANTS ix_entries__tenant_effective, which ADR-0020's decision rule has
+        -- not cleared for the write path: both existing indexes put account_id in
+        -- second position, so a tenant-wide range on effective_at has no leading
+        -- path through either and this term gets a sequential scan today.
+        SELECT e.currency, e.account_id,
+               CASE WHEN e.direction = 'debit'  THEN e.amount_minor::numeric ELSE 0 END,
+               CASE WHEN e.direction = 'credit' THEN e.amount_minor::numeric ELSE 0 END
+        FROM a
+        JOIN ledger_entries e
+          ON e.tenant_id = p_tenant AND e.currency = a.currency
+         AND e.effective_at >= a.boundary AND e.effective_at < p_asof
+         AND e.xact_id < p_cursor
+        JOIN ledger_transactions x
+          ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id AND x.status = 'posted'
+        UNION ALL
+        -- 3. tail B -- the backdated arrivals, which is why ix_entries__asof_commit
+        -- exists (ADR-0011 §3). PostgreSQL 18's btree skip scan chooses that index
+        -- for the TENANT-WIDE form as well as the single-account one it was
+        -- measured on, so this term is served today.
+        SELECT e.currency, e.account_id,
+               CASE WHEN e.direction = 'debit'  THEN e.amount_minor::numeric ELSE 0 END,
+               CASE WHEN e.direction = 'credit' THEN e.amount_minor::numeric ELSE 0 END
+        FROM a
+        JOIN ledger_entries e
+          ON e.tenant_id = p_tenant AND e.currency = a.currency
+         AND e.effective_at < a.boundary
+         AND e.xact_id >= a.ckpt_cursor AND e.xact_id < p_cursor
+         AND (a.close_txn IS NULL OR e.transaction_id <> a.close_txn)
+        JOIN ledger_transactions x
+          ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id AND x.status = 'posted'
+    )
+    SELECT t.currency, t.account_id, SUM(t.dr), SUM(t.cr)
+    FROM terms t
+    GROUP BY t.currency, t.account_id;
+$function$
+
 CREATE OR REPLACE FUNCTION public.income_statement_for(p_tenant text, p_from timestamp with time zone, p_to timestamp with time zone, p_cursor xid8, p_chart_version integer DEFAULT NULL::integer)
- RETURNS TABLE(tenant_id text, currency character, chart_version integer, fs_line text, caption text, sort_order integer, amount_minor bigint, side text, pinned_cursor xid8)
+ RETURNS TABLE(tenant_id text, currency character, chart_version integer, fs_line text, caption text, sort_order integer, amount_minor numeric, side text, pinned_cursor xid8)
  LANGUAGE plpgsql
  STABLE
 AS $function$
 DECLARE
     v_cv int;
 BEGIN
+    IF p_tenant IS NULL OR p_from IS NULL OR p_to IS NULL OR p_cursor IS NULL THEN
+        RAISE EXCEPTION
+          'income_statement_for requires a tenant, both range bounds and a cursor; a NULL argument returns a complete, all-zero statement'
+            USING ERRCODE = '22004';
+    END IF;
     -- A13: the chart version must EXIST. The old COALESCE never touched
     -- chart_versions, so income_statement_for(..., 999) returned a fabricated,
     -- all-zero, perfectly balanced statement citing a version nobody created.
@@ -1433,7 +1679,7 @@ BEGIN
                   WHERE l.tenant_id = p_tenant)
     SELECT s.tenant_id, s.currency, v_cv, f.code, f.caption, f.sort_order,
            -- credit-normal lines (revenue) present positive; debit-normal (expense) too
-           (CASE WHEN f.side = 'credit' THEN -1 ELSE 1 END * COALESCE(SUM(d.v), 0))::bigint,
+           CASE WHEN f.side = 'credit' THEN -1 ELSE 1 END * COALESCE(SUM(d.v), 0),
            f.side, p_cursor
     FROM scopes s
     JOIN fs_lines f ON f.chart_version = v_cv
@@ -1451,6 +1697,18 @@ CREATE OR REPLACE FUNCTION public.recon_equation_breaks(p_cursor xid8, p_asof ti
  LANGUAGE sql
  STABLE
 AS $function$
+    -- AN ALGEBRAIC IDENTITY, NOT A PRESENTATION CHECK. gap_minor is the sum of
+    -- every presented position, so it is identically zero on any journal that
+    -- foots: every routing error and every `side` error inside the chart is
+    -- INVISIBLE here, and every red this can produce is also another check's red.
+    -- Proven both ways, spike 025 F1. The header comment in
+    -- migrations/00004_the_report_path_reads_the_checkpoint.sql carries the
+    -- evidence and what a real presentation check would need.
+    --
+    -- It runs the statement FUNCTION rather than re-deriving it, which is what it
+    -- is genuinely for: a statement that raises, a chart that cannot be presented
+    -- through, or a checkpoint reader that disagrees with the journal on the face
+    -- all reach the operator here.
     WITH tenants AS (SELECT DISTINCT l.tenant_id FROM ledger_accounts l),
     bs AS (
         SELECT b.tenant_id, b.currency, b.side, b.amount_minor
@@ -1458,14 +1716,14 @@ AS $function$
         CROSS JOIN LATERAL balance_sheet_at(tn.tenant_id, p_asof, p_cursor) b
     )
     SELECT bs.tenant_id, bs.currency,
-           COALESCE(SUM(bs.amount_minor::numeric) FILTER (WHERE bs.side = 'asset'), 0) AS assets_minor,
-           COALESCE(SUM(bs.amount_minor::numeric) FILTER (WHERE bs.side IN ('liability','equity')), 0) AS liab_equity_minor,
-           COALESCE(SUM(bs.amount_minor::numeric) FILTER (WHERE bs.side = 'asset'), 0)
-             - COALESCE(SUM(bs.amount_minor::numeric) FILTER (WHERE bs.side IN ('liability','equity')), 0) AS gap_minor
+           COALESCE(SUM(bs.amount_minor) FILTER (WHERE bs.side = 'asset'), 0) AS assets_minor,
+           COALESCE(SUM(bs.amount_minor) FILTER (WHERE bs.side IN ('liability','equity')), 0) AS liab_equity_minor,
+           COALESCE(SUM(bs.amount_minor) FILTER (WHERE bs.side = 'asset'), 0)
+             - COALESCE(SUM(bs.amount_minor) FILTER (WHERE bs.side IN ('liability','equity')), 0) AS gap_minor
     FROM bs
     GROUP BY bs.tenant_id, bs.currency
-    HAVING COALESCE(SUM(bs.amount_minor::numeric) FILTER (WHERE bs.side = 'asset'), 0)
-        <> COALESCE(SUM(bs.amount_minor::numeric) FILTER (WHERE bs.side IN ('liability','equity')), 0);
+    HAVING COALESCE(SUM(bs.amount_minor) FILTER (WHERE bs.side = 'asset'), 0)
+        <> COALESCE(SUM(bs.amount_minor) FILTER (WHERE bs.side IN ('liability','equity')), 0);
 $function$
 
 CREATE OR REPLACE FUNCTION public.refuse_journal_ddl()
@@ -1573,17 +1831,14 @@ AS $function$
 $function$
 
 CREATE OR REPLACE FUNCTION public.trial_balance_at(p_tenant text, p_from timestamp with time zone, p_to timestamp with time zone, p_cursor xid8)
- RETURNS TABLE(tenant_id text, account_id uuid, purpose text, category ledger_category, currency character, debits bigint, credits bigint, balance_debit_positive bigint)
+ RETURNS TABLE(tenant_id text, account_id uuid, purpose text, category ledger_category, currency character, debits numeric, credits numeric, balance_debit_positive numeric)
  LANGUAGE sql
  STABLE
 AS $function$
--- amount_minor is summed as `numeric` and cast back at the end (ADR-0013): a
--- single huge-but-legal row overflows a running bigint SUM and raises the whole
--- SELECT, and a report that dies on one large row reports nothing.
 SELECT a.tenant_id, a.id, a.purpose, t.category, e.currency,
-       COALESCE(SUM(e.amount_minor::numeric) FILTER (WHERE e.direction='debit'), 0)::bigint,
-       COALESCE(SUM(e.amount_minor::numeric) FILTER (WHERE e.direction='credit'), 0)::bigint,
-       SUM(CASE WHEN e.direction='debit' THEN e.amount_minor::numeric ELSE -e.amount_minor::numeric END)::bigint
+       COALESCE(SUM(e.amount_minor::numeric) FILTER (WHERE e.direction='debit'), 0),
+       COALESCE(SUM(e.amount_minor::numeric) FILTER (WHERE e.direction='credit'), 0),
+       SUM(CASE WHEN e.direction='debit' THEN e.amount_minor::numeric ELSE -e.amount_minor::numeric END)
 FROM ledger_entries e
 JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
                           AND x.status = 'posted'
@@ -1713,6 +1968,9 @@ ledger_transactions.reverses_id: openledger_app INSERT
 ledger_transactions.status: openledger_app INSERT
 ledger_transactions.tenant_id: openledger_app INSERT
 
+== routine grants (to openledger_* and PUBLIC) ==
+recon_equation_breaks(p_cursor xid8, p_asof timestamp with time zone): openledger_recon EXECUTE
+
 == account_types.is_perimeter / mirror_type (ADR-0007 §2's charged data) ==
 (none)
 
@@ -1773,11 +2031,13 @@ column transaction_id of table ledger_period_closes = The closing transaction, p
 column xact_id of table ledger_entries = The entry's OWN commit-ordering key (ADR-0011). Filter xact_id < :cursor for a reproducible as-of read. Deliberately NOT tied to the transaction's xact_id under an FK: a leg appended to an already-committed transaction carries a HIGHER id, so a report pinned before the append cannot see it.
 column xact_id of table ledger_events = The commit-ordering key (ADR-0011) for an operation that writes no transaction -- where it records its position on the commit axis.
 column xact_id of table ledger_transactions = The commit-ordering key the as-of cursor pins to. Filter xact_id < :cursor for a reproducible as-of read: a later arrival carries its own, HIGHER id and cannot rewrite an already-issued report (ADR-0011).
-function balance_sheet_at(text,timestamp with time zone,xid8,integer) = The balance sheet as at an instant p_asof (effective_at < p_asof, half-open), at a commit cursor, under a chart version (default: current). Enumerates FROM the chart; positions are per-account then routed to a contra line on sign-swing; synthesises the un-closed-earnings plug; RAISES on an unpresented type. Returns its pinned cursor (ADR-0011, ADR-0012).
-function income_statement_for(text,timestamp with time zone,timestamp with time zone,xid8,integer) = The income statement over an effective range [p_from, p_to), at a commit cursor, under a chart version (default: current). Enumerates FROM the chart; RAISES if the version does not exist or does not present every posted account type in-window; excludes the period's closing transaction. Returns its pinned cursor (ADR-0011).
-function recon_equation_breaks(xid8,timestamp with time zone) = The accounting equation on the FACE of the balance sheet: runs balance_sheet_at per tenant at (p_cursor, p_asof) and returns a row only where assets <> liabilities + equity + earnings, per currency. The highest-leverage check -- no journal-level test can falsify presentation (ADR-0011).
+function balance_sheet_at(text,timestamp with time zone,xid8,integer) = The balance sheet as at an instant p_asof (effective_at < p_asof, half-open), at a commit cursor, under a chart version (default: current). READS THE PERIOD CHECKPOINT plus two tails, per currency, instead of aggregating the journal from inception -- proven equal to the from-inception form at 60 (tenant, cursor, as-of) points. Enumerates FROM the chart; positions are per-account then routed to a contra line on sign-swing; synthesises the un-closed-earnings plug; RAISES on a NULL argument and on an unpresented type. Publishes numeric. Returns its pinned cursor (ADR-0011, ADR-0012, ADR-0020).
+function checkpoint_anchor(text,timestamp with time zone,xid8) = The close a report at (as_of, cursor) may read from, PER CURRENCY: the latest whose period end is at or before as_of and whose whole checkpoint -- including its own closing transaction -- is visible at the cursor. Returns boundary -infinity and cursor 0 for a currency with no close, so the reader degrades to the from-inception form with no special case (ADR-0020).
+function checkpoint_position(text,timestamp with time zone,xid8) = Per-account GROSS debits and credits as at (as_of, cursor), from the period checkpoint plus the two tails ADR-0011 §3 specifies -- chosen per currency, and excluding the close's own transaction from the backdated tail because the checkpoint already carries it. Exactly equal to the from-inception aggregate: proven to the minor unit at 60 (tenant, cursor, as-of) points (ADR-0020).
+function income_statement_for(text,timestamp with time zone,timestamp with time zone,xid8,integer) = The income statement over an effective range [p_from, p_to), at a commit cursor, under a chart version (default: current). Enumerates FROM the chart; RAISES on a NULL argument, on a version that does not exist, and on a version that does not present every posted account type in-window; excludes the period's closing transaction. Reads no checkpoint, and cannot: the accounts it reports are exactly the ones a close zeroes. Publishes numeric. Returns its pinned cursor (ADR-0011, ADR-0020).
+function recon_equation_breaks(xid8,timestamp with time zone) = Assets against liabilities + equity + earnings on the FACE of the balance sheet, per tenant and currency, at (p_cursor, p_asof). AN ALGEBRAIC IDENTITY, not a presentation check, and the old comment claiming it the "highest-leverage check" was false: gap_minor is the sum of every presented position, so it is identically zero on any journal that foots and every routing or side error inside the chart is invisible to it -- proven by a well-formed chart version that moved customer funds onto trade payables with this check at zero rows. What it does catch is a position removed from that sum or added with no opposite, all three classes journal-level and each already reported by another check; what it is FOR is that it runs the statement function rather than re-deriving it, so a statement that raises or a checkpoint reader that disagrees with the journal reaches the operator here. EXECUTE is not PUBLIC: an RLS-scoped reader got zero rows over zero tenants, which is a green check that did not execute (ADR-0010, ADR-0020).
 function report_cursor() = The commit cursor a report pins itself to: pg_snapshot_xmin of the current snapshot. Everything strictly below it has committed or aborted and can never grow; a row invisible now carries a HIGHER id. Pass it as :cursor to the statement functions (ADR-0011).
-function trial_balance_at(text,timestamp with time zone,timestamp with time zone,xid8) = The trial balance pinned: per-account debits/credits/debit-positive balance for one tenant over an effective range [p_from, p_to) at a commit cursor (xact_id < p_cursor). Sums as numeric to survive a huge legal row (ADR-0011, ADR-0013).
+function trial_balance_at(text,timestamp with time zone,timestamp with time zone,xid8) = The trial balance pinned: per-account debits/credits/debit-positive balance for one tenant over an effective range [p_from, p_to) at a commit cursor (xact_id < p_cursor). PUBLISHES numeric, and that is the fix rather than the decoration the old comment claimed: SUM(bigint) already returns numeric in PostgreSQL, so what overflowed was the cast back to a DECLARED bigint -- reproduced as "bigint out of range" through the writer over HTTP. Not guarded against a NULL argument: a RAISE cannot live in a bare SELECT and the plpgsql form loses the inlining ADR-0011 §4 relies on, so a NULL cursor returns zero rows. No reconciliation check reads this function (ADR-0011, ADR-0013, ADR-0020).
 table account_types = The chart of accounts -- what an account MEANS. IDENTITY only (category, normal_balance, counterparty_scope, is_perimeter, mirror_type); which financial-statement line a type reports under is PRESENTATION and lives in chart_presentation, keyed by chart_version. Seed data, shipped by schema/chart.sql, not by this migration (ADR-0012).
 table chart_presentation = Which fs_line a type reports under, per chart_version. Append-only: so "which line was this presented under" is one key lookup, never a walk of overrides. category and counterparty_scope are copied from account_types under a composite FK; fs_statement/fs_side are GENERATED from category (ADR-0012).
 table chart_versions = The chart as append-only history. A reclassification is a NEW version carrying a complete chart, never an edit -- an issued statement names the version it was presented under. "Current" is DERIVED as max(version) (see chart_version_current), never stored (ADR-0012).
@@ -1786,23 +2046,22 @@ table ledger_account_balances = The O(1) cached POSTED balance AND the write-sid
 table ledger_accounts = The account register: whose money, in what currency, of what type (purpose). NOT history -- metadata is editable -- but an account's identity (purpose/category/normal_balance) and owner are FROZEN while any balance row references them (NO ACTION on fk_balances__account_purpose / _owner) (ADR-0009, ADR-0012).
 table ledger_entries = The append-only journal: one leg of one movement (direction + amount_minor), the ground truth every report and drift check derives from. NO running balance (spike 009) -- 'balance now' is ledger_account_balances and 'as of a business date' aggregates over effective_at. For a reproducible as-of read, filter effective_at and xact_id < :cursor (ADR-0006, ADR-0009, ADR-0011).
 table ledger_events = The idempotency spine: every accepted operation, INCLUDING the ones that write no ledger transaction (an account opened, a limit changed, a posting rejected). Append-only. One event causes at most one transaction (uq_txn__one_per_event). Replay contract: same idempotency_key + same idempotency_hash replays the stored result, same key + different hash is rejected (ADR-0005, ADR-0013).
-table ledger_period_balances = The effective-axis checkpoint: the at-close balance per account per period. DERIVED and exactly recomputable from ledger_entries at (effective_at < ends_at, xact_id < computed_at_xid); reconciled by recon_checkpoint_breaks. Same input/output convention as ledger_account_balances, posted entries only (ADR-0011).
+table ledger_period_balances = The effective-axis checkpoint: one row per account per closed period per currency. AT-CLOSE balances -- the closing entries are included, so a temporary account's row is exactly 0 and the earnings account carries the swept earnings -- and they are admitted to their own checkpoint by TRANSACTION IDENTITY, not through the cursor: a reproducible computed_at_xid is at or below the closing transaction's own xid, so no inequality can reach them (ADR-0020, amending ADR-0011 §3). Derived, exactly rebuildable, off the write path, read by balance_sheet_at and reconciled by recon_checkpoint_breaks.
 table ledger_period_closes = One close per tenant/period/currency: names the transaction that closed the period (an ordinary posting, kind='period_close') and the commit cursor computed_at_xid it was computed at. Lets the income statement exclude closing entries declaratively instead of matching a free-text kind (ADR-0011).
 table ledger_periods = A resolved period boundary [starts_at, ends_at). HALF-OPEN, and the instants are resolved ONCE from (local date, tz) at creation and never re-resolved -- IANA rules change, so a stored (date, zone) pair is not a stable instant. A tenant's periods may not overlap (ex_periods__no_overlap) (ADR-0011).
 table ledger_transactions = The unit of atomicity and the event's bookkeeping. Append-only; status NEVER mutates -- a pending->posted change is a NEW row via resolves_id, not an UPDATE. Every transaction references the event that caused it (event_id NOT NULL). Reports read status='posted' only (ADR-0009, ADR-0011).
 table perimeter_attestations = What a third party (bank, network, trustee) said an is_perimeter account's balance was on their statement date. The only thing that can falsify is_perimeter's "must reconcile against an external balance" claim, since a CHECK cannot. Compared on the EFFECTIVE axis by perimeter_drift; append-only (ADR-0012).
-view chart_lint = Chart claims the account register contradicts: a type no version presents, a per_shard type in a house account, a same-side mirror pair, an unattested perimeter account, live drift, and more -- ten shape rules a CHECK or key cannot reach. Empty is passing; reconciliation counts the error-severity rows (ADR-0012).
+view chart_lint = Chart claims the account register or the presentation contradicts: a type no version presents, a per_shard type in a house account, a same-side mirror pair, an unattested perimeter account, live drift, a line receiving more than one counterparty grain, restricted money sharing a caption with unencumbered money, and more -- twelve shape rules a CHECK or key cannot reach. Empty is passing; reconciliation counts the error-severity rows only, and the two presentation rules are warn because the published reference chart trips each once, legitimately (ADR-0012, ADR-0020).
 view chart_version_current = The current chart version, DERIVED as max(version) -- the default the statement functions read when no version is passed (ADR-0012).
-view close_disclosures = Entries legally backdated past a close (effective_at before ends_at, xact_id at/after computed_at_xid) -- not a break: the analogue of IAS 1.41's reclassification disclosure, so a row here means an already-issued report no longer matches a re-run at "now" (ADR-0011).
+view close_disclosures = Entries legally backdated past a close (effective_at before ends_at, xact_id at or after computed_at_xid) EXCEPT the close's own legs, which the checkpoint carries by identity -- not a break: the analogue of IAS 1.41's reclassification disclosure, so a row here means an already-issued report no longer matches a re-run at "now" (ADR-0011, ADR-0020).
 view perimeter_drift = What a third party attested against what our book says on the same business date (effective axis, bounded by the stored as_of_end instant), per is_perimeter account -- the drift is the difference. Fed into chart_lint (ADR-0012).
 view recon_balance_breaks = The cached balance against the recomputed sum over the journal, per account/currency/stripe -- a nonzero row is drift the cache introduced. Six break classes (balance_drift, seq_behind/ahead/gap, no_cache_row, no_entries); input/output vs POSTED entries, last_seq vs ALL entries (ADR-0010).
-view recon_checkpoint_breaks = The stored period checkpoint against ledger_entries recomputed at the checkpoint's own cursor, per account -- missing, spurious or value-drifted rows. Compares values, so a dormant 0/0 row is not a break (ADR-0011).
-view recon_close_breaks = Closes whose computed_at_xid precedes their own closing transaction's xact_id -- a checkpoint computed at a cursor that could not have seen the close it records (ADR-0011).
-view recon_cursor_breaks = Entries whose commit key is impossible -- an xact_id above the current snapshot horizon, or below its own transaction's (a leg claiming to predate its transaction). Where a forged xact_id shows, since it silences no other check (ADR-0011).
+view recon_checkpoint_breaks = The stored period checkpoint against ledger_entries, in ONE pass over the journal plus one over the stored rows instead of one prefix re-aggregation per close: each entry is banded to the first close whose checkpoint contains it, and consecutive stored levels are differenced against that band. Two halves, both load-bearing -- the value comparison (missing_row, spurious_row, value_drift) and the presence comparison (row_span), which catches a deleted trailing row the difference form cannot see. The close's own transaction is admitted to its own checkpoint by identity. SOUND ONLY WHILE recon_close_breaks IS GREEN: an out-of-order close makes the stored levels stop nesting and this view report false drift (ADR-0020).
+view recon_close_breaks = Closes that cannot be what they claim: a cursor below its own closing transaction (cursor_precedes_close) or above the current snapshot's xmax (cursor_above_assigned); closes out of cursor order, or one whose cursor has not cleared the previous close's transaction (recon_close_order -- the invariant the bounded checkpoint check and the at-close claim both need); a close whose period's revenue and expense positions do not net to zero in the checkpoint it wrote (close_does_not_sweep -- ADR-0011 §2's definition of a close, and the only bound on a MISLABELLED one); and a posted kind='period_close' transaction that no period record names (close_orphan -- with no close row the income statement counts the sweep as operating activity, and every key that types a close is vacuous). Five reasons, one summary row (ADR-0020).
+view recon_cursor_breaks = Entries whose commit key is impossible -- an xact_id at or above the current snapshot's XMAX (nothing committed can reach latestCompletedXid + 1), or below its own transaction's (a leg claiming to predate its transaction). Bounded by xmax and NOT by xmin: the cluster horizon is held back by any long-running transaction anywhere on the server, so the xmin form reported breaks on honest committed entries and took the daily sweep to exit 1 on a healthy book. What it gives up: a forgery inside the narrow in-flight band between the horizon and xmax (ADR-0011, ADR-0020).
 view recon_entry_breaks = Journal entries that fail one of the three joins every report makes -- no_transaction, no_account or no_account_type, one row each. Empty wherever the foreign keys are enforced; a pending entry is not an orphan (ADR-0009).
 view recon_journal_to_reports = A reconciliation statement (one row per tenant/currency, always footing): journal debits minus the named reconciling items -- pending, superseded, out_of_window, orphan -- against what trial_balance actually shows; the unexplained remainder must be zero (ADR-0010).
 view recon_pending_bridge = The available balance derived, not stored: the posted cache plus the live pending population (retired holds excluded), per account. A reconciling population, not a break list (ADR-0010).
 view recon_scope_breaks = The two sides of a cross-scope obligation that fail to eliminate: for a mirrored account-type pair, the debit-positive sum over both types must be zero, per currency and per counterparty. The one check that aggregates across tenants (ADR-0010).
 view recon_transaction_breaks = Transactions whose entries do not balance per currency (debits_ne_credits), plus single-leg and entryless ones -- except the void: a zero-entry posted marker reversing a PENDING target is legitimate (ADR-0016), while every other entryless transaction stays a break. The exception list for the balance invariant the writer's type makes unrepresentable (ADR-0005, ADR-0007).
-view reconciliation = The daily sweep operators run (openledger reconcile, roadmap M2): one row per check -- cache-vs-journal, orphan entries, imbalance, cross-scope, journal-vs-reports, checkpoint, close typing, cursor forgery, the accounting equation, chart lint -- with its break count, all zero on a healthy book. SELECT * FROM reconciliation WHERE breaks <> 0 is the whole interface; the pending bridge and close disclosures are excluded as legitimate populations (ADR-0004, ADR-0010).
 view trial_balance = Per-account gross arithmetic at "now" and the reconciliation substrate half the recon views read. security_invoker, so RLS scopes it. Publishes both balance_minor (normal-balance-signed, for showing one account) and balance_debit_positive (roll up with THIS one). Enumerates INWARD from entries -- not the completeness surface (ADR-0011).

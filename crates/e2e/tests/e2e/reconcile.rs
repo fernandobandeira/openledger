@@ -114,48 +114,161 @@ async fn insert_an_entryless_transaction(book: &TestBook) -> TestResult {
     Ok(())
 }
 
-/// One close of period 2026-08, correct in everything but the cursor
-/// expression the caller passes — `'1'` for the close_typing forgery,
-/// `pg_current_xact_id()` for the honest cursor the checkpoint test needs.
-/// Shared because the two tests differ in EXACTLY that one value, and the
-/// forgery must not drift away from the honest shape it forges.
-async fn close_the_august_period(
+/// The account a close routes swept earnings to (ADR-0011 §2). A house
+/// account, `none`-scoped and non-perimeter, so it stays out of `chart_lint`
+/// exactly as the fixture pair does.
+async fn open_the_retained_earnings_account(
     book: &TestBook,
-    receivable: uuid::Uuid,
+) -> Result<uuid::Uuid, Box<dyn std::error::Error>> {
+    Ok(book
+        .account("t1", None, "retained_earnings", "equity", "credit", "none")
+        .await?)
+}
+
+/// The axes a close can be wrong on, one field each — because a close is not
+/// one thing, and since ADR-0020 the sweep names five separate ways for it to
+/// be a `close_typing` break. ADR-0011 §2 says what the closing transaction
+/// CONTAINS, ADR-0020 says what its checkpoint holds and how its cursor
+/// relates to its own transaction, and each of those fails on its own. Spelled
+/// out so every forgery below is ONE field away from the honest shape it
+/// forges, which is what stops a forgery drifting into an unrelated book.
+struct AClose<'a> {
+    /// the period code and the half-open instants it resolved to
+    period: &'a str,
+    starts_at: &'a str,
+    ends_at: &'a str,
+    /// the closing transaction's own effective date, inside the period
+    /// (`ck_closes__txn_in_period`)
+    closes_at: &'a str,
+    /// the last two hex digits of every id this close writes, so two closes on
+    /// one book cannot collide
+    ids: &'a str,
+    /// the SQL expression stored as `computed_at_xid`
+    computed_at_xid: &'a str,
+    /// the sweep. `Some(minor)` debits `fee_revenue` and credits retained
+    /// earnings by that amount, which is what makes the period's temporary
+    /// positions net to zero at the close; `None` writes the ENTRYLESS close a
+    /// period with nothing to sweep produces (ADR-0020's carve-out).
+    sweeps_minor: Option<i64>,
+    /// whether `ledger_period_closes` names the transaction at all. `false` is
+    /// spike 025 F2(a): an honest close whose one INSERT was forgotten.
+    recorded: bool,
+    /// whether the checkpoint lands. Computed at the STORED cursor with the
+    /// close's own transaction admitted by identity — migration 00004 part 1's
+    /// `INSERT … SELECT`, verbatim, because a fixture that computes the
+    /// checkpoint some other way is testing the fixture.
+    checkpointed: bool,
+}
+
+/// Write one close of `t1`'s book. Every column here is one the app role may
+/// INSERT, and the cache is advanced the way the writer advances it (the entry
+/// carries the `last_seq` the cache row just took), so a close written by this
+/// helper leaves `balance_cache` and `unbalanced_transactions` green and only
+/// the axis under test red.
+async fn close_the_period(
+    book: &TestBook,
     revenue: uuid::Uuid,
-    computed_at_xid: &str,
+    retained_earnings: uuid::Uuid,
+    close: &AClose<'_>,
 ) -> TestResult {
-    sqlx::raw_sql(AssertSqlSafe(format!(
+    let AClose {
+        period,
+        starts_at,
+        ends_at,
+        closes_at,
+        ids,
+        computed_at_xid,
+        sweeps_minor,
+        recorded,
+        checkpointed,
+    } = *close;
+    let event = format!("0e2e0000-0000-7000-8000-0000000000{ids}");
+    let txn = format!("0e2e0000-0000-7000-8000-0000000001{ids}");
+    let mut sql = format!(
         "INSERT INTO ledger_periods (tenant_id, code, starts_at, ends_at, tz)
-         VALUES ('t1', '2026-08', '2026-08-01T00:00:00Z', '2026-09-01T00:00:00Z', 'UTC');
+         VALUES ('t1', '{period}', '{starts_at}', '{ends_at}', 'UTC');
          INSERT INTO ledger_events (tenant_id, id, kind, source, idempotency_key,
                                     idempotency_hash, payload, effective_at)
-         VALUES ('t1', '0e2e0000-0000-7000-8000-000000000040', 'period_close', 'internal',
-                 'close-2026-08', decode('00', 'hex'), '{{}}'::jsonb, '2026-08-31T00:00:00Z');
+         VALUES ('t1', '{event}', 'period_close', 'internal',
+                 'close-{period}', decode('00', 'hex'), '{{}}'::jsonb, '{closes_at}');
          INSERT INTO ledger_transactions (tenant_id, id, event_id, kind, status, effective_at)
-         VALUES ('t1', '0e2e0000-0000-7000-8000-000000000041',
-                 '0e2e0000-0000-7000-8000-000000000040', 'period_close', 'posted',
-                 '2026-08-31T00:00:00Z');
-         INSERT INTO ledger_entries (tenant_id, transaction_id, account_id, direction,
-                                     amount_minor, currency, account_seq, effective_at)
-         VALUES ('t1', '0e2e0000-0000-7000-8000-000000000041', '{receivable}',
-                 'debit', 100, 'USD', 2, '2026-08-31T00:00:00Z'),
-                ('t1', '0e2e0000-0000-7000-8000-000000000041', '{revenue}',
-                 'credit', 100, 'USD', 2, '2026-08-31T00:00:00Z');
-         UPDATE ledger_account_balances SET input = input + 100, last_seq = 2
-         WHERE tenant_id = 't1' AND account_id = '{receivable}';
-         UPDATE ledger_account_balances SET output = output + 100, last_seq = 2
-         WHERE tenant_id = 't1' AND account_id = '{revenue}';
-         INSERT INTO ledger_period_closes (tenant_id, period_code, currency, starts_at,
-                                           ends_at, transaction_id, txn_effective_at,
-                                           computed_at_xid)
-         VALUES ('t1', '2026-08', 'USD', '2026-08-01T00:00:00Z', '2026-09-01T00:00:00Z',
-                 '0e2e0000-0000-7000-8000-000000000041', '2026-08-31T00:00:00Z',
-                 {computed_at_xid})"
-    )))
-    .execute(&book.pool)
-    .await?;
+         VALUES ('t1', '{txn}', '{event}', 'period_close', 'posted', '{closes_at}');"
+    );
+    if let Some(amount) = sweeps_minor {
+        sql.push_str(&format!(
+            "INSERT INTO ledger_account_balances AS b
+                 (tenant_id, account_id, currency, input, output, last_seq,
+                  owner_type, owner_id_key, purpose, category, normal_balance)
+             SELECT 't1', a.id, 'USD',
+                    CASE WHEN a.id = '{revenue}' THEN {amount} ELSE 0 END,
+                    CASE WHEN a.id = '{revenue}' THEN 0 ELSE {amount} END,
+                    1, a.owner_type, a.owner_id_key, a.purpose, a.category, a.normal_balance
+             FROM ledger_accounts a
+             WHERE a.tenant_id = 't1' AND a.id IN ('{revenue}', '{retained_earnings}')
+             ON CONFLICT (tenant_id, account_id, currency, stripe) DO UPDATE
+                SET input = b.input + EXCLUDED.input, output = b.output + EXCLUDED.output,
+                    last_seq = b.last_seq + 1;
+             INSERT INTO ledger_entries (tenant_id, transaction_id, account_id, direction,
+                                         amount_minor, currency, account_seq, effective_at)
+             SELECT 't1', '{txn}', b.account_id,
+                    CASE WHEN b.account_id = '{revenue}' THEN 'debit'
+                         ELSE 'credit' END::ledger_direction,
+                    {amount}, 'USD', b.last_seq, '{closes_at}'
+             FROM ledger_account_balances b
+             WHERE b.tenant_id = 't1'
+               AND b.account_id IN ('{revenue}', '{retained_earnings}');"
+        ));
+    }
+    if recorded {
+        sql.push_str(&format!(
+            "INSERT INTO ledger_period_closes (tenant_id, period_code, currency, starts_at,
+                                               ends_at, transaction_id, txn_effective_at,
+                                               computed_at_xid)
+             VALUES ('t1', '{period}', 'USD', '{starts_at}', '{ends_at}', '{txn}',
+                     '{closes_at}', {computed_at_xid});"
+        ));
+    }
+    if checkpointed {
+        sql.push_str(&format!(
+            "INSERT INTO ledger_period_balances (tenant_id, period_code, currency, account_id,
+                                                 input, output)
+             SELECT 't1', '{period}', 'USD', e.account_id,
+                    COALESCE(SUM(e.amount_minor) FILTER (WHERE e.direction = 'debit'), 0),
+                    COALESCE(SUM(e.amount_minor) FILTER (WHERE e.direction = 'credit'), 0)
+             FROM ledger_entries e
+             JOIN ledger_transactions x ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+                                       AND x.status = 'posted'
+             WHERE e.tenant_id = 't1' AND e.currency = 'USD'
+               AND e.effective_at < '{ends_at}'
+               AND (e.xact_id < (SELECT c.computed_at_xid FROM ledger_period_closes c
+                                 WHERE c.tenant_id = 't1' AND c.period_code = '{period}'
+                                   AND c.currency = 'USD')
+                    OR e.transaction_id = '{txn}')
+             GROUP BY e.account_id;"
+        ));
+    }
+    sqlx::raw_sql(AssertSqlSafe(sql))
+        .execute(&book.pool)
+        .await?;
     Ok(())
+}
+
+/// August, swept: the honest close every forgery below is one field away
+/// from. 25.00 of `fee_revenue` — the charge `post_one_charge` posted — moved
+/// to retained earnings, so the period's temporary positions are exactly zero
+/// at the close, which is what `close_does_not_sweep` asserts.
+fn an_honest_august_close<'a>(computed_at_xid: &'a str) -> AClose<'a> {
+    AClose {
+        period: "2026-08",
+        starts_at: "2026-08-01T00:00:00Z",
+        ends_at: "2026-09-01T00:00:00Z",
+        closes_at: "2026-08-31T00:00:00Z",
+        ids: "41",
+        computed_at_xid,
+        sweeps_minor: Some(2500),
+        recorded: true,
+        checkpointed: true,
+    }
 }
 
 // ---------------------------------------------------------------- controls
@@ -593,21 +706,29 @@ async fn a_single_posted_leg_breaks_the_equation_and_the_transaction_check() -> 
     Ok(())
 }
 
-/// A full, honest close — period, event, `period_close` transaction,
-/// balanced closing entries, cache advanced — whose stored close row names
-/// a cursor BELOW its own closing transaction's commit position:
+/// A full, honest close — period, event, `period_close` transaction, a real
+/// sweep of the period's revenue to retained earnings, cache advanced, and a
+/// checkpoint computed exactly as the sweep recomputes it — whose stored close
+/// row names a cursor BELOW its own closing transaction's commit position:
 /// `computed_at_xid = 1`. The composite FKs type everything else about a
 /// close declaratively; the cursor-to-commit relationship is the one
-/// property only the sweep holds (`recon_close_breaks`' own comment), and
-/// a cursor of 1 is exactly the forgery that makes the checkpoint check
-/// vacuously green — which is why it must be a break of its own.
+/// property only the sweep holds (`recon_close_breaks`' own comment).
+///
+/// TWO reasons, not one, and the pair is the point: at a cursor of 1 the
+/// checkpoint the close writes can see nothing but its own legs, so the
+/// period's revenue is NOT zero in it either. A cursor forged low and a
+/// period that did not sweep are the same forgery seen from two sides, and
+/// after ADR-0020 the sweep says so — where the shipped view said only that
+/// the cursor was low, and `checkpoint_drift` was vacuously green because a
+/// cursor of 1 admits no entries at all.
 #[tokio::test]
 async fn a_close_whose_cursor_precedes_it_is_a_close_typing_break() -> TestResult {
     let book = TestBook::new("reconcile_close_typing").await?;
-    let (receivable, revenue) = post_one_charge(&book).await?;
+    let (_receivable, revenue) = post_one_charge(&book).await?;
+    let retained = open_the_retained_earnings_account(&book).await?;
     book.assert_reconciled().await?;
 
-    close_the_august_period(&book, receivable, revenue, "'1'").await?;
+    close_the_period(&book, revenue, retained, &an_honest_august_close("'1'")).await?;
 
     book.wait_for_the_horizon_to_retire_this_book().await?;
     let (code, _stdout, stderr) = sweep(&book.db_url)?;
@@ -616,10 +737,18 @@ async fn a_close_whose_cursor_precedes_it_is_a_close_typing_break() -> TestResul
         stderr.contains("close_typing") && stderr.contains("breaks in 1 of 10 checks"),
         "the mis-cursored close must break close_typing alone; stderr was: {stderr}"
     );
-    let (reason,): (String,) = sqlx::query_as("SELECT reason FROM recon_close_breaks")
-        .fetch_one(&book.pool)
-        .await?;
-    assert_eq!(reason, "cursor_precedes_close");
+    let reasons: Vec<(String,)> =
+        sqlx::query_as("SELECT DISTINCT reason FROM recon_close_breaks ORDER BY 1")
+            .fetch_all(&book.pool)
+            .await?;
+    assert_eq!(
+        reasons,
+        [
+            ("close_does_not_sweep".to_owned(),),
+            ("cursor_precedes_close".to_owned(),)
+        ],
+        "a cursor forged below the close is also a checkpoint that did not sweep"
+    );
     Ok(())
 }
 
@@ -627,18 +756,27 @@ async fn a_close_whose_cursor_precedes_it_is_a_close_typing_break() -> TestResul
 /// "a checkpoint nothing reconciles is the balance_after column with
 /// better manners" (ADR-0011), and a close whose `ledger_period_balances`
 /// never landed is one the sweep must refuse to call closed. The recompute
-/// finds the charge's entries below the cursor and the stored side empty:
-/// one `missing_row` per account.
+/// finds the charge's entries AND the close's own legs — admitted by
+/// transaction identity since ADR-0020 — against an empty stored side: one
+/// `missing_row` per account.
+///
+/// `close_typing` stays green here on purpose: `close_does_not_sweep` reads
+/// the STORED rows, and there are none to disagree with. The absent
+/// checkpoint is `checkpoint_drift`'s to report, and a break counted twice is
+/// a break argued about twice (ADR-0010).
 #[tokio::test]
 async fn a_close_with_no_checkpoint_rows_is_a_checkpoint_drift_break() -> TestResult {
     let book = TestBook::new("reconcile_checkpoint").await?;
-    let (receivable, revenue) = post_one_charge(&book).await?;
+    let (_receivable, revenue) = post_one_charge(&book).await?;
+    let retained = open_the_retained_earnings_account(&book).await?;
     book.assert_reconciled().await?;
 
     // pg_current_xact_id() inside the same batch as the closing transaction
     // is that transaction's own xact_id, so recon_close_breaks stays quiet
     // and only the missing checkpoint speaks.
-    close_the_august_period(&book, receivable, revenue, "pg_current_xact_id()").await?;
+    let mut close = an_honest_august_close("pg_current_xact_id()");
+    close.checkpointed = false;
+    close_the_period(&book, revenue, retained, &close).await?;
 
     book.wait_for_the_horizon_to_retire_this_book().await?;
     let (code, _stdout, stderr) = sweep(&book.db_url)?;
@@ -656,6 +794,221 @@ async fn a_close_with_no_checkpoint_rows_is_a_checkpoint_drift_break() -> TestRe
         [("missing_row".to_owned(),)],
         "every break must be a checkpoint row that never landed"
     );
+    Ok(())
+}
+
+/// `computed_at_xid` was bounded from BELOW only (spike 025 F8): forged to
+/// 2^62 the close was green in the shipped view, and it silenced
+/// `close_disclosures` for that period entirely — while sitting under a
+/// TABLE-WIDE INSERT grant, unlike `ledger_entries.xact_id`, which a
+/// column-level grant withholds for the identical reason. The symmetric twin
+/// of the `computed_at_xid = 1` test above.
+///
+/// Everything else about this close is honest, and that is what makes it a
+/// clean single-reason red: at a cursor of 2^62 the checkpoint sees the whole
+/// book, so it IS the at-close position — `checkpoint_drift` and
+/// `close_does_not_sweep` are both correctly quiet, and the only thing wrong
+/// is a cursor that cannot have been captured.
+#[tokio::test]
+async fn a_close_whose_cursor_is_above_the_assigned_horizon_is_a_close_typing_break() -> TestResult
+{
+    let book = TestBook::new("reconcile_close_forged_high").await?;
+    let (_receivable, revenue) = post_one_charge(&book).await?;
+    let retained = open_the_retained_earnings_account(&book).await?;
+    book.assert_reconciled().await?;
+
+    close_the_period(
+        &book,
+        revenue,
+        retained,
+        &an_honest_august_close("'4611686018427387904'"),
+    )
+    .await?;
+
+    book.wait_for_the_horizon_to_retire_this_book().await?;
+    let (code, _stdout, stderr) = sweep(&book.db_url)?;
+    assert_eq!(code, Some(1), "a cursor above the horizon must exit 1");
+    assert!(
+        stderr.contains("close_typing") && stderr.contains("breaks in 1 of 10 checks"),
+        "the forged-high cursor must break close_typing alone; stderr was: {stderr}"
+    );
+    let reasons: Vec<(String,)> = sqlx::query_as("SELECT DISTINCT reason FROM recon_close_breaks")
+        .fetch_all(&book.pool)
+        .await?;
+    assert_eq!(reasons, [("cursor_above_assigned".to_owned(),)]);
+    Ok(())
+}
+
+/// Spike 025's MOST SEVERE finding, and a plain omission rather than an
+/// attack: an honest close — real sweep, balanced, cache advanced, dated
+/// inside the period — whose one `ledger_period_closes` INSERT was forgotten.
+/// `income_statement_for` excludes the closing transaction by key lookup into
+/// that table, so with no row the lookup finds nothing and the entry whose
+/// whole job is to zero revenue is counted as OPERATING ACTIVITY: the period
+/// reports 0.00 of revenue. Measured on the shipped schema with all ten
+/// checks green and `openledger reconcile` exiting 0.
+///
+/// It cannot be a key: the transaction is written BEFORE the close row, so a
+/// NOT NULL reference from the journal into the period record is unwritable
+/// in the order the close happens. `close_orphan` is the lint ADR-0004 admits
+/// for exactly that shape.
+#[tokio::test]
+async fn a_period_close_no_close_row_names_is_a_close_typing_break() -> TestResult {
+    let book = TestBook::new("reconcile_close_orphan").await?;
+    let (_receivable, revenue) = post_one_charge(&book).await?;
+    let retained = open_the_retained_earnings_account(&book).await?;
+    book.assert_reconciled().await?;
+
+    let mut close = an_honest_august_close("pg_current_xact_id()");
+    close.recorded = false;
+    close.checkpointed = false;
+    close_the_period(&book, revenue, retained, &close).await?;
+
+    book.wait_for_the_horizon_to_retire_this_book().await?;
+    let (code, _stdout, stderr) = sweep(&book.db_url)?;
+    assert_eq!(code, Some(1), "an unrecorded close must exit 1");
+    assert!(
+        stderr.contains("close_typing") && stderr.contains("breaks in 1 of 10 checks"),
+        "the unrecorded close must break close_typing alone; stderr was: {stderr}"
+    );
+    let reasons: Vec<(String,)> = sqlx::query_as("SELECT DISTINCT reason FROM recon_close_breaks")
+        .fetch_all(&book.pool)
+        .await?;
+    assert_eq!(reasons, [("close_orphan".to_owned(),)]);
+
+    // ...and the damage the check exists to name: 25.00 was earned in August
+    // and the income statement reports none of it, because the sweep is being
+    // read as operating activity.
+    let (journal_credits, reported_revenue): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT SUM(e.amount_minor)::bigint FROM ledger_entries e
+                  WHERE e.tenant_id = 't1' AND e.account_id = $1 AND e.direction = 'credit'),
+                (SELECT s.amount_minor::bigint
+                   FROM income_statement_for('t1', '2026-08-01T00:00:00Z',
+                                             '2026-09-01T00:00:00Z', report_cursor()) s
+                  WHERE s.fs_line = 'revenue')",
+    )
+    .bind(revenue)
+    .fetch_one(&book.pool)
+    .await?;
+    assert_eq!(
+        (journal_credits, reported_revenue),
+        (2500, 0),
+        "the journal earned 25.00 and the income statement reports 0.00"
+    );
+    Ok(())
+}
+
+/// A period in which no revenue and no expense moved has nothing to sweep, so
+/// its close writes a `period_close` transaction with ZERO ENTRIES — and
+/// `recon_transaction_breaks` flagged every entryless transaction as
+/// `no_entries`, the ADR-0004 TRUNCATE scar's class. Measured: a book that
+/// reconciles at ten zeros takes `openledger reconcile` to exit 1 the moment
+/// its one empty period is closed. Migration 00003 carved out the void;
+/// ADR-0020 gives the empty close the same narrow shape — zero entries AND
+/// kind = 'period_close' AND a close row naming it.
+///
+/// July, which is before the charge: nothing was earned, and nothing is
+/// effective before the period end either, so the checkpoint is legitimately
+/// empty too.
+#[tokio::test]
+async fn a_period_with_nothing_to_sweep_closes_clean() -> TestResult {
+    let book = TestBook::new("reconcile_empty_close").await?;
+    let (_receivable, revenue) = post_one_charge(&book).await?;
+    let retained = open_the_retained_earnings_account(&book).await?;
+    book.assert_reconciled().await?;
+
+    close_the_period(
+        &book,
+        revenue,
+        retained,
+        &AClose {
+            period: "2026-07",
+            starts_at: "2026-07-01T00:00:00Z",
+            ends_at: "2026-08-01T00:00:00Z",
+            closes_at: "2026-07-31T00:00:00Z",
+            ids: "47",
+            computed_at_xid: "pg_current_xact_id()",
+            sweeps_minor: None,
+            recorded: true,
+            checkpointed: true,
+        },
+    )
+    .await?;
+
+    // The close IS entryless, or this test is not about what it says it is.
+    let (legs,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(e.id) FROM ledger_transactions x
+         LEFT JOIN ledger_entries e ON e.tenant_id = x.tenant_id AND e.transaction_id = x.id
+         WHERE x.tenant_id = 't1' AND x.kind = 'period_close'",
+    )
+    .fetch_one(&book.pool)
+    .await?;
+    assert_eq!(legs, 0, "a period with nothing to sweep posts no legs");
+
+    book.assert_reconciled().await?;
+    let (code, stdout, stderr) = sweep(&book.db_url)?;
+    assert_eq!(
+        code,
+        Some(0),
+        "an empty period must be closeable (stderr: {stderr})"
+    );
+    assert!(stdout.contains("0 breaks"), "stdout was: {stdout}");
+    Ok(())
+}
+
+/// Out-of-order closes are LEGAL today — the shipped sweep reports zero breaks
+/// on them — and they are what makes the bounded checkpoint check unsound: it
+/// differences consecutive stored levels, and a difference of levels is only a
+/// difference of nested sets while the levels nest. Measured on a larger book:
+/// the level form reports 0 and the bounded form reports 3 false
+/// `value_drift` rows. The same invariant is what makes the at-close claim
+/// true, and what keeps `close_disclosures`' wide carve-out alive.
+///
+/// August is closed first and July after it, so July's cursor is HIGHER than
+/// August's while its period end is LOWER.
+#[tokio::test]
+async fn closes_written_out_of_period_order_are_a_close_typing_break() -> TestResult {
+    let book = TestBook::new("reconcile_close_order").await?;
+    let (_receivable, revenue) = post_one_charge(&book).await?;
+    let retained = open_the_retained_earnings_account(&book).await?;
+    book.assert_reconciled().await?;
+
+    close_the_period(
+        &book,
+        revenue,
+        retained,
+        &an_honest_august_close("pg_current_xact_id()"),
+    )
+    .await?;
+    close_the_period(
+        &book,
+        revenue,
+        retained,
+        &AClose {
+            period: "2026-07",
+            starts_at: "2026-07-01T00:00:00Z",
+            ends_at: "2026-08-01T00:00:00Z",
+            closes_at: "2026-07-31T00:00:00Z",
+            ids: "47",
+            computed_at_xid: "pg_current_xact_id()",
+            sweeps_minor: None,
+            recorded: true,
+            checkpointed: true,
+        },
+    )
+    .await?;
+
+    book.wait_for_the_horizon_to_retire_this_book().await?;
+    let (code, _stdout, stderr) = sweep(&book.db_url)?;
+    assert_eq!(code, Some(1), "closes out of order must exit 1");
+    assert!(
+        stderr.contains("close_typing") && stderr.contains("breaks in 1 of 10 checks"),
+        "the out-of-order close must break close_typing alone; stderr was: {stderr}"
+    );
+    let reasons: Vec<(String,)> = sqlx::query_as("SELECT DISTINCT reason FROM recon_close_breaks")
+        .fetch_all(&book.pool)
+        .await?;
+    assert_eq!(reasons, [("recon_close_order".to_owned(),)]);
     Ok(())
 }
 
@@ -971,12 +1324,18 @@ async fn a_write_smuggled_into_the_sweep_is_refused_by_the_read_only_transaction
 
 /// Sweeps spawned while a wave of API posts is landing must never read a
 /// mid-flight or freshly-committed posting as drift: a posting commits
-/// atomically, and the sweep's one SELECT sees all of it or none. One
-/// tolerance, and it is ADR-0010's own: a sweep whose snapshot catches
-/// entries above the cluster horizon may transiently report
-/// `cursor_forgery` (the quiescence assumption the clean tests wait out on
-/// purpose) — but never any OTHER check. After the wave, the same book
-/// sweeps clean.
+/// atomically, and the sweep's one SELECT sees all of it or none. EXIT 0,
+/// UNCONDITIONALLY — and that is stronger than this test used to be.
+///
+/// It used to tolerate a transient `cursor_forgery`, which was ADR-0010's
+/// quiescence assumption written down as an exception. Since ADR-0020 that
+/// exception does not exist: `recon_cursor_breaks` bounds an entry's xact_id
+/// by `pg_snapshot_xmax` rather than by the cluster's xmin horizon, and a row
+/// VISIBLE to the sweep's snapshot has committed, so its xact_id is at or
+/// below latestCompletedXid and strictly below xmax. There is no window in
+/// which an honest entry can be above the bound, so a mid-race red here is a
+/// real regression rather than a race — which is the whole reason the
+/// tolerance is gone.
 ///
 /// WHAT THIS DOES NOT PIN, on purpose: the `REPEATABLE READ` half of the
 /// sweep transaction. The sweep is one statement today, and one statement
@@ -1009,25 +1368,14 @@ async fn a_sweep_racing_live_writers_never_reads_them_as_drift() -> TestResult {
         // race under test.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let (code, _stdout, stderr) = sweep(&book.db_url)?;
-        if code == Some(1) {
-            for check in ALL_CHECKS.iter().filter(|c| **c != "cursor_forgery") {
-                assert!(
-                    !stderr.contains(check),
-                    "a sweep racing live writers reported {check} — a mid-flight \
-                     posting read as drift; stderr was: {stderr}"
-                );
-            }
-            assert!(
-                stderr.contains("cursor_forgery"),
-                "exit 1 mid-race can only be the horizon transient; stderr was: {stderr}"
-            );
-        } else {
-            assert_eq!(
-                code,
-                Some(0),
-                "mid-race sweep failed oddly; stderr: {stderr}"
-            );
-        }
+        // ALL_CHECKS is still read here, so a renamed check still fails the
+        // clean test above rather than making this message a lie.
+        assert_eq!(
+            code,
+            Some(0),
+            "a sweep racing live writers must be clean — none of {ALL_CHECKS:?} may \
+             read a mid-flight posting as drift; stderr was: {stderr}"
+        );
     }
 
     // Every racer landed...
