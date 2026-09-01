@@ -184,16 +184,7 @@ impl Queue {
         let tenant = head.command.tenant_id().to_owned();
         let mut batch = vec![head];
         if collects_company {
-            let mut position = 0;
-            while position < waiting.len() && batch.len() < ceiling {
-                let rides = waiting
-                    .get(position)
-                    .is_some_and(|waiter| rides_with_the_batch(&batch, &tenant, waiter));
-                match rides.then(|| waiting.remove(position)).flatten() {
-                    Some(waiter) => batch.push(waiter),
-                    None => position += 1,
-                }
-            }
+            collect_the_company_behind(&tenant, &mut batch, &mut waiting, ceiling);
         }
         self.hand_the_baton_on(&waiting);
         batch
@@ -217,6 +208,39 @@ impl Queue {
     fn hand_the_baton_on(&self, waiting: &VecDeque<Submission>) {
         if !waiting.is_empty() {
             self.arrived.notify_one();
+        }
+    }
+}
+
+/// Grow the head's batch out of the queue behind it, up to the ceiling: every
+/// waiter [`rides_with_the_batch`] admits is taken OUT of the queue and into
+/// the batch, and every waiter it does not is STEPPED OVER — the scan looks
+/// past a tenant it cannot carry rather than stopping at it, which is what
+/// keeps one tenant's head-of-line stall out of another's writes. What it
+/// steps over stays queued for the next dispatcher, which is what the baton
+/// wakes.
+fn collect_the_company_behind(
+    tenant: &str,
+    batch: &mut Vec<Submission>,
+    waiting: &mut VecDeque<Submission>,
+    ceiling: usize,
+) {
+    let mut position = 0;
+    while position < waiting.len() && batch.len() < ceiling {
+        let joins = waiting
+            .get(position)
+            .is_some_and(|waiter| rides_with_the_batch(batch, tenant, waiter));
+        if !joins {
+            position += 1;
+            continue;
+        }
+        // Taken from the position just tested, so the next waiter slides into
+        // it and `position` stays where it is. `remove` answers with the
+        // caller it took; an absence is impossible here — the position is in
+        // range — and is stepped over rather than spun on.
+        match waiting.remove(position) {
+            Some(joining) => batch.push(joining),
+            None => position += 1,
         }
     }
 }

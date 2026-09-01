@@ -249,53 +249,69 @@ where
         }
     };
     match state.ledger.post(&command).await {
-        Ok(posted) => {
-            // Replay re-renders the stored result; the caller told apart by the
-            // header and the code, not by a cached body (ADR-0013 §2).
-            let status = if posted.replayed {
-                StatusCode::OK
-            } else {
-                StatusCode::CREATED
-            };
-            let replayed = if posted.replayed { "true" } else { "false" };
-            (
-                status,
-                [(IDEMPOTENCY_REPLAYED, replayed)],
-                axum::Json(TransactionCreated {
-                    event_id: posted.event_id,
-                    transaction_id: posted.transaction_id,
-                }),
-            )
-                .into_response()
-        }
+        Ok(posted) => answer_the_stored_result(posted),
+        Err(refused) => refusal_for(refused),
+    }
+}
+
+/// The accepted answer, rendered from what the writer stored. The one decision
+/// here is 201-vs-200, and the `Idempotency-Replayed` header is read off the
+/// same flag, so the two cannot disagree: a replay re-renders the stored
+/// result, and the caller is told apart by the header and the code, not by a
+/// cached body (ADR-0013 §2).
+fn answer_the_stored_result(posted: ledger::Posted) -> Response {
+    let status = if posted.replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    let replayed = if posted.replayed { "true" } else { "false" };
+    (
+        status,
+        [(IDEMPOTENCY_REPLAYED, replayed)],
+        axum::Json(TransactionCreated {
+            event_id: posted.event_id,
+            transaction_id: posted.transaction_id,
+        }),
+    )
+        .into_response()
+}
+
+/// Every refusal the writer can produce here, on the wire — the whole table in
+/// one place, because the nine named `type`s ARE the domain and they are what
+/// the `#[utoipa::path]` responses above document. Exhaustive by construction:
+/// a new [`ledger::WriteError`] variant does not compile until it is named a
+/// `type` and given its prose.
+fn refusal_for(error: ledger::WriteError) -> Response {
+    match error {
         // 422, not 400 or 409: the caller must CHANGE the request to escape
         // (ADR-0013 §2 takes the IETF draft's split by what the client must do).
-        Err(ledger::WriteError::KeyReused) => refuse(
+        ledger::WriteError::KeyReused => refuse(
             StatusCode::UNPROCESSABLE_ENTITY,
             "idempotency_key_reused",
             "this idempotency key was already used by a request with a different body; \
              nothing was written — send a new key, or resend the original request unchanged"
                 .to_owned(),
         ),
-        Err(ledger::WriteError::AccountUnknown {
+        ledger::WriteError::AccountUnknown {
             account_id,
             currency,
-        }) => refuse(
+        } => refuse(
             StatusCode::UNPROCESSABLE_ENTITY,
             "account_unknown",
             format!("account {account_id} does not exist, or does not hold {currency}"),
         ),
-        Err(ledger::WriteError::Overflow) => refuse(
+        ledger::WriteError::Overflow => refuse(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_request",
             "the posting amounts overflow 64-bit minor units".to_owned(),
         ),
-        Err(ledger::WriteError::ResolveTargetUnknown { resolves_id }) => refuse(
+        ledger::WriteError::ResolveTargetUnknown { resolves_id } => refuse(
             StatusCode::UNPROCESSABLE_ENTITY,
             "resolve_target_unknown",
             format!("resolves_id {resolves_id} names no transaction on this tenant's book"),
         ),
-        Err(ledger::WriteError::ResolveTargetNotPending { resolves_id }) => refuse(
+        ledger::WriteError::ResolveTargetNotPending { resolves_id } => refuse(
             StatusCode::UNPROCESSABLE_ENTITY,
             "resolve_target_not_pending",
             format!(
@@ -303,12 +319,12 @@ where
                  resolved, and its status never mutates"
             ),
         ),
-        Err(ledger::WriteError::ReverseTargetUnknown { reverses_id }) => refuse(
+        ledger::WriteError::ReverseTargetUnknown { reverses_id } => refuse(
             StatusCode::UNPROCESSABLE_ENTITY,
             "reverse_target_unknown",
             format!("reverses_id {reverses_id} names no transaction on this tenant's book"),
         ),
-        Err(ledger::WriteError::ReverseTargetNotReversible { reverses_id }) => refuse(
+        ledger::WriteError::ReverseTargetNotReversible { reverses_id } => refuse(
             StatusCode::UNPROCESSABLE_ENTITY,
             "reverse_target_not_reversible",
             format!(
@@ -317,7 +333,7 @@ where
                  mistaken correction is a fresh posting"
             ),
         ),
-        Err(ledger::WriteError::TargetAlreadySuperseded { transaction_id }) => refuse(
+        ledger::WriteError::TargetAlreadySuperseded { transaction_id } => refuse(
             StatusCode::UNPROCESSABLE_ENTITY,
             "target_already_superseded",
             format!(
@@ -329,7 +345,7 @@ where
         // internals, the operator's log gets the difference — a storage
         // failure reads as the backend's error, an Internal as the writer
         // naming its own can't-happen state.
-        Err(ledger::WriteError::Storage(e)) => {
+        ledger::WriteError::Storage(e) => {
             eprintln!("openledger: write failed: {e}");
             refuse(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -337,7 +353,7 @@ where
                 "the write failed; nothing was committed".to_owned(),
             )
         }
-        Err(ledger::WriteError::Internal(detail)) => {
+        ledger::WriteError::Internal(detail) => {
             eprintln!("openledger: write failed: {detail}");
             refuse(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -352,7 +368,14 @@ fn to_command(body: TransactionBody) -> Result<ledger::PostTransaction, ledger::
     let postings = body
         .postings
         .into_iter()
-        .map(|p| ledger::Posting::new(p.source, p.destination, p.amount_minor, p.currency))
+        .map(|posting| {
+            ledger::Posting::new(
+                posting.source,
+                posting.destination,
+                posting.amount_minor,
+                posting.currency,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     // Omitted means posted — the wire's default is decided here, at the
     // boundary, so the domain constructor never sees an absence.

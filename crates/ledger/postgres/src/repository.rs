@@ -978,6 +978,35 @@ fn collect_balance_upserts(rows: Vec<ClaimedRow>) -> Vec<BalanceUpsert> {
         .collect()
 }
 
+/// What [`CLAIM_AND_APPEND`]'s rows MEAN — the single path's interpretation,
+/// the way [`outcome_for_member`] is the batched path's. Zero rows back means
+/// the key was already claimed and none of the append ran: the answer anchors
+/// on the CLAIMED row, so a zero-delta void is still rows back and is never
+/// mistaken for a replay. A `NULL` transaction id means the supersede gate
+/// refused, and the refusal is named from the target columns the statement
+/// carried back ([`diagnose_supersede_refusal`]). Otherwise the append
+/// happened, uncommitted, and the rows carry each delta's counter
+/// ([`collect_balance_upserts`]).
+fn claimed_from_the_rows(
+    command: &PostTransaction,
+    rows: Vec<ClaimedRow>,
+) -> Result<Option<Claimed>, StorageError> {
+    let Some(first) = rows.first() else {
+        return Ok(None);
+    };
+    let event_id = first.event_id;
+    let Some(transaction_id) = first.transaction_id else {
+        return Ok(Some(Claimed::SupersessionRefused(
+            diagnose_supersede_refusal(command, first)?,
+        )));
+    };
+    Ok(Some(Claimed::Appended(Appended {
+        event_id,
+        transaction_id,
+        balance_upserts: collect_balance_upserts(rows),
+    })))
+}
+
 /// The batch carries plain POSTED postings only (ADR-0018 §4), and this is
 /// where that scope is enforced rather than assumed. A pending, resolving or
 /// reversing command belongs on [`CLAIM_AND_APPEND`], which has the supersede
@@ -1088,20 +1117,17 @@ impl Repository for PgRepository {
     /// movement, and a reversal's plan is EMPTY, the statement deriving the
     /// mirror or the void from the target): marshal the plan into the
     /// parallel arrays [`CLAIM_AND_APPEND`] binds, run the one statement,
-    /// read its answer. This writer's stripe affinity rides along as the
-    /// last bind and the statement picks the stripe from it — once, for the
-    /// whole coalesced set (ADR-0018 §1); the port's `BalanceUpsert` never
-    /// learns of it, because the service's only two questions are whether
-    /// every delta came back and whether any counter came back `None`, and
-    /// neither needs a stripe. Zero rows back means the key was already claimed
-    /// and none of the append ran — the answer anchors on the claimed row,
-    /// so a zero-delta void is still rows back, never mistaken for a
-    /// replay; a `NULL` transaction id means the supersede gate refused
-    /// ([`diagnose_supersede_refusal`]); a unique violation on the
-    /// supersession index is the race's refusal
-    /// ([`refusal_from_supersession_race`]); otherwise the append happened,
-    /// uncommitted, and the rows carry each delta's counter
-    /// ([`collect_balance_upserts`]).
+    /// and interpret its answer ([`claimed_from_the_rows`]) — except the one
+    /// answer that arrives as an ERROR rather than as rows: a unique violation
+    /// on the supersession index is the race's refusal
+    /// ([`refusal_from_supersession_race`]), classified here where the
+    /// `sqlx::Error` is.
+    ///
+    /// This writer's stripe affinity rides along as the last bind and the
+    /// statement picks the stripe from it — once, for the whole coalesced set
+    /// (ADR-0018 §1); the port's `BalanceUpsert` never learns of it, because
+    /// the service's only two questions are whether every delta came back and
+    /// whether any counter came back `None`, and neither needs a stripe.
     async fn claim_and_append(
         &self,
         tx: &mut Self::Tx,
@@ -1143,20 +1169,7 @@ impl Repository for PgRepository {
                 };
             }
         };
-        let Some(first) = rows.first() else {
-            return Ok(None);
-        };
-        let event_id = first.event_id;
-        let Some(transaction_id) = first.transaction_id else {
-            return Ok(Some(Claimed::SupersessionRefused(
-                diagnose_supersede_refusal(command, first)?,
-            )));
-        };
-        Ok(Some(Claimed::Appended(Appended {
-            event_id,
-            transaction_id,
-            balance_upserts: collect_balance_upserts(rows),
-        })))
+        claimed_from_the_rows(command, rows)
     }
 
     /// Statement A, batched (ADR-0018 §3): refuse anything the batch cannot

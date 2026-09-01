@@ -40,48 +40,9 @@ use crate::Database;
 /// deliberately database-free (migrate.rs's test module states why).
 pub async fn verify_schema_is_current(database: &Database) -> Result<(), String> {
     let pool = database.pool();
-    // With a lazy pool this SELECT is also the first real connection, so an
-    // unreachable database surfaces here, once, with its own message —
-    // instead of at pool construction.
-    let (migrated,): (bool,) = sqlx::query_as("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
-        .fetch_one(pool)
-        .await
-        .map_err(|e| format!("could not read the schema state: {e}"))?;
-    if !migrated {
-        return Err(
-            "this database has never been migrated (no _sqlx_migrations table). \
-             Run `openledger migrate` first — the serving process never migrates \
-             (ADR-0003)."
-                .to_owned(),
-        );
-    }
-
-    let applied: Vec<(i64, Vec<u8>)> = sqlx::query_as(
-        "SELECT version, checksum FROM _sqlx_migrations WHERE success ORDER BY version",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| format!("could not read the applied migrations: {e}"))?;
-
-    // The versions and checksums this binary carries, from the same macro
-    // `migrate` runs.
-    let mut missing: Vec<String> = Vec::new();
-    let mut mismatched: Vec<String> = Vec::new();
-    for migration in sqlx::migrate!("../../migrations")
-        .iter()
-        .filter(|m| !m.migration_type.is_down_migration())
-    {
-        match applied
-            .iter()
-            .find(|(version, _)| *version == migration.version)
-        {
-            None => missing.push(migration.version.to_string()),
-            Some((_, checksum)) if checksum.as_slice() != migration.checksum.as_ref() => {
-                mismatched.push(migration.version.to_string());
-            }
-            Some(_) => {}
-        }
-    }
+    refuse_an_unmigrated_database(pool).await?;
+    let applied = applied_migration_checksums(pool).await?;
+    let (missing, mismatched) = drift_from_the_embedded_migrations(&applied);
 
     if !missing.is_empty() {
         return Err(format!(
@@ -102,4 +63,143 @@ pub async fn verify_schema_is_current(database: &Database) -> Result<(), String>
         ));
     }
     Ok(())
+}
+
+/// The first of the three failures: a database the migration job never
+/// reached at all. With a lazy pool this SELECT is also the first real
+/// connection, so an unreachable database surfaces here, once, with its own
+/// message — instead of at pool construction.
+async fn refuse_an_unmigrated_database(pool: &sqlx::PgPool) -> Result<(), String> {
+    let (migrated,): (bool,) = sqlx::query_as("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("could not read the schema state: {e}"))?;
+    if !migrated {
+        return Err(
+            "this database has never been migrated (no _sqlx_migrations table). \
+             Run `openledger migrate` first — the serving process never migrates \
+             (ADR-0003)."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// One `_sqlx_migrations` row as this check reads it: the version, and the
+/// checksum of the file that was actually applied.
+type AppliedRow = (i64, Vec<u8>);
+
+/// What the database says it applied: version and checksum for every
+/// SUCCESSFUL row, in version order. `success` is sqlx's own flag — a row for
+/// a migration that failed mid-run is not something this binary may serve on.
+async fn applied_migration_checksums(pool: &sqlx::PgPool) -> Result<Vec<AppliedRow>, String> {
+    sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations WHERE success ORDER BY version")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("could not read the applied migrations: {e}"))
+}
+
+/// The comparison, and the only part of this check with a rule in it: what the
+/// binary embeds, against what the database applied. Two lists back — versions
+/// the database is MISSING, and versions whose applied checksum DIFFERS from
+/// the embedded copy. Applied versions this binary does not embed are ignored,
+/// which is the rolling-restart tolerance the doc above promises.
+///
+/// Pure, and deliberately: the embedded set comes from the same
+/// `sqlx::migrate!` macro `migrate` runs, so this is testable with no database
+/// in the room.
+fn drift_from_the_embedded_migrations(applied: &[AppliedRow]) -> (Vec<String>, Vec<String>) {
+    let mut missing: Vec<String> = Vec::new();
+    let mut mismatched: Vec<String> = Vec::new();
+    for migration in sqlx::migrate!("../../migrations")
+        .iter()
+        .filter(|m| !m.migration_type.is_down_migration())
+    {
+        match applied
+            .iter()
+            .find(|(version, _)| *version == migration.version)
+        {
+            None => missing.push(migration.version.to_string()),
+            Some((_, checksum)) if checksum.as_slice() != migration.checksum.as_ref() => {
+                mismatched.push(migration.version.to_string());
+            }
+            Some(_) => {}
+        }
+    }
+    (missing, mismatched)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The comparison walk, held against the migration set `sqlx::migrate!`
+    //! compiles into this binary — no database in the room, the same way
+    //! migrate.rs's tests state it. What the two SELECTs above see is held end
+    //! to end instead (`crates/e2e/tests/e2e/startup.rs`); what the walk MEANS
+    //! is held here, because it is the half with the rule in it.
+
+    use super::{AppliedRow, drift_from_the_embedded_migrations};
+
+    /// Every migration this binary embeds, rendered as the rows a database
+    /// that applied all of them would return.
+    fn a_database_that_applied_all_of_them() -> Vec<AppliedRow> {
+        sqlx::migrate!("../../migrations")
+            .iter()
+            .filter(|m| !m.migration_type.is_down_migration())
+            .map(|m| (m.version, m.checksum.to_vec()))
+            .collect()
+    }
+
+    /// The same checksum, no longer the same file: one byte longer is enough
+    /// to be a different sum, and it is what a database migrated from a file
+    /// that predates the baseline freeze looks like from here.
+    fn a_different_checksum(mut checksum: Vec<u8>) -> Vec<u8> {
+        checksum.push(0);
+        checksum
+    }
+
+    #[test]
+    fn a_database_holding_every_embedded_migration_has_drifted_in_neither_direction() {
+        let applied = a_database_that_applied_all_of_them();
+
+        let (missing, mismatched) = drift_from_the_embedded_migrations(&applied);
+
+        assert!(
+            missing.is_empty() && mismatched.is_empty(),
+            "an up-to-date database reported missing {missing:?} and mismatched {mismatched:?}"
+        );
+    }
+
+    #[test]
+    fn an_applied_migration_whose_checksum_differs_is_mismatched_and_never_missing() {
+        let tampered: Vec<AppliedRow> = a_database_that_applied_all_of_them()
+            .into_iter()
+            .map(|(version, checksum)| (version, a_different_checksum(checksum)))
+            .collect();
+        let every_version: Vec<String> = tampered
+            .iter()
+            .map(|(version, _)| version.to_string())
+            .collect();
+
+        let (missing, mismatched) = drift_from_the_embedded_migrations(&tampered);
+
+        // The dangerous branch: the row IS there, so nothing is missing —
+        // reporting it as missing would send the operator to `migrate` for a
+        // disagreement `migrate` will refuse.
+        assert!(missing.is_empty(), "a present row reported as missing");
+        assert_eq!(mismatched, every_version);
+    }
+
+    #[test]
+    fn an_embedded_migration_the_database_never_applied_is_missing_and_never_mismatched() {
+        let mut applied = a_database_that_applied_all_of_them();
+        let never_applied = applied.pop().map(|(version, _)| version.to_string());
+
+        let (missing, mismatched) = drift_from_the_embedded_migrations(&applied);
+
+        assert_eq!(missing, Vec::from_iter(never_applied));
+        assert!(
+            mismatched.is_empty(),
+            "an absent row reported as a checksum mismatch"
+        );
+    }
 }

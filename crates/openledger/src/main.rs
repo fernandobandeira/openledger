@@ -15,9 +15,9 @@
 //! defines 1, 2 and 3, and the only reason `main` handles `clap`'s errors
 //! separately is to keep a usage error at 2 whether it came from `clap` or
 //! from us. What is left in this file is exactly the seam: parse, dispatch,
-//! map to an exit code — and the composition root in `dispatch`, the one
-//! place the Postgres repository is wired into the writer service, and the
-//! service into the api router as its `Ledger`.
+//! map to an exit code — and, beside it, the composition root in
+//! `serve_the_api`, the one place the Postgres repository is wired into the
+//! writer service, and the service into the api router as its `Ledger`.
 //!
 //! Beside it, since ADR-0018, is `batching` — the accumulator's machinery:
 //! the queue, the dispatcher pool and the permit each dispatcher's turn is.
@@ -112,45 +112,53 @@ fn dispatch(cli: Cli) -> Result<(), Failure> {
         }
         Some(Command::Serve { database_url, bind }) => {
             let database_url = require_database_url(database_url)?;
-            // The composition root: this is the one place the Postgres
-            // repository is chosen as the writer service's storage, and the
-            // service as the api router's `Ledger`. The api crate never sees
-            // the pool — it takes the port; the pool's sizing lives in db —
-            // and this crate never names an sqlx type: the repository takes
-            // `db::Database`, which is what lets deny.toml refuse sqlx here.
-            block_on(async {
-                // Lazy, so nothing has connected yet: a malformed URL is the
-                // only failure here, and it is a usage error.
-                let database = db::Database::connect_lazy(&database_url).map_err(|e| {
-                    Failure::Usage(format!("could not parse the database URL: {e}"))
-                })?;
-                // The startup gate, before anything binds or listens: an
-                // unmigrated or behind database is exit 1 with the remedy
-                // (`openledger migrate`) in the message — not a server that
-                // fails its first query at runtime. Lock-free; ADR-0003's
-                // "the ledger process never migrates" is why it can be.
-                db::verify_schema_is_current(&database)
-                    .await
-                    .map_err(Failure::Failed)?;
-                // The writer pool: one writer per dispatcher, each striping
-                // on the index it will hold for its lifetime (ADR-0018 §1 —
-                // a single writer holding a single affinity puts every write
-                // for one account on one stripe, and striping then buys
-                // nothing).
-                let writers = (0..batching::DISPATCHERS)
-                    .map(|index| {
-                        ledger::LedgerService::new(ledger_postgres::PgRepository::for_writer(
-                            &database,
-                            index as u32,
-                        ))
-                    })
-                    .collect();
-                api::run(batching::BatchingLedger::dispatching_over(writers), bind)
-                    .await
-                    .map_err(Failure::from)
-            })
+            block_on(serve_the_api(&database_url, bind))
         }
     }
+}
+
+/// The composition root: this is the one place the Postgres repository is
+/// chosen as the writer service's storage, and the service as the api router's
+/// `Ledger`. The api crate never sees the pool — it takes the port; the pool's
+/// sizing lives in db — and this crate never names an sqlx type: the
+/// repository takes `db::Database`, which is what lets deny.toml refuse sqlx
+/// here. The startup gate runs before anything binds; after that this returns
+/// only when serving stops.
+async fn serve_the_api(database_url: &str, bind: std::net::SocketAddr) -> Result<(), Failure> {
+    // Lazy, so nothing has connected yet: a malformed URL is the only failure
+    // here, and it is a usage error.
+    let database = db::Database::connect_lazy(database_url)
+        .map_err(|e| Failure::Usage(format!("could not parse the database URL: {e}")))?;
+    // The startup gate, before anything binds or listens: an unmigrated or
+    // behind database is exit 1 with the remedy (`openledger migrate`) in the
+    // message — not a server that fails its first query at runtime. Lock-free;
+    // ADR-0003's "the ledger process never migrates" is why it can be.
+    db::verify_schema_is_current(&database)
+        .await
+        .map_err(Failure::Failed)?;
+    let writers = one_writer_per_dispatcher(&database);
+    api::run(batching::BatchingLedger::dispatching_over(writers), bind)
+        .await
+        .map_err(Failure::from)
+}
+
+/// The writer pool: one writer per dispatcher, each striping on the index it
+/// will hold for its lifetime. The index is the writer's for good because
+/// worker affinity is the property of being CONSTANT for one writer and
+/// different between concurrent ones (ADR-0018 §1) — a single writer holding a
+/// single affinity would put every write for one account on one stripe, and
+/// striping would then buy nothing.
+fn one_writer_per_dispatcher(
+    database: &db::Database,
+) -> Vec<ledger::LedgerService<ledger_postgres::PgRepository>> {
+    (0..batching::DISPATCHERS)
+        .map(|index| {
+            ledger::LedgerService::new(ledger_postgres::PgRepository::for_writer(
+                database,
+                index as u32,
+            ))
+        })
+        .collect()
 }
 
 /// One current-thread runtime, built by hand rather than by `#[tokio::main]`,

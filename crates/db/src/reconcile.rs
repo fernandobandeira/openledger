@@ -67,16 +67,7 @@ pub async fn run(database_url: &str) -> Result<(), ReconcileError> {
     let _ = conn.close().await;
     let checks = checks?;
 
-    if checks.len() != EXPECTED_CHECKS {
-        return Err(ReconcileError::Failed(format!(
-            "the reconciliation view returned {} check(s) where this binary expects \
-             {EXPECTED_CHECKS} — a summary missing a check is silence read as assent \
-             (ADR-0010). The schema and this binary disagree; run `openledger migrate` \
-             with the binary that owns this database's schema before trusting a sweep.",
-            checks.len()
-        )));
-    }
-
+    refuse_a_summary_missing_a_check(&checks)?;
     refuse_drift(&checks)?;
 
     say(&format!(
@@ -141,6 +132,24 @@ async fn sweep_in_one_snapshot(
         ReconcileError::Failed(format!("could not close the sweep transaction: {e}"))
     })?;
     Ok(checks)
+}
+
+/// One row per check, or the sweep is not a book. A summary short of a check
+/// is ADR-0010's "silence read as assent" — a check that returned nothing
+/// because it was never run is indistinguishable from one that passed — so the
+/// count is refused before the numbers are believed, and the message names
+/// which side to fix.
+fn refuse_a_summary_missing_a_check(checks: &[(String, i64)]) -> Result<(), ReconcileError> {
+    if checks.len() != EXPECTED_CHECKS {
+        return Err(ReconcileError::Failed(format!(
+            "the reconciliation view returned {} check(s) where this binary expects \
+             {EXPECTED_CHECKS} — a summary missing a check is silence read as assent \
+             (ADR-0010). The schema and this binary disagree; run `openledger migrate` \
+             with the binary that owns this database's schema before trusting a sweep.",
+            checks.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Zero breaks on every check passes; anything else is `Drift`, with every
