@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { GetAccountBalanceData, GetAccountBalanceErrors, GetAccountBalanceResponses, GetBalanceSheetData, GetBalanceSheetErrors, GetBalanceSheetResponses, GetIncomeStatementData, GetIncomeStatementErrors, GetIncomeStatementResponses, GetTransactionData, GetTransactionErrors, GetTransactionResponses, GetTrialBalanceData, GetTrialBalanceErrors, GetTrialBalanceResponses, ListAccountsData, ListAccountsErrors, ListAccountsResponses, OpenAccountData, OpenAccountErrors, OpenAccountResponses, PostTransactionData, PostTransactionErrors, PostTransactionResponses } from './types.gen';
+import type { GetAccountBalanceData, GetAccountBalanceErrors, GetAccountBalanceResponses, GetBalanceSheetData, GetBalanceSheetErrors, GetBalanceSheetResponses, GetCursorData, GetCursorErrors, GetCursorResponses, GetIncomeStatementData, GetIncomeStatementErrors, GetIncomeStatementResponses, GetTransactionData, GetTransactionErrors, GetTransactionResponses, GetTrialBalanceData, GetTrialBalanceErrors, GetTrialBalanceResponses, ListAccountsData, ListAccountsErrors, ListAccountsResponses, OpenAccountData, OpenAccountErrors, OpenAccountResponses, PostTransactionData, PostTransactionErrors, PostTransactionResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -59,6 +59,19 @@ export const openAccount = <ThrowOnError extends boolean = false>(options: Optio
  * balance next door.
  */
 export const getAccountBalance = <ThrowOnError extends boolean = false>(options: Options<GetAccountBalanceData, ThrowOnError>): RequestResult<GetAccountBalanceResponses, GetAccountBalanceErrors, ThrowOnError> => (options.client ?? client).get<GetAccountBalanceResponses, GetAccountBalanceErrors, ThrowOnError>({ url: '/v1/accounts/{account_id}/balance', ...options });
+
+/**
+ * Read the commit horizon.
+ *
+ * **ADR-0019 refused a cursor-minting endpoint** — *"every report already
+ * returns the cursor it used"* — and that refusal is qualified rather than
+ * contradicted here: it is true, and it is what made asking for the horizon
+ * ALONE cost a whole report. A dashboard refreshing it issues a trial balance
+ * over `0001-01-01`…`9999-12-31` for one scalar, which on a large book is the
+ * ~28-second query ADR-0019's own cost list records. One statement answers
+ * the same value, on the same read path, under the same bracket.
+ */
+export const getCursor = <ThrowOnError extends boolean = false>(options: Options<GetCursorData, ThrowOnError>): RequestResult<GetCursorResponses, GetCursorErrors, ThrowOnError> => (options.client ?? client).get<GetCursorResponses, GetCursorErrors, ThrowOnError>({ url: '/v1/cursor', ...options });
 
 /**
  * Read the balance-sheet face as at one instant.

@@ -73,14 +73,20 @@ which is what keeps `refused` meaning *the ledger refused*.
 1. **The horizon mark advances only on a report answered without a supplied
    cursor** (plus an explicit refresh, and after a successful write). A report
    re-run *at* a pin returns that pin as its `pinned_cursor`, so taking every
-   answer at face value drags the horizon backwards.
+   answer at face value drags the horizon backwards. The explicit refresh is
+   `GET /v1/cursor` — one statement, not a report over the widest range.
 2. **Report panels never auto-fill their inputs from the last answer.** Pin the
    cursor, then re-run at it: both are things you do on purpose.
 
 ## Money
 
-A report amount is an exact-integer decimal **string** and can exceed 2^53, so
-nothing in `src/lib/amount.ts` goes near `Number` — formatting is string
-surgery and subtotals are `BigInt`. A single posting or entry amount is a JSON
-number bounded by its own column; that asymmetry is ADR-0019's, and the one
-place it bites is marked in the UI rather than smoothed over.
+**Every** amount on the wire is an exact-integer decimal **string** — a report
+total, a posting on the way in, an entry on the way out (ADR-0022). A `bigint`
+column reaches far past 2^53 and JSON has no integer type, so nothing in
+`src/lib/amount.ts` goes near `Number`: formatting is string surgery and
+subtotals are `BigInt`.
+
+The posting form applies the API's own grammar before sending — `-?[0-9]+`,
+then the `i64` range, then strictly positive — and says so in the API's own
+words, so `25.00` and `2,500` never leave the page. A refusal that does come
+back is still rendered verbatim, `type` and `detail` unedited.

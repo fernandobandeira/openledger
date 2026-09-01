@@ -24,6 +24,7 @@ import type {
   ErrorBody,
   GetAccountBalanceData,
   GetBalanceSheetData,
+  GetCursorData,
   GetIncomeStatementData,
   GetTransactionData,
   GetTrialBalanceData,
@@ -38,6 +39,7 @@ export type {
   AccountCreated,
   AccountListRead,
   AccountRead,
+  CursorRead,
   EntryRead,
   ErrorBody,
   PostingBody,
@@ -59,6 +61,7 @@ export type Status = generated.StatusBody;
 // than restated. Every one of these is required on the wire (`tenant_id`
 // alone makes it so), so none needs unwrapping.
 export type ListAccountsQuery = ListAccountsData["query"];
+export type CursorQuery = GetCursorData["query"];
 export type AccountBalanceQuery = GetAccountBalanceData["query"];
 export type TransactionQuery = GetTransactionData["query"];
 export type TrialBalanceQuery = GetTrialBalanceData["query"];
@@ -201,7 +204,7 @@ export function replayedHeader(headers: Headers): boolean | null {
   return null;
 }
 
-/* ---- the eight routes ---------------------------------------------------- */
+/* ---- the nine routes ----------------------------------------------------- */
 
 export function openAccount(
   body: generated.AccountBody
@@ -285,4 +288,17 @@ export function runIncomeStatement(
       query: withoutBlanks(query),
     })
   );
+}
+
+/**
+ * The commit horizon on its own, without running a report.
+ *
+ * `tenant_id` is required for the scoping every other read has, and the
+ * horizon it answers is the CLUSTER's — `report_cursor()` is
+ * `pg_snapshot_xmin`, so every book is told the same number (ADR-0022).
+ */
+export function readCursor(
+  query: CursorQuery
+): Promise<Answer<generated.CursorRead>> {
+  return answerFrom(generated.getCursor({ client: throughTheProxy, query }));
 }

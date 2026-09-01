@@ -7,34 +7,25 @@ import { cn } from "@/lib/utils";
  * dashboard's assumption, said out loud in the footer — so the unrounded
  * integer has to stay reachable, and `title` is where it lives.
  *
- * `exact={false}` marks a figure that was already imprecise when it arrived:
- * an entry amount is a JSON number over a `bigint` column, so a leg above 2^53
- * is rounded by `JSON.parse` before any code here runs.
+ * Every amount this renders arrived as an exact-integer decimal string, an
+ * entry's as much as a report total's (ADR-0022), so there is no such thing
+ * here as a figure that was already imprecise when it landed.
  */
 export function Amount({
   minor,
   currency,
-  exact = true,
   className,
 }: {
   minor: string;
   currency?: string;
-  exact?: boolean;
   className?: string;
 }) {
   const unit = currency ? `${currency} minor units` : "minor units";
-  const title = exact
-    ? `${minor} ${unit}`
-    : `${minor} ${unit} — outside the exact-integer range of a JSON number, so this value was already rounded by the parser`;
 
   return (
     <span
-      className={cn(
-        "font-mono tabular-nums",
-        !exact && "text-credit underline decoration-dotted underline-offset-2",
-        className
-      )}
-      title={title}
+      className={cn("font-mono tabular-nums", className)}
+      title={`${minor} ${unit}`}
     >
       {formatMinor(minor)}
     </span>

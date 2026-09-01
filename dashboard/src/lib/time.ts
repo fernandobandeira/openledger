@@ -9,10 +9,6 @@
  * RFC 3339 instant that will be sent.
  */
 
-/** The widest range the reports accept — used by the horizon probe. */
-export const EARLIEST = "0001-01-01T00:00:00Z";
-export const LATEST = "9999-12-31T23:59:59Z";
-
 /** Local wall time from a `datetime-local` input → an RFC 3339 UTC instant. */
 export function toInstant(local: string): string | null {
   if (local.trim() === "") return null;

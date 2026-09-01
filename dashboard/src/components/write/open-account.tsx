@@ -9,7 +9,6 @@ import { Identifier, Mono } from "@/components/mono";
 import { Panel, PanelNote } from "@/components/panel";
 import { Button } from "@/components/ui/button";
 import {
-  listAccounts,
   openAccount,
   replayedHeader,
   type AccountBody,
@@ -36,10 +35,10 @@ function freshKey(): string {
  * no fields for those three, because a body that stated them would earn a
  * foreign-key error instead of an answer (ADR-0021).
  *
- * The derived triple is NOT in the opening response, which carries two ids and
- * nothing else. So the panel reads the account back from `GET /v1/accounts`
- * and shows what the server decided; that second call is labelled where it
- * happens rather than hidden.
+ * The answer carries the whole account (ADR-0022), so what the server derived
+ * is on screen from the response this panel already has: one request, no
+ * listing, no client-side scan. The `200` that replays the key re-renders the
+ * identical account.
  */
 export function OpenAccount({
   tenant,
@@ -59,8 +58,6 @@ export function OpenAccount({
   const [busy, setBusy] = useState(false);
   const [answer, setAnswer] = useState<Answer<AccountCreated> | null>(null);
   const [replayed, setReplayed] = useState<boolean | null>(null);
-  const [derived, setDerived] = useState<AccountRead | null>(null);
-  const [derivedMissing, setDerivedMissing] = useState<string | null>(null);
   const [badMetadata, setBadMetadata] = useState<string | null>(null);
 
   async function submit() {
@@ -70,8 +67,6 @@ export function OpenAccount({
     const key = idempotencyKey.trim() === "" ? freshKey() : idempotencyKey.trim();
     setIdempotencyKey(key);
     setBusy(true);
-    setDerived(null);
-    setDerivedMissing(null);
     setBadMetadata(null);
 
     let parsedMetadata: unknown;
@@ -109,33 +104,8 @@ export function OpenAccount({
 
     if (result.outcome === "answered") {
       onOpened();
-      await readBackWhatTheServerDerived(result.body.account_id);
     }
     setBusy(false);
-  }
-
-  async function readBackWhatTheServerDerived(accountId: string) {
-    const page = await listAccounts({
-      tenant_id: tenant,
-      purpose,
-      limit: 1000,
-    });
-    if (page.outcome !== "answered") {
-      setDerivedMissing(
-        "The read-back listing did not answer, so the derived triple is not shown."
-      );
-      return;
-    }
-    const found = page.body.accounts.find(
-      (account) => account.account_id === accountId
-    );
-    if (found) {
-      setDerived(found);
-    } else {
-      setDerivedMissing(
-        "The account is not on the first 1000 rows for this purpose. There is no GET /v1/accounts/{id}, so the register has to be paged to find it."
-      );
-    }
   }
 
   return (
@@ -185,7 +155,7 @@ export function OpenAccount({
           value={metadata}
           onChange={setMetadata}
           placeholder={`{"note":"opened from the dashboard"}`}
-          hint="Your own JSON object, stored as given. Optional."
+          hint="Your own JSON object, stored as given. Optional — it comes back in the answer and in the register."
         />
       </div>
 
@@ -233,18 +203,16 @@ export function OpenAccount({
           <dl className="mt-2 grid gap-x-4 gap-y-1 text-[0.75rem] sm:grid-cols-[8rem_1fr]">
             <dt className="text-dim">account_id</dt>
             <dd>
-              <Identifier value={answer.body.account_id} />
+              <Identifier value={answer.body.account.account_id} />
             </dd>
             <dt className="text-dim">event_id</dt>
             <dd>
               <Identifier value={answer.body.event_id} />
             </dd>
           </dl>
+          <TheAccountItOpened account={answer.body.account} />
         </WriteOutcome>
       ) : null}
-
-      {derived ? <DerivedTriple account={derived} /> : null}
-      {derivedMissing ? <PanelNote>{derivedMissing}</PanelNote> : null}
 
       <PanelNote>
         Opening an account writes an event and no ledger transaction — the case
@@ -255,15 +223,18 @@ export function OpenAccount({
   );
 }
 
-/** What the caller did NOT send, and the server worked out from the chart. */
-function DerivedTriple({ account }: { account: AccountRead }) {
+/** The account the answer carried — what the caller sent, and what it did not. */
+function TheAccountItOpened({ account }: { account: AccountRead }) {
+  const metadata = JSON.stringify(account.metadata);
+
   return (
     <div className="mt-3 border border-rule px-3 py-2">
       <p className="text-[0.72rem] text-dim">
         The first three were derived by the server from{" "}
         <code>{account.purpose}</code>; the stripe count is the hint you sent,
-        echoed. All four are read back from <code>GET /v1/accounts</code>,
-        because the opening response carries only the two ids above.
+        echoed. All of it came back in the answer above — the account is the
+        same <code>AccountRead</code> a register row is, so one type serves both
+        verbs.
       </p>
       <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-[0.78rem] sm:grid-cols-4">
         <div>
@@ -290,6 +261,29 @@ function DerivedTriple({ account }: { account: AccountRead }) {
             <Mono>{account.stripe_count}</Mono>
           </dd>
         </div>
+      </dl>
+      <dl className="mt-2 grid gap-x-4 gap-y-1 text-[0.75rem] sm:grid-cols-[8rem_1fr]">
+        <dt className="text-dim">created_at</dt>
+        <dd>
+          <Mono>{account.created_at}</Mono>{" "}
+          <span className="text-[0.7rem] text-dim">
+            the database&rsquo;s clock
+          </span>
+        </dd>
+        <dt className="text-dim">metadata</dt>
+        <dd>
+          <Mono className="break-words">{metadata}</Mono>{" "}
+          {metadata === "{}" ? (
+            <span className="text-[0.7rem] text-dim">
+              none given — the column defaults to an empty object, so this
+              field is never null
+            </span>
+          ) : (
+            <span className="text-[0.7rem] text-dim">
+              your own object, stored as given
+            </span>
+          )}
+        </dd>
       </dl>
       <p className="mt-2 text-[0.68rem] text-dim">
         <code>normal_balance</code> is not derivable from <code>category</code>:

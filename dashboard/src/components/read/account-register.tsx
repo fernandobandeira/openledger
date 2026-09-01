@@ -123,6 +123,7 @@ export function AccountRegisterPanel({
                 <th className="py-1 pr-3 text-left font-medium">ccy</th>
                 <th className="py-1 pr-3 text-right font-medium">stripes</th>
                 <th className="py-1 pr-3 text-left font-medium">opened</th>
+                <th className="py-1 text-left font-medium">metadata</th>
               </tr>
             </thead>
             <tbody>
@@ -142,9 +143,11 @@ export function AccountRegisterPanel({
       ) : null}
 
       <PanelNote>
-        The listing returns identity, never money: a balance is per currency and
-        per stripe, and one per row would be N+1. The balance route answers that
-        question one account at a time.
+        The listing returns identity, the triple the server derived, the stripe
+        count and your own <code>metadata</code> — and never money: a balance is
+        per currency and per stripe, and one per row would be N+1. The balance
+        route answers that question one account at a time. An account that named
+        no metadata reads back <code>{"{}"}</code>, not null.
       </PanelNote>
     </Panel>
   );
@@ -218,6 +221,14 @@ function Row({
       <td className="py-1.5 pr-3 whitespace-nowrap">
         <Mono className="text-[0.7rem] text-dim">
           {account.created_at.slice(0, 19).replace("T", " ")}
+        </Mono>
+      </td>
+      <td
+        className="max-w-[14rem] truncate py-1.5"
+        title={JSON.stringify(account.metadata)}
+      >
+        <Mono className="text-[0.7rem] text-dim">
+          {JSON.stringify(account.metadata)}
         </Mono>
       </td>
     </tr>

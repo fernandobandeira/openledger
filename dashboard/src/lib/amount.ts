@@ -1,14 +1,13 @@
 /**
- * Money, handled the way ADR-0019 requires.
+ * Money, handled the way ADR-0022 requires.
  *
- * A REPORT amount arrives as an exact-integer decimal STRING, because an
- * aggregate can exceed 2^53 and a JSON number above that is silently rounded
- * by the parser. So no value on this file is ever passed through `Number` or
- * `parseInt`: formatting is string surgery, and arithmetic is `BigInt`.
- *
- * A single POSTING or ENTRY amount is a JSON number, bounded by its own
- * `bigint` column. That asymmetry is deliberate, and it has one sharp edge
- * this file cannot file down — see `minorFromEntry`.
+ * EVERY amount on the wire is an exact-integer decimal STRING, in both
+ * directions and at every size: a report aggregate, a posting on the way in,
+ * an entry on the way out. A `bigint` column reaches far past 2^53 and JSON
+ * has no integer type, so a number would be rounded by the parser — a posting
+ * of 9007199254740993 came back as ...992 before the contract was fixed. So no
+ * value in this file is ever passed through `Number` or `parseInt`: formatting
+ * is string surgery, and arithmetic is `BigInt`.
  *
  * The wire carries no currency exponent. Two decimals is this dashboard's
  * assumption about the minor unit, stated in the footer and never hidden: the
@@ -95,21 +94,46 @@ export function isNegativeMinor(minor: string): boolean {
   return parsed !== null && parsed < 0n;
 }
 
+/** The range `ledger_entries.amount_minor` holds. */
+const I64_MIN = -9223372036854775808n;
+const I64_MAX = 9223372036854775807n;
+
 /**
- * An entry's `amount_minor` is a JSON number over a `bigint` column, so a leg
- * above 2^53 was already rounded by `JSON.parse` before this function ever saw
- * it. Nothing downstream can undo that, so the one honest thing is to say so:
- * `exact` is false exactly when the number is outside the safe-integer range.
+ * The one value this dashboard parses on the way OUT: a posting amount, typed
+ * into a form and sent as the exact-integer string `POST /v1/transactions`
+ * takes.
+ *
+ * The grammar is the API's own — `-?[0-9]+`, and nothing else — and the three
+ * refusals carry the API's own meanings in the API's own words, so the same
+ * input is refused the same way whichever side sees it first. `"2,500"` and
+ * `"25.00"` never leave this page: a round trip to be told what the form
+ * already knows teaches an operator nothing.
+ *
+ * Whitespace is refused rather than trimmed, exactly as the API refuses it: a
+ * request is answered or named, never quietly rewritten into a different one.
+ * Sign is judged last and separately, because "too large" and "not positive"
+ * are different things to fix — which is also where the API draws the line,
+ * between its parse and the domain's rule.
  */
-export function minorFromEntry(amount: number): {
-  minor: string;
-  exact: boolean;
-} {
-  if (!Number.isInteger(amount)) {
-    return { minor: String(amount), exact: false };
+export function minorUnitsToPost(
+  text: string
+): { minor: string } | { error: string } {
+  if (!/^-?[0-9]+$/.test(text)) {
+    return {
+      error:
+        `amount_minor ${JSON.stringify(text)} is not an exact integer: send ` +
+        "minor units as a decimal string of digits, optionally signed, with " +
+        "no leading plus, no whitespace, no decimal point and no exponent",
+    };
   }
-  return {
-    minor: BigInt(amount).toString(),
-    exact: Number.isSafeInteger(amount),
-  };
+  const exact = BigInt(text);
+  if (exact < I64_MIN || exact > I64_MAX) {
+    return {
+      error:
+        `amount_minor ${JSON.stringify(text)} is outside the range of 64-bit ` +
+        "minor units, which is what ledger_entries.amount_minor holds",
+    };
+  }
+  if (exact <= 0n) return { error: "amount_minor must be positive" };
+  return { minor: text };
 }

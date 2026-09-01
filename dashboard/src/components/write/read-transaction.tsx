@@ -14,11 +14,12 @@ import {
   type Answer,
   type TransactionRead,
 } from "@/lib/ledger";
-import { minorFromEntry, sumMinor } from "@/lib/amount";
+import { sumMinor } from "@/lib/amount";
 
 /**
- * Reading a write back. The write path answers with two UUIDs and nothing that
- * says what they point at, so this is the endpoint that makes `status`,
+ * Reading a write back. `POST /v1/transactions` answers with two UUIDs and
+ * nothing that says what they point at — unlike an opening, which now carries
+ * the whole account — so this is the endpoint that makes `status`,
  * `resolves_id` and `reverses_id` observable at all (ADR-0019).
  */
 export function ReadTransaction({
@@ -136,10 +137,10 @@ function Entries({ entries }: { entries: TransactionRead["entries"] }) {
 
   const debits = entries
     .filter((entry) => entry.direction === "debit")
-    .map((entry) => minorFromEntry(entry.amount_minor).minor);
+    .map((entry) => entry.amount_minor);
   const credits = entries
     .filter((entry) => entry.direction === "credit")
-    .map((entry) => minorFromEntry(entry.amount_minor).minor);
+    .map((entry) => entry.amount_minor);
   const debitTotal = sumMinor(debits);
   const creditTotal = sumMinor(credits);
   const balanced = debitTotal.total === creditTotal.total;
@@ -158,7 +159,6 @@ function Entries({ entries }: { entries: TransactionRead["entries"] }) {
         </thead>
         <tbody>
           {entries.map((entry, index) => {
-            const amount = minorFromEntry(entry.amount_minor);
             const isCredit = entry.direction === "credit";
             return (
               <tr key={index} className="border-b border-rule">
@@ -172,9 +172,8 @@ function Entries({ entries }: { entries: TransactionRead["entries"] }) {
                 </td>
                 <td className="py-1 pr-3 text-right">
                   <Amount
-                    minor={amount.minor}
+                    minor={entry.amount_minor}
                     currency={entry.currency}
-                    exact={amount.exact}
                     className={isCredit ? "text-credit" : undefined}
                   />
                 </td>
@@ -206,8 +205,9 @@ function Entries({ entries }: { entries: TransactionRead["entries"] }) {
         </tfoot>
       </table>
       <p className="mt-1 text-[0.68rem] text-dim">
-        Direction carries the sign; the amount never does. Totals are summed
-        with BigInt.
+        Direction carries the sign; the amount never does. Each{" "}
+        <code>amount_minor</code> is an exact-integer string, and the totals are
+        summed with BigInt — nothing here goes through <code>Number</code>.
       </p>
     </div>
   );

@@ -88,19 +88,31 @@ export type AccountBody = {
 
 /**
  * The stored result of an accepted opening: the event, and the account it
- * caused.
+ * caused — **the whole account**, not its id.
+ *
+ * **Two UUIDs undercut ADR-0021's own design.** The decision's centre is
+ * that the caller names a `purpose` and the server DERIVES `category`,
+ * `normal_balance` and `counterparty_scope`; answering with an id meant the
+ * derived triple could only be seen by a second call to `GET /v1/accounts`
+ * plus a client-side scan, because there is no `GET /v1/accounts/{id}` and
+ * the listing filters on `purpose` and `owner_id` but not on the account.
+ * "Show me the account I just opened" was a paged search. It is one field
+ * now, and it is the SAME [`AccountRead`] a listing row is — one type, so
+ * the two cannot come to disagree about what an account looks like.
+ *
+ * `event_id` stays beside it: opening an account writes an EVENT and no
+ * ledger transaction, which is the case ADR-0005 justified the event log by,
+ * and the spine is a fact a caller should still be able to see.
  */
 export type AccountCreated = {
     /**
-     * The account. Never null, unlike a posting's `transaction_id`: an
-     * accepted opening always wrote one, and a replay finds it by the
-     * natural key its own body names.
+     * The account, as the register holds it. Never null, unlike a posting's
+     * `transaction_id`: an accepted opening always wrote one, and a replay
+     * finds it by the natural key its own body names.
      */
-    account_id: string;
+    account: AccountRead;
     /**
      * The event row this call claimed — or, on a replay, the one it found.
-     * Opening an account writes an EVENT and no ledger transaction, which is
-     * the case ADR-0005 justified the event log by.
      */
     event_id: string;
 };
@@ -130,12 +142,16 @@ export type AccountListRead = {
 };
 
 /**
- * One account, as the register holds it.
+ * One account, as the register holds it — the representation BOTH of this
+ * resource's verbs answer with: a row of the listing, and the whole of an
+ * accepted opening's `account`.
  *
  * **No balance, and that is contract** (ADR-0021): balances are per currency
  * and per stripe, so a balance per row would be N+1, and
  * `GET /v1/accounts/{account_id}/balance` answers that question one account
- * at a time and exactly.
+ * at a time and exactly. `metadata` is here and a balance is not, and the
+ * two are different questions: metadata is the caller's own object, written
+ * at the opening and readable on no other route.
  */
 export type AccountRead = {
     account_id: string;
@@ -155,6 +171,17 @@ export type AccountRead = {
      */
     created_at: string;
     currency: string;
+    /**
+     * The caller's own object, as the opening set it — `{}` when it named
+     * none, because the column is `NOT NULL DEFAULT '{}'`.
+     *
+     * It is here because until now a caller could WRITE metadata and had no
+     * route that read it back, which is a hole rather than a missing
+     * feature. ADR-0021's "identity plus `stripe_count`" is extended by this
+     * one field and by nothing else: the part of that sentence that was
+     * load-bearing is the absence of BALANCES, and they are still absent.
+     */
+    metadata: unknown;
     /**
      * `debit` or `credit`. **Not derivable from `category`**: a loss
      * allowance is an asset with a credit normal balance, which is why the
@@ -183,10 +210,24 @@ export type AccountRead = {
 };
 
 /**
- * One leg. `amount_minor` is a JSON number here and a decimal STRING on
- * every report, and the asymmetry is deliberate (ADR-0019): a single posting
- * is bounded by its column, and only an aggregate can exceed what a JSON
- * number carries exactly.
+ * The commit horizon, on its own.
+ */
+export type CursorRead = {
+    /**
+     * The current horizon, as a decimal string — an `xid8` is a 64-bit
+     * unsigned value and JSON numbers are not. Send it back as `cursor` on
+     * any report route to pin that report here; everything strictly below it
+     * has finished committing and can never grow.
+     */
+    cursor: string;
+};
+
+/**
+ * One leg. `amount_minor` is an exact-integer decimal STRING, the same shape
+ * the request sends and every report total already carried: a `bigint`
+ * reaches far past 2⁵³ and a JSON number does not carry it exactly, so the
+ * read-back of a large posting was silently one lower than what was written
+ * (ADR-0019's asymmetry, corrected by building a client against it).
  */
 export type EntryRead = {
     account_id: string;
@@ -196,7 +237,7 @@ export type EntryRead = {
      * in any response (ADR-0013 §4).
      */
     account_seq: number;
-    amount_minor: number;
+    amount_minor: string;
     currency: string;
     /**
      * `debit` or `credit`. Direction carries the sign; the amount never does.
@@ -231,9 +272,19 @@ export type OwnerTypeBody = 'company' | 'platform' | 'bank_account' | 'house';
  */
 export type PostingBody = {
     /**
-     * Minor units of `currency`. Strictly positive.
+     * Minor units of `currency`, strictly positive, as an exact-integer
+     * decimal STRING — never a JSON number.
+     *
+     * **The column is exact and the wire was not.** `ledger_entries.amount_minor`
+     * is a `bigint`, which reaches far past 2⁵³, and JSON has no integer type
+     * at all: RFC 8259 leaves precision beyond an IEEE-754 double to the
+     * implementation, and JavaScript's parser is one that loses it.
+     * Demonstrated against this API rather than reasoned — a posting of
+     * 9007199254740993 was accepted and `JSON.parse` read it back as
+     * 9007199254740992, silently off by one in both directions. So a single
+     * amount travels the way every report total already does.
      */
-    amount_minor: number;
+    amount_minor: string;
     /**
      * ISO 4217 alphabetic code, three uppercase ASCII letters.
      */
@@ -533,7 +584,7 @@ export type ListAccountsError = ListAccountsErrors[keyof ListAccountsErrors];
 
 export type ListAccountsResponses = {
     /**
-     * One page of the account register, in creation order. An unknown tenant answers 200 with an empty list, never 404: there is no tenant registry to consult, so inventing the status would mean inventing the registry (ADR-0019).
+     * One page of the account register, in creation order — identity, the derived chart triple, the stripe count and the caller's own `metadata`, and no balances (ADR-0021). An unknown tenant answers 200 with an empty list, never 404: there is no tenant registry to consult, so inventing the status would mean inventing the registry (ADR-0019).
      */
     200: AccountListRead;
 };
@@ -574,11 +625,11 @@ export type OpenAccountError = OpenAccountErrors[keyof OpenAccountErrors];
 
 export type OpenAccountResponses = {
     /**
-     * Replayed: this key was already accepted with this same body. The stored result is re-rendered — never a cached response body — and nothing was written (ADR-0013 §2).
+     * Replayed: this key was already accepted with this same body. The stored result is re-rendered — never a cached response body — and nothing was written (ADR-0013 §2). It carries the same full account the 201 did, read back from the register.
      */
     200: AccountCreated;
     /**
-     * Opened: this call claimed the idempotency key and wrote the account and its event atomically.
+     * Opened: this call claimed the idempotency key and wrote the account and its event atomically. The answer carries the whole account, including the `category`, `normal_balance` and `counterparty_scope` the server DERIVED from `purpose` — the same representation `GET /v1/accounts` answers per row (ADR-0021).
      */
     201: AccountCreated;
 };
@@ -639,6 +690,52 @@ export type GetAccountBalanceResponses = {
 };
 
 export type GetAccountBalanceResponse = GetAccountBalanceResponses[keyof GetAccountBalanceResponses];
+
+export type GetCursorData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * The book to read. **The horizon is the CLUSTER's**, not this book's —
+         * `report_cursor()` is `pg_snapshot_xmin` — so two tenants are answered
+         * the same number. It is required anyway so that this route runs the
+         * identical scoped read bracket every other read runs, rather than being
+         * the one read that reaches the database unscoped.
+         */
+        tenant_id: string;
+    };
+    url: '/v1/cursor';
+};
+
+export type GetCursorErrors = {
+    /**
+     * The `tenant_id` query parameter is missing, or would not deserialize into its documented type. `type` is `invalid_request`.
+     */
+    400: ErrorBody;
+    /**
+     * Refused. `type` is `tenant_mismatch` — the `tenant_id` asked about is not the scope the read path set on the session. Vacuous today by construction and declared anyway (ADR-0019).
+     */
+    422: ErrorBody;
+    /**
+     * The read failed. `type` is `internal`.
+     */
+    500: ErrorBody;
+    /**
+     * The read exceeded this deployment's `statement_timeout` (`57014`). `type` is `report_timed_out`.
+     */
+    503: ErrorBody;
+};
+
+export type GetCursorError = GetCursorErrors[keyof GetCursorErrors];
+
+export type GetCursorResponses = {
+    /**
+     * The current commit horizon — one `SELECT report_cursor()`, no report. Store it and send it back as `cursor` to pin a report here. **It is the cluster's horizon and not this tenant's**: `report_cursor()` is `pg_snapshot_xmin`, so every tenant is answered the same number, and `tenant_id` is required for the scoping every other read has rather than because the answer depends on it.
+     */
+    200: CursorRead;
+};
+
+export type GetCursorResponse = GetCursorResponses[keyof GetCursorResponses];
 
 export type GetBalanceSheetData = {
     body?: never;

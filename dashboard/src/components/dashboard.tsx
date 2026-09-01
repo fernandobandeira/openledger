@@ -18,9 +18,8 @@ import {
 import { ReadTransaction } from "@/components/write/read-transaction";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { runTrialBalance } from "@/lib/ledger";
+import { readCursor } from "@/lib/ledger";
 import { isBehind } from "@/lib/cursor";
-import { EARLIEST, LATEST } from "@/lib/time";
 
 /**
  * The spine: writes on the left, reads on the right, the cursor rail across
@@ -67,20 +66,19 @@ export function Dashboard() {
   );
 
   /**
-   * There is no cursor-minting endpoint — ADR-0019 refused one, because every
-   * report already returns the cursor it used. So reading the horizon means
-   * running a report without one, and the trial balance over the widest range
-   * is the cheapest of the three.
+   * One statement, not a report. `GET /v1/cursor` answers the horizon alone
+   * (ADR-0022); this used to be a trial balance over 0001-01-01…9999-12-31 —
+   * a full scan run for one scalar, which on a large book is the ~28-second
+   * query ADR-0019's own cost list records.
+   *
+   * It supplies no cursor, so it is exactly the kind of answer rule 1 lets
+   * move the mark.
    */
   const refreshHorizon = useCallback(async () => {
     setProbing(true);
-    const result = await runTrialBalance({
-      tenant_id: tenant,
-      effective_from: EARLIEST,
-      effective_to: LATEST,
-    });
+    const result = await readCursor({ tenant_id: tenant });
     if (result.outcome === "answered") {
-      noteAnswer(result.body.pinned_cursor, true, "an explicit refresh");
+      noteAnswer(result.body.cursor, true, "GET /v1/cursor");
     }
     setProbing(false);
   }, [noteAnswer, tenant]);

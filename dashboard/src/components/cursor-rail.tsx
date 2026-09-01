@@ -10,7 +10,7 @@ export interface Horizon {
   cursor: string;
   /** When this dashboard observed it. */
   observedAt: string;
-  /** Which unpinned answer carried it. */
+  /** Which answer carried it — a report run unpinned, or `GET /v1/cursor`. */
   from: string;
   /** True when the newly observed horizon was BELOW the previous one. */
   regressed: boolean;
@@ -20,8 +20,9 @@ export interface Horizon {
  * The cursor rail — a commit-position ruler carrying two marks: the cluster
  * horizon, and the cursor you pinned.
  *
- * The horizon advances only on an answer that supplied NO cursor (plus an
- * explicit refresh, and after a successful write). A report re-run AT a pin
+ * The horizon advances only on an answer that supplied NO cursor — a report
+ * run unpinned, or `GET /v1/cursor`, which is what "refresh" reads and what
+ * runs after a successful write. A report re-run AT a pin
  * returns that pin as its `pinned_cursor`, so taking every answer at face
  * value would drag the horizon backwards — which is the one thing this rail
  * must never do on its own.
@@ -152,13 +153,12 @@ export function CursorRail({
           {horizon ? (
             <>
               The horizon came from{" "}
-              <span className="text-ink">{horizon.from}</span>, answered without
-              a cursor at{" "}
+              <span className="text-ink">{horizon.from}</span>, read at{" "}
               <Mono className="text-ink">
                 {new Date(horizon.observedAt).toLocaleTimeString()}
               </Mono>
               . A report re-run at a pin answers with that pin, so only an
-              unpinned answer moves this mark.
+              answer that supplied no cursor moves this mark.
               {horizon.regressed ? (
                 <span className="text-credit">
                   {" "}
@@ -170,10 +170,10 @@ export function CursorRail({
             </>
           ) : (
             <>
-              There is no cursor-minting endpoint (ADR-0019 refused one), so the
-              only way to read the cluster horizon over HTTP is to run a report
-              without a cursor. Refreshing runs the trial balance over the
-              widest range.
+              Refreshing reads <code>GET /v1/cursor</code> — one statement on
+              the read path, not a report. Every report also answers with the{" "}
+              <code>pinned_cursor</code> it used, and one run without a cursor
+              moves this mark too.
             </>
           )}
         </p>

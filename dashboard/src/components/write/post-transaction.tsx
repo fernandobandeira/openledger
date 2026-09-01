@@ -17,6 +17,7 @@ import {
   type TransactionBody,
   type TransactionCreated,
 } from "@/lib/ledger";
+import { minorUnitsToPost } from "@/lib/amount";
 import { toInstant } from "@/lib/time";
 
 export interface Leg {
@@ -35,32 +36,8 @@ const STATUSES: { value: Status; label: string }[] = [
   { value: "pending", label: "pending" },
 ];
 
-const SAFE = BigInt(Number.MAX_SAFE_INTEGER);
-
 function freshKey(): string {
   return `post-${crypto.randomUUID()}`;
-}
-
-/**
- * A posting amount is a JSON NUMBER on this endpoint — bounded by its own
- * `bigint` column, unlike a report total, which is a string (ADR-0019). Above
- * 2^53 the wire type stops being able to carry it exactly, so the dashboard
- * refuses to send one rather than let `JSON.stringify` round it.
- */
-function readAmount(text: string): { minor: number } | { error: string } {
-  const trimmed = text.trim();
-  if (!/^\d+$/.test(trimmed)) {
-    return { error: "Minor units, digits only, strictly positive." };
-  }
-  const exact = BigInt(trimmed);
-  if (exact === 0n) return { error: "Strictly positive — a zero leg is not a posting." };
-  if (exact > SAFE) {
-    return {
-      error:
-        "Above 2^53. amount_minor is declared as a JSON number here, which cannot carry this value exactly — the column is a bigint, the wire is not.",
-    };
-  }
-  return { minor: Number(exact) };
 }
 
 export function PostTransaction({
@@ -110,7 +87,7 @@ export function PostTransaction({
     if (!isReversal) {
       const built: PostingBody[] = [];
       for (const [index, leg] of legs.entries()) {
-        const amount = readAmount(leg.amount);
+        const amount = minorUnitsToPost(leg.amount);
         if ("error" in amount) {
           setRefusedHere(`Leg ${index + 1}: ${amount.error}`);
           return;
@@ -352,7 +329,11 @@ export function PostTransaction({
       <PanelNote>
         Balance is the posting type&rsquo;s, not this form&rsquo;s: every leg
         moves one amount from a source to a destination, so a one-legged
-        transaction has no spelling here.
+        transaction has no spelling here. <code>amount_minor</code> goes out as
+        an exact-integer decimal <em>string</em> (ADR-0022) — digits only, no
+        separator, no decimal point, no exponent — so a leg of
+        9007199254740993 is sent and read back as itself. The dashboard applies
+        that grammar before sending, in the API&rsquo;s own words.
       </PanelNote>
     </Panel>
   );
