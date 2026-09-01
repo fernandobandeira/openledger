@@ -45,6 +45,8 @@ pub fn openapi_json() -> Result<String, serde_json::Error> {
         crate::accounts::open_account,
         crate::accounts::list_accounts,
         crate::accounts::get_account_statement,
+        crate::periods::define_period,
+        crate::periods::close_period,
         crate::reports::get_account_balance,
         crate::reports::get_cursor,
         crate::reports::get_trial_balance,
@@ -56,6 +58,9 @@ pub fn openapi_json() -> Result<String, serde_json::Error> {
         (name = "accounts", description = "Open an account, list them, read one's posted \
                                            balance, and read one's entries in order on either \
                                            time axis."),
+        (name = "periods", description = "Define an accounting period, and close one for one \
+                                          currency — the sweep, the close record and the \
+                                          checkpoint, in one database transaction."),
         (name = "reports", description = "The pinned reports: both time axes, by parameter — \
                                           and the horizon they pin at, on its own."),
     ),

@@ -10,5 +10,6 @@
 
 pub mod accounts;
 pub mod cursor;
+pub mod periods;
 pub mod reports;
 pub mod transactions;

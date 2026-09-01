@@ -8,7 +8,13 @@
 //! per statement is what that costs. Since ADR-0021 there are three more,
 //! all for opening an account: the chart read the derived triple comes from,
 //! the claim that carries the account insert, and that operation's own replay
-//! lookup — one method per statement, again.
+//! lookup — one method per statement, again. ADR-0024 adds five more for the
+//! period: two for a definition (the claim carrying the insert, and its replay
+//! lookup) and THREE for a close, because a close cannot be one statement —
+//! its checkpoint aggregates the very entries its sweep just wrote, and the
+//! data-modifying CTEs of one statement cannot see each other's effects on
+//! the target table (ADR-0020's ordering constraint (a), which is therefore
+//! structural here rather than a rule the writer must remember).
 //!
 //! This seam is NOT storage-agnosticism. There is one adapter
 //! (`crates/ledger/postgres`, a nested workspace member) and no swappability
@@ -24,6 +30,7 @@ use uuid::Uuid;
 
 use crate::accounts::{Account, ChartTriple, OpenAccount};
 use crate::domain::PostTransaction;
+use crate::periods::{ClosePeriod, DefinePeriod, Period, SweptPosition};
 use crate::postings::Append;
 
 /// What the single call answered for one coalesced delta, in account order:
@@ -213,6 +220,122 @@ pub enum OpenedAccount {
 /// exactly what the first call answered — a replay that carried less than the
 /// 201 would make the header the only honest part of it.
 pub type StoredAccount = (Uuid, Option<Account>);
+
+/// What the period-definition statement answered after claiming the key: the
+/// period it wrote, or the constraint's refusal.
+///
+/// Both refusals arrive as ERRORS from the backend rather than as rows —
+/// `23P01` on `ex_periods__no_overlap` and `22023` from `timezone()` under
+/// `ck_periods__tz_known` — and the adapter classifies them, the same shape
+/// [`OpenedAccount::AlreadyExists`] is classified in. The service names the
+/// refusal and rolls back; nothing is written.
+pub enum DefinedPeriod {
+    Defined {
+        event_id: Uuid,
+        /// The register's own row, read back from the insert's `RETURNING` —
+        /// never this crate's reconstruction of what it asked for. The
+        /// instants a report will filter on are the ones the column holds.
+        period: Period,
+    },
+    /// `pk_periods`: this tenant already has a period under this code. It is
+    /// checked before the exclusion index, so it is what a caller re-defining
+    /// a code actually meets — the overlap below is reachable only under a
+    /// different code.
+    Exists,
+    /// `ex_periods__no_overlap`: this tenant already has a period covering
+    /// part of the one asked for. A GiST exclusion is the only thing that can
+    /// say so under concurrency — a read before the insert cannot see an
+    /// uncommitted rival — which is why this is a variant rather than a
+    /// pre-flight check.
+    Overlaps,
+    /// `ck_periods__tz_known`: the server does not recognise this zone. It is
+    /// the SERVER's tzdata that decides, which is exactly why the writer does
+    /// not keep a zone list of its own to disagree with it.
+    ZoneUnknown,
+}
+
+/// What an already-claimed DEFINITION stored, as its replay lookup answers it:
+/// the event, and the period it caused.
+///
+/// `None` in the inner position is a can't-happen state and not a legitimate
+/// shape — an accepted definition always wrote a period, and the lookup finds
+/// it by the natural key the replayed body itself names (`pk_periods`). The
+/// service answers it as `Internal`. `None` for the whole pair is the
+/// different fact [`StoredResult`]'s is: the key was reused with a different
+/// body.
+pub type StoredPeriod = (Uuid, Option<Period>);
+
+/// Everything a close needs from the book before it claims anything: the
+/// period's own resolved bounds, and the account the sweep has to land in.
+///
+/// It is ONE read because both facts are refusals — `period_unknown` and
+/// `retained_earnings_unknown` — and both must be decided BEFORE the claim.
+/// That ordering matters more here than on the opening path: a close's
+/// idempotency key is DERIVED, so a key burnt by a refused attempt could never
+/// be retried under a different name (ADR-0024).
+pub struct PeriodCloseContext {
+    /// Carried into `ledger_period_closes` under `fk_closes__period`, so the
+    /// close cannot name a period's code without also naming the instants
+    /// that period resolved to.
+    pub starts_at: time::OffsetDateTime,
+    /// The half-open upper bound: the checkpoint's effective bound, and the
+    /// instant the closing transaction's own date is one microsecond below.
+    pub ends_at: time::OffsetDateTime,
+    /// The tenant's `retained_earnings` HOUSE account in this currency.
+    /// `None` is `retained_earnings_unknown` — the sweep has no destination,
+    /// and ADR-0011 §2 has no Income Summary account to fall back on.
+    pub retained_earnings: Option<Uuid>,
+}
+
+/// What the writer decided from that context, and everything the two closing
+/// statements bind beyond the command itself.
+///
+/// It exists so neither statement takes eight arguments, and it says something
+/// while it is at it: a [`PeriodCloseContext`] is what the BOOK answered, and
+/// this is what the writer made of it — the earnings account narrowed from an
+/// option to the one the sweep will use, and `closes_at` derived. Nothing
+/// downstream has to re-decide either.
+pub struct ClosePlan {
+    /// Carried into `ledger_period_closes` under `fk_closes__period`.
+    pub starts_at: time::OffsetDateTime,
+    /// The half-open upper bound — the checkpoint's effective bound.
+    pub ends_at: time::OffsetDateTime,
+    /// Where the sweep lands. Not an option: `retained_earnings_unknown` was
+    /// refused before this value was built.
+    pub retained_earnings: Uuid,
+    /// `ends_at - 1 microsecond`, from
+    /// [`crate::periods::the_last_instant_inside`] — the closing
+    /// transaction's own `effective_at` (ADR-0011 §2).
+    pub closes_at: time::OffsetDateTime,
+}
+
+/// What the closing statement answered after claiming the derived key: the
+/// close it wrote, or `pk_closes`' refusal.
+///
+/// `AlreadyClosed` is the narrow second door. The derived key normally gets
+/// there first — a repeated close finds `uq_events__idempotency` held and
+/// never reaches this statement's inserts — so this variant is for a close
+/// row written by something other than this writer (the e2e fixtures write
+/// them in SQL, and so did every close this project had before ADR-0024).
+/// It arrives as `23505` on `pk_closes` and the adapter classifies it.
+pub enum ClosedPeriod {
+    Closed {
+        event_id: Uuid,
+        transaction_id: Uuid,
+        /// `computed_at_xid`, as the statement stored it, rendered as text —
+        /// the value the checkpoint's own bound then binds, so the two agree
+        /// because they are one value rather than two readings of one
+        /// expression.
+        computed_at_xid: String,
+        /// The debit-positive position moved out of each temporary account,
+        /// in account order. EMPTY for a period with nothing to sweep, which
+        /// is a legitimate close (migration `00004`'s entryless carve-out) and
+        /// never a refusal.
+        swept: Vec<SweptPosition>,
+    },
+    /// `pk_closes` already holds this (tenant, period, currency).
+    AlreadyClosed,
+}
 
 /// The opaque storage failure. The port names no backend error type — the
 /// Postgres error stays inside the adapter crate, boxed at exactly one
@@ -414,6 +537,130 @@ pub trait Repository: Send + Sync {
         command: &OpenAccount,
         hash: &[u8],
     ) -> impl Future<Output = Result<Option<StoredAccount>, StorageError>> + Send;
+
+    /// Statement A for a definition: claim the idempotency key, storing the
+    /// command's hash and `payload` beside it, and — only when the claim
+    /// returns a row — insert the period, in this ONE statement (ADR-0024's
+    /// *"the same database transaction as the `ledger_periods` insert"*, held
+    /// as one statement for the same reason opening an account is).
+    ///
+    /// `Some` means this caller is the first writer — either the period is
+    /// written, uncommitted, or a constraint refused it
+    /// ([`DefinedPeriod::Overlaps`], [`DefinedPeriod::ZoneUnknown`]). `None`
+    /// means an earlier caller claimed the key and NOTHING here ran; the
+    /// replay half stays the separate [`stored_period`](Repository::stored_period),
+    /// because folding the two is the one-statement hole ADR-0013 §2
+    /// reproduced.
+    fn claim_and_define_period(
+        &self,
+        tx: &mut Self::Tx,
+        command: &DefinePeriod,
+        hash: &[u8],
+        payload: &serde_json::Value,
+    ) -> impl Future<Output = Result<Option<DefinedPeriod>, StorageError>> + Send;
+
+    /// Statement B for a definition: the [`StoredPeriod`] of the already
+    /// claimed key — with the hash in the lookup's WHERE, never compared by
+    /// the caller, exactly as every other replay lookup here does it
+    /// (ADR-0013 §2).
+    ///
+    /// The period is found by the natural key the REPLAYED BODY names
+    /// (`pk_periods`), since `ledger_periods` carries no `event_id` column —
+    /// the same shape [`stored_account`](Repository::stored_account) uses.
+    fn stored_period(
+        &self,
+        tx: &mut Self::Tx,
+        command: &DefinePeriod,
+        hash: &[u8],
+    ) -> impl Future<Output = Result<Option<StoredPeriod>, StorageError>> + Send;
+
+    /// The one read a close makes before it claims anything: the period's
+    /// resolved bounds and the `retained_earnings` house account the sweep
+    /// lands in. `None` means the tenant has no such period, which the service
+    /// answers as `period_unknown`.
+    ///
+    /// It runs INSIDE the close's own database transaction, for the reason
+    /// [`chart_triple_for_purpose`](Repository::chart_triple_for_purpose) does:
+    /// the bounds this read answers with are the bounds the close binds, and
+    /// `fk_closes__period` is what verifies them — a period edited between
+    /// the two would be a foreign-key error where a named refusal belongs.
+    fn period_close_context(
+        &self,
+        tx: &mut Self::Tx,
+        command: &ClosePeriod,
+    ) -> impl Future<Output = Result<Option<PeriodCloseContext>, StorageError>> + Send;
+
+    /// Statement A for a close, carrying the whole sweep with it: claim the
+    /// DERIVED key, and — only from the claimed row — insert the
+    /// `period_close` transaction, compute each temporary account's position
+    /// as at the cursor, upsert every swept account's balance row, append the
+    /// legs, and write the `ledger_period_closes` row naming the transaction.
+    /// Steps 1 to 3 of ADR-0024's four, in one statement.
+    ///
+    /// `plan` carries `ends_at - 1 microsecond`, computed in the domain
+    /// ([`crate::periods::the_last_instant_inside`]) rather than in SQL, so
+    /// ADR-0011 §2's rule is unit-tested rather than buried in a literal.
+    ///
+    /// `Some` means this caller is the first writer — either the close is
+    /// written, uncommitted, or `pk_closes` refused it. `None` means the
+    /// derived key is already held, which for this operation is the ordinary
+    /// second attempt: the service asks
+    /// [`stored_close`](Repository::stored_close) which of the two sentences
+    /// it is.
+    ///
+    /// **What this statement must NOT do is write the checkpoint.** Its own
+    /// entries are invisible to any other CTE of the same statement, so a
+    /// checkpoint computed here would be the PRE-close position — measured
+    /// (spike 024 FINDINGS §1.2) and the exact defect ADR-0020's ordering
+    /// constraint (a) exists to prevent.
+    fn claim_and_close_period(
+        &self,
+        tx: &mut Self::Tx,
+        command: &ClosePeriod,
+        hash: &[u8],
+        payload: &serde_json::Value,
+        plan: &ClosePlan,
+    ) -> impl Future<Output = Result<Option<ClosedPeriod>, StorageError>> + Send;
+
+    /// Step 4 of ADR-0024's four, and a statement of its own because it has to
+    /// be: `ledger_period_balances`, one row per account, aggregated from the
+    /// entries the previous statement just wrote.
+    ///
+    /// Its bound is `xact_id < computed_at_xid OR transaction_id = <this
+    /// close>` — identity admission (ADR-0020), the same predicate
+    /// `recon_checkpoint_breaks` recomputes with, so the two agree by
+    /// construction rather than by coincidence. `computed_at_xid` is passed
+    /// back from [`claim_and_close_period`](Repository::claim_and_close_period)
+    /// rather than re-derived, so the value in the bound is literally the
+    /// value in the stored row.
+    ///
+    /// Answers how many rows it wrote — the count the response reports, and
+    /// the one number that distinguishes "the close wrote no checkpoint" from
+    /// "the checkpoint is empty because the book is".
+    fn checkpoint_the_close(
+        &self,
+        tx: &mut Self::Tx,
+        command: &ClosePeriod,
+        plan: &ClosePlan,
+        transaction_id: Uuid,
+        computed_at_xid: &str,
+    ) -> impl Future<Output = Result<u64, StorageError>> + Send;
+
+    /// Statement B for a close: does an event with THIS body already hold the
+    /// derived key?
+    ///
+    /// It is not a replay lookup, because a close does not replay — it is the
+    /// one question that tells `period_already_closed` (the same close, run
+    /// again) from `idempotency_key_reused` (something else claimed the
+    /// string). The hash is in the WHERE for the reason it is in every other
+    /// lookup here: a caller that forgets to compare gets nothing rather than
+    /// the wrong stored result (ADR-0013 §2).
+    fn stored_close(
+        &self,
+        tx: &mut Self::Tx,
+        command: &ClosePeriod,
+        hash: &[u8],
+    ) -> impl Future<Output = Result<Option<Uuid>, StorageError>> + Send;
 
     /// Commit the bracket: the event claim and everything it caused become
     /// durable together.

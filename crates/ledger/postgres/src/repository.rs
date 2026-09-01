@@ -29,8 +29,10 @@ use std::collections::BTreeMap;
 
 use ledger::{
     Account, AccountOwnerType, Append, Appended, BalanceUpsert, BatchMember, ChartTriple, Claimed,
-    Delta, Direction, Leg, MemberOutcome, OpenAccount, OpenedAccount, PostTransaction, Repository,
-    StorageError, StoredAccount, StoredResult, SupersedeRefusal, TransactionStatus,
+    ClosePeriod, ClosePlan, ClosedPeriod, DefinePeriod, DefinedPeriod, Delta, Direction, Leg,
+    MemberOutcome, OpenAccount, OpenedAccount, Period, PeriodCloseContext, PostTransaction,
+    Repository, StorageError, StoredAccount, StoredPeriod, StoredResult, SupersedeRefusal,
+    SweptPosition, TransactionStatus,
 };
 use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
@@ -986,6 +988,525 @@ const STORED_ACCOUNT: &str = "SELECT e.id AS event_id,
                AND a.currency = $7
         WHERE e.tenant_id = $1 AND e.idempotency_key = $2 AND e.idempotency_hash = $3";
 
+/// Statement A for a period definition (ADR-0024): the claim, with the period
+/// insert riding on it — the same shape [`CLAIM_AND_OPEN_ACCOUNT`] has, and
+/// for the same reason. ADR-0024's *"claims the key and writes
+/// `ledger_events` + `ledger_periods` in one database transaction"* is held
+/// as ONE STATEMENT rather than as two the caller must remember to pair.
+///
+/// - `claimed` claims the idempotency key (`ON CONFLICT DO NOTHING`) in the
+///   same index a posting and an opening claim in, and the period insert
+///   selects `FROM` it — so when the key is already held, zero rows come back
+///   and NOTHING here ran;
+/// - `effective_at` is `now()`, and it is the one value here the caller does
+///   not supply. Defining a period moves no money, so there is no instant for
+///   it to be *deemed to have happened* at — the same reasoning an opening's
+///   `now()` carries. **It is emphatically not the period's own boundary**: a
+///   period's instants are the ones the ROW carries, and copying one onto the
+///   event would invite a reader to filter the event log by it;
+/// - `defined` inserts the period. `starts_at` and `ends_at` are bound as
+///   RESOLVED instants and `tz` rides beside them as provenance — the API
+///   never accepts a local date and a zone and resolves them, which is
+///   ADR-0011 §5 measured twice (a local midnight that never happened, and
+///   the same pair resolving an hour apart after a tzdata update);
+/// - **the insert RETURNS the whole row**, and the outer `SELECT` carries it
+///   out, so the answer is the register's row rather than a re-rendering of
+///   the request;
+/// - the final `SELECT` anchors on the CLAIMED row, exactly as the other two
+///   claims do, so zero rows means "the key was already held" and nothing
+///   else.
+///
+/// What arrives as an ERROR rather than as rows is BOTH of this operation's
+/// named refusals — `23P01` on `ex_periods__no_overlap`, and `22023` from
+/// `timezone()` under `ck_periods__tz_known` — classified by
+/// [`refusal_from_the_period_constraints`]. Neither could honestly have been
+/// asked first: an overlap is a statement about other rows that no read can
+/// make under concurrency, and a zone's existence is the server's tzdata.
+const CLAIM_AND_DEFINE_PERIOD: &str = "WITH claimed AS (
+         INSERT INTO ledger_events
+                (tenant_id, kind, source, idempotency_key, idempotency_hash,
+                 payload, effective_at)
+         VALUES ($1, 'period_defined', 'api', $2, $3, $4, now())
+         ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
+         RETURNING id
+     ),
+     defined AS (
+         INSERT INTO ledger_periods (tenant_id, code, starts_at, ends_at, tz)
+         SELECT $1, $5, $6, $7, $8
+         FROM claimed c
+         RETURNING code, starts_at, ends_at, tz
+     )
+     SELECT c.id AS event_id,
+            d.code AS code,
+            d.starts_at AS starts_at,
+            d.ends_at AS ends_at,
+            d.tz AS tz
+     FROM claimed c
+     LEFT JOIN defined d ON true";
+
+/// Statement B for a definition: the stored result of the already claimed
+/// key, with the hash in the WHERE for the reason every other replay lookup
+/// here has it there (ADR-0013 §2) — a same-key/different-body replay must
+/// return NO row.
+///
+/// The period is found by the NATURAL KEY the replayed body names, because
+/// `ledger_periods` carries no `event_id` column: `pk_periods` is
+/// `(tenant_id, code)`, and this reads it from the other side. The body is
+/// the one whose hash matched, so the code it names is the code the first
+/// writer used.
+const STORED_PERIOD: &str = "SELECT e.id AS event_id,
+            p.code AS code,
+            p.starts_at AS starts_at,
+            p.ends_at AS ends_at,
+            p.tz AS tz
+         FROM ledger_events e
+         LEFT JOIN ledger_periods p
+                ON p.tenant_id = e.tenant_id AND p.code = $4
+        WHERE e.tenant_id = $1 AND e.idempotency_key = $2 AND e.idempotency_hash = $3";
+
+/// The one read a close makes before it claims anything: the period's own
+/// resolved bounds, and the `retained_earnings` HOUSE account the sweep lands
+/// in.
+///
+/// One statement for two refusals, because they are asked at the same moment
+/// and neither is worth a round trip of its own. No row at all is
+/// `period_unknown`; a row whose `retained_earnings` is `NULL` is
+/// `retained_earnings_unknown` — ADR-0011 §2 has no Income Summary account to
+/// fall back on, so a book with no earnings account in this currency has
+/// nowhere for the sweep to go.
+///
+/// `uq_accounts__house` is one house account per purpose and currency per
+/// tenant, so the `LEFT JOIN` cannot fan the period's row out.
+const PERIOD_CLOSE_CONTEXT: &str = "SELECT p.starts_at AS starts_at,
+            p.ends_at AS ends_at,
+            r.id AS retained_earnings
+         FROM ledger_periods p
+         LEFT JOIN ledger_accounts r
+                ON r.tenant_id = p.tenant_id
+               AND r.purpose = 'retained_earnings'
+               AND r.owner_type = 'house'
+               AND r.currency = $3
+        WHERE p.tenant_id = $1 AND p.code = $2";
+
+/// Statement A for a close: ADR-0024's steps 1 to 3 in one statement — claim
+/// the derived key, write the `period_close` transaction and its sweep, and
+/// write the `ledger_period_closes` row that names it. Step 4, the
+/// checkpoint, is [`CHECKPOINT_THE_CLOSE`] and CANNOT be here; see the bottom
+/// of this comment.
+///
+/// What each stage holds:
+///
+/// - `cursor_at` is `pg_current_xact_id()`, read ONCE. It is this
+///   transaction's own id, so it equals the closing transaction's `xact_id`
+///   by construction — which is what keeps `recon_close_breaks`'
+///   `cursor_precedes_close` from firing, and why ADR-0024 says this writer
+///   does not store `pg_snapshot_xmin`: that value is *below* its own
+///   transaction whenever any older writer is running, and the predicate
+///   ships unfixed (ADR-0020's named known issue). The recorded cost of this
+///   side of the trade is ADR-0020's too, and it is real: a rival holding a
+///   LOWER id that commits after this statement runs is below the stored
+///   cursor and was never aggregated, so it falls in neither the checkpoint
+///   nor the reader's tail. The function is STABLE, so the value is one value
+///   however many times the statement reads it;
+/// - `claimed` claims the DERIVED key — `tenant:close:period:currency`
+///   (ADR-0011 §2) — and every insert below selects `FROM` it, so a second
+///   close of the same period and currency returns zero rows and NOTHING here
+///   runs. That is the whole of "a close happens once": the index refuses it,
+///   not a check written in Rust;
+/// - `txn` inserts the closing transaction, `kind = 'period_close'` and
+///   `status = 'posted'`, dated `$5` — `ends_at - 1 microsecond`, computed in
+///   the domain so that ADR-0011 §2's rule is unit-tested rather than a
+///   literal in a string;
+/// - `position` is the sweep's subject: every TEMPORARY account's
+///   debit-positive position in this currency, over POSTED entries effective
+///   before the period end and committed BELOW the cursor. `HAVING <> 0` is
+///   what ADR-0011 §2's "one posting per temporary account" means in
+///   practice — an account that already nets to zero has nothing to sweep.
+///   The bound is CUMULATIVE and deliberately has no lower effective bound:
+///   a previous close zeroed everything before it, so the cumulative position
+///   IS this period's, and `recon_close_breaks.close_does_not_sweep` asserts
+///   exactly that on the stored checkpoint afterwards. The close's OWN legs
+///   are excluded twice over — they carry this transaction's `xact_id`, which
+///   is the cursor, and `<` excludes it — so nothing here can see the
+///   movement it is about to make. `e.account_id <> $10` keeps the
+///   destination out of its own sweep: a chart that classified
+///   `retained_earnings` as temporary would otherwise put one account in both
+///   halves of `leg` and collide two `seq_offset` runs on one counter;
+/// - `leg` is the postings, rendered: one leg per temporary account moving
+///   its position OUT, and one leg per temporary account moving it INTO
+///   `retained_earnings`. Two legs per posting, never a single netted
+///   earnings leg — "no leg is constructible on its own" is ADR-0005's rule
+///   and a close is an ordinary transaction. The destination's legs walk
+///   their `seq_offset` back from its own counter exactly as the mirror
+///   legs of a reversal do; each temporary account has one leg and therefore
+///   offset zero;
+/// - `delta` coalesces per account — the SQL twin of the plan's `coalesce`,
+///   and what turns N earnings legs into ONE balance upsert carrying N;
+/// - `striped` picks the stripe this writer's affinity lands on, modulo the
+///   account's own `stripe_count`, and joins `ledger_accounts` for the frozen
+///   identity columns the upsert copies. `AS MATERIALIZED` is load-bearing
+///   for the reason [`CLAIM_AND_APPEND`]'s is: the stripe expression is read
+///   twice below, as the inserted value and as the `ORDER BY` key the lock
+///   ordering hangs on;
+/// - `balance` upserts each swept account's row in `(account_id, currency,
+///   stripe)` order — the same deterministic lock ordering every other write
+///   here takes — and hands the counter back so the entries need not
+///   recompute it. **A close blocks behind any open writer on an account it
+///   sweeps**, which is ADR-0020's recorded defect and ADR-0024's first cost:
+///   it is these row locks, and nothing here fixes them;
+/// - `entry` lands the legs, numbered `last_seq - seq_offset` beside the
+///   counter its own stripe's upsert returned, on that stripe;
+/// - `recorded` writes `ledger_period_closes`. It carries the period's own
+///   `starts_at`/`ends_at` under `fk_closes__period`, the transaction's
+///   `effective_at` under `fk_closes__txn_effective`, and the cursor — so
+///   `ck_closes__txn_in_period` constrains the real transaction rather than a
+///   free copy, and `fk_closes__txn_kind` forces the named transaction to be
+///   a close. It is in THIS statement rather than the next because a
+///   foreign key is checked at the end of the statement, by which time `txn`
+///   has inserted its row;
+/// - the final `SELECT` anchors on the CLAIMED row and carries `position`
+///   out on a `LEFT JOIN`, so an ENTRYLESS close — a period with nothing to
+///   sweep — is still exactly one row back rather than none. Zero rows means
+///   "the derived key was already held", and nothing else.
+///
+/// **Why the checkpoint is not here.** PostgreSQL runs every data-modifying
+/// CTE of one statement against the same snapshot: they "cannot see each
+/// other's effects on the target tables". A checkpoint stage reading
+/// `ledger_entries` here would therefore aggregate the book WITHOUT the legs
+/// `entry` is inserting beside it, and store the PRE-close position — spike
+/// 024 measured exactly that shape, `fee_revenue` stored at −500 with no
+/// earnings row at all. ADR-0020's ordering constraint (a) is a rule the
+/// writer must follow; in this adapter it is the reason there are two
+/// statements, which makes it structural.
+const CLAIM_AND_CLOSE_PERIOD: &str = "WITH cursor_at AS (
+         SELECT pg_current_xact_id() AS xid
+     ),
+     claimed AS (
+         INSERT INTO ledger_events
+                (tenant_id, kind, source, idempotency_key, idempotency_hash,
+                 payload, effective_at)
+         VALUES ($1, 'period_close', 'api', $2, $3, $4, $5)
+         ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
+         RETURNING id
+     ),
+     txn AS (
+         INSERT INTO ledger_transactions
+                (tenant_id, event_id, kind, status, effective_at)
+         SELECT $1, c.id, 'period_close', 'posted', $5
+         FROM claimed c
+         RETURNING id
+     ),
+     position AS (
+         SELECT e.account_id,
+                SUM(CASE WHEN e.direction = 'debit' THEN e.amount_minor
+                         ELSE -e.amount_minor END)::bigint AS debit_positive
+         FROM claimed c
+         CROSS JOIN ledger_entries e
+         JOIN ledger_transactions x
+           ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+          AND x.status = 'posted'
+         JOIN ledger_accounts a
+           ON a.tenant_id = e.tenant_id AND a.id = e.account_id
+          AND a.currency = e.currency
+         WHERE e.tenant_id = $1 AND e.currency = $6
+           AND a.category IN ('revenue', 'expense')
+           AND e.account_id <> $10
+           AND e.effective_at < $7
+           AND e.xact_id < (SELECT xid FROM cursor_at)
+         GROUP BY e.account_id
+         HAVING SUM(CASE WHEN e.direction = 'debit' THEN e.amount_minor
+                         ELSE -e.amount_minor END) <> 0
+     ),
+     leg AS (
+         SELECT p.account_id,
+                (CASE WHEN p.debit_positive > 0 THEN 'credit'
+                      ELSE 'debit' END)::text AS direction,
+                abs(p.debit_positive) AS amount_minor,
+                0::bigint AS seq_offset
+         FROM position p
+         UNION ALL
+         SELECT $10::uuid AS account_id,
+                (CASE WHEN p.debit_positive > 0 THEN 'debit'
+                      ELSE 'credit' END)::text AS direction,
+                abs(p.debit_positive) AS amount_minor,
+                (count(*) OVER () - row_number() OVER (ORDER BY p.account_id))
+                    AS seq_offset
+         FROM position p
+     ),
+     delta AS (
+         SELECT l.account_id,
+                COALESCE(SUM(l.amount_minor) FILTER (WHERE l.direction = 'debit'),
+                         0)::bigint AS input,
+                COALESCE(SUM(l.amount_minor) FILTER (WHERE l.direction = 'credit'),
+                         0)::bigint AS output,
+                COUNT(*) AS legs
+         FROM leg l
+         GROUP BY l.account_id
+     ),
+     striped AS MATERIALIZED (
+         SELECT a.tenant_id, a.id AS account_id, a.currency,
+                a.owner_type, a.owner_id_key, a.purpose, a.category,
+                a.normal_balance, d.input, d.output, d.legs,
+                ($11::int % a.stripe_count)::smallint AS stripe
+         FROM delta d
+         JOIN ledger_accounts a
+           ON a.tenant_id = $1 AND a.id = d.account_id AND a.currency = $6
+     ),
+     balance AS (
+         INSERT INTO ledger_account_balances
+                (tenant_id, account_id, currency, stripe,
+                 owner_type, owner_id_key, purpose, category, normal_balance,
+                 input, output, last_seq)
+         SELECT s.tenant_id, s.account_id, s.currency, s.stripe,
+                s.owner_type, s.owner_id_key, s.purpose, s.category,
+                s.normal_balance, s.input, s.output, s.legs
+         FROM striped s
+         ORDER BY s.account_id, s.currency, s.stripe
+         ON CONFLICT (tenant_id, account_id, currency, stripe) DO UPDATE
+         SET input      = ledger_account_balances.input + EXCLUDED.input,
+             output     = ledger_account_balances.output + EXCLUDED.output,
+             last_seq   = ledger_account_balances.last_seq + EXCLUDED.last_seq,
+             updated_at = now()
+         RETURNING account_id, currency, stripe, last_seq
+     ),
+     entry AS (
+         INSERT INTO ledger_entries
+                (tenant_id, transaction_id, account_id, direction, amount_minor,
+                 currency, stripe, account_seq, effective_at)
+         SELECT $1, t.id, l.account_id, l.direction::ledger_direction,
+                l.amount_minor, $6, b.stripe, b.last_seq - l.seq_offset, $5
+         FROM txn t
+         CROSS JOIN leg l
+         JOIN balance b ON b.account_id = l.account_id AND b.currency = $6
+     ),
+     recorded AS (
+         INSERT INTO ledger_period_closes
+                (tenant_id, period_code, currency, starts_at, ends_at,
+                 transaction_id, txn_effective_at, computed_at_xid)
+         SELECT $1, $9, $6, $8, $7, t.id, $5, (SELECT xid FROM cursor_at)
+         FROM txn t
+     )
+     SELECT c.id AS event_id,
+            t.id AS transaction_id,
+            (SELECT xid FROM cursor_at)::text AS computed_at_xid,
+            p.account_id AS swept_account_id,
+            p.debit_positive AS swept_position_minor
+     FROM claimed c
+     LEFT JOIN txn t ON true
+     LEFT JOIN position p ON true
+     ORDER BY p.account_id";
+
+/// Step 4 of the close, and a statement of its own for the reason
+/// [`CLAIM_AND_CLOSE_PERIOD`]'s doc ends on: the closing entries have to
+/// EXIST before this aggregates them, and one statement's CTEs cannot see
+/// each other's writes.
+///
+/// **The bound is migration `00004` part 1's, verbatim** — `effective_at <
+/// ends_at`, POSTED only, `xact_id < computed_at_xid OR transaction_id =
+/// <this close>` — which is the same predicate `recon_checkpoint_breaks`
+/// recomputes with, so `checkpoint_drift` reads zero by construction rather
+/// than by coincidence. The identity term is the whole of ADR-0020's
+/// correction: the closing legs carry this transaction's own `xact_id`, which
+/// IS the cursor, so no inequality can reach them and admitting them by name
+/// is the only mechanism that works (`<=` was tested and refused — it holds
+/// only where equality holds, which is the arm that is not reproducible).
+///
+/// `computed_at_xid` is BOUND, from the value the previous statement stored,
+/// rather than re-read as `pg_current_xact_id()`. Both would be the same
+/// number in the same transaction; binding it makes the bound literally the
+/// stored row, so no future edit can make the two expressions drift apart.
+///
+/// **One row per ACCOUNT, not per temporary account.** The checkpoint is the
+/// whole effective-axis position at the boundary — `balance_sheet_at` reads
+/// it for every line of the face — so an asset account with entries in this
+/// currency gets a row exactly as a swept revenue account does. Grouping over
+/// the entries is also what keeps the stored account set MONOTONE in the
+/// period end, which is what `recon_checkpoint_breaks`' `row_span` half
+/// asserts.
+///
+/// Nothing here binds NULL into a bound parameter of an indexed predicate
+/// (ADR-0023): every bound is a value the close already has.
+const CHECKPOINT_THE_CLOSE: &str = "INSERT INTO ledger_period_balances
+            (tenant_id, period_code, currency, account_id, input, output)
+     SELECT $1, $2, $3, e.account_id,
+            COALESCE(SUM(e.amount_minor) FILTER (WHERE e.direction = 'debit'), 0),
+            COALESCE(SUM(e.amount_minor) FILTER (WHERE e.direction = 'credit'), 0)
+     FROM ledger_entries e
+     JOIN ledger_transactions x
+       ON x.tenant_id = e.tenant_id AND x.id = e.transaction_id
+      AND x.status = 'posted'
+     WHERE e.tenant_id = $1 AND e.currency = $3
+       AND e.effective_at < $4
+       AND (e.xact_id < $5::xid8 OR e.transaction_id = $6)
+     GROUP BY e.account_id";
+
+/// Statement B for a close — and NOT a replay lookup, because a close does
+/// not replay. It answers the one question that tells `period_already_closed`
+/// from `idempotency_key_reused`: does an event with THIS body already hold
+/// the derived key?
+///
+/// The hash is in the WHERE, exactly as it is in every other lookup here
+/// (ADR-0013 §2). A row back is this very close, made already; no row back is
+/// the string claimed by some other request, which is the ordinary poisoned
+/// replay.
+const STORED_CLOSE: &str = "SELECT e.id
+         FROM ledger_events e
+        WHERE e.tenant_id = $1 AND e.idempotency_key = $2 AND e.idempotency_hash = $3";
+
+/// One row of [`CLAIM_AND_DEFINE_PERIOD`]'s answer and of [`STORED_PERIOD`]'s:
+/// the event, and the period half — every column of it `NULL` together when
+/// the `LEFT JOIN` found no row. One struct for both statements because they
+/// select the same columns on purpose, the same rule [`OpenedRow`] follows.
+#[derive(sqlx::FromRow)]
+struct PeriodRow {
+    event_id: Uuid,
+    code: Option<String>,
+    starts_at: Option<OffsetDateTime>,
+    ends_at: Option<OffsetDateTime>,
+    tz: Option<String>,
+}
+
+/// The period out of a claim's answer or a replay's lookup. `None` means the
+/// period half was absent: on the claim that is the can't-happen
+/// disagreement, and on the replay it is the equally can't-happen
+/// event-without-a-period. Every column is `NOT NULL` on a real row, so there
+/// is nothing here that is legitimately absent.
+fn period_from(row: PeriodRow) -> Option<Period> {
+    Some(Period {
+        code: row.code?,
+        starts_at: row.starts_at?,
+        ends_at: row.ends_at?,
+        tz: row.tz?,
+    })
+}
+
+/// [`CLAIM_AND_DEFINE_PERIOD`]'s answer, read. No row is the one fact the
+/// statement's anchor makes unambiguous: an earlier caller holds this key,
+/// and nothing here ran.
+///
+/// A row whose period is `NULL` is a disagreement between this adapter and
+/// the writer service about the statement — `defined` inserts one row per
+/// claimed row, so the join cannot miss — and is answered as storage rather
+/// than as a definition that succeeded with no period.
+fn defined_from_the_row(claimed: Option<PeriodRow>) -> Result<Option<DefinedPeriod>, StorageError> {
+    let Some(row) = claimed else {
+        return Ok(None);
+    };
+    let event_id = row.event_id;
+    let Some(period) = period_from(row) else {
+        return Err("the definition statement claimed a key and wrote no period row".into());
+    };
+    Ok(Some(DefinedPeriod::Defined { event_id, period }))
+}
+
+/// The three refusals a period definition can only hear from the database,
+/// classified where the `sqlx::Error` is.
+///
+/// `pk_periods` is the one ADR-0024's table does not carry, and it is checked
+/// FIRST — measured on the running binary, a second definition of one code is
+/// a `23505` on the primary key even when the two ranges are identical, so
+/// without this arm re-defining a code is a 500 and the overlap refusal is
+/// reachable only under a different code.
+///
+/// `ex_periods__no_overlap` is a GiST exclusion, so it raises `23P01` and
+/// names itself. `ck_periods__tz_known` does NOT raise a check violation:
+/// `timezone(text, timestamptz)` RAISES on an unrecognised zone rather than
+/// returning NULL, so the CHECK never gets to fail and the error arrives as
+/// `22023` (`invalid_parameter_value`) with no constraint name at all. Both
+/// are mapped by what they actually are, not by what the constraint list
+/// suggests they would be.
+///
+/// Anything else is a state this statement's own construction rules out, and
+/// is answered as storage rather than dressed up as a refusal the caller
+/// could act on.
+fn refusal_from_the_period_constraints(error: &sqlx::Error) -> Option<DefinedPeriod> {
+    let sqlx::Error::Database(db) = error else {
+        return None;
+    };
+    if db.constraint() == Some("pk_periods") {
+        return Some(DefinedPeriod::Exists);
+    }
+    if db.constraint() == Some("ex_periods__no_overlap") {
+        return Some(DefinedPeriod::Overlaps);
+    }
+    if db.code().as_deref() == Some(UNRECOGNISED_TIME_ZONE) {
+        return Some(DefinedPeriod::ZoneUnknown);
+    }
+    None
+}
+
+/// `invalid_parameter_value` — what PostgreSQL raises for a time zone name it
+/// does not recognise. Spelled once, beside the only mapping that reads it.
+const UNRECOGNISED_TIME_ZONE: &str = "22023";
+
+/// A close row this writer did not put there: `pk_closes` already holds this
+/// `(tenant, period, currency)`, so the sweep would be the second one.
+///
+/// The derived key normally gets there first — a repeat finds
+/// `uq_events__idempotency` held and never reaches these inserts — so this is
+/// the narrow door for a close written some other way. Every close this
+/// project had before ADR-0024 was written that way, in SQL, and the e2e
+/// fixtures still are.
+fn refusal_from_the_close_race(error: &sqlx::Error) -> Option<ClosedPeriod> {
+    match error {
+        sqlx::Error::Database(db) if db.constraint() == Some("pk_closes") => {
+            Some(ClosedPeriod::AlreadyClosed)
+        }
+        _ => None,
+    }
+}
+
+/// One row of [`CLAIM_AND_CLOSE_PERIOD`]'s answer: the claim, the transaction,
+/// the cursor, and ONE swept position — `NULL` on the single anchored row an
+/// entryless close comes back as, exactly as a zero-delta void's row carries
+/// no account on the posting path.
+#[derive(sqlx::FromRow)]
+struct ClosedRow {
+    event_id: Uuid,
+    transaction_id: Option<Uuid>,
+    computed_at_xid: String,
+    swept_account_id: Option<Uuid>,
+    swept_position_minor: Option<i64>,
+}
+
+/// What [`CLAIM_AND_CLOSE_PERIOD`]'s rows MEAN. Zero rows is the derived key
+/// already held — the service asks [`STORED_CLOSE`] which sentence that is.
+/// Otherwise the close happened, uncommitted, and the rows carry one swept
+/// position each; an EMPTY sweep is one row with a `NULL` account, which is a
+/// period with nothing to sweep and a legitimate close (migration `00004`'s
+/// entryless carve-out), never a refusal.
+///
+/// A claimed key with no transaction is a state the statement cannot produce
+/// — `txn` selects `FROM claimed` — and is answered as the disagreement it
+/// would have to be, the same rule [`diagnose_supersede_refusal`] follows.
+fn closed_from_the_rows(rows: Vec<ClosedRow>) -> Result<Option<ClosedPeriod>, StorageError> {
+    let Some(first) = rows.first() else {
+        return Ok(None);
+    };
+    let event_id = first.event_id;
+    let computed_at_xid = first.computed_at_xid.clone();
+    let Some(transaction_id) = first.transaction_id else {
+        return Err("the closing statement claimed a key and wrote no transaction".into());
+    };
+    let mut swept = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let (Some(account_id), Some(position_minor)) =
+            (row.swept_account_id, row.swept_position_minor)
+        {
+            swept.push(SweptPosition {
+                account_id,
+                position_minor,
+            });
+        }
+    }
+    Ok(Some(ClosedPeriod::Closed {
+        event_id,
+        transaction_id,
+        computed_at_xid,
+        swept,
+    }))
+}
+
 /// One row of [`CLAIM_AND_APPEND`]'s answer, named so the matches downstream
 /// read: the claim, the transaction (`None` when the supersede gate withheld
 /// it), one delta's upsert counter (`account_id`/`currency` are `None` on a
@@ -1590,6 +2111,172 @@ impl Repository for PgRepository {
             .await
             .map_err(storage)?;
         Ok(found.map(|row| (row.event_id, account_from(row))))
+    }
+
+    /// Statement A for a definition: bind the command into
+    /// [`CLAIM_AND_DEFINE_PERIOD`], run the one statement, and read its
+    /// answer — except the two answers that arrive as ERRORS rather than as
+    /// rows, which are both of this operation's named refusals
+    /// ([`refusal_from_the_period_constraints`]), classified here where the
+    /// `sqlx::Error` is.
+    async fn claim_and_define_period(
+        &self,
+        tx: &mut Self::Tx,
+        command: &DefinePeriod,
+        hash: &[u8],
+        payload: &serde_json::Value,
+    ) -> Result<Option<DefinedPeriod>, StorageError> {
+        let outcome: Result<Option<PeriodRow>, sqlx::Error> =
+            sqlx::query_as(CLAIM_AND_DEFINE_PERIOD)
+                .bind(command.tenant_id())
+                .bind(command.idempotency_key())
+                .bind(hash)
+                .bind(payload)
+                .bind(command.code())
+                .bind(command.starts_at())
+                .bind(command.ends_at())
+                .bind(command.tz())
+                .fetch_optional(&mut **tx)
+                .await;
+        let claimed = match outcome {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                return match refusal_from_the_period_constraints(&error) {
+                    Some(refused) => Ok(Some(refused)),
+                    None => Err(storage(error)),
+                };
+            }
+        };
+        defined_from_the_row(claimed)
+    }
+
+    /// Statement B for a definition: the stored result of the claimed key
+    /// ([`STORED_PERIOD`]).
+    async fn stored_period(
+        &self,
+        tx: &mut Self::Tx,
+        command: &DefinePeriod,
+        hash: &[u8],
+    ) -> Result<Option<StoredPeriod>, StorageError> {
+        let found: Option<PeriodRow> = sqlx::query_as(STORED_PERIOD)
+            .bind(command.tenant_id())
+            .bind(command.idempotency_key())
+            .bind(hash)
+            .bind(command.code())
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(storage)?;
+        Ok(found.map(|row| (row.event_id, period_from(row))))
+    }
+
+    /// The close's one pre-flight read ([`PERIOD_CLOSE_CONTEXT`]), inside the
+    /// close's own database transaction.
+    async fn period_close_context(
+        &self,
+        tx: &mut Self::Tx,
+        command: &ClosePeriod,
+    ) -> Result<Option<PeriodCloseContext>, StorageError> {
+        let found: Option<(OffsetDateTime, OffsetDateTime, Option<Uuid>)> =
+            sqlx::query_as(PERIOD_CLOSE_CONTEXT)
+                .bind(command.tenant_id())
+                .bind(command.period_code())
+                .bind(command.currency())
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(storage)?;
+        Ok(found.map(
+            |(starts_at, ends_at, retained_earnings)| PeriodCloseContext {
+                starts_at,
+                ends_at,
+                retained_earnings,
+            },
+        ))
+    }
+
+    /// Statement A for a close: bind the command, the period's own bounds,
+    /// the earnings account and the closing instant into
+    /// [`CLAIM_AND_CLOSE_PERIOD`], run the one statement, and read its answer
+    /// — except the one answer that arrives as an ERROR: `23505` on
+    /// `pk_closes` is a close row this writer did not put there
+    /// ([`refusal_from_the_close_race`]).
+    ///
+    /// This writer's stripe affinity rides along as the last bind, exactly as
+    /// it does on the posting path, and the statement picks each swept
+    /// account's stripe from it.
+    async fn claim_and_close_period(
+        &self,
+        tx: &mut Self::Tx,
+        command: &ClosePeriod,
+        hash: &[u8],
+        payload: &serde_json::Value,
+        plan: &ClosePlan,
+    ) -> Result<Option<ClosedPeriod>, StorageError> {
+        let outcome: Result<Vec<ClosedRow>, sqlx::Error> = sqlx::query_as(CLAIM_AND_CLOSE_PERIOD)
+            .bind(command.tenant_id())
+            .bind(command.idempotency_key())
+            .bind(hash)
+            .bind(payload)
+            .bind(plan.closes_at)
+            .bind(command.currency())
+            .bind(plan.ends_at)
+            .bind(plan.starts_at)
+            .bind(command.period_code())
+            .bind(plan.retained_earnings)
+            .bind(self.stripe_affinity)
+            .fetch_all(&mut **tx)
+            .await;
+        let rows = match outcome {
+            Ok(rows) => rows,
+            Err(error) => {
+                return match refusal_from_the_close_race(&error) {
+                    Some(refused) => Ok(Some(refused)),
+                    None => Err(storage(error)),
+                };
+            }
+        };
+        closed_from_the_rows(rows)
+    }
+
+    /// Step 4 ([`CHECKPOINT_THE_CLOSE`]): the checkpoint, written AFTER the
+    /// closing entries exist, bounded by the cursor the previous statement
+    /// stored and admitting this close's own transaction by identity.
+    async fn checkpoint_the_close(
+        &self,
+        tx: &mut Self::Tx,
+        command: &ClosePeriod,
+        plan: &ClosePlan,
+        transaction_id: Uuid,
+        computed_at_xid: &str,
+    ) -> Result<u64, StorageError> {
+        let written = sqlx::query(CHECKPOINT_THE_CLOSE)
+            .bind(command.tenant_id())
+            .bind(command.period_code())
+            .bind(command.currency())
+            .bind(plan.ends_at)
+            .bind(computed_at_xid)
+            .bind(transaction_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(storage)?;
+        Ok(written.rows_affected())
+    }
+
+    /// Statement B for a close ([`STORED_CLOSE`]): whether an event with this
+    /// body already holds the derived key.
+    async fn stored_close(
+        &self,
+        tx: &mut Self::Tx,
+        command: &ClosePeriod,
+        hash: &[u8],
+    ) -> Result<Option<Uuid>, StorageError> {
+        let found: Option<(Uuid,)> = sqlx::query_as(STORED_CLOSE)
+            .bind(command.tenant_id())
+            .bind(command.idempotency_key())
+            .bind(hash)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(storage)?;
+        Ok(found.map(|(event_id,)| event_id))
     }
 
     /// Commit the bracket: the event claim and everything it caused become

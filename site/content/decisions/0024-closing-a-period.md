@@ -67,7 +67,8 @@ checksum, and this transaction is balanced by construction.
 | --- | --- |
 | `period_unknown` | `{code}` names no period on this tenant |
 | `period_already_closed` | `pk_closes` — this period and currency are closed, and a close happens once |
-| `period_overlaps` | `ex_periods__no_overlap`, on definition |
+| `period_exists` | `pk_periods` — this tenant already defines this code. **Added 2026-09-01 during the build, and the table was wrong without it**: PostgreSQL checks the primary key *before* the exclusion constraint — measured on the running binary, even where the two ranges are identical — so redefining a code reached the caller as an unnamed `23505` and a **500**, and `period_overlaps` was reachable only under a *different* code. Named in [0021](/decisions/0021-accounts-over-http)'s `account_exists` grammar |
+| `period_overlaps` | `ex_periods__no_overlap`, on definition, and only for a code that is not already taken |
 | `period_zone_unknown` | `ck_periods__tz_known` |
 | `retained_earnings_unknown` | the tenant holds no `retained_earnings` house account in that currency, so the sweep has no destination |
 | `invalid_request` | `ends_at` not after `starts_at`, a malformed instant, a bad currency |
@@ -104,6 +105,17 @@ checksum, and this transaction is balanced by construction.
   `pg_snapshot_xmin` as its close cursor
   ([0020](/decisions/0020-checkpoint-on-the-report-path)). This writer does not store that value, so
   it does not trip it — but the predicate is still wrong for one that would.
+- **Two closes of the same period and currency that overlap in time can leave the later one's
+  checkpoint missing the earlier sweep.** Storing `pg_current_xact_id()` makes the *sequential* case
+  correct by construction — the previous close's legs are always below this cursor — so
+  [0020](/decisions/0020-checkpoint-on-the-report-path)'s ordering constraint (b) is inert rather than
+  enforced. The concurrent case is **caught by `checkpoint_drift`, not refused**. That is the same
+  class as 0020's recorded "with one other writer open" cost, and it is the price of a cursor that
+  cannot trip `cursor_precedes_close`.
+- **A rival transaction with a lower xid that commits after the checkpoint statement** is below the
+  stored cursor and was never aggregated, so it lands in neither the checkpoint nor the reader's tail.
+  That is row 2 of [0020](/decisions/0020-checkpoint-on-the-report-path)'s table, arriving as
+  predicted, and it is documented at the statement rather than discovered later.
 - **Reversing a close is refused** and stays refused ([0016](/decisions/0016-pending-to-posted)):
   un-closing would contradict a standing checkpoint. A close is corrected by a later posting, like
   everything else here.

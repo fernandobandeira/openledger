@@ -6,17 +6,23 @@
 //! response, and no invented 409 — a concurrent duplicate blocks on the key
 //! claim and finds a durable result, so there is no in-flight state to name.
 //!
-//! Ten endpoints: two writes, and the eight reads — a balance, three
+//! Twelve endpoints: four writes, and the eight reads — a balance, three
 //! reports, a transaction read-back (ADR-0019), one account listing
 //! (ADR-0021), one account statement (ADR-0023) and the commit horizon on its
 //! own. The second write is
 //! `POST /v1/accounts`, the operation that had no API at all until ADR-0021:
 //! accounts were seeded by SQL, which made `psql` a required part of
 //! onboarding a ledger whose whole adoption surface is this crate. The
-//! horizon route is the youngest, and it is ADR-0019's refusal of a
+//! horizon route is the youngest read, and it is ADR-0019's refusal of a
 //! cursor-minting endpoint qualified rather than overturned: every report
 //! does return its cursor, and that made asking for the horizon alone cost a
 //! whole report.
+//!
+//! The third and fourth writes are the period's (ADR-0024):
+//! `POST /v1/periods` and `POST /v1/periods/{code}/close`. Same hole, one
+//! table over — `ledger_periods`, `ledger_period_closes` and
+//! `ledger_period_balances` have existed since the baseline and nothing in
+//! Rust had ever written any of them.
 //!
 //! No authentication by decision, not omission (ADR-0017): the ledger deploys
 //! internally only, the trust story is the deployment perimeter's, and the
@@ -49,6 +55,7 @@ use axum::Router;
 use ledger::{Ledger, Reports};
 
 mod accounts;
+mod periods;
 mod reports;
 mod serve;
 mod spec;
@@ -111,6 +118,8 @@ route_table! { L, R =>
     get "/v1/transactions/{transaction_id}" transactions::get_transaction::<L, R>,
     post "/v1/accounts" accounts::open_account::<L, R>,
     get "/v1/accounts" accounts::list_accounts::<L, R>,
+    post "/v1/periods" periods::define_period::<L, R>,
+    post "/v1/periods/{code}/close" periods::close_period::<L, R>,
     get "/v1/accounts/{account_id}/balance" reports::get_account_balance::<L, R>,
     get "/v1/accounts/{account_id}/entries" accounts::get_account_statement::<L, R>,
     get "/v1/cursor" reports::get_cursor::<L, R>,

@@ -54,11 +54,15 @@ use uuid::Uuid;
 
 use crate::accounts::{Account, AccountOpened, ChartTriple, OpenAccount};
 use crate::domain::{PostTransaction, Posted};
-use crate::port::{Ledger, OpenAccountError, WriteError};
+use crate::periods::{
+    ClosePeriod, DefinePeriod, Period, PeriodClosed, PeriodDefined, SweptPosition,
+    the_last_instant_inside,
+};
+use crate::port::{ClosePeriodError, DefinePeriodError, Ledger, OpenAccountError, WriteError};
 use crate::postings::{self, Append, Delta};
 use crate::repository::{
-    Appended, BatchMember, Claimed, MemberOutcome, OpenedAccount, Repository, StorageError,
-    StoredResult, SupersedeRefusal,
+    Appended, BatchMember, Claimed, ClosePlan, ClosedPeriod, DefinedPeriod, MemberOutcome,
+    OpenedAccount, Repository, StorageError, StoredResult, SupersedeRefusal,
 };
 
 /// The writer behind the [`Ledger`] port, generic over the repository. One
@@ -102,6 +106,17 @@ impl<R: Repository> Ledger for LedgerService<R> {
 
     async fn open_account(&self, command: &OpenAccount) -> Result<AccountOpened, OpenAccountError> {
         open_account(&self.repository, command).await
+    }
+
+    async fn define_period(
+        &self,
+        command: &DefinePeriod,
+    ) -> Result<PeriodDefined, DefinePeriodError> {
+        define_period(&self.repository, command).await
+    }
+
+    async fn close_period(&self, command: &ClosePeriod) -> Result<PeriodClosed, ClosePeriodError> {
+        close_period(&self.repository, command).await
     }
 }
 
@@ -852,6 +867,381 @@ async fn replay_the_opened_account_or_refuse_the_key<R: Repository>(
     }
 }
 
+// ----------------------------------------------------------------------
+// The period (ADR-0024) — defining one is the opening's bracket with a
+// different insert; closing one is the same bracket around three statements
+// whose ORDER is the decision.
+
+/// The definition path's storage error, folded into its own port answer — a
+/// separate function per enum, for the reason [`storage_while_opening`] is
+/// separate from [`storage`]: the paths cannot come to share a refusal by
+/// accident.
+fn storage_while_defining(e: StorageError) -> DefinePeriodError {
+    DefinePeriodError::Storage(e)
+}
+
+/// The close path's storage error, likewise.
+fn storage_while_closing(e: StorageError) -> ClosePeriodError {
+    ClosePeriodError::Storage(e)
+}
+
+/// Define one period atomically, or return the stored result. One database
+/// transaction: the event claim and the `ledger_periods` row commit together,
+/// so there is no in-flight state to report and no way to end up with a
+/// claimed key and no period (ADR-0024, inheriting ADR-0013 §2).
+///
+/// It is [`open_account`] with the chart read taken out. **Both refusals it
+/// can hear are the DATABASE's**, and neither could honestly be asked first:
+/// an overlap is a statement about other rows that a read cannot make under
+/// concurrency, and a zone's existence is the server's tzdata. So this path
+/// has no pre-flight step at all — the claim runs, and the constraint is
+/// named.
+async fn define_period<R: Repository>(
+    repository: &R,
+    command: &DefinePeriod,
+) -> Result<PeriodDefined, DefinePeriodError> {
+    let hash = command
+        .idempotency_hash()
+        .map_err(|invalid| DefinePeriodError::Internal(invalid.detail().to_owned()))?;
+    let payload = command
+        .payload()
+        .map_err(|invalid| DefinePeriodError::Internal(invalid.detail().to_owned()))?;
+
+    let mut tx = repository.begin().await.map_err(storage_while_defining)?;
+
+    match repository
+        .claim_and_define_period(&mut tx, command, &hash, &payload)
+        .await
+        .map_err(storage_while_defining)?
+    {
+        // This caller is the first writer and the period is written,
+        // uncommitted, in this open transaction: close the bracket.
+        Some(DefinedPeriod::Defined { event_id, period }) => {
+            commit_the_defined_period(repository, tx, event_id, period).await
+        }
+        Some(DefinedPeriod::Exists) => {
+            refuse_the_definition_after_rollback(
+                repository,
+                tx,
+                DefinePeriodError::PeriodExists {
+                    code: command.code().to_owned(),
+                },
+            )
+            .await
+        }
+        Some(DefinedPeriod::Overlaps) => {
+            refuse_the_definition_after_rollback(
+                repository,
+                tx,
+                DefinePeriodError::PeriodOverlaps {
+                    code: command.code().to_owned(),
+                },
+            )
+            .await
+        }
+        Some(DefinedPeriod::ZoneUnknown) => {
+            refuse_the_definition_after_rollback(
+                repository,
+                tx,
+                DefinePeriodError::PeriodZoneUnknown {
+                    tz: command.tz().to_owned(),
+                },
+            )
+            .await
+        }
+        // The key belongs to an earlier definition: replay its stored result —
+        // never define a second period — or refuse the key if the body differs.
+        None => replay_the_defined_period_or_refuse_the_key(repository, tx, command, &hash).await,
+    }
+}
+
+/// The first writer's second half: the period already exists, uncommitted, in
+/// this transaction, so what is left is closing the bracket.
+async fn commit_the_defined_period<R: Repository>(
+    repository: &R,
+    tx: R::Tx,
+    event_id: Uuid,
+    period: Period,
+) -> Result<PeriodDefined, DefinePeriodError> {
+    repository
+        .commit(tx)
+        .await
+        .map_err(storage_while_defining)?;
+    Ok(PeriodDefined {
+        event_id,
+        period,
+        replayed: false,
+    })
+}
+
+/// Roll the bracket back, THEN refuse — the ordering that makes every
+/// refusal's "nothing was written" true, and the reason each one travels here
+/// as a value rather than being returned where it was discovered.
+async fn refuse_the_definition_after_rollback<R: Repository>(
+    repository: &R,
+    tx: R::Tx,
+    refusal: DefinePeriodError,
+) -> Result<PeriodDefined, DefinePeriodError> {
+    repository
+        .rollback(tx)
+        .await
+        .map_err(storage_while_defining)?;
+    Err(refusal)
+}
+
+/// The key was already claimed: answer the replay, or refuse the reuse — the
+/// same shape [`replay_the_opened_account_or_refuse_the_key`] has, and a
+/// separate statement for the same reason (ADR-0013 §2).
+async fn replay_the_defined_period_or_refuse_the_key<R: Repository>(
+    repository: &R,
+    mut tx: R::Tx,
+    command: &DefinePeriod,
+    hash: &[u8],
+) -> Result<PeriodDefined, DefinePeriodError> {
+    let stored = repository
+        .stored_period(&mut tx, command, hash)
+        .await
+        .map_err(storage_while_defining)?;
+    repository
+        .rollback(tx)
+        .await
+        .map_err(storage_while_defining)?;
+    match stored {
+        Some((event_id, Some(period))) => Ok(PeriodDefined {
+            event_id,
+            period,
+            replayed: true,
+        }),
+        Some((event_id, None)) => Err(DefinePeriodError::Internal(format!(
+            "event {event_id} claimed this key with this body and no period carries its code"
+        ))),
+        None => Err(DefinePeriodError::KeyReused),
+    }
+}
+
+/// Close one period, for one currency — the whole of ADR-0024's four steps,
+/// in one database transaction, in the order the decision spells out:
+///
+/// 1. claim the DERIVED key (`tenant:close:period:currency`), so a second
+///    attempt is refused by `uq_events__idempotency` rather than by a check
+///    written here;
+/// 2. write the `period_close` transaction — one posting per temporary
+///    account holding a non-zero position, destination `retained_earnings`,
+///    dated `ends_at - 1 microsecond`;
+/// 3. write the `ledger_period_closes` row naming it, with its cursor;
+/// 4. **then** the checkpoint, because identity admission has nothing to
+///    admit if the closing entries do not exist yet (ADR-0020).
+///
+/// Steps 1–3 are one statement and step 4 is another, and the split is
+/// structural rather than stylistic: the data-modifying CTEs of one statement
+/// cannot see each other's effects on the target table, so a checkpoint
+/// written alongside the entries would store the PRE-close position.
+///
+/// The TWO reads that can refuse — the period's existence and the earnings
+/// account's — run before the claim. That ordering matters more here than
+/// anywhere else on this port: the key is derived, so a key burnt by a refused
+/// attempt could never be retried under a different name.
+async fn close_period<R: Repository>(
+    repository: &R,
+    command: &ClosePeriod,
+) -> Result<PeriodClosed, ClosePeriodError> {
+    let hash = command.idempotency_hash();
+    let payload = command.payload();
+
+    let mut tx = repository.begin().await.map_err(storage_while_closing)?;
+
+    let context = match repository
+        .period_close_context(&mut tx, command)
+        .await
+        .map_err(storage_while_closing)?
+    {
+        Some(context) => context,
+        None => {
+            return refuse_the_close_after_rollback(
+                repository,
+                tx,
+                ClosePeriodError::PeriodUnknown {
+                    code: command.period_code().to_owned(),
+                },
+            )
+            .await;
+        }
+    };
+    // ADR-0011 §2 has no Income Summary account to fall back on: temporary
+    // accounts close DIRECTLY to `retained_earnings`, so without one there is
+    // nowhere for the sweep to land and nothing to do about it here.
+    let Some(retained_earnings) = context.retained_earnings else {
+        return refuse_the_close_after_rollback(
+            repository,
+            tx,
+            ClosePeriodError::RetainedEarningsUnknown {
+                currency: command.currency().to_owned(),
+            },
+        )
+        .await;
+    };
+    // The last representable instant inside a half-open period. `None` is the
+    // floor of the representable range, which no period a caller could define
+    // reaches — answered as the internal state it would have to be, never by
+    // inventing a date (ADR-0006).
+    let Some(closes_at) = the_last_instant_inside(context.ends_at) else {
+        return refuse_the_close_after_rollback(
+            repository,
+            tx,
+            ClosePeriodError::Internal(
+                "the period ends at the first representable instant, so it has no closing \
+                 instant one microsecond inside it"
+                    .to_owned(),
+            ),
+        )
+        .await;
+    };
+    // Everything both statements bind beyond the command, decided once: the
+    // book's answer narrowed to what the writer will use.
+    let plan = ClosePlan {
+        starts_at: context.starts_at,
+        ends_at: context.ends_at,
+        retained_earnings,
+        closes_at,
+    };
+
+    match repository
+        .claim_and_close_period(&mut tx, command, &hash, &payload, &plan)
+        .await
+        .map_err(storage_while_closing)?
+    {
+        Some(ClosedPeriod::Closed {
+            event_id,
+            transaction_id,
+            computed_at_xid,
+            swept,
+        }) => {
+            checkpoint_and_commit_the_close(
+                repository,
+                tx,
+                command,
+                &plan,
+                ClosedSoFar {
+                    event_id,
+                    transaction_id,
+                    computed_at_xid,
+                    swept,
+                },
+            )
+            .await
+        }
+        // `pk_closes` already holds this close — a close row written by
+        // something other than this writer, since a close of ITS own would
+        // have been stopped by the derived key one CTE earlier.
+        Some(ClosedPeriod::AlreadyClosed) => {
+            refuse_the_close_after_rollback(
+                repository,
+                tx,
+                ClosePeriodError::PeriodAlreadyClosed {
+                    code: command.period_code().to_owned(),
+                    currency: command.currency().to_owned(),
+                },
+            )
+            .await
+        }
+        // The derived key is held. Which sentence that is depends on WHOSE
+        // body holds it, and the stored hash is the only thing that knows.
+        None => refuse_the_repeated_close(repository, tx, command, &hash).await,
+    }
+}
+
+/// What steps 1–3 wrote, on its way to step 4 — one value because the four
+/// fields travel together and a function taking them one at a time would take
+/// four arguments of which two are `Uuid`.
+struct ClosedSoFar {
+    event_id: Uuid,
+    transaction_id: Uuid,
+    computed_at_xid: String,
+    swept: Vec<SweptPosition>,
+}
+
+/// Step 4, then the commit. The checkpoint runs HERE — after the statement
+/// that wrote the closing entries and before the bracket closes — which is
+/// the whole of ADR-0020's ordering constraint (a): computed first, the stored
+/// rows are the pre-close position and identity admission has nothing to
+/// admit.
+async fn checkpoint_and_commit_the_close<R: Repository>(
+    repository: &R,
+    mut tx: R::Tx,
+    command: &ClosePeriod,
+    plan: &ClosePlan,
+    closed: ClosedSoFar,
+) -> Result<PeriodClosed, ClosePeriodError> {
+    let checkpoint_rows = repository
+        .checkpoint_the_close(
+            &mut tx,
+            command,
+            plan,
+            closed.transaction_id,
+            &closed.computed_at_xid,
+        )
+        .await
+        .map_err(storage_while_closing)?;
+    repository.commit(tx).await.map_err(storage_while_closing)?;
+    Ok(PeriodClosed {
+        event_id: closed.event_id,
+        transaction_id: closed.transaction_id,
+        period_code: command.period_code().to_owned(),
+        currency: command.currency().to_owned(),
+        effective_at: plan.closes_at,
+        computed_at_xid: closed.computed_at_xid,
+        swept: closed.swept,
+        checkpoint_rows,
+    })
+}
+
+/// Roll the bracket back, THEN refuse — and on this path the rollback is
+/// carrying more than anywhere else: a refused close may already have written
+/// a transaction, its entries, a balance row per swept account and a close
+/// record, and "nothing was written" is true only because of this line.
+async fn refuse_the_close_after_rollback<R: Repository>(
+    repository: &R,
+    tx: R::Tx,
+    refusal: ClosePeriodError,
+) -> Result<PeriodClosed, ClosePeriodError> {
+    repository
+        .rollback(tx)
+        .await
+        .map_err(storage_while_closing)?;
+    Err(refusal)
+}
+
+/// The derived key is held: say which of the two refusals that is.
+///
+/// A stored event whose hash MATCHES this body is this very close, run a
+/// second time — `period_already_closed`, the sentence ADR-0024 names, and
+/// exactly what a caller retrying a close it already made should hear. No
+/// match means the string was claimed by some other request, which is the
+/// ordinary poisoned replay under the ordinary name. This path only read, so
+/// the bracket closes by rollback before the answer leaves.
+async fn refuse_the_repeated_close<R: Repository>(
+    repository: &R,
+    mut tx: R::Tx,
+    command: &ClosePeriod,
+    hash: &[u8],
+) -> Result<PeriodClosed, ClosePeriodError> {
+    let held_by_this_close = repository
+        .stored_close(&mut tx, command, hash)
+        .await
+        .map_err(storage_while_closing)?;
+    repository
+        .rollback(tx)
+        .await
+        .map_err(storage_while_closing)?;
+    if held_by_this_close.is_some() {
+        return Err(ClosePeriodError::PeriodAlreadyClosed {
+            code: command.period_code().to_owned(),
+            currency: command.currency().to_owned(),
+        });
+    }
+    Err(ClosePeriodError::KeyReused)
+}
+
 #[cfg(test)]
 mod tests {
     //! Orchestration tests over a fake repository — read top to bottom, the
@@ -873,7 +1263,7 @@ mod tests {
     use super::*;
     use crate::accounts::{AccountOwner, AccountOwnerType};
     use crate::domain::{Invalid, Posting, TransactionStatus};
-    use crate::repository::{BalanceUpsert, StoredAccount};
+    use crate::repository::{BalanceUpsert, PeriodCloseContext, StoredAccount, StoredPeriod};
 
     // Fixed ids: SOURCE < DESTINATION, so SOURCE leads the coalesced map —
     // and is the account an all-unknown refusal must name.
@@ -1054,6 +1444,85 @@ mod tests {
         FindingTheKeyClaimed,
     }
 
+    /// What the period-DEFINITION statement answered, as a test says it.
+    #[derive(Clone, Copy)]
+    enum Defines {
+        /// The key was claimed and the period is written, uncommitted.
+        ThePeriod,
+        /// `pk_periods` refused it: this tenant already has a period under
+        /// this code.
+        RefusingAnExistingCode,
+        /// `ex_periods__no_overlap` refused it: `23P01`, as the adapter
+        /// classifies it.
+        RefusingAnOverlap,
+        /// The server does not recognise the zone: `22023` from `timezone()`,
+        /// which raises rather than letting the CHECK fail.
+        RefusingAnUnknownZone,
+        /// An earlier caller holds this key; nothing was inserted.
+        FindingTheKeyClaimed,
+    }
+
+    /// What the CLOSING statement answered.
+    #[derive(Clone, Copy)]
+    enum Closes {
+        /// The derived key was free and the sweep ran, uncommitted.
+        TheSweep,
+        /// The same, over a period whose temporary accounts had nothing in
+        /// them — a legitimate close with no legs at all (ADR-0020's
+        /// entryless carve-out).
+        NothingToSweep,
+        /// `pk_closes` already holds this close, written some other way.
+        RefusingAnExistingClose,
+        /// The derived key is already held; nothing was inserted.
+        FindingTheKeyClaimed,
+    }
+
+    /// The account a close sweeps in these tests, and the cursor it stores.
+    /// The cursor is TEXT because an `xid8` is 64-bit and every cursor on
+    /// this surface travels as a string (ADR-0022's reasoning about amounts,
+    /// applied to the one other value past 2^53).
+    const SWEPT_ACCOUNT: Uuid = Uuid::from_u128(0xB1);
+    const CURSOR: &str = "16024";
+
+    /// One period as `ledger_periods` would hand it back.
+    fn a_period_row() -> Period {
+        Period {
+            code: "2026-08".to_owned(),
+            starts_at: OffsetDateTime::UNIX_EPOCH,
+            ends_at: OffsetDateTime::UNIX_EPOCH + time::Duration::days(31),
+            tz: "UTC".to_owned(),
+        }
+    }
+
+    /// What the close's one pre-flight read answers on a book that can be
+    /// closed: the period's own resolved bounds, and an earnings account for
+    /// the sweep to land in.
+    fn a_close_context() -> PeriodCloseContext {
+        PeriodCloseContext {
+            starts_at: OffsetDateTime::UNIX_EPOCH,
+            ends_at: OffsetDateTime::UNIX_EPOCH + time::Duration::days(31),
+            retained_earnings: Some(Uuid::from_u128(0xE1)),
+        }
+    }
+
+    /// One definition, the shape every test here varies nothing about: the
+    /// refusals this operation can hear are all the database's.
+    fn a_definition() -> Result<DefinePeriod, Invalid> {
+        DefinePeriod::new(
+            "acme".to_owned(),
+            "period-2026-08".to_owned(),
+            "2026-08".to_owned(),
+            OffsetDateTime::UNIX_EPOCH,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::days(31),
+            "UTC".to_owned(),
+        )
+    }
+
+    /// One close of that period, in dollars.
+    fn a_closing() -> Result<ClosePeriod, Invalid> {
+        ClosePeriod::new("acme".to_owned(), "2026-08".to_owned(), "USD".to_owned())
+    }
+
     /// One account as the register would hand it back — the whole row, since
     /// ADR-0021's cost list was closed by answering with what the server
     /// derived rather than with two UUIDs. The id is the axis the tests vary:
@@ -1150,6 +1619,23 @@ mod tests {
         /// can hold that the writer bound the chart's answer and not the
         /// caller's wish.
         bound_triple: Arc<Mutex<Option<ChartTriple>>>,
+        /// What the period-definition statement answers.
+        defines: Defines,
+        /// What the definition's replay lookup finds for a claimed key.
+        stored_period: Option<StoredPeriod>,
+        /// What the close's one pre-flight read answers — `None` is a period
+        /// this tenant does not hold.
+        close_context: Option<PeriodCloseContext>,
+        /// What the closing statement answers.
+        closes: Closes,
+        /// Whether an event with THIS body already holds the derived key —
+        /// what tells `period_already_closed` from `idempotency_key_reused`.
+        stored_close: Option<Uuid>,
+        /// What the checkpoint statement was actually BOUND: the transaction
+        /// identity admission names, and the cursor the close stored.
+        /// Recorded so a test can hold that the bound IS the stored row
+        /// rather than a second reading of the same expression.
+        bound_checkpoint: Arc<Mutex<Option<(Uuid, String)>>>,
         calls: Calls,
     }
 
@@ -1168,6 +1654,12 @@ mod tests {
                 opens: Opens::TheAccount,
                 stored_account: None,
                 bound_triple: Arc::default(),
+                defines: Defines::ThePeriod,
+                stored_period: None,
+                close_context: Some(a_close_context()),
+                closes: Closes::TheSweep,
+                stored_close: None,
+                bound_checkpoint: Arc::default(),
                 calls: Calls::default(),
             }
         }
@@ -1311,8 +1803,126 @@ mod tests {
             fake
         }
 
+        /// The single call defines the period: the claim returned a row and
+        /// the insert rode on it.
+        fn defining_a_period() -> Self {
+            Self::first_writer()
+        }
+
+        /// `pk_periods` refused it: this tenant already has a period under
+        /// this code, which is the constraint checked BEFORE the exclusion
+        /// index.
+        fn finding_the_code_taken() -> Self {
+            let mut fake = Self::defining_a_period();
+            fake.defines = Defines::RefusingAnExistingCode;
+            fake
+        }
+
+        /// `ex_periods__no_overlap` refused it — `23P01`, as the adapter
+        /// classifies it. A refusal only the database can make: no read
+        /// before the insert can see an uncommitted rival period.
+        fn finding_the_period_overlaps() -> Self {
+            let mut fake = Self::defining_a_period();
+            fake.defines = Defines::RefusingAnOverlap;
+            fake
+        }
+
+        /// The server does not recognise the zone — `22023` from
+        /// `timezone()`, which RAISES rather than letting
+        /// `ck_periods__tz_known` fail.
+        fn finding_the_zone_unknown() -> Self {
+            let mut fake = Self::defining_a_period();
+            fake.defines = Defines::RefusingAnUnknownZone;
+            fake
+        }
+
+        /// The key is already claimed and the body matches: the claim returns
+        /// nothing and the replay lookup finds the stored period.
+        fn replaying_a_defined_period() -> Self {
+            let mut fake = Self::defining_a_period();
+            fake.defines = Defines::FindingTheKeyClaimed;
+            fake.stored_period = Some((EVENT, Some(a_period_row())));
+            fake
+        }
+
+        /// The key is already claimed with a DIFFERENT body: the lookup's
+        /// hash-in-WHERE finds nothing.
+        fn defining_over_a_poisoned_key() -> Self {
+            let mut fake = Self::defining_a_period();
+            fake.defines = Defines::FindingTheKeyClaimed;
+            fake.stored_period = None;
+            fake
+        }
+
+        /// The single call closes the period: the derived key was free, the
+        /// sweep ran, and the close row names the transaction.
+        fn closing_a_period() -> Self {
+            Self::first_writer()
+        }
+
+        /// The same, with nothing to sweep — ADR-0020's entryless close,
+        /// which migration `00004` carved out of `recon_transaction_breaks`
+        /// precisely so it is a close rather than a refusal.
+        fn closing_a_period_with_nothing_to_sweep() -> Self {
+            let mut fake = Self::closing_a_period();
+            fake.closes = Closes::NothingToSweep;
+            fake
+        }
+
+        /// The tenant holds no such period: the pre-flight read answers
+        /// nothing and the derived key is never claimed.
+        fn without_the_period() -> Self {
+            let mut fake = Self::closing_a_period();
+            fake.close_context = None;
+            fake
+        }
+
+        /// The tenant holds the period and no `retained_earnings` house
+        /// account in this currency: the sweep has no destination, and
+        /// ADR-0011 §2 has no Income Summary to fall back on.
+        fn without_the_earnings_account() -> Self {
+            let mut fake = Self::closing_a_period();
+            fake.close_context = Some(PeriodCloseContext {
+                retained_earnings: None,
+                ..a_close_context()
+            });
+            fake
+        }
+
+        /// The derived key is already held by THIS close: the claim returns
+        /// nothing and the stored-close lookup's hash matches.
+        fn finding_the_period_already_closed() -> Self {
+            let mut fake = Self::closing_a_period();
+            fake.closes = Closes::FindingTheKeyClaimed;
+            fake.stored_close = Some(EVENT);
+            fake
+        }
+
+        /// The derived key is held by something else — a different body
+        /// under the same string, which is the ordinary poisoned replay.
+        fn closing_over_a_poisoned_key() -> Self {
+            let mut fake = Self::closing_a_period();
+            fake.closes = Closes::FindingTheKeyClaimed;
+            fake.stored_close = None;
+            fake
+        }
+
+        /// `pk_closes` refused the insert: a close row written some other way
+        /// — in SQL, as every close in this project was before ADR-0024 —
+        /// already holds this period and currency.
+        fn finding_a_close_row_already_there() -> Self {
+            let mut fake = Self::closing_a_period();
+            fake.closes = Closes::RefusingAnExistingClose;
+            fake
+        }
+
         fn calls(&self) -> Calls {
             Arc::clone(&self.calls)
+        }
+
+        /// What the checkpoint statement was bound with.
+        fn bound_checkpoint(&self) -> Arc<Mutex<Option<(Uuid, String)>>> {
+            Arc::clone(&self.bound_checkpoint)
         }
 
         /// The triple the opening statement was bound with.
@@ -1510,6 +2120,109 @@ mod tests {
         ) -> Result<Option<StoredAccount>, StorageError> {
             self.record("stored_account");
             Ok(self.stored_account.clone())
+        }
+
+        async fn claim_and_define_period(
+            &self,
+            _tx: &mut FakeTx,
+            _command: &DefinePeriod,
+            _hash: &[u8],
+            _payload: &serde_json::Value,
+        ) -> Result<Option<DefinedPeriod>, StorageError> {
+            self.record("claim_and_define_period");
+            Ok(match self.defines {
+                Defines::ThePeriod => Some(DefinedPeriod::Defined {
+                    event_id: EVENT,
+                    period: a_period_row(),
+                }),
+                Defines::RefusingAnExistingCode => Some(DefinedPeriod::Exists),
+                Defines::RefusingAnOverlap => Some(DefinedPeriod::Overlaps),
+                Defines::RefusingAnUnknownZone => Some(DefinedPeriod::ZoneUnknown),
+                Defines::FindingTheKeyClaimed => None,
+            })
+        }
+
+        async fn stored_period(
+            &self,
+            _tx: &mut FakeTx,
+            _command: &DefinePeriod,
+            _hash: &[u8],
+        ) -> Result<Option<StoredPeriod>, StorageError> {
+            self.record("stored_period");
+            Ok(self.stored_period.clone())
+        }
+
+        async fn period_close_context(
+            &self,
+            _tx: &mut FakeTx,
+            _command: &ClosePeriod,
+        ) -> Result<Option<PeriodCloseContext>, StorageError> {
+            self.record("period_close_context");
+            Ok(self
+                .close_context
+                .as_ref()
+                .map(|context| PeriodCloseContext {
+                    starts_at: context.starts_at,
+                    ends_at: context.ends_at,
+                    retained_earnings: context.retained_earnings,
+                }))
+        }
+
+        async fn claim_and_close_period(
+            &self,
+            _tx: &mut FakeTx,
+            _command: &ClosePeriod,
+            _hash: &[u8],
+            _payload: &serde_json::Value,
+            _plan: &ClosePlan,
+        ) -> Result<Option<ClosedPeriod>, StorageError> {
+            self.record("claim_and_close_period");
+            Ok(match self.closes {
+                Closes::TheSweep => Some(ClosedPeriod::Closed {
+                    event_id: EVENT,
+                    transaction_id: TRANSACTION,
+                    computed_at_xid: CURSOR.to_owned(),
+                    swept: vec![SweptPosition {
+                        account_id: SWEPT_ACCOUNT,
+                        position_minor: -2500,
+                    }],
+                }),
+                Closes::NothingToSweep => Some(ClosedPeriod::Closed {
+                    event_id: EVENT,
+                    transaction_id: TRANSACTION,
+                    computed_at_xid: CURSOR.to_owned(),
+                    swept: Vec::new(),
+                }),
+                Closes::RefusingAnExistingClose => Some(ClosedPeriod::AlreadyClosed),
+                Closes::FindingTheKeyClaimed => None,
+            })
+        }
+
+        async fn checkpoint_the_close(
+            &self,
+            _tx: &mut FakeTx,
+            _command: &ClosePeriod,
+            _plan: &ClosePlan,
+            transaction_id: Uuid,
+            computed_at_xid: &str,
+        ) -> Result<u64, StorageError> {
+            self.record("checkpoint_the_close");
+            *self
+                .bound_checkpoint
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) =
+                Some((transaction_id, computed_at_xid.to_owned()));
+            Ok(3)
+        }
+
+        async fn stored_close(
+            &self,
+            _tx: &mut FakeTx,
+            _command: &ClosePeriod,
+            _hash: &[u8],
+        ) -> Result<Option<Uuid>, StorageError> {
+            self.record("stored_close");
+            Ok(self.stored_close)
         }
 
         async fn commit(&self, _tx: FakeTx) -> Result<(), StorageError> {
@@ -2350,6 +3063,374 @@ mod tests {
         let opened = run(service.open_account(&command));
 
         assert!(matches!(opened, Err(OpenAccountError::Internal(_))));
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // The period (ADR-0024). Defining one is the opening's shape with two
+    // database-only refusals; closing one is the only use-case here whose
+    // ORDER is the decision, so most of what follows reads the call list.
+
+    #[test]
+    fn a_definition_writes_the_period_in_one_call_between_begin_and_commit() -> Result<(), Invalid>
+    {
+        let repository = FakeRepository::defining_a_period();
+        let calls = repository.calls();
+        let service = LedgerService::new(repository);
+        let command = a_definition()?;
+
+        let defined = run(service.define_period(&command));
+
+        assert!(matches!(
+            defined,
+            Ok(PeriodDefined {
+                event_id: e,
+                replayed: false,
+                ..
+            }) if e == EVENT
+        ));
+        // Three repository calls: the claim carrying the period insert,
+        // between the bracket's ends. There is NO pre-flight read at all on
+        // this path — both refusals it can hear are the database's, and
+        // neither could honestly be asked first.
+        assert_eq!(
+            taken(&calls),
+            ["begin", "claim_and_define_period", "commit"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_period_overlapping_another_is_refused_by_name_after_rollback() -> Result<(), Invalid> {
+        let repository = FakeRepository::finding_the_period_overlaps();
+        let calls = repository.calls();
+        let service = LedgerService::new(repository);
+        let command = a_definition()?;
+
+        let defined = run(service.define_period(&command));
+
+        assert!(matches!(
+            defined,
+            Err(DefinePeriodError::PeriodOverlaps { code }) if code == "2026-08"
+        ));
+        // The rollback is what makes "nothing was written" true: the claim
+        // itself ran before the exclusion index spoke.
+        assert_eq!(
+            taken(&calls),
+            ["begin", "claim_and_define_period", "rollback"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_code_this_book_already_uses_is_refused_by_name_after_rollback() -> Result<(), Invalid> {
+        // Not in ADR-0024's table, and reachable before every refusal that is:
+        // `pk_periods` is checked ahead of the exclusion index, so without
+        // this arm re-defining a code is a 500.
+        let repository = FakeRepository::finding_the_code_taken();
+        let calls = repository.calls();
+        let service = LedgerService::new(repository);
+        let command = a_definition()?;
+
+        let defined = run(service.define_period(&command));
+
+        assert!(matches!(
+            defined,
+            Err(DefinePeriodError::PeriodExists { code }) if code == "2026-08"
+        ));
+        assert_eq!(
+            taken(&calls),
+            ["begin", "claim_and_define_period", "rollback"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_zone_the_server_does_not_recognise_is_refused_by_name_after_rollback()
+    -> Result<(), Invalid> {
+        // Not judged in Rust, deliberately: the set of recognised zones is
+        // the SERVER's tzdata, and a copy of it here would drift against the
+        // very database that stores the row (ADR-0011 §5).
+        let repository = FakeRepository::finding_the_zone_unknown();
+        let calls = repository.calls();
+        let service = LedgerService::new(repository);
+        let command = a_definition()?;
+
+        let defined = run(service.define_period(&command));
+
+        assert!(matches!(
+            defined,
+            Err(DefinePeriodError::PeriodZoneUnknown { tz }) if tz == "UTC"
+        ));
+        assert_eq!(
+            taken(&calls),
+            ["begin", "claim_and_define_period", "rollback"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_replayed_definition_answers_the_stored_period_and_defines_no_second_one()
+    -> Result<(), Invalid> {
+        let repository = FakeRepository::replaying_a_defined_period();
+        let calls = repository.calls();
+        let service = LedgerService::new(repository);
+        let command = a_definition()?;
+
+        let defined = run(service.define_period(&command));
+
+        assert!(matches!(
+            defined,
+            Ok(PeriodDefined {
+                event_id: e,
+                replayed: true,
+                ..
+            }) if e == EVENT
+        ));
+        // The claim ran and returned nothing, the lookup answered, and the
+        // bracket closed by ROLLBACK: a replay only read.
+        assert_eq!(
+            taken(&calls),
+            [
+                "begin",
+                "claim_and_define_period",
+                "stored_period",
+                "rollback"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_reused_key_with_a_different_body_is_refused_when_defining_a_period() -> Result<(), Invalid>
+    {
+        let repository = FakeRepository::defining_over_a_poisoned_key();
+        let service = LedgerService::new(repository);
+        let command = a_definition()?;
+
+        let defined = run(service.define_period(&command));
+
+        assert!(matches!(defined, Err(DefinePeriodError::KeyReused)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_close_checkpoints_after_the_sweep_and_before_the_commit() -> Result<(), Invalid> {
+        // ADR-0024's whole ordering claim, and ADR-0020's proof behind it:
+        // the checkpoint runs AFTER the statement that wrote the closing
+        // entries, or identity admission has nothing to admit and the stored
+        // rows are the PRE-close position.
+        let repository = FakeRepository::closing_a_period();
+        let calls = repository.calls();
+        let service = LedgerService::new(repository);
+        let command = a_closing()?;
+
+        let closed = run(service.close_period(&command));
+
+        assert!(matches!(
+            closed,
+            Ok(PeriodClosed {
+                event_id: e,
+                transaction_id: t,
+                checkpoint_rows: 3,
+                ..
+            }) if e == EVENT && t == TRANSACTION
+        ));
+        assert_eq!(
+            taken(&calls),
+            [
+                "begin",
+                "period_close_context",
+                "claim_and_close_period",
+                "checkpoint_the_close",
+                "commit"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_checkpoint_is_bounded_by_the_cursor_the_close_stored_and_admits_its_own_transaction()
+    -> Result<(), Invalid> {
+        // The two halves of `xact_id < C OR transaction_id = <this close>`,
+        // held as the values the writer hands the statement: `C` is the
+        // cursor the close row carries, passed through rather than re-derived,
+        // and the transaction is the one the sweep just wrote. This is what
+        // makes the close's arithmetic and `recon_checkpoint_breaks`'
+        // recompute agree by construction.
+        let repository = FakeRepository::closing_a_period();
+        let bound = repository.bound_checkpoint();
+        let service = LedgerService::new(repository);
+        let command = a_closing()?;
+
+        let closed = run(service.close_period(&command));
+
+        assert!(closed.is_ok());
+        assert_eq!(
+            bound.lock().unwrap_or_else(PoisonError::into_inner).clone(),
+            Some((TRANSACTION, CURSOR.to_owned()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_close_is_dated_one_microsecond_inside_the_period_it_closes() -> Result<(), Invalid> {
+        let repository = FakeRepository::closing_a_period();
+        let service = LedgerService::new(repository);
+        let command = a_closing()?;
+
+        let closed = run(service.close_period(&command));
+
+        // The last representable instant inside a half-open period
+        // (ADR-0011 §2), derived from the period the book holds rather than
+        // from anything the caller sent.
+        assert_eq!(
+            closed.ok().map(|closed| closed.effective_at),
+            Some(a_close_context().ends_at - time::Duration::microseconds(1))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_period_with_nothing_to_sweep_closes_cleanly() -> Result<(), Invalid> {
+        // Migration `00004` carved the entryless close out of
+        // `recon_transaction_breaks` for exactly this (ADR-0020), so the
+        // writer relies on the carve-out rather than making a quiet month an
+        // error.
+        let repository = FakeRepository::closing_a_period_with_nothing_to_sweep();
+        let calls = repository.calls();
+        let service = LedgerService::new(repository);
+        let command = a_closing()?;
+
+        let closed = run(service.close_period(&command));
+
+        assert_eq!(closed.ok().map(|closed| closed.swept), Some(Vec::new()));
+        assert_eq!(
+            taken(&calls),
+            [
+                "begin",
+                "period_close_context",
+                "claim_and_close_period",
+                "checkpoint_the_close",
+                "commit"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_period_this_book_does_not_hold_is_refused_before_the_key_is_claimed() -> Result<(), Invalid>
+    {
+        // The ordering matters more here than anywhere else on this port: the
+        // close's key is DERIVED, so a key burnt by a refused attempt could
+        // never be retried under a different name.
+        let repository = FakeRepository::without_the_period();
+        let calls = repository.calls();
+        let service = LedgerService::new(repository);
+        let command = a_closing()?;
+
+        let closed = run(service.close_period(&command));
+
+        assert!(matches!(
+            closed,
+            Err(ClosePeriodError::PeriodUnknown { code }) if code == "2026-08"
+        ));
+        assert_eq!(taken(&calls), ["begin", "period_close_context", "rollback"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_book_with_no_retained_earnings_account_is_refused_before_the_key_is_claimed()
+    -> Result<(), Invalid> {
+        // ADR-0011 §2 has no Income Summary account to fall back on:
+        // temporary accounts close DIRECTLY to `retained_earnings`, so
+        // without one the sweep has no destination at all.
+        let repository = FakeRepository::without_the_earnings_account();
+        let calls = repository.calls();
+        let service = LedgerService::new(repository);
+        let command = a_closing()?;
+
+        let closed = run(service.close_period(&command));
+
+        assert!(matches!(
+            closed,
+            Err(ClosePeriodError::RetainedEarningsUnknown { currency }) if currency == "USD"
+        ));
+        assert_eq!(taken(&calls), ["begin", "period_close_context", "rollback"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_close_of_one_period_and_currency_is_refused_by_the_derived_key()
+    -> Result<(), Invalid> {
+        let repository = FakeRepository::finding_the_period_already_closed();
+        let calls = repository.calls();
+        let service = LedgerService::new(repository);
+        let command = a_closing()?;
+
+        let closed = run(service.close_period(&command));
+
+        assert!(matches!(
+            closed,
+            Err(ClosePeriodError::PeriodAlreadyClosed { code, currency })
+                if code == "2026-08" && currency == "USD"
+        ));
+        // The claim found the key held and NOTHING was swept; the stored-close
+        // lookup is what says which of the two refusals this is, and the
+        // checkpoint never runs.
+        assert_eq!(
+            taken(&calls),
+            [
+                "begin",
+                "period_close_context",
+                "claim_and_close_period",
+                "stored_close",
+                "rollback"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_derived_key_held_by_a_different_body_is_refused_as_key_reuse() -> Result<(), Invalid> {
+        // The hash is what tells the two apart. Without it a close would be
+        // told "already closed" for a key some unrelated request happened to
+        // claim under the same string.
+        let repository = FakeRepository::closing_over_a_poisoned_key();
+        let service = LedgerService::new(repository);
+        let command = a_closing()?;
+
+        let closed = run(service.close_period(&command));
+
+        assert!(matches!(closed, Err(ClosePeriodError::KeyReused)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_close_row_written_some_other_way_is_refused_as_already_closed() -> Result<(), Invalid> {
+        // `pk_closes`' own refusal, reached when the derived key was free —
+        // a close written in SQL rather than through this endpoint, which is
+        // how every close in this project was made before ADR-0024.
+        let repository = FakeRepository::finding_a_close_row_already_there();
+        let calls = repository.calls();
+        let service = LedgerService::new(repository);
+        let command = a_closing()?;
+
+        let closed = run(service.close_period(&command));
+
+        assert!(matches!(
+            closed,
+            Err(ClosePeriodError::PeriodAlreadyClosed { .. })
+        ));
+        assert_eq!(
+            taken(&calls),
+            [
+                "begin",
+                "period_close_context",
+                "claim_and_close_period",
+                "rollback"
+            ]
+        );
         Ok(())
     }
 }

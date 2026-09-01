@@ -39,9 +39,18 @@
 //! where they already were. It is a module of its own because a posting and
 //! an opening share nothing but the idempotency spine, and the spine is
 //! `ledger_events`, not a Rust type.
+//!
+//! ADR-0024 added the third and fourth writes the same way: `periods` is the
+//! period's two commands — defining one, which is the opening's shape again,
+//! and closing one, which is the only command here whose idempotency key the
+//! WRITER derives rather than the caller supplying. The close is also the one
+//! use-case that cannot be a single statement: its checkpoint aggregates the
+//! entries its own sweep just wrote, and one statement's data-modifying CTEs
+//! cannot see each other's effects.
 
 mod accounts;
 mod domain;
+mod periods;
 mod port;
 mod postings;
 mod report_service;
@@ -60,7 +69,8 @@ pub use accounts::{
     Account, AccountOpened, AccountOwner, AccountOwnerType, ChartTriple, OpenAccount,
 };
 pub use domain::{Invalid, PostTransaction, Posted, Posting, TransactionStatus};
-pub use port::{Ledger, OpenAccountError, WriteError};
+pub use periods::{ClosePeriod, DefinePeriod, Period, PeriodClosed, PeriodDefined, SweptPosition};
+pub use port::{ClosePeriodError, DefinePeriodError, Ledger, OpenAccountError, WriteError};
 pub use postings::{Append, Delta, Direction, Leg};
 pub use report_service::ReportService;
 pub use report_store::{
@@ -75,7 +85,8 @@ pub use reports::{
     TrialBalanceQuery, TrialBalanceRow,
 };
 pub use repository::{
-    Appended, BalanceUpsert, BatchMember, Claimed, MemberOutcome, OpenedAccount, Repository,
-    StorageError, StoredAccount, StoredResult, SupersedeRefusal,
+    Appended, BalanceUpsert, BatchMember, Claimed, ClosePlan, ClosedPeriod, DefinedPeriod,
+    MemberOutcome, OpenedAccount, PeriodCloseContext, Repository, StorageError, StoredAccount,
+    StoredPeriod, StoredResult, SupersedeRefusal,
 };
 pub use service::LedgerService;

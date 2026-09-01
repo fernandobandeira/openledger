@@ -45,8 +45,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use ledger::{
-    AccountOpened, Ledger, LedgerService, OpenAccount, OpenAccountError, PostTransaction, Posted,
-    Repository, TransactionStatus, WriteError,
+    AccountOpened, ClosePeriod, ClosePeriodError, DefinePeriod, DefinePeriodError, Ledger,
+    LedgerService, OpenAccount, OpenAccountError, PeriodClosed, PeriodDefined, PostTransaction,
+    Posted, Repository, TransactionStatus, WriteError,
 };
 use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinSet;
@@ -284,13 +285,17 @@ fn rides_with_the_batch(batch: &[Submission], tenant: &str, waiter: &Submission)
 /// posting shared a statement. It is not a decorator over another `Ledger`,
 /// because a batch is ONE call for N commands rather than N calls.
 ///
-/// **Only the posting half is batched, and the other half says so by holding
-/// a writer of its own.** Opening an account (ADR-0021) never joins a batch:
-/// there is nothing to share — it writes no entries and upserts no balance
-/// row, so it has no accounts to overlap with anyone and no lock to order —
-/// and it is rare where a posting is hot. So it takes the writer below
-/// directly, out of the queue's way entirely, and a burst of openings cannot
-/// occupy a dispatcher that postings are waiting on.
+/// **Only the posting half is batched, and the other three say so by sharing
+/// a writer of their own.** Opening an account (ADR-0021) never joins a
+/// batch: there is nothing to share — it writes no entries and upserts no
+/// balance row, so it has no accounts to overlap with anyone and no lock to
+/// order — and it is rare where a posting is hot. Defining a period
+/// (ADR-0024) is the same shape. Closing one is the opposite shape and lands
+/// in the same place: it writes a great deal, but none of it is what the
+/// batched statement carries, and a sweep linear in account count must not
+/// hold a dispatcher. All three take the writer below directly, out of the
+/// queue's way entirely, so a burst of them cannot occupy a dispatcher that
+/// postings are waiting on.
 ///
 /// Generic in the repository, where the posting half is not, and that is the
 /// cost of the second method: the queue hands its members to whichever
@@ -398,6 +403,29 @@ impl<R: Repository> Ledger for BatchingLedger<R> {
     /// behind postings and put postings behind it.
     async fn open_account(&self, command: &OpenAccount) -> Result<AccountOpened, OpenAccountError> {
         self.opener.open_account(command).await
+    }
+
+    /// Define the period on this request's own task, for the reason opening
+    /// an account takes one: it writes no entries and upserts no balance row,
+    /// so there is nothing for a batch to share.
+    async fn define_period(
+        &self,
+        command: &DefinePeriod,
+    ) -> Result<PeriodDefined, DefinePeriodError> {
+        self.opener.define_period(command).await
+    }
+
+    /// Close the period on this request's own task too — and here the reason
+    /// is the opposite one. A close writes plenty: a transaction, a leg pair
+    /// per swept account, a balance upsert for each, a close record and a
+    /// checkpoint row per account. What it cannot do is share the BATCHED
+    /// statement, which carries plain posted postings only (ADR-0018 §4) and
+    /// derives none of that; and it must not occupy a dispatcher for the
+    /// length of a sweep that is linear in account count (ADR-0024's second
+    /// cost: ~49 s for a million accounts), because a dispatcher held is
+    /// every posting behind it held.
+    async fn close_period(&self, command: &ClosePeriod) -> Result<PeriodClosed, ClosePeriodError> {
+        self.opener.close_period(command).await
     }
 }
 
@@ -615,11 +643,12 @@ mod tests {
             Ok(None)
         }
 
-        // The three opening statements, refused rather than faked. Nothing in
-        // this module's tests opens an account — an opening never joins a
-        // batch and never reaches a dispatcher (ADR-0021) — so a call landing
-        // here would mean the routing this file owns had changed underneath
-        // the tests, and it should say so instead of answering.
+        // The three opening statements and the five the period needs,
+        // refused rather than faked. Nothing in this module's tests opens an
+        // account, defines a period or closes one — none of the three ever
+        // joins a batch or reaches a dispatcher (ADR-0021, ADR-0024) — so a
+        // call landing here would mean the routing this file owns had changed
+        // underneath the tests, and it should say so instead of answering.
         async fn chart_triple_for_purpose(
             &self,
             _tx: &mut NoTransaction,
@@ -646,6 +675,64 @@ mod tests {
             _hash: &[u8],
         ) -> Result<Option<ledger::StoredAccount>, ledger::StorageError> {
             Err("the dispatcher's repository was asked for a stored account".into())
+        }
+
+        async fn claim_and_define_period(
+            &self,
+            _tx: &mut NoTransaction,
+            _command: &DefinePeriod,
+            _hash: &[u8],
+            _payload: &serde_json::Value,
+        ) -> Result<Option<ledger::DefinedPeriod>, ledger::StorageError> {
+            Err("the dispatcher's repository was asked to define a period".into())
+        }
+
+        async fn stored_period(
+            &self,
+            _tx: &mut NoTransaction,
+            _command: &DefinePeriod,
+            _hash: &[u8],
+        ) -> Result<Option<ledger::StoredPeriod>, ledger::StorageError> {
+            Err("the dispatcher's repository was asked for a stored period".into())
+        }
+
+        async fn period_close_context(
+            &self,
+            _tx: &mut NoTransaction,
+            _command: &ClosePeriod,
+        ) -> Result<Option<ledger::PeriodCloseContext>, ledger::StorageError> {
+            Err("the dispatcher's repository was asked to read a period's close context".into())
+        }
+
+        async fn claim_and_close_period(
+            &self,
+            _tx: &mut NoTransaction,
+            _command: &ClosePeriod,
+            _hash: &[u8],
+            _payload: &serde_json::Value,
+            _plan: &ledger::ClosePlan,
+        ) -> Result<Option<ledger::ClosedPeriod>, ledger::StorageError> {
+            Err("the dispatcher's repository was asked to close a period".into())
+        }
+
+        async fn checkpoint_the_close(
+            &self,
+            _tx: &mut NoTransaction,
+            _command: &ClosePeriod,
+            _plan: &ledger::ClosePlan,
+            _transaction_id: Uuid,
+            _computed_at_xid: &str,
+        ) -> Result<u64, ledger::StorageError> {
+            Err("the dispatcher's repository was asked to write a checkpoint".into())
+        }
+
+        async fn stored_close(
+            &self,
+            _tx: &mut NoTransaction,
+            _command: &ClosePeriod,
+            _hash: &[u8],
+        ) -> Result<Option<Uuid>, ledger::StorageError> {
+            Err("the dispatcher's repository was asked for a stored close".into())
         }
 
         async fn stored_result_batch(

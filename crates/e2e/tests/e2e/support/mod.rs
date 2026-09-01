@@ -7,10 +7,10 @@ mod book;
 pub mod postgres;
 
 pub use book::{
-    AClose, ASweep, PostAnswer, PostOutcome, TestBook, TestResult, a_report_issued,
+    AClose, ASweep, PERIODS_PATH, PostAnswer, PostOutcome, TestBook, TestResult, a_report_issued,
     account_balance_path, account_entries_path, accounts_path, accounts_reported_by,
     amount_of_the_line, assert_every_member_was_accepted, balance_sheet_path, charge,
-    close_the_period, cursor_path, header, pinned_cursor_of, post_a_charge_dated,
-    post_a_pending_hold, refusal_detail, refusal_type, row_of_the_account, transaction_path,
-    trial_balance_path,
+    close_a_period, close_path, close_the_period, cursor_path, define_a_period, header,
+    open_an_account, pinned_cursor_of, post_a_charge_dated, post_a_pending_hold, refusal_detail,
+    refusal_type, row_of_the_account, transaction_path, trial_balance_path,
 };

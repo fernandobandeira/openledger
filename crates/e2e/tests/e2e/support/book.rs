@@ -112,6 +112,102 @@ pub async fn post_a_charge_dated(
         .parse()?)
 }
 
+/// The period resource's two paths (ADR-0024) — the collection a definition
+/// posts to, and one period's close.
+pub const PERIODS_PATH: &str = "/v1/periods";
+
+/// `POST /v1/periods/{code}/close` as a path.
+pub fn close_path(code: &str) -> String {
+    format!("{PERIODS_PATH}/{code}/close")
+}
+
+/// One period defined through the front door, asserting its own 201 — an
+/// ARRANGE helper, for the tests whose subject is what happens to a period
+/// that exists. A test whose subject is the DEFINITION itself posts the body
+/// itself and states the status in its own assert phase.
+pub async fn define_a_period(
+    book: &TestBook,
+    key: &str,
+    code: &str,
+    starts_at: &str,
+    ends_at: &str,
+) -> TestResult {
+    let created = book
+        .post_to(
+            PERIODS_PATH,
+            &serde_json::json!({
+                "tenant_id": "t1",
+                "idempotency_key": key,
+                "code": code,
+                "starts_at": starts_at,
+                "ends_at": ends_at,
+                "tz": "UTC",
+            }),
+        )
+        .await?;
+    assert_eq!(created.status(), 201, "defining the period {code}");
+    Ok(())
+}
+
+/// One period closed through the front door, asserting its own 201 and
+/// answering with the body — the ARRANGE half for tests that read the book
+/// afterwards, and the ACT half for the ones that read the answer. It is one
+/// helper for both because a close has exactly one accepted shape: there is no
+/// replay to tell apart (the key is derived, so a repeat is a refusal).
+pub async fn close_a_period(
+    book: &TestBook,
+    code: &str,
+    currency: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let closed = book
+        .post_to(
+            &close_path(code),
+            &serde_json::json!({"tenant_id": "t1", "currency": currency}),
+        )
+        .await?;
+    let status = closed.status();
+    let body: serde_json::Value = closed.json().await?;
+    assert_eq!(status, 201, "closing {code} in {currency}: {body}");
+    Ok(body)
+}
+
+/// One account opened through `POST /v1/accounts`, answering with its id.
+///
+/// The suite's other fixtures write accounts in SQL (`TestBook::account`),
+/// which fixes the currency at USD; this goes through the endpoint, so a test
+/// that needs a book in two currencies can have one — and gets the register's
+/// own id back rather than one it chose.
+pub async fn open_an_account(
+    book: &TestBook,
+    key: &str,
+    purpose: &str,
+    owner: Option<&str>,
+    currency: &str,
+) -> Result<Uuid, Box<dyn std::error::Error>> {
+    let opened = book
+        .open_account(&serde_json::json!({
+            "tenant_id": "t1",
+            "idempotency_key": key,
+            "purpose": purpose,
+            "owner_type": if owner.is_some() { "company" } else { "house" },
+            "owner_id": owner,
+            "currency": currency,
+        }))
+        .await?;
+    assert_eq!(
+        opened.status(),
+        201,
+        "opening the {purpose} account in {currency}"
+    );
+    let body: serde_json::Value = opened.json().await?;
+    Ok(body
+        .get("account")
+        .and_then(|account| account.get("account_id"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("no account_id on the opening's 201")?
+        .parse()?)
+}
+
 /// `GET /v1/reports/balance-sheet` as a path: the two parameters every call
 /// needs, plus whatever this call is varying — `cursor`, `chart_version`, or a
 /// deliberately malformed one of either.
