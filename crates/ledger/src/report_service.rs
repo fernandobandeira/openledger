@@ -1025,6 +1025,7 @@ mod tests {
         AccountStatementEntry {
             entry_id: Uuid::from_u128(0xE00 + position as u128),
             transaction_id: TRANSACTION,
+            status: "posted".to_owned(),
             direction: "debit".to_owned(),
             amount_minor: 100,
             currency: "USD".to_owned(),

@@ -47,14 +47,17 @@ anyone who can read the process table.";
 const SERVE_ABOUT: &str = "\
 Serve the ledger API until stopped.
 
-Nine endpoints. Two writes: POST /v1/transactions and the
-posting engine behind it (M3), and POST /v1/accounts, which
-opens an account through the same idempotency spine (ADR-0021).
-Seven reads: one account balance, the trial balance, the balance
-sheet, the income statement, a transaction read-back (M5), the
-keyset-paginated account listing, and GET /v1/cursor — the
-commit horizon on its own, for a caller that wants it without
-paying for a whole report.
+Twelve endpoints. Four writes: POST /v1/transactions and the
+posting engine behind it (M3); POST /v1/accounts, which opens an
+account through the same idempotency spine (ADR-0021); and
+POST /v1/periods with POST /v1/periods/{code}/close, which define
+a period and close it in one transaction (ADR-0024).
+Eight reads: one account balance, an account's statement of
+entries on either time axis (ADR-0023), the trial balance, the
+balance sheet, the income statement, a transaction read-back
+(M5), the keyset-paginated account listing, and GET /v1/cursor —
+the commit horizon on its own, for a caller that wants it
+without paying for a whole report.
 
 Run `openledger migrate` first: serve checks that the schema is
 current before it listens, and an unmigrated or behind database

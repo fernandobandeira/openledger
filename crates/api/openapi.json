@@ -369,10 +369,15 @@
           {
             "name": "axis",
             "in": "query",
-            "description": "**Required, and there is no default** (ADR-0023). `recorded` orders by\ncommit position — what the ledger learnt, and when — and `effective`\norders by business date. The two disagree about where a backdated\nentry sits, which is what two axes MEAN (ADR-0006): whichever one were\nchosen for a caller who named none would be the axis they did not\nthink about, so this endpoint refuses rather than picks.",
+            "description": "**Required, and there is no default** (ADR-0023). `recorded` orders by\ncommit position — what the ledger learnt, and when — and `effective`\norders by business date. The two disagree about where a backdated\nentry sits, which is what two axes MEAN (ADR-0006): whichever one were\nchosen for a caller who named none would be the axis they did not\nthink about, so this endpoint refuses rather than picks.\n\nThe two values are declared as a schema `enum` rather than left to\nthis prose, so a generated client's type is the union and a typo does\nnot have to reach the server to be found. The server refuses an\nunknown axis regardless — see [`AxisParam`].",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "description": "The two axes `GET /v1/accounts/{account_id}/entries` orders by, as a TYPE\n— so the generated client's parameter is `\"recorded\" | \"effective\"` and a\nmisspelling is a compile error rather than a `422` in production.\n\n**It documents the parameter; it does not enforce it.** The handler still\ntakes the axis as text and [`ledger::StatementAxis::parse`] still refuses\nanything that is not one of these two, by name and with both values in the\nmessage (ADR-0023). That refusal is the contract; this enum is the\ndescription of it, and a spec that describes a rule is not a spec that\nkeeps it — which is exactly the drift class ADR-0014's cost list names.\nDeserializing INTO this enum instead would have moved the refusal into\naxum's extractor and answered `400` where the ledger answers `422` naming\nboth axes, so the parse stays where it is.",
+              "enum": [
+                "recorded",
+                "effective"
+              ]
             },
             "example": "recorded"
           },
@@ -431,7 +436,7 @@
         ],
         "responses": {
           "200": {
-            "description": "One page of the account's entries, in the axis's order, with the cursor the page was pinned at and the key of the next page. **The two axes answer the same SET in different ORDERS**, and a backdated entry is where they disagree: it sits in its own past on the effective axis and at the end of the recorded one. An account that exists and has no entries in range answers an empty list, never a 404.",
+            "description": "One page of the account's entries, in the axis's order, with the cursor the page was pinned at and the key of the next page. **The two axes answer the same SET in different ORDERS**, and a backdated entry is where they disagree: it sits in its own past on the effective axis and at the end of the recorded one. An account that exists and has no entries in range answers an empty list, never a 404. **The page is NOT posted-only**: a pending hold writes entries and they are here, each carrying its transaction's `status`, so a reader can tell a settled row from a claim — which `GET /v1/accounts/{account_id}/balance` cannot show, because it reads the balance cache and that means posted (ADR-0010). Summing this page and comparing it to that balance requires dropping the `pending` rows first.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1351,7 +1356,11 @@
             "minLength": 1
           },
           "metadata": {
-            "description": "Caller's own JSON object, stored as given. It must BE an object:\n`jsonb` would store a bare number as happily, and a metadata field\nthat is sometimes a scalar is a shape every reader has to defend\nagainst."
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Caller's own JSON object, stored as given. It must BE an object:\n`jsonb` would store a bare number as happily, and a metadata field\nthat is sometimes a scalar is a shape every reader has to defend\nagainst. A scalar, an array or a string here is\n`422 invalid_request` — the writer checks it (`AccountOpening::new`),\nso the `object` below is a claim the service actually keeps rather\nthan a hope the schema expresses.\n\nTyped as an object because the alternative is worse than vague:\n`serde_json::Value` with no annotation generates as `unknown`, and a\ncaller holding an `unknown` can only `JSON.stringify` the one field\nthis API exists to let them put their own structure in."
           },
           "owner_id": {
             "type": [
@@ -1469,7 +1478,8 @@
             "type": "string"
           },
           "metadata": {
-            "description": "The caller's own object, as the opening set it — `{}` when it named\nnone, because the column is `NOT NULL DEFAULT '{}'`.\n\nIt is here because until now a caller could WRITE metadata and had no\nroute that read it back, which is a hole rather than a missing\nfeature. ADR-0021's \"identity plus `stripe_count`\" is extended by this\none field and by nothing else: the part of that sentence that was\nload-bearing is the absence of BALANCES, and they are still absent."
+            "type": "object",
+            "description": "The caller's own object, as the opening set it — `{}` when it named\nnone, because the column is `NOT NULL DEFAULT '{}'`.\n\nIt is here because until now a caller could WRITE metadata and had no\nroute that read it back, which is a hole rather than a missing\nfeature. ADR-0021's \"identity plus `stripe_count`\" is extended by this\none field and by nothing else: the part of that sentence that was\nload-bearing is the absence of BALANCES, and they are still absent.\n\nAlways an object, never a scalar and never null: the column is\n`NOT NULL DEFAULT '{}'` and the writer refuses a body whose metadata\nis not an object, so both ends of the round trip hold the shape the\nschema declares."
           },
           "normal_balance": {
             "type": "string",
@@ -1593,6 +1603,7 @@
           },
           "amount_minor": {
             "type": "string",
+            "description": "Minor units, as an exact-integer decimal string — **not a JSON\nnumber** (ADR-0022). `ledger_entries.amount_minor` is a `bigint` and\nJSON has no integer type, so a large amount read as a number comes back\nsilently wrong. Always digits and always strictly positive here: the\nsign a caller may send is the domain's refusal, never a stored value.",
             "example": "2500"
           },
           "currency": {
@@ -1794,7 +1805,7 @@
         "properties": {
           "amount_minor": {
             "type": "string",
-            "description": "Minor units of `currency`, strictly positive, as an exact-integer\ndecimal STRING — never a JSON number.\n\n**The column is exact and the wire was not.** `ledger_entries.amount_minor`\nis a `bigint`, which reaches far past 2⁵³, and JSON has no integer type\nat all: RFC 8259 leaves precision beyond an IEEE-754 double to the\nimplementation, and JavaScript's parser is one that loses it.\nDemonstrated against this API rather than reasoned — a posting of\n9007199254740993 was accepted and `JSON.parse` read it back as\n9007199254740992, silently off by one in both directions. So a single\namount travels the way every report total already does.",
+            "description": "Minor units of `currency`, strictly positive, as an exact-integer\ndecimal STRING — never a JSON number.\n\n**The column is exact and the wire was not.** `ledger_entries.amount_minor`\nis a `bigint`, which reaches far past 2⁵³, and JSON has no integer type\nat all: RFC 8259 leaves precision beyond an IEEE-754 double to the\nimplementation, and JavaScript's parser is one that loses it.\nDemonstrated against this API rather than reasoned — a posting of\n9007199254740993 was accepted and `JSON.parse` read it back as\n9007199254740992, silently off by one in both directions. So a single\namount travels the way every report total already does.\n\n**The accepted form is three rules, and the schema can express one of\nthem.** They are stated here in full because a client that has to\nguess ends up restating them from the refusal messages, with nothing\ncomparing its copy against this one:\n\n1. **The grammar `^-?[0-9]+$`** — digits, optionally preceded by a\n   single `-`. No leading `+`, no surrounding whitespace, no decimal\n   point, no exponent, no thousands separator, and not the empty\n   string. Each is refused rather than trimmed or coerced, because\n   two spellings of one amount hash differently under the idempotency\n   key that covers the request bytes. **This rule is the `pattern`\n   above** — a client generated from this document can check it\n   without reading this sentence.\n2. **It must fit a signed 64-bit integer**, which is\n   `ledger_entries.amount_minor`'s own range: −9223372036854775808 to\n   9223372036854775807 inclusive. **JSON Schema cannot express this**\n   — `minimum`/`maximum` bound a number and this is a string, and no\n   pattern distinguishes 19 digits that fit from 19 that do not. It is\n   enforced by the service, and a value outside it is\n   `422 invalid_request` naming the field.\n3. **It must be strictly positive**, so `\"0\"` and every negative are\n   refused. Direction is carried by the `source`/`destination` pair\n   and never by a sign, which is why the grammar admits a `-` that the\n   domain then refuses: *\"not a number\"* and *\"not positive\"* are\n   different things for a caller to fix, and they are answered\n   separately. **Also inexpressible here**, and also\n   `422 invalid_request`.\n\nSo: rule 1 is checked by this schema; rules 2 and 3 are checked only\nby the server, and a client that wants to refuse before the round trip\nhas to implement them itself, knowing that this paragraph — not a\nkeyword — is what it is copying.",
             "example": "2500",
             "pattern": "^-?[0-9]+$"
           },
@@ -1823,6 +1834,7 @@
         "required": [
           "entry_id",
           "transaction_id",
+          "status",
           "direction",
           "amount_minor",
           "currency",
@@ -1862,6 +1874,11 @@
             "type": "string",
             "format": "date-time",
             "description": "When the entry was WRITTEN — the database's clock. It is provenance\nrather than an ordering: the recorded axis is ordered by commit\nposition (`xact_id`), which `recorded_at` cannot stand in for, because\na clock reading taken before a commit does not order commits\n(ADR-0006)."
+          },
+          "status": {
+            "type": "string",
+            "description": "`pending` or `posted` — the status of the transaction this leg belongs\nto, and **the field that says whether the balance counts this row**.\n\n**A statement is not posted-only.** A pending hold writes entries and\ndraws `account_seq` for them exactly as a posted charge does\n(ADR-0016), and this page filters no status — so a pending leg has\nalways been here. What it had no way to say was that\n`GET /v1/accounts/{account_id}/balance` does not count it: that route\nreads the balance CACHE, which means POSTED (ADR-0010). A row the\ntotal excludes now says so on the row, rather than requiring one\n`GET /v1/transactions/{transaction_id}` per distinct transaction to\nfind out.\n\nIt never mutates: a pending transaction becomes posted by a NEW\ntransaction naming it in `resolves_id`, which writes its OWN entries —\nso a settled hold shows on this page as two rows, the pending original\nand the posted resolution, and not as one row that changed its mind.",
+            "example": "posted"
           },
           "transaction_id": {
             "type": "string",

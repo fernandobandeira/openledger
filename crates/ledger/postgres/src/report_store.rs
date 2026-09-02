@@ -369,9 +369,23 @@ const ACCOUNTS: &str = "SELECT a.id AS account_id,
 /// what a drift check walks — and it appears in no `ORDER BY` here or below,
 /// because `uq_entries__account_seq` is per `(tenant, account, STRIPE, seq)`
 /// and a striped account's counters interleave (ADR-0023).
+///
+/// **The transaction's `status` rides along as a SCALAR SUBQUERY in the
+/// target list, deliberately, and not as a join.** This statement filters no
+/// status — the page is every entry of the account, pending legs included —
+/// so the transaction row is wanted for one column and for nothing else, and
+/// the shape has to buy that column without touching the plan the keyset
+/// above was measured on. A scalar subquery in the target list is evaluated
+/// per OUTPUT row, which is after `LIMIT`: exactly one primary-key lookup per
+/// entry returned, and no way for the planner to reorder or re-drive the
+/// ordered index scan the way an added join could. It cannot return NULL for
+/// an entry that exists — `fk_entries__txn` guarantees the transaction row —
+/// and it cannot return more than one, because `pk_txn` is
+/// `(tenant_id, id)`.
 const ACCOUNT_STATEMENT_BY_RECORDED: &str = "SELECT a.id AS account_id,
             entry.entry_id AS entry_id,
             entry.transaction_id AS transaction_id,
+            entry.status AS status,
             entry.direction AS direction,
             entry.amount_minor AS amount_minor,
             entry.currency AS currency,
@@ -383,6 +397,10 @@ const ACCOUNT_STATEMENT_BY_RECORDED: &str = "SELECT a.id AS account_id,
          LEFT JOIN LATERAL (
               SELECT e.id AS entry_id,
                      e.transaction_id AS transaction_id,
+                     (SELECT x.status::text
+                        FROM ledger_transactions x
+                       WHERE x.tenant_id = e.tenant_id
+                         AND x.id = e.transaction_id) AS status,
                      e.direction::text AS direction,
                      e.amount_minor AS amount_minor,
                      e.currency::text AS currency,
@@ -434,6 +452,7 @@ const ACCOUNT_STATEMENT_BY_RECORDED: &str = "SELECT a.id AS account_id,
 const ACCOUNT_STATEMENT_BY_EFFECTIVE: &str = "SELECT a.id AS account_id,
             entry.entry_id AS entry_id,
             entry.transaction_id AS transaction_id,
+            entry.status AS status,
             entry.direction AS direction,
             entry.amount_minor AS amount_minor,
             entry.currency AS currency,
@@ -445,6 +464,10 @@ const ACCOUNT_STATEMENT_BY_EFFECTIVE: &str = "SELECT a.id AS account_id,
          LEFT JOIN LATERAL (
               SELECT e.id AS entry_id,
                      e.transaction_id AS transaction_id,
+                     (SELECT x.status::text
+                        FROM ledger_transactions x
+                       WHERE x.tenant_id = e.tenant_id
+                         AND x.id = e.transaction_id) AS status,
                      e.direction::text AS direction,
                      e.amount_minor AS amount_minor,
                      e.currency::text AS currency,
@@ -654,6 +677,11 @@ struct AccountStatementSqlRow {
     account_id: Uuid,
     entry_id: Option<Uuid>,
     transaction_id: Option<Uuid>,
+    /// The status of the transaction this leg belongs to — `pending` or
+    /// `posted`. NULL only with the rest of the entry half, never on its own:
+    /// `fk_entries__txn` means an entry always has a transaction to read it
+    /// from.
+    status: Option<String>,
     direction: Option<String>,
     amount_minor: Option<i64>,
     currency: Option<String>,
@@ -694,6 +722,7 @@ fn statement_entry_from(
     let (
         Some(entry_id),
         Some(transaction_id),
+        Some(status),
         Some(direction),
         Some(amount_minor),
         Some(currency),
@@ -704,6 +733,7 @@ fn statement_entry_from(
     ) = (
         row.entry_id,
         row.transaction_id,
+        row.status,
         row.direction,
         row.amount_minor,
         row.currency,
@@ -718,6 +748,7 @@ fn statement_entry_from(
     Ok(Some(AccountStatementEntry {
         entry_id,
         transaction_id,
+        status,
         direction,
         amount_minor,
         currency,

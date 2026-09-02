@@ -4,11 +4,22 @@
 //! and compares bytes. The e2e conformance test holds the other half — that
 //! the committed document matches the running router.
 //!
-//! Two tests, because a byte-diff against a committed file rests on emission
-//! being DETERMINISTIC, and that is a different property from the drift the
-//! diff reports: non-deterministic emission failed the drift test with a
-//! message about the annotations having changed — the wrong story about the
-//! wrong file. Held apart, each failure names itself.
+//! Two tests hold the file itself, because a byte-diff against a committed
+//! file rests on emission being DETERMINISTIC, and that is a different
+//! property from the drift the diff reports: non-deterministic emission failed
+//! the drift test with a message about the annotations having changed — the
+//! wrong story about the wrong file. Held apart, each failure names itself.
+//!
+//! **Two more hold what the document SAYS**, and they exist because a spec
+//! can be byte-perfect against its annotations and still be weaker than the
+//! contract. Both were found by consuming this API from a generated client
+//! rather than by reading it: an `axis` typed `string` where the service
+//! accepts exactly two values, and an `amount_minor` typed `string` where
+//! the service enforces a grammar. Neither is a routing fact, so the
+//! conformance suite cannot see them, and neither is a byte fact, so the
+//! drift test cannot either — a regeneration would carry a weakened
+//! annotation through happily. They read the COMMITTED file, so a
+//! regeneration is required to satisfy them.
 
 /// Where the committed spec lives: the bytes the drift test compares against,
 /// and the file its regeneration branch rewrites.
@@ -80,5 +91,116 @@ fn the_committed_spec_matches_the_code() -> Result<(), Box<dyn std::error::Error
          regenerate it with OPENLEDGER_WRITE_SPEC=1 cargo test -p api --test spec \
          and commit the diff"
     );
+    Ok(())
+}
+
+/// The document a consumer generates a client from, as JSON — for the two
+/// tests below that ask what it SAYS rather than what bytes it is.
+///
+/// The committed file, normally, because that is the artifact a consumer
+/// actually has. Under the rewrite opt-in it is the freshly generated
+/// document instead: the drift test in this same binary is replacing those
+/// bytes, so reading them would be a race whose outcome is test order. The
+/// two are the same document by construction — making them so is what the
+/// drift test is for.
+fn the_document_a_consumer_gets() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let json = if asked_to_rewrite_the_committed_spec() {
+        api::openapi_json()?
+    } else {
+        the_committed_spec()?
+    };
+    Ok(serde_json::from_str(&json)?)
+}
+
+/// One operation's parameter, by name.
+fn the_parameter<'a>(
+    document: &'a serde_json::Value,
+    method: &str,
+    path: &str,
+    name: &str,
+) -> Option<&'a serde_json::Value> {
+    document
+        .get("paths")?
+        .get(path)?
+        .get(method)?
+        .get("parameters")?
+        .as_array()?
+        .iter()
+        .find(|parameter| parameter.get("name").and_then(serde_json::Value::as_str) == Some(name))
+}
+
+#[test]
+fn the_committed_spec_gives_the_statements_axis_its_two_values()
+-> Result<(), Box<dyn std::error::Error>> {
+    // ADR-0023's axis is REQUIRED and is exactly `recorded` or `effective` —
+    // the service refuses anything else, naming both. Left as a bare
+    // `string` the document generated a client that type-checked
+    // `"recorderd"` and failed at runtime, which is the whole value of a
+    // generated client thrown away for one missing keyword. The refusal is
+    // still the contract; this asserts that the description of it is not
+    // weaker than it.
+    let document = the_document_a_consumer_gets()?;
+
+    let axis = the_parameter(
+        &document,
+        "get",
+        "/v1/accounts/{account_id}/entries",
+        "axis",
+    )
+    .ok_or("the committed spec documents no `axis` parameter on the statement route")?;
+
+    assert_eq!(
+        axis.get("required").and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the axis must be required — there is no default (ADR-0023): {axis}"
+    );
+    assert_eq!(
+        axis.pointer("/schema/enum"),
+        Some(&serde_json::json!(["recorded", "effective"])),
+        "the axis parameter carries no enum, so a generated client cannot hold a caller to \
+         either value: {axis}"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_committed_spec_states_the_amount_grammar_it_can_express()
+-> Result<(), Box<dyn std::error::Error>> {
+    // ADR-0022's accepted form is three rules and JSON Schema can express
+    // one: the grammar as a `pattern`. The other two — the `i64` bound and
+    // strict positivity — cannot be written as keywords over a STRING, so
+    // the description has to carry them precisely enough that a client author
+    // does not reconstruct them from refusal messages. Both halves are
+    // asserted, because a pattern with silent prose beside it is the same
+    // trap one step along.
+    let document = the_document_a_consumer_gets()?;
+
+    let amount = document
+        .pointer("/components/schemas/PostingBody/properties/amount_minor")
+        .ok_or("the committed spec documents no PostingBody.amount_minor")?;
+
+    assert_eq!(
+        amount.get("pattern").and_then(serde_json::Value::as_str),
+        Some("^-?[0-9]+$"),
+        "the amount grammar is expressible as a pattern and is not in the document: {amount}"
+    );
+    let description = amount
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("PostingBody.amount_minor carries no description")?;
+    for rule in [
+        // The bound, spelled as the number a client would compare against.
+        "9223372036854775807",
+        // ...and the sign rule, which the grammar deliberately admits.
+        "strictly positive",
+        // ...each said to be enforced somewhere other than this schema.
+        "JSON Schema cannot express this",
+    ] {
+        assert!(
+            description.contains(rule),
+            "the amount description does not state {rule:?}, so a client author has to guess \
+             it: {description}"
+        );
+    }
     Ok(())
 }

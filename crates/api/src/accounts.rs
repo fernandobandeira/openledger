@@ -61,6 +61,33 @@ pub(crate) enum OwnerTypeBody {
     House,
 }
 
+/// The two axes `GET /v1/accounts/{account_id}/entries` orders by, as a TYPE
+/// — so the generated client's parameter is `"recorded" | "effective"` and a
+/// misspelling is a compile error rather than a `422` in production.
+///
+/// **It documents the parameter; it does not enforce it.** The handler still
+/// takes the axis as text and [`ledger::StatementAxis::parse`] still refuses
+/// anything that is not one of these two, by name and with both values in the
+/// message (ADR-0023). That refusal is the contract; this enum is the
+/// description of it, and a spec that describes a rule is not a spec that
+/// keeps it — which is exactly the drift class ADR-0014's cost list names.
+/// Deserializing INTO this enum instead would have moved the refusal into
+/// axum's extractor and answered `400` where the ledger answers `422` naming
+/// both axes, so the parse stays where it is.
+#[derive(ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[expect(
+    dead_code,
+    reason = "a documented type: the handler takes the axis as text so the ledger keeps the \
+              refusal, and these variants exist to be READ by the ToSchema derive"
+)]
+pub(crate) enum AxisParam {
+    /// Commit order — when the ledger LEARNT of the entry.
+    Recorded,
+    /// Business order — when the entry is DATED.
+    Effective,
+}
+
 /// The body of `POST /v1/accounts`.
 ///
 /// **What is NOT here is the design** (ADR-0021): there is no `category`, no
@@ -111,8 +138,17 @@ pub(crate) struct AccountBody {
     /// Caller's own JSON object, stored as given. It must BE an object:
     /// `jsonb` would store a bare number as happily, and a metadata field
     /// that is sometimes a scalar is a shape every reader has to defend
-    /// against.
+    /// against. A scalar, an array or a string here is
+    /// `422 invalid_request` — the writer checks it (`AccountOpening::new`),
+    /// so the `object` below is a claim the service actually keeps rather
+    /// than a hope the schema expresses.
+    ///
+    /// Typed as an object because the alternative is worse than vague:
+    /// `serde_json::Value` with no annotation generates as `unknown`, and a
+    /// caller holding an `unknown` can only `JSON.stringify` the one field
+    /// this API exists to let them put their own structure in.
     #[serde(default)]
+    #[schema(value_type = Option<Object>)]
     metadata: Option<serde_json::Value>,
 }
 
@@ -480,6 +516,12 @@ pub(crate) struct AccountRead {
     /// feature. ADR-0021's "identity plus `stripe_count`" is extended by this
     /// one field and by nothing else: the part of that sentence that was
     /// load-bearing is the absence of BALANCES, and they are still absent.
+    ///
+    /// Always an object, never a scalar and never null: the column is
+    /// `NOT NULL DEFAULT '{}'` and the writer refuses a body whose metadata
+    /// is not an object, so both ends of the round trip hold the shape the
+    /// schema declares.
+    #[schema(value_type = Object)]
     metadata: serde_json::Value,
     /// When the account was opened — the database's clock.
     #[serde(with = "time::serde::rfc3339")]
@@ -608,7 +650,12 @@ pub(crate) struct AccountStatementParams {
     /// entry sits, which is what two axes MEAN (ADR-0006): whichever one were
     /// chosen for a caller who named none would be the axis they did not
     /// think about, so this endpoint refuses rather than picks.
-    #[param(example = "recorded")]
+    ///
+    /// The two values are declared as a schema `enum` rather than left to
+    /// this prose, so a generated client's type is the union and a typo does
+    /// not have to reach the server to be found. The server refuses an
+    /// unknown axis regardless — see [`AxisParam`].
+    #[param(inline, value_type = AxisParam, example = "recorded")]
     axis: String,
     /// The commit position to pin the page to — a `pinned_cursor` from an
     /// earlier read. Omit it and one is pinned server-side and returned. It
@@ -683,6 +730,25 @@ pub(crate) struct StatementEntryRead {
     entry_id: Uuid,
     /// The transaction this leg belongs to.
     transaction_id: Uuid,
+    /// `pending` or `posted` — the status of the transaction this leg belongs
+    /// to, and **the field that says whether the balance counts this row**.
+    ///
+    /// **A statement is not posted-only.** A pending hold writes entries and
+    /// draws `account_seq` for them exactly as a posted charge does
+    /// (ADR-0016), and this page filters no status — so a pending leg has
+    /// always been here. What it had no way to say was that
+    /// `GET /v1/accounts/{account_id}/balance` does not count it: that route
+    /// reads the balance CACHE, which means POSTED (ADR-0010). A row the
+    /// total excludes now says so on the row, rather than requiring one
+    /// `GET /v1/transactions/{transaction_id}` per distinct transaction to
+    /// find out.
+    ///
+    /// It never mutates: a pending transaction becomes posted by a NEW
+    /// transaction naming it in `resolves_id`, which writes its OWN entries —
+    /// so a settled hold shows on this page as two rows, the pending original
+    /// and the posted resolution, and not as one row that changed its mind.
+    #[schema(example = "posted")]
+    status: String,
     /// `debit` or `credit`. Direction carries the sign; the amount never does.
     direction: String,
     /// Minor units, as an exact-integer decimal string — **not a JSON
@@ -738,7 +804,13 @@ pub(crate) struct StatementEntryRead {
                            entry is where they disagree: it sits in its own past on the \
                            effective axis and at the end of the recorded one. An account that \
                            exists and has no entries in range answers an empty list, never a \
-                           404.",
+                           404. **The page is NOT posted-only**: a pending hold writes entries \
+                           and they are here, each carrying its transaction's `status`, so a \
+                           reader can tell a settled row from a claim — which \
+                           `GET /v1/accounts/{account_id}/balance` cannot show, because it \
+                           reads the balance cache and that means posted (ADR-0010). Summing \
+                           this page and comparing it to that balance requires dropping the \
+                           `pending` rows first.",
             body = AccountStatementRead
         ),
         (
@@ -845,6 +917,7 @@ fn answer_the_statement_page(page: ledger::AccountStatement) -> Response {
             .map(|entry| StatementEntryRead {
                 entry_id: entry.entry_id,
                 transaction_id: entry.transaction_id,
+                status: entry.status,
                 direction: entry.direction,
                 amount_minor: entry.amount_minor.to_string(),
                 currency: entry.currency,

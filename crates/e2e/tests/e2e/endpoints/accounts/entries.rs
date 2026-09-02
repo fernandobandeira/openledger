@@ -29,8 +29,8 @@
 use uuid::Uuid;
 
 use crate::support::{
-    PostAnswer, TestBook, TestResult, account_entries_path, charge, post_a_charge_dated,
-    refusal_detail, refusal_type,
+    PostAnswer, TestBook, TestResult, account_balance_path, account_entries_path, charge,
+    post_a_charge_dated, post_a_pending_hold, refusal_detail, refusal_type,
 };
 
 /// The charge recorded FIRST and dated LATER — 5.00 on the 20th.
@@ -136,6 +136,20 @@ fn field_of(page: &serde_json::Value, field: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The `status` each row of a page carries — `pending` or `posted`, the
+/// transaction's own, and the field that says whether the balance counts the
+/// row.
+fn statuses_of(page: &serde_json::Value) -> Vec<String> {
+    field_of(page, "status")
+}
+
+/// The `amount_minor` each row carries — a decimal STRING on this surface and
+/// never a JSON number (ADR-0022), which is why it reads out with the rest of
+/// the text fields.
+fn amounts_of(page: &serde_json::Value) -> Vec<String> {
+    field_of(page, "amount_minor")
 }
 
 /// The `account_seq` each row of a page carries. Returned on every entry
@@ -699,6 +713,150 @@ async fn the_effective_range_is_half_open_and_the_recorded_axis_refuses_it() -> 
     );
     assert_eq!(refused_status.as_u16(), 422, "{refused}");
     assert_eq!(refusal_type(&refused), Some("invalid_request"), "{refused}");
+
+    book.assert_reconciled().await
+}
+
+/// The posted charge the test below stands beside the hold: 25.00, recorded
+/// first so the recorded axis puts it first.
+const SETTLED_MINOR: i64 = 2500;
+const SETTLED_DATE: &str = "2026-08-27T12:00:00Z";
+
+/// What `post_a_pending_hold` holds — 5.00, which is the amount the statement
+/// must show and the balance must not count.
+const HELD_MINOR: i64 = 500;
+
+#[tokio::test]
+async fn a_pending_leg_is_on_the_statement_carrying_its_status_while_the_balance_omits_it()
+-> TestResult {
+    // **The statement was never posted-only, and that is the finding.** These
+    // queries filter no status: a pending hold writes entries and draws
+    // `account_seq` for them exactly as a posted charge does (ADR-0016), so
+    // its leg has always been on this page. What it could not say was that
+    // `GET /v1/accounts/{id}/balance` does not count it — that route reads the
+    // balance CACHE, which means POSTED (ADR-0010). Two rows, one total: a
+    // reader had to issue one transaction read per distinct id to find out
+    // which row the number left out, and until then a claim about money looked
+    // exactly like money that moved.
+    let book = TestBook::new("entries_pending_status").await?;
+    let (receivable, revenue) = book.fixture_accounts().await?;
+    let settled = post_a_charge_dated(
+        &book,
+        "settled",
+        SETTLED_DATE,
+        SETTLED_MINOR,
+        revenue,
+        receivable,
+    )
+    .await?;
+    let held = post_a_pending_hold(&book, revenue, receivable).await?;
+    book.wait_for_the_horizon_to_retire_this_book().await?;
+
+    let (status, page) = book
+        .read(&account_entries_path("t1", receivable, "recorded", &[]))
+        .await?;
+    let (balance_status, balance) = book
+        .read(&account_balance_path("t1", receivable, "USD"))
+        .await?;
+
+    assert_eq!(status.as_u16(), 200, "{page}");
+    // Both legs are on the page — the pending one is not filtered out — and
+    // each names the transaction it belongs to, in commit order.
+    assert_eq!(
+        transactions_of(&page),
+        [settled.to_string(), held.to_string()],
+        "the statement must carry the pending leg beside the posted one: {page}"
+    );
+    // ...and each says which it is, which is the whole of the fix: the row
+    // the balance excludes is legible as excluded without a second request.
+    assert_eq!(
+        statuses_of(&page),
+        ["posted", "pending"],
+        "a statement row must carry its transaction's status: {page}"
+    );
+    // The other half of the pair, asserted here so the two answers are held
+    // against each other rather than separately: the balance counts the
+    // posted leg alone, and the difference between it and the page's sum is
+    // exactly the row labelled `pending`.
+    assert_eq!(balance_status.as_u16(), 200, "{balance}");
+    assert_eq!(
+        balance
+            .get("posted_minor")
+            .and_then(serde_json::Value::as_str),
+        Some(SETTLED_MINOR.to_string().as_str()),
+        "the balance must leave the hold out — the cache means posted: {balance}"
+    );
+    assert_eq!(
+        amounts_of(&page),
+        [SETTLED_MINOR.to_string(), HELD_MINOR.to_string()],
+        "{page}"
+    );
+
+    book.assert_reconciled().await
+}
+
+#[tokio::test]
+async fn a_resolved_hold_is_two_rows_and_only_the_resolution_is_posted() -> TestResult {
+    // Status never mutates (ADR-0016): a pending transaction becomes posted
+    // by a NEW transaction naming it in `resolves_id`, which writes its OWN
+    // entries. So a settled hold is TWO rows on this account — the original,
+    // still `pending` forever, and the resolution, `posted` — and a reader
+    // that summed the page without reading the status would double-count the
+    // money. This is the assertion that makes the field load-bearing rather
+    // than decorative.
+    let book = TestBook::new("entries_resolved_hold").await?;
+    let (receivable, revenue) = book.fixture_accounts().await?;
+    let held = post_a_pending_hold(&book, revenue, receivable).await?;
+    let resolution = book
+        .post(&serde_json::json!({
+            "tenant_id": "t1",
+            "idempotency_key": "resolve-1",
+            "effective_at": "2026-08-29T00:00:00Z",
+            "resolves_id": held,
+            "postings": [{
+                "source": revenue, "destination": receivable,
+                "amount_minor": HELD_MINOR.to_string(), "currency": "USD"
+            }],
+        }))
+        .await?;
+    assert_eq!(resolution.status(), 201, "seeding the resolution");
+    let resolution: serde_json::Value = resolution.json().await?;
+    let resolution = resolution
+        .get("transaction_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("no transaction_id on the resolution's 201")?
+        .to_owned();
+    book.wait_for_the_horizon_to_retire_this_book().await?;
+
+    let (status, page) = book
+        .read(&account_entries_path("t1", receivable, "recorded", &[]))
+        .await?;
+    let (balance_status, balance) = book
+        .read(&account_balance_path("t1", receivable, "USD"))
+        .await?;
+
+    assert_eq!(status.as_u16(), 200, "{page}");
+    assert_eq!(
+        transactions_of(&page),
+        [held.to_string(), resolution],
+        "a resolved hold is the original and the resolution, both on the page: {page}"
+    );
+    assert_eq!(
+        statuses_of(&page),
+        ["pending", "posted"],
+        "the original stays pending forever — status never mutates: {page}"
+    );
+    // The page shows 10.00 across two rows; the account holds 5.00. The
+    // status column is what reconciles the two, and nothing else on the row
+    // could.
+    assert_eq!(balance_status.as_u16(), 200, "{balance}");
+    assert_eq!(
+        balance
+            .get("posted_minor")
+            .and_then(serde_json::Value::as_str),
+        Some(HELD_MINOR.to_string().as_str()),
+        "{balance}"
+    );
 
     book.assert_reconciled().await
 }

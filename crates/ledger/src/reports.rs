@@ -405,6 +405,19 @@ pub struct AccountStatement {
 pub struct AccountStatementEntry {
     pub entry_id: Uuid,
     pub transaction_id: Uuid,
+    /// The status of the transaction this leg belongs to — `pending` or
+    /// `posted`.
+    ///
+    /// **A statement is not posted-only, and without this field it looked
+    /// like one.** The two statement queries filter no status: an account's
+    /// entries are every entry written against it, and a pending hold writes
+    /// entries and draws `account_seq` for them exactly as a posted charge
+    /// does (ADR-0016). So a pending leg has always been on this page — it
+    /// simply arrived indistinguishable from a settled one, while
+    /// `GET /v1/accounts/{id}/balance` reads the balance CACHE, which means
+    /// POSTED (ADR-0010) and therefore excludes it. A row that a total does
+    /// not count has to say so on the row.
+    pub status: String,
     pub direction: String,
     /// An `i64` here and an exact-integer decimal STRING on the wire, for the
     /// reason every amount on this surface is one (ADR-0022).

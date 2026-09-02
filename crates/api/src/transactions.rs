@@ -46,6 +46,39 @@ pub(crate) struct PostingBody {
     /// 9007199254740993 was accepted and `JSON.parse` read it back as
     /// 9007199254740992, silently off by one in both directions. So a single
     /// amount travels the way every report total already does.
+    ///
+    /// **The accepted form is three rules, and the schema can express one of
+    /// them.** They are stated here in full because a client that has to
+    /// guess ends up restating them from the refusal messages, with nothing
+    /// comparing its copy against this one:
+    ///
+    /// 1. **The grammar `^-?[0-9]+$`** — digits, optionally preceded by a
+    ///    single `-`. No leading `+`, no surrounding whitespace, no decimal
+    ///    point, no exponent, no thousands separator, and not the empty
+    ///    string. Each is refused rather than trimmed or coerced, because
+    ///    two spellings of one amount hash differently under the idempotency
+    ///    key that covers the request bytes. **This rule is the `pattern`
+    ///    above** — a client generated from this document can check it
+    ///    without reading this sentence.
+    /// 2. **It must fit a signed 64-bit integer**, which is
+    ///    `ledger_entries.amount_minor`'s own range: −9223372036854775808 to
+    ///    9223372036854775807 inclusive. **JSON Schema cannot express this**
+    ///    — `minimum`/`maximum` bound a number and this is a string, and no
+    ///    pattern distinguishes 19 digits that fit from 19 that do not. It is
+    ///    enforced by the service, and a value outside it is
+    ///    `422 invalid_request` naming the field.
+    /// 3. **It must be strictly positive**, so `"0"` and every negative are
+    ///    refused. Direction is carried by the `source`/`destination` pair
+    ///    and never by a sign, which is why the grammar admits a `-` that the
+    ///    domain then refuses: *"not a number"* and *"not positive"* are
+    ///    different things for a caller to fix, and they are answered
+    ///    separately. **Also inexpressible here**, and also
+    ///    `422 invalid_request`.
+    ///
+    /// So: rule 1 is checked by this schema; rules 2 and 3 are checked only
+    /// by the server, and a client that wants to refuse before the round trip
+    /// has to implement them itself, knowing that this paragraph — not a
+    /// keyword — is what it is copying.
     #[schema(pattern = r"^-?[0-9]+$", example = "2500")]
     amount_minor: String,
     /// ISO 4217 alphabetic code, three uppercase ASCII letters.
@@ -476,6 +509,11 @@ pub(crate) struct EntryRead {
     account_id: Uuid,
     /// `debit` or `credit`. Direction carries the sign; the amount never does.
     direction: String,
+    /// Minor units, as an exact-integer decimal string — **not a JSON
+    /// number** (ADR-0022). `ledger_entries.amount_minor` is a `bigint` and
+    /// JSON has no integer type, so a large amount read as a number comes back
+    /// silently wrong. Always digits and always strictly positive here: the
+    /// sign a caller may send is the domain's refusal, never a stored value.
     #[schema(example = "2500")]
     amount_minor: String,
     currency: String,

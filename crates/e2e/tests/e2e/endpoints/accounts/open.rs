@@ -527,13 +527,20 @@ async fn a_body_outside_what_the_columns_hold_is_refused_as_an_invalid_request()
     // `ck_accounts__stripe_count`, `ck_accounts__currency_iso` and
     // `ck_accounts__tenant_non_empty` — refused at the door instead, where
     // the answer names the field rather than the constraint. Metadata rides
-    // with them: `jsonb` would store a bare number as happily as an object.
+    // with them: `jsonb` would store a bare number as happily as an object,
+    // and an array or a string as happily as either. All three are refused,
+    // which is what lets the spec declare the field an `object` rather than
+    // leave it untyped — a client generated from an untyped `metadata` can
+    // only `JSON.stringify` the one field this API exists to let it put its
+    // own structure in.
     let book = TestBook::new("open_account_invalid").await?;
     let cases = [
         ("stripe_count", serde_json::json!(1025)),
         ("currency", serde_json::json!("usd")),
         ("tenant_id", serde_json::json!("   ")),
         ("metadata", serde_json::json!(3)),
+        ("metadata", serde_json::json!([{"region": "eu"}])),
+        ("metadata", serde_json::json!("region=eu")),
     ];
 
     for (n, (field, value)) in cases.iter().enumerate() {
