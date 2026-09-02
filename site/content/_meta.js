@@ -3,6 +3,9 @@ export default {
   index: 'Overview',
   '-- design': { type: 'separator', title: 'The ledger' },
   vision: 'Vision',
+  // Between the why and the how it is built: the conceptual bridge from a real
+  // payment to a set of balanced transactions. Reads before the schema on purpose.
+  bookings: 'Booking a payment',
   database: 'The database',
   service: 'The service',
   roadmap: 'Roadmap',

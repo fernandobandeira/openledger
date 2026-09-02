@@ -1,21 +1,28 @@
 # The service, built and running
 
-**One binary, `openledger`, with three subcommands and one endpoint.** `openledger migrate` applies
+**One binary, `openledger`, with three subcommands and twelve endpoints.** `openledger migrate` applies
 the schema the [database page](/database) explains, and exits. `openledger serve` refuses to start
 against a database that schema never reached, then answers `POST /v1/transactions`: post a balanced
 transaction — posted; pending, later resolved or voided by a new posted transaction naming it;
 or reversed in full by a server-derived mirror ([ADR-0016](/decisions/0016-pending-to-posted)) —
 or replay the stored answer for an idempotency key it has already seen.
+It also opens accounts and defines and closes periods, and answers eight reads — an account's posted
+balance, its statement of entries on either time axis, the three statements, a transaction read-back,
+the account listing, and the commit horizon on its own
+([ADR-0019](/decisions/0019-read-path), [0021](/decisions/0021-accounts-over-http),
+[0023](/decisions/0023-account-statement), [0024](/decisions/0024-closing-a-period)).
 `openledger reconcile` runs the schema's ten reconciliation checks in one snapshot and turns them
 into an exit code — the daily sweep as a command. The rest of
 this page walks that code — the startup gate, the write path and what it guarantees, the wire
 contract, the crate boundaries that enforce the design, what the e2e suite proves, and
 [what is not built yet](#still-open--what-is-not-there).
 
-The census, recounted 2026-09-01 against the workspace: **6 crates · 3 subcommands · 1 endpoint ·
-4 exit codes · 78 end-to-end tests · 10 reconciliation checks asserted at zero after every
-endpoint test.** *(It read 63, a count taken before the batching, striping and concurrency files
-existed, and 73 for one pass before the adversary round added five more.)*
+The census, recounted 2026-09-01 against the workspace: **6 crates · 3 subcommands · 12 endpoints ·
+4 exit codes · 179 end-to-end tests · 10 reconciliation checks asserted at zero after every
+endpoint test.** *(It read 63, then 73, then 78 — each a count taken before the next slice landed.
+The endpoint count read **1** until the read path, the account routes, the statement and the period
+close shipped on 2026-09-01; four decisions in one day is what a surface does the first time a real
+client is built against it.)*
 
 The API itself is browsable as rendered documentation: **[the API reference](/api-reference/)**,
 generated on every site build from the committed `crates/api/openapi.json` — never a second
@@ -492,8 +499,13 @@ Stated the way the database page states its gaps: each of these is a hole today,
 > no caller sees a difference. The batching speedup therefore does not apply to them
 > ([ADR-0018](/decisions/0018-batching-and-stripe-selection) §4).
 
-> **STILL OPEN — one endpoint.** There is no read over HTTP: balances, entries and reports are
-> reachable only through SQL and the report functions the schema ships. The write path came first
-> because it is the half that can corrupt.
+> **CLOSED 2026-09-01 — the reads are over HTTP now.** This block read *"STILL OPEN — one endpoint.
+> There is no read over HTTP: balances, entries and reports are reachable only through SQL and the
+> report functions the schema ships."* The write path did come first, for the reason given — it is
+> the half that can corrupt — and the read path followed as [ADR-0019](/decisions/0019-read-path),
+> with accounts, the statement and the period close behind it. What remains genuinely absent is a
+> **global transaction listing** ([0023](/decisions/0023-account-statement) keeps that refused) and
+> **reconciliation over HTTP**, which is deliberate: the views are cross-tenant, and the sweep is a
+> command.
 
 The unbuilt work these imply is on the [roadmap](/roadmap).
