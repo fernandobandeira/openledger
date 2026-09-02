@@ -14,6 +14,7 @@ import {
   type Answer,
   type TransactionRead,
 } from "@/lib/ledger";
+import { ownerOf } from "@/lib/owner";
 import { cn } from "@/lib/utils";
 
 /**
@@ -114,7 +115,7 @@ function Facts({ transaction }: { transaction: TransactionRead }) {
         </Mono>{" "}
         <span className="text-[0.7rem] text-dim">
           {pending
-            ? "money that MAY move — its legs are in the journal and out of every balance"
+            ? "may move — out of every balance"
             : "on the books"}
         </span>
       </dd>
@@ -139,9 +140,7 @@ function Facts({ transaction }: { transaction: TransactionRead }) {
         ) : (
           <>
             <Identifier value={transaction.resolves_id} truncate />
-            <span className="ml-2 text-[0.7rem] text-dim">
-              the pending transaction this one turned into a posting
-            </span>
+            <span className="ml-2 text-[0.7rem] text-dim">resolved</span>
           </>
         )}
       </dd>
@@ -152,9 +151,7 @@ function Facts({ transaction }: { transaction: TransactionRead }) {
         ) : (
           <>
             <Identifier value={transaction.reverses_id} truncate />
-            <span className="ml-2 text-[0.7rem] text-dim">
-              the transaction this one undid — same legs, directions flipped
-            </span>
+            <span className="ml-2 text-[0.7rem] text-dim">reversed</span>
           </>
         )}
       </dd>
@@ -201,7 +198,7 @@ function Legs({
 
   return (
     <div className="mt-3 overflow-x-auto">
-      <table className="w-full min-w-[34rem] border-collapse text-[0.75rem]">
+      <table className="w-full min-w-[28rem] border-collapse text-[0.75rem]">
         <thead>
           <tr className="border-b border-line text-[0.66rem] tracking-wide text-dim">
             <th className="py-1 pr-3 text-left font-medium">account</th>
@@ -222,11 +219,13 @@ function Legs({
                 key={`${entry.account_id}:${entry.account_seq}`}
                 className={cn("border-b border-rule", here && "bg-surface")}
               >
-                <td className="py-1.5 pr-3">
+                <td className="w-full max-w-0 py-1.5 pr-3">
                   {here ? (
                     <span className="flex flex-wrap items-baseline gap-2">
                       <Mono className="text-[0.72rem] text-peach">
-                        {known?.purpose ?? entry.account_id}
+                        {known === undefined
+                          ? entry.account_id
+                          : `${known.purpose} · ${ownerOf(known)}`}
                       </Mono>
                       <span className="text-[0.66rem] text-dim">
                         the account you are on
@@ -240,7 +239,9 @@ function Legs({
                     >
                       <ArrowRightIcon className="size-3 shrink-0" aria-hidden />
                       <Mono className="truncate text-[0.72rem]">
-                        {known?.purpose ?? entry.account_id}
+                        {known === undefined
+                          ? entry.account_id
+                          : `${known.purpose} · ${ownerOf(known)}`}
                       </Mono>
                     </button>
                   )}
@@ -250,7 +251,7 @@ function Legs({
                     {entry.direction}
                   </Mono>
                 </td>
-                <td className="py-1.5 pr-3 text-right">
+                <td className="w-px py-1.5 pr-3 text-right whitespace-nowrap">
                   <Amount
                     minor={entry.amount_minor}
                     currency={entry.currency}

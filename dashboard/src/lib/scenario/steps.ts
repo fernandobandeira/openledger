@@ -47,7 +47,7 @@ export const CARD_LIFECYCLE: readonly ScenarioStep[] = [
     id: "authorized",
     label: "Card authorized · 500.00",
     teaches:
-      "A hold is recorded and no balance moves: the legs are in the journal, and the balance cache holds posted only.",
+      "A hold moves no balance.",
     requires: [],
     async run(context) {
       await context.openTheChart();
@@ -76,7 +76,7 @@ export const CARD_LIFECYCLE: readonly ScenarioStep[] = [
       await context.observe(
         "customer_receivable",
         "customer_receivable, posted balance",
-        "Zero, with a 500.00 leg already in the entries below. Nothing is owed until it clears, and it may never clear."
+        "Zero, with a 500.00 leg already in the entries — a hold owes nothing."
       );
     },
   },
@@ -84,7 +84,7 @@ export const CARD_LIFECYCLE: readonly ScenarioStep[] = [
     id: "cleared_300",
     label: "Cleared · 300.00",
     teaches:
-      "The merchant shipped half the order. You never owed the network 300 — the settlement obligation arrives already net of the interchange you keep.",
+      "You never owed the network 300 — it arrives net of interchange.",
     requires: ["authorized"],
     async run(context) {
       await context.post({
@@ -107,7 +107,7 @@ export const CARD_LIFECYCLE: readonly ScenarioStep[] = [
       await context.observe(
         "customer_receivable",
         "customer_receivable, posted balance",
-        "300.00 — the part that cleared, and only that part. The hold still stands for the rest."
+        "300.00 — the part that cleared; the hold stands for the rest."
       );
     },
   },
@@ -115,7 +115,7 @@ export const CARD_LIFECYCLE: readonly ScenarioStep[] = [
     id: "revenue_share",
     label: "Revenue share · 1.62",
     teaches:
-      "One event, two obligations. The platform's cut goes out under a second idempotency key because it has its own life — you settle the network daily and the platform monthly.",
+      "One event, two obligations, two idempotency keys.",
     requires: ["cleared_300"],
     async run(context) {
       await context.post({
@@ -136,7 +136,7 @@ export const CARD_LIFECYCLE: readonly ScenarioStep[] = [
     id: "cleared_200",
     label: "Cleared · 200.00",
     teaches:
-      "The rest of the order ships and the hold is consumed. A pending transaction becomes posted through a NEW transaction naming it — and it gets exactly one such fate, which is why the first capture could not claim it.",
+      "A hold is superseded once, by a new transaction naming it.",
     requires: ["authorized", "cleared_300"],
     async run(context) {
       const hold = context.recall(HOLD);
@@ -173,7 +173,7 @@ export const CARD_LIFECYCLE: readonly ScenarioStep[] = [
       await context.observe(
         "network_settlement_payable",
         "network_settlement_payable, posted balance",
-        "Debit-positive, so a payable reads negative: 491.00 is owed to the network — 294.60 from the first capture and 196.40 from this one. That is the wire two steps down."
+        "A payable reads negative: 491.00 owed to the network, and that is the wire."
       );
     },
   },
@@ -181,7 +181,7 @@ export const CARD_LIFECYCLE: readonly ScenarioStep[] = [
     id: "facility_draw",
     label: "Facility draw · 425.00",
     teaches:
-      "Funding has nothing to do with exposure. Treasury draws 85% of the purchase on the warehouse line, batched daily, and what the cardholder can spend does not move.",
+      "Funding is not exposure — the cardholder's balance does not move.",
     requires: [],
     async run(context) {
       await context.post({
@@ -202,7 +202,7 @@ export const CARD_LIFECYCLE: readonly ScenarioStep[] = [
     id: "settled",
     label: "Settle to network · 491.00",
     teaches:
-      "You wire 491, not 500. The 9 you kept was never a receipt — it is the gap between what the cardholder owes you and what you owed the network.",
+      "You wire 491, not 500. The 9 you kept was never a receipt.",
     requires: ["cleared_300", "cleared_200", "facility_draw"],
     async run(context) {
       await context.post({
@@ -220,7 +220,7 @@ export const CARD_LIFECYCLE: readonly ScenarioStep[] = [
       await context.observe(
         "network_settlement_payable",
         "network_settlement_payable, posted balance",
-        "Zero. Both captures and the wire net out, and the 9.00 of interchange stayed with us."
+        "Zero — the captures and the wire net out; the 9.00 stayed with us."
       );
     },
   },
@@ -228,7 +228,7 @@ export const CARD_LIFECYCLE: readonly ScenarioStep[] = [
     id: "facility_repaid",
     label: "Facility repaid",
     teaches:
-      "Principal, the month's interest and the platform's share settle together. Interest was an expense for thirty days before it was ever cash.",
+      "Interest was an expense before it was ever cash.",
     requires: ["facility_draw"],
     async run(context) {
       await context.post({
@@ -264,7 +264,7 @@ export const CARD_LIFECYCLE: readonly ScenarioStep[] = [
       await context.observe(
         "operating_cash",
         "operating_cash, posted balance",
-        "Below zero, and the ledger let it be: this walk never collects from the cardholder, so the cash to repay with was never pulled in. An overdrawn account is a legal state here, not an assertion failure."
+        "Below zero, and legal: this walk never collects from the cardholder."
       );
     },
   },
@@ -272,12 +272,12 @@ export const CARD_LIFECYCLE: readonly ScenarioStep[] = [
     id: "disputed",
     label: "Disputed → chargeback",
     teaches:
-      "A chargeback is not an undo. It is a new economic event with its own business date, so it posts as an ordinary transaction — both the clearing and the chargeback stay on the cardholder's statement.",
+      "A chargeback is not an undo — it has its own business date.",
     requires: ["cleared_300"],
     async run(context) {
       await context.post({
         key: "evt_dispute:chargeback",
-        wrote: "300.00 taken back off the cardholder — 294.60 recovered from the network, 5.40 of interchange given up. Dated back to the day of the purchase, and recorded today.",
+        wrote: "300.00 taken back — 294.60 recovered, 5.40 of interchange given up, dated back to the purchase",
         effectiveAt: context.at(1, 10),
         postings: [
           {
@@ -295,7 +295,7 @@ export const CARD_LIFECYCLE: readonly ScenarioStep[] = [
       await context.observe(
         "customer_receivable",
         "customer_receivable, posted balance",
-        "The disputed 300.00 is off the cardholder. Both transactions are still in the entries below — and because this one is dated back to the purchase, the two orders in the table disagree about where it sits."
+        "Off the cardholder — and dated back, so the two axes disagree about where it sits."
       );
     },
   },
@@ -303,7 +303,7 @@ export const CARD_LIFECYCLE: readonly ScenarioStep[] = [
     id: "reversed",
     label: "Operator error → reverse",
     teaches:
-      "The undo that really is one. Reversing sends no postings at all: the server mirrors the target's own legs with the directions flipped, as a new transaction that names it.",
+      "The undo that really is one — no postings sent.",
     requires: [],
     async run(context) {
       const mistake = await context.post({
@@ -330,7 +330,7 @@ export const CARD_LIFECYCLE: readonly ScenarioStep[] = [
     id: "sent_twice",
     label: "Send it twice",
     teaches:
-      "The same key with the same body is not a second write. The ledger answers 200 with the result it stored, and says so in a header rather than leaving you to guess.",
+      "Same key, same body: 200, and a header that says so.",
     requires: ["revenue_share"],
     async run(context) {
       await context.post({

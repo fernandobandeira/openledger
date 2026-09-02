@@ -2,6 +2,7 @@
 
 import { PinIcon, PlayIcon, RotateCcwIcon } from "lucide-react";
 
+import { GuideLink } from "@/components/guide-link";
 import { Mono } from "@/components/mono";
 import { TextField } from "@/components/field";
 import { Button } from "@/components/ui/button";
@@ -29,12 +30,7 @@ export function CursorField({
       onChange={onChange}
       inputMode="numeric"
       placeholder="empty — the read path pins one"
-      hint={
-        <>
-          An <code>xid8</code>. Empty means the server pins the current horizon
-          and answers with it.
-        </>
-      }
+      hint="empty = the server pins one"
     />
   );
 }
@@ -99,39 +95,18 @@ export function PinnedCursor({
         <span className="text-[0.72rem] text-dim">pinned_cursor</span>
         <Mono className="text-[0.8rem] text-peach">{cursor}</Mono>
       </p>
-      <Button
-        size="xs"
-        variant={alreadyPinned ? "ghost" : "secondary"}
-        disabled={alreadyPinned}
-        onClick={() => onPin(cursor)}
-      >
-        <PinIcon aria-hidden />
-        {alreadyPinned ? "Pinned" : "Pin this cursor"}
-      </Button>
+      <span className="flex items-center gap-3">
+        <GuideLink>what a cursor reproduces</GuideLink>
+        <Button
+          size="xs"
+          variant={alreadyPinned ? "ghost" : "secondary"}
+          disabled={alreadyPinned}
+          onClick={() => onPin(cursor)}
+        >
+          <PinIcon aria-hidden />
+          {alreadyPinned ? "Pinned" : "Pin this cursor"}
+        </Button>
+      </span>
     </div>
-  );
-}
-
-/**
- * What a stored cursor does and does not buy back, said where the amounts are.
- * The AMOUNTS at a cursor are reproducible; the ROW SET is not — the lines are
- * enumerated from tables that carry no commit position, so an account opened
- * afterwards adds lines to a report re-run at a fixed cursor (ADR-0019).
- */
-export function ReproducibilityNote({
-  kind,
-}: {
-  kind: "trial-balance" | "balance-sheet" | "income-statement";
-}) {
-  return (
-    <p className="mt-2 max-w-prose text-[0.7rem] leading-relaxed text-dim">
-      Re-running at this cursor reproduces the amounts, not the row set: the
-      lines come from the chart and the account register, which carry no commit
-      position, so an account opened since will add a row here at the same
-      cursor.
-      {kind === "income-statement"
-        ? " An income statement carries one more hole: a period close recorded after this answer removes its transactions from a re-run at this very cursor."
-        : ""}
-    </p>
   );
 }

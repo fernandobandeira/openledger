@@ -23,10 +23,16 @@ import type {
 export function StepReport({
   step,
   result,
+  ordinal,
+  at,
   onOpenTransaction,
 }: {
   step: ScenarioStep;
   result: StepResult;
+  /** The step's place in the walk, when this is a line of the record. */
+  ordinal?: number;
+  /** When this dashboard recorded the run, RFC 3339. */
+  at?: string;
   onOpenTransaction: (transactionId: string) => void;
 }) {
   // Both outcomes carry what was written: a halt does not undo the calls that
@@ -39,8 +45,17 @@ export function StepReport({
       className="border-t border-rule pt-3"
     >
       <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-        <h3 className="text-[0.85rem] font-medium">{step.label}</h3>
-        <p className="text-[0.7rem] text-dim">{step.teaches}</p>
+        <h3 className="flex items-baseline gap-2 text-[0.85rem] font-medium">
+          {ordinal === undefined ? null : (
+            <Mono className="text-[0.7rem] text-dim">{ordinal}</Mono>
+          )}
+          {step.label}
+          {at === undefined ? null : (
+            <Mono className="text-[0.66rem] font-normal text-dim">
+              {new Date(at).toLocaleTimeString()}
+            </Mono>
+          )}
+        </h3>
       </div>
 
       {result.kind === "halted" ? (
@@ -108,8 +123,7 @@ function WriteLine({
       <p className="mt-0.5 text-[0.78rem] leading-snug">{write.wrote}</p>
       {replay ? (
         <p className="mt-0.5 text-[0.68rem] text-dim">
-          Nothing was written. This key was already accepted with this same
-          body, so the ledger re-rendered the result it stored.
+          Nothing written — the stored result, re-rendered.
         </p>
       ) : null}
       {write.transactionId === null ? null : (

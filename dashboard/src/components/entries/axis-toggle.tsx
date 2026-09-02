@@ -1,5 +1,6 @@
 "use client";
 
+import { GuideLink } from "@/components/guide-link";
 import type { EntryAxis } from "@/components/entries/use-account-entries";
 import { cn } from "@/lib/utils";
 
@@ -66,13 +67,7 @@ export function AxisToggle({
           );
         })}
       </div>
-      <p className="max-w-prose text-[0.68rem] leading-relaxed text-dim">
-        The same entries, in two orders. One is the order the ledger learnt
-        them in; the other is the order they happened in the business. An entry
-        dated back to last week is at the end of the first and in the middle of
-        the second, and neither is more true than the other — which is why the
-        API will not pick one for you.
-      </p>
+      <GuideLink>the two clocks</GuideLink>
     </div>
   );
 }

@@ -6,7 +6,7 @@ import { PlusIcon, RefreshCwIcon } from "lucide-react";
 import { Trouble, WriteOutcome } from "@/components/answer-view";
 import { Choice, TextField } from "@/components/field";
 import { Identifier, Mono } from "@/components/mono";
-import { Panel, PanelNote } from "@/components/panel";
+import { Panel } from "@/components/panel";
 import { Button } from "@/components/ui/button";
 import {
   openAccount,
@@ -40,6 +40,13 @@ function freshKey(): string {
  * listing, no client-side scan. The `200` that replays the key re-renders the
  * identical account.
  */
+/** The rule the writer enforces (`metadata must be a JSON object`), as a type
+ * predicate: a bare `typeof x === "object"` narrows `unknown` to `{}`, which is
+ * not the record the generated `AccountBody` asks for. */
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export function OpenAccount({
   tenant,
   onOpened,
@@ -69,20 +76,22 @@ export function OpenAccount({
     setBusy(true);
     setBadMetadata(null);
 
-    let parsedMetadata: unknown;
+    let parsedMetadata: Record<string, unknown> | undefined;
     if (metadata.trim() !== "") {
+      let parsed: unknown;
       try {
-        parsedMetadata = JSON.parse(metadata);
+        parsed = JSON.parse(metadata);
       } catch (cause) {
         setBadMetadata(cause instanceof Error ? cause.message : String(cause));
         setBusy(false);
         return;
       }
-      if (typeof parsedMetadata !== "object" || parsedMetadata === null || Array.isArray(parsedMetadata)) {
-        setBadMetadata("metadata must be a JSON object — the column stores a bare number just as happily, and a field that is sometimes a scalar is a shape every reader has to defend against.");
+      if (!isJsonObject(parsed)) {
+        setBadMetadata("metadata must be a JSON object.");
         setBusy(false);
         return;
       }
+      parsedMetadata = parsed;
     }
 
     const body: AccountBody = {
@@ -116,7 +125,7 @@ export function OpenAccount({
           value={purpose}
           onChange={setPurpose}
           placeholder="customer_wallet"
-          hint="A chart code this deployment carries. Anything else is account_type_unknown."
+          hint="A chart code this deployment carries."
         />
         <Choice
           label="owner_type"
@@ -130,9 +139,7 @@ export function OpenAccount({
           onChange={setOwnerId}
           placeholder="co_1"
           hint={
-            ownerType === "house"
-              ? "Not sent: a house account is the ledger's own side and has no owner."
-              : "Required for every owner_type except house."
+            ownerType === "house" ? "Not sent — a house account has no owner." : "Required except for house."
           }
         />
         <TextField
@@ -140,7 +147,7 @@ export function OpenAccount({
           value={currency}
           onChange={setCurrency}
           placeholder="USD"
-          hint="Three uppercase letters. One account holds one currency."
+          hint="One account, one currency."
         />
         <TextField
           label="stripe_count"
@@ -148,14 +155,14 @@ export function OpenAccount({
           onChange={setStripeCount}
           inputMode="numeric"
           placeholder="empty — one stripe"
-          hint="1–1024. A hint to the writer, not an invariant; no stripe value appears in any response."
+          hint="1–1024, a hint to the writer."
         />
         <TextField
           label="metadata"
           value={metadata}
           onChange={setMetadata}
           placeholder={`{"note":"opened from the dashboard"}`}
-          hint="Your own JSON object, stored as given. Optional — it comes back in the answer and in the register."
+          hint="Your own JSON object, stored as given."
         />
       </div>
 
@@ -166,7 +173,7 @@ export function OpenAccount({
           value={idempotencyKey}
           onChange={setIdempotencyKey}
           placeholder="minted when you send"
-          hint="Sending the same key with the same body again replays the stored result: 200, not 201."
+          hint="Same key, same body: 200, not 201."
         />
         <Button
           variant="outline"
@@ -214,11 +221,6 @@ export function OpenAccount({
         </WriteOutcome>
       ) : null}
 
-      <PanelNote>
-        Opening an account writes an event and no ledger transaction — the case
-        the event log exists for. It shares one idempotency namespace with{" "}
-        <code>POST /v1/transactions</code>, deliberately: it is the same spine.
-      </PanelNote>
     </Panel>
   );
 }
@@ -230,11 +232,7 @@ function TheAccountItOpened({ account }: { account: AccountRead }) {
   return (
     <div className="mt-3 border border-rule px-3 py-2">
       <p className="text-[0.72rem] text-dim">
-        The first three were derived by the server from{" "}
-        <code>{account.purpose}</code>; the stripe count is the hint you sent,
-        echoed. All of it came back in the answer above — the account is the
-        same <code>AccountRead</code> a register row is, so one type serves both
-        verbs.
+        Derived by the server from <code>{account.purpose}</code>.
       </p>
       <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-[0.78rem] sm:grid-cols-4">
         <div>
@@ -266,30 +264,16 @@ function TheAccountItOpened({ account }: { account: AccountRead }) {
         <dt className="text-dim">created_at</dt>
         <dd>
           <Mono>{account.created_at}</Mono>{" "}
-          <span className="text-[0.7rem] text-dim">
-            the database&rsquo;s clock
-          </span>
+          <span className="text-[0.7rem] text-dim">the database&rsquo;s clock</span>
         </dd>
         <dt className="text-dim">metadata</dt>
         <dd>
           <Mono className="break-words">{metadata}</Mono>{" "}
           {metadata === "{}" ? (
-            <span className="text-[0.7rem] text-dim">
-              none given — the column defaults to an empty object, so this
-              field is never null
-            </span>
-          ) : (
-            <span className="text-[0.7rem] text-dim">
-              your own object, stored as given
-            </span>
-          )}
+            <span className="text-[0.7rem] text-dim">none given</span>
+          ) : null}
         </dd>
       </dl>
-      <p className="mt-2 text-[0.68rem] text-dim">
-        <code>normal_balance</code> is not derivable from <code>category</code>:
-        a loss allowance is an asset with a credit normal balance, which is why
-        the schema stores both.
-      </p>
     </div>
   );
 }

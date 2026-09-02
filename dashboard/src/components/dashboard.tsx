@@ -5,26 +5,19 @@ import { PanelLeftIcon } from "lucide-react";
 
 import { AccountSidenav } from "@/components/accounts/account-sidenav";
 import { useAccountBalances } from "@/components/accounts/use-account-balances";
-import { CursorRail, type Horizon } from "@/components/cursor-rail";
+import { ComposerBar, type ComposerAction } from "@/components/composer/composer-bar";
+import { CursorRail, type Horizon } from "@/components/cursor/cursor-rail";
+import { useBookCommits } from "@/components/cursor/use-book-commits";
 import { AccountPanel } from "@/components/entries/account-panel";
 import { useAccountEntries } from "@/components/entries/use-account-entries";
-import { AccountBalance } from "@/components/read/account-balance";
-import { BalanceSheet } from "@/components/read/balance-sheet";
-import { IncomeStatement } from "@/components/read/income-statement";
-import { TrialBalance } from "@/components/read/trial-balance";
 import { useAccountRegister } from "@/components/read/use-account-register";
 import { ScenarioStrip } from "@/components/scenario/scenario-strip";
 import { useScenario } from "@/components/scenario/use-scenario";
+import { GuideLink } from "@/components/guide-link";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { OpenAccount } from "@/components/write/open-account";
-import {
-  emptyLeg,
-  PostTransaction,
-  type Leg,
-} from "@/components/write/post-transaction";
-import { ReadTransaction } from "@/components/write/read-transaction";
+import { emptyLeg, type Leg } from "@/components/write/post-transaction";
 import { isBehind } from "@/lib/cursor";
 import { readCursor } from "@/lib/ledger";
 
@@ -36,29 +29,35 @@ function freshBook(): string {
 /**
  * The operator's page.
  *
- * Accounts down the left, the walk and the selected account's entries in the
- * middle, and the composer underneath — where every route is spelled out, in
- * its own words, with every field the API takes. The walk is an on-ramp into a
- * live book and not a demo mode: it posts through the same routes the composer
- * does, and everything it writes shows up in the panels below.
+ * Four things, in this order: what book you are on, where the cursor is,
+ * every account on the book beside the walk and the selected account's
+ * entries — and the composer, which is a bar of seven actions and a drawer
+ * behind each one.
+ *
+ * The composer used to be seven forms expanded down the page, and the page
+ * was mostly them. Nothing about it was deleted: the drawers hold the same
+ * fields under the same names with the same explanation under each. What
+ * moved is the wall — the book is now what the page shows, and a form appears
+ * over it when you ask for one.
  */
 export function Dashboard() {
   const [tenant, setTenant] = useState("t1");
 
   const [horizon, setHorizon] = useState<Horizon | null>(null);
   const [pinned, setPinned] = useState<string | null>(null);
-  const [observed, setObserved] = useState<string[]>([]);
   const [probing, setProbing] = useState(false);
 
   const [legs, setLegs] = useState<Leg[]>([emptyLeg()]);
   const [activeLeg, setActiveLeg] = useState(0);
-  const [balanceAccount, setBalanceAccount] = useState("");
-  const [balanceCurrency, setBalanceCurrency] = useState("USD");
   const [transactionId, setTransactionId] = useState("");
 
   const [selectedAccount, setSelectedAccount] = useState<string | null>(null);
   const [openTransaction, setOpenTransaction] = useState<string | null>(null);
   const [navOpen, setNavOpen] = useState(false);
+  const [composing, setComposing] = useState<ComposerAction | null>(null);
+
+  /** Bumped whenever the book may have moved on, so the rail re-walks it. */
+  const [bookMoved, setBookMoved] = useState(0);
 
   const register = useAccountRegister(tenant);
   const balances = useAccountBalances(tenant, register.accounts);
@@ -71,9 +70,6 @@ export function Dashboard() {
    */
   const noteAnswer = useCallback(
     (cursor: string, ranWithoutCursor: boolean, from: string) => {
-      setObserved((previous) =>
-        previous.includes(cursor) ? previous : [...previous, cursor]
-      );
       if (!ranWithoutCursor) return;
       setHorizon((previous) => ({
         cursor,
@@ -105,6 +101,14 @@ export function Dashboard() {
   );
 
   /**
+   * The commits this book actually made, for the rail to draw as ticks. It is
+   * a read of its own and it never moves the horizon: every page after the
+   * first supplies a cursor, and a background walk is not the deliberate
+   * unpinned answer rule 1 lets move the mark.
+   */
+  const book = useBookCommits(tenant, account?.account_id ?? null, bookMoved);
+
+  /**
    * One statement, not a report. `GET /v1/cursor` answers the horizon alone
    * (ADR-0022); this used to be a trial balance over 0001-01-01…9999-12-31 —
    * a full scan run for one scalar, which on a large book is the ~28-second
@@ -128,6 +132,7 @@ export function Dashboard() {
     void balances.refresh();
     entries.reload();
     void refreshHorizon();
+    setBookMoved((previous) => previous + 1);
   }, [balances, entries, refreshHorizon, register]);
 
   const scenario = useScenario(tenant, register.accounts, afterAWrite);
@@ -148,30 +153,21 @@ export function Dashboard() {
     setSelectedAccount(null);
     setOpenTransaction(null);
     setTransactionId("");
-    setBalanceAccount("");
     setLegs([emptyLeg()]);
     setActiveLeg(0);
     scenario.forget();
   }
 
-  function goToTheComposer() {
-    const target = document.getElementById("open-account");
-    if (target === null) return;
-    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    target.scrollIntoView({ behavior: reduced ? "auto" : "smooth", block: "start" });
-  }
-
   return (
     <main className="flex min-h-full flex-col">
-      <header className="border-b border-rule px-4 py-4 sm:px-6">
+      <header className="border-b border-rule px-4 py-3 sm:px-6">
         <div className="mx-auto flex max-w-[110rem] flex-wrap items-end justify-between gap-4">
           <div>
             <h1 className="text-lg font-medium tracking-tight">
               OpenLedger operator
             </h1>
             <p className="mt-0.5 text-[0.75rem] text-dim">
-              Walk a card through the book, read any account back, and re-run
-              any report at a cursor you pinned.
+              Write to a book, read it back, pin a cursor.
             </p>
           </div>
           <div className="flex flex-wrap items-end gap-2">
@@ -180,7 +176,7 @@ export function Dashboard() {
                 htmlFor="tenant"
                 className="text-[0.72rem] tracking-wide text-dim"
               >
-                tenant_id — the book every request below names
+tenant_id
               </Label>
               <Input
                 id="tenant"
@@ -197,18 +193,36 @@ export function Dashboard() {
         </div>
       </header>
 
-      <div className="sticky top-0 z-10">
+      {/* The bar and the rail travel together: what you can do to the book,
+          and where the book is. Both stay on screen while you read it. */}
+      <div className="sticky top-0 z-20">
+        <ComposerBar
+          tenant={tenant}
+          accounts={register.accounts}
+          open={composing}
+          onOpen={setComposing}
+          legs={legs}
+          setLegs={setLegs}
+          activeLeg={activeLeg}
+          setActiveLeg={setActiveLeg}
+          transactionId={transactionId}
+          setTransactionId={setTransactionId}
+          pinned={pinned}
+          onPin={setPinned}
+          onAnswer={noteAnswer}
+          afterAWrite={afterAWrite}
+        />
         <CursorRail
           horizon={horizon}
           pinned={pinned}
-          observed={observed}
+          book={book}
           busy={probing}
           onRefresh={() => void refreshHorizon()}
           onUnpin={() => setPinned(null)}
         />
       </div>
 
-      <div className="mx-auto w-full max-w-[110rem] px-4 py-6 sm:px-6">
+      <div className="mx-auto w-full max-w-[110rem] px-4 py-5 sm:px-6">
         <Button
           size="sm"
           variant="outline"
@@ -231,12 +245,12 @@ export function Dashboard() {
               balances={balances}
               selected={account?.account_id ?? null}
               onSelect={(chosen) => selectAccount(chosen.account_id)}
-              onOpenComposer={goToTheComposer}
+              onOpenComposer={() => setComposing("open-account")}
               onReset={startAFreshBook}
             />
           </div>
 
-          <div className="flex min-w-0 flex-col gap-8 border-rule lg:border-l lg:pl-6">
+          <div className="flex min-w-0 flex-col gap-6 border-rule lg:border-l lg:pl-6">
             <ScenarioStrip
               scenario={scenario}
               onOpenTransaction={setOpenTransaction}
@@ -267,32 +281,11 @@ export function Dashboard() {
                   )
                 )
               }
-              onFillBalance={(accountId, currency) => {
-                setBalanceAccount(accountId);
-                setBalanceCurrency(currency);
-              }}
+              onComposePosting={() => setComposing("post-transaction")}
             />
           </div>
         </div>
       </div>
-
-      <Composer
-        tenant={tenant}
-        legs={legs}
-        setLegs={setLegs}
-        activeLeg={activeLeg}
-        setActiveLeg={setActiveLeg}
-        balanceAccount={balanceAccount}
-        setBalanceAccount={setBalanceAccount}
-        balanceCurrency={balanceCurrency}
-        setBalanceCurrency={setBalanceCurrency}
-        transactionId={transactionId}
-        setTransactionId={setTransactionId}
-        pinned={pinned}
-        onPin={setPinned}
-        onAnswer={noteAnswer}
-        afterAWrite={afterAWrite}
-      />
 
       <Footnotes />
     </main>
@@ -300,147 +293,22 @@ export function Dashboard() {
 }
 
 /**
- * The composer, and the point of the page: every route spelled out, in the
- * API's own field names, with nothing filled in for you that you did not fill
- * in on purpose. The walk above is a fast way into a book with something in
- * it; this is where you write the next thing yourself.
+ * One line, and a way out to the guide.
+ *
+ * This was three paragraphs — minor units, reconciliation, authentication —
+ * and `site/content/bookings.md` now carries all three properly. The page
+ * shows; the guide explains.
  */
-function Composer({
-  tenant,
-  legs,
-  setLegs,
-  activeLeg,
-  setActiveLeg,
-  balanceAccount,
-  setBalanceAccount,
-  balanceCurrency,
-  setBalanceCurrency,
-  transactionId,
-  setTransactionId,
-  pinned,
-  onPin,
-  onAnswer,
-  afterAWrite,
-}: {
-  tenant: string;
-  legs: Leg[];
-  setLegs: (legs: Leg[]) => void;
-  activeLeg: number;
-  setActiveLeg: (index: number) => void;
-  balanceAccount: string;
-  setBalanceAccount: (value: string) => void;
-  balanceCurrency: string;
-  setBalanceCurrency: (value: string) => void;
-  transactionId: string;
-  setTransactionId: (value: string) => void;
-  pinned: string | null;
-  onPin: (cursor: string) => void;
-  onAnswer: (cursor: string, ranWithoutCursor: boolean, from: string) => void;
-  afterAWrite: () => void;
-}) {
-  return (
-    <div className="border-t border-rule">
-      <div className="mx-auto grid w-full max-w-[110rem] gap-10 px-4 py-8 sm:px-6 lg:grid-cols-2 lg:gap-0">
-        <section
-          id="open-account"
-          className="flex min-w-0 scroll-mt-24 flex-col gap-8 lg:pr-10"
-        >
-          <SpineHeading
-            side="Write"
-            port="the Ledger port — a refusal here wrote nothing"
-          />
-          <OpenAccount tenant={tenant} onOpened={afterAWrite} />
-          <PostTransaction
-            tenant={tenant}
-            legs={legs}
-            setLegs={setLegs}
-            activeLeg={activeLeg}
-            setActiveLeg={setActiveLeg}
-            onPosted={(id) => {
-              if (id !== null) setTransactionId(id);
-              afterAWrite();
-            }}
-          />
-          <ReadTransaction
-            tenant={tenant}
-            transactionId={transactionId}
-            setTransactionId={setTransactionId}
-          />
-        </section>
-
-        <section className="flex min-w-0 flex-col gap-8 border-rule lg:border-l lg:pl-10">
-          <SpineHeading
-            side="Read"
-            port="the Reports port — its own pool, its own login, RLS-scoped"
-          />
-          <AccountBalance
-            tenant={tenant}
-            accountId={balanceAccount}
-            setAccountId={setBalanceAccount}
-            currency={balanceCurrency}
-            setCurrency={setBalanceCurrency}
-          />
-          <TrialBalance
-            tenant={tenant}
-            pinned={pinned}
-            onPin={onPin}
-            onAnswer={onAnswer}
-          />
-          <BalanceSheet
-            tenant={tenant}
-            pinned={pinned}
-            onPin={onPin}
-            onAnswer={onAnswer}
-          />
-          <IncomeStatement
-            tenant={tenant}
-            pinned={pinned}
-            onPin={onPin}
-            onAnswer={onAnswer}
-          />
-        </section>
-      </div>
-    </div>
-  );
-}
-
-function SpineHeading({ side, port }: { side: string; port: string }) {
-  return (
-    <div className="flex flex-wrap items-baseline gap-x-3 border-b border-line pb-2">
-      <h2 className="text-[0.8rem] tracking-[0.14em] text-peach uppercase">
-        {side}
-      </h2>
-      <p className="text-[0.72rem] text-dim">{port}</p>
-    </div>
-  );
-}
-
-/** The three things an operator has to know that no panel owns. */
 function Footnotes() {
   return (
-    <footer className="border-t border-rule px-4 py-6 text-[0.72rem] leading-relaxed text-dim sm:px-6">
-      <div className="mx-auto grid max-w-[110rem] gap-6 sm:grid-cols-3">
-        <p>
-          <span className="text-ink">Minor units, shown at two decimals.</span>{" "}
-          The wire carries no currency exponent, so two is this dashboard&rsquo;s
-          assumption rather than the ledger&rsquo;s statement. Every figure keeps
-          its exact minor-unit integer in its <code>title</code> — hover any
-          amount to read it unrounded.
-        </p>
-        <p>
-          <span className="text-ink">Reconciliation is not on this page.</span>{" "}
-          The reconciliation views are cross-tenant on a service with no
-          authentication, so they are deliberately not exposed over HTTP. The
-          sweep is <code>openledger reconcile</code>, run and scheduled by an
-          operator.
-        </p>
-        <p>
-          <span className="text-ink">There is no authentication.</span>{" "}
-          <code>tenant_id</code> is data scoping, never an identity claim: the
-          trust boundary is the deployment perimeter. Anyone who can reach this
-          page can name any book.
-        </p>
-      </div>
+    <footer className="mt-auto border-t border-rule px-4 py-3 text-[0.7rem] text-dim sm:px-6">
+      <p className="mx-auto flex max-w-[110rem] flex-wrap items-baseline gap-x-3 gap-y-1">
+        <span>
+          Minor units, two decimals · hover for the exact integer · no
+          authentication
+        </span>
+        <GuideLink>Booking a payment</GuideLink>
+      </p>
     </footer>
   );
 }

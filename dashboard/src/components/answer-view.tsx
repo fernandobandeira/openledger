@@ -26,9 +26,7 @@ export function Trouble({ answer }: { answer: Answer<unknown> | null }) {
           {answer.error.detail}
         </Mono>
         <p className="mt-2 text-[0.68rem] text-dim">
-          The status, <code>type</code> and <code>detail</code> above are the
-          API&rsquo;s own words. Parse <code>type</code>; never{" "}
-          <code>detail</code>.
+          Parse <code>type</code>; never <code>detail</code>.
         </p>
       </div>
     );
@@ -59,10 +57,8 @@ export function Trouble({ answer }: { answer: Answer<unknown> | null }) {
         {answer.detail}
       </Mono>
       <p className="mt-2 text-[0.68rem] text-dim">
-        This app proxies <code>/v1/*</code> to{" "}
-        <code>OPENLEDGER_API_ORIGIN</code> (default{" "}
-        <code>http://127.0.0.1:8080</code>). Check that{" "}
-        <code>openledger serve</code> is running there.
+        Is <code>openledger serve</code> running on{" "}
+        <code>OPENLEDGER_API_ORIGIN</code>?
       </p>
     </div>
   );
@@ -104,8 +100,8 @@ export function WriteOutcome({
       </p>
       <p className="mt-1 text-[0.78rem]">
         {isReplay
-          ? `Replayed. This key was already accepted with this same body, so nothing was written — ${wrote} below is the stored result, re-rendered.`
-          : `Written. This call claimed the idempotency key and wrote ${wrote} atomically.`}
+          ? `Replayed — nothing written, ${wrote} is the stored result.`
+          : `Written — this call claimed the key and wrote ${wrote}.`}
       </p>
       {children}
     </div>

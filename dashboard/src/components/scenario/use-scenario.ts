@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 
 import { specFor, TRACE_CHART, type ChartPurpose } from "@/lib/scenario/chart";
 import { CARD_LIFECYCLE } from "@/lib/scenario/steps";
@@ -52,18 +52,58 @@ export interface StepState {
   result: StepResult | null;
 }
 
+/**
+ * One run of one step, kept.
+ *
+ * The walk used to show the report of whichever step ran last and throw the
+ * rest away, so ten steps left one paragraph and no trail: what the sixth
+ * step wrote was gone by the time the seventh answered. A walk is a sequence
+ * of writes to a real book and the record of it is the point, so every run is
+ * appended here — the calls it made, the status each was answered with, and
+ * the one line saying what it wrote.
+ *
+ * `seq` is monotonic rather than the step's id, so a step run twice is two
+ * entries. Re-running IS a thing this walk teaches — the last step is a
+ * deliberate replay — and a log that collapsed the second run into the first
+ * would hide the header that makes it a replay.
+ */
+export interface LoggedRun {
+  seq: number;
+  stepId: StepId;
+  /** The step's place in the walk, so the log reads in the walk's numbers. */
+  ordinal: number;
+  /** When this dashboard recorded it. */
+  at: string;
+  result: StepResult;
+}
+
 export interface Scenario {
   steps: readonly ScenarioStep[];
   stateOf(id: StepId): StepState;
   /** Why this step cannot run yet, in the words of the steps it waits on. */
   blockedBecause(step: ScenarioStep): string | null;
   running: StepId | null;
-  /** The step whose report is on screen — the last one run. */
+  /** The step whose tile is lit — the last one run. */
   showing: StepId | null;
-  show(id: StepId): void;
+  /** Every run, newest first. The record of the walk. */
+  log: readonly LoggedRun[];
   run(step: ScenarioStep): Promise<void>;
   /** Forget every run. The book itself is discarded by switching tenant. */
   forget(): void;
+}
+
+/** Everything one book's walk has produced, and which book that is. */
+interface Walk {
+  tenant: string;
+  results: Partial<Record<StepId, StepResult>>;
+  /** The step whose run is highlighted — the last one to start. */
+  showing: StepId | null;
+  /** Newest first. */
+  log: readonly LoggedRun[];
+}
+
+function nothingRunYet(tenant: string): Walk {
+  return { tenant, results: {}, showing: null, log: [] };
 }
 
 /**
@@ -80,9 +120,28 @@ export function useScenario(
   accounts: readonly AccountRead[],
   onWrote: () => void
 ): Scenario {
-  const [results, setResults] = useState<Partial<Record<StepId, StepResult>>>({});
+  const [walk, setWalk] = useState<Walk>(() => nothingRunYet(tenant));
   const [running, setRunning] = useState<StepId | null>(null);
-  const [showing, setShowing] = useState<StepId | null>(null);
+
+  /**
+   * The walk belongs to ONE book, and it is shown only while it still
+   * describes the book on screen — the same rule the entries panel keeps
+   * about its page. Switching tenant therefore forgets every run without an
+   * effect that blanks state on the way past, and without a render in which
+   * a new book briefly wears the old book's record.
+   */
+  const current = walk.tenant === tenant ? walk : nothingRunYet(tenant);
+  const { results, showing, log } = current;
+
+  /** Every update starts from the walk that belongs to THIS book. */
+  const amend = useCallback(
+    (change: (previous: Walk) => Walk) => {
+      setWalk((previous) =>
+        change(previous.tenant === tenant ? previous : nothingRunYet(tenant))
+      );
+    },
+    [tenant]
+  );
 
   /**
    * What the walk learnt about ONE book: the accounts it opened, and the
@@ -105,11 +164,6 @@ export function useScenario(
       };
     }
     return memory.current;
-  }, [tenant]);
-
-  useEffect(() => {
-    setResults({});
-    setShowing(null);
   }, [tenant]);
 
   const registered = useMemo(() => {
@@ -236,31 +290,46 @@ export function useScenario(
         },
       };
 
+      /** Both outcomes are kept, and both are logged: a halt is what happened. */
+      function record(result: StepResult) {
+        const ordinal =
+          CARD_LIFECYCLE.findIndex((candidate) => candidate.id === step.id) + 1;
+        const at = new Date().toISOString();
+        amend((previous) => ({
+          ...previous,
+          results: { ...previous.results, [step.id]: result },
+          log: [
+            {
+              seq: previous.log.length === 0 ? 1 : previous.log[0].seq + 1,
+              stepId: step.id,
+              ordinal,
+              at,
+              result,
+            },
+            ...previous.log,
+          ],
+        }));
+      }
+
       setRunning(step.id);
-      setShowing(step.id);
+      amend((previous) => ({ ...previous, showing: step.id }));
       try {
         await step.run(context);
-        setResults((previous) => ({
-          ...previous,
-          [step.id]: { kind: "wrote", writes, observations },
-        }));
+        record({ kind: "wrote", writes, observations });
       } catch (cause) {
         if (!(cause instanceof StepHalted)) throw cause;
-        setResults((previous) => ({
-          ...previous,
-          [step.id]: {
-            kind: "halted",
-            at: cause.at,
-            answer: cause.answer,
-            writes,
-          },
-        }));
+        record({
+          kind: "halted",
+          at: cause.at,
+          answer: cause.answer,
+          writes,
+        });
       } finally {
         setRunning(null);
         onWrote();
       }
     },
-    [memoryForThisBook, onWrote, registered, tenant]
+    [amend, memoryForThisBook, onWrote, registered, tenant]
   );
 
   const stateOf = useCallback(
@@ -281,22 +350,19 @@ export function useScenario(
         (id) =>
           CARD_LIFECYCLE.find((candidate) => candidate.id === id)?.label ?? id
       );
-      return names.length === 1
-        ? `Run “${names[0]}” first — this step needs what it wrote.`
-        : `Run “${names.slice(0, -1).join("”, “")}” and “${names[names.length - 1]}” first — this step needs what they wrote.`;
+      return `needs ${names.map((name) => `“${name}”`).join(" and ")}`;
     },
     [results]
   );
 
   const forget = useCallback(() => {
-    setResults({});
-    setShowing(null);
+    setWalk(nothingRunYet(tenant));
     memory.current = {
       tenant: memory.current.tenant,
       accounts: new Map<ChartPurpose, string>(),
       transactions: new Map<string, string>(),
     };
-  }, []);
+  }, [tenant]);
 
   return {
     steps: CARD_LIFECYCLE,
@@ -304,7 +370,7 @@ export function useScenario(
     blockedBecause,
     running,
     showing,
-    show: setShowing,
+    log,
     run,
     forget,
   };

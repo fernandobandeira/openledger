@@ -34,15 +34,6 @@ export function Panel({
   );
 }
 
-/** A sentence about what the answer means, not about what the button does. */
-export function PanelNote({ children }: { children: ReactNode }) {
-  return (
-    <p className="mt-2 max-w-prose text-[0.78rem] leading-relaxed text-dim">
-      {children}
-    </p>
-  );
-}
-
 /** A statement about a bitemporal ledger, not a shrug. */
 export function Empty({ children }: { children: ReactNode }) {
   return (

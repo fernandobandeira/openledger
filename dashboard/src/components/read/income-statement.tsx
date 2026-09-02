@@ -5,11 +5,10 @@ import { useState } from "react";
 import { Trouble } from "@/components/answer-view";
 import { InstantField, TextField } from "@/components/field";
 import { Mono } from "@/components/mono";
-import { Panel, PanelNote } from "@/components/panel";
+import { Panel } from "@/components/panel";
 import {
   CursorField,
   PinnedCursor,
-  ReproducibilityNote,
   RunRow,
 } from "@/components/report-frame";
 import { StatementFace } from "@/components/read/statement-face";
@@ -85,7 +84,7 @@ export function IncomeStatement({
           label="effective_to"
           value={to}
           onChange={setTo}
-          hint="Exclusive — the window is half-open."
+          hint="Exclusive — half-open."
         />
         <CursorField value={cursor} onChange={setCursor} />
         <TextField
@@ -94,7 +93,6 @@ export function IncomeStatement({
           onChange={setChartVersion}
           inputMode="numeric"
           placeholder="empty — the server names one"
-          hint="Explicit v1 and the default answered 1 and 3 on the same database."
         />
       </div>
 
@@ -127,19 +125,12 @@ export function IncomeStatement({
             onPin={onPin}
           />
           <p className="mt-2 text-[0.72rem] text-dim">
-            presented at chart version{" "}
-            <Mono className="text-ink">{report.chart_version}</Mono>
+            chart version <Mono className="text-ink">{report.chart_version}</Mono>
           </p>
           <StatementFace lines={report.lines} check="income-statement" />
-          <ReproducibilityNote kind="income-statement" />
         </>
       ) : null}
 
-      <PanelNote>
-        Closing entries are excluded by a predicate that is not pinned to the
-        cursor — the one hole in this report&rsquo;s reproducibility, and the
-        reason it is stated here rather than left for a reader to discover.
-      </PanelNote>
     </Panel>
   );
 }

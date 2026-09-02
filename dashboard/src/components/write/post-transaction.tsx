@@ -6,7 +6,8 @@ import { ArrowRightIcon, PlusIcon, RefreshCwIcon, XIcon } from "lucide-react";
 import { Trouble, WriteOutcome } from "@/components/answer-view";
 import { Choice, InstantField, TextField } from "@/components/field";
 import { Identifier, Mono } from "@/components/mono";
-import { Panel, PanelNote } from "@/components/panel";
+import { GuideLink } from "@/components/guide-link";
+import { Panel } from "@/components/panel";
 import { Button } from "@/components/ui/button";
 import {
   postTransaction,
@@ -94,7 +95,7 @@ export function PostTransaction({
         }
         if (leg.source.trim() === "" || leg.destination.trim() === "") {
           setRefusedHere(
-            `Leg ${index + 1}: both a source and a destination account are needed. Select an account in the sidenav and send it here from the panel above.`
+            `Leg ${index + 1}: both a source and a destination account are needed. Pick an account in the sidenav and send it here with “Use as leg ${activeLeg + 1} source” on its header, behind this drawer.`
           );
           return;
         }
@@ -137,16 +138,14 @@ export function PostTransaction({
           value={status}
           options={STATUSES}
           onChange={setStatus}
-          hint="Omitted means posted. Status never mutates: a pending transaction becomes posted through a NEW transaction naming it below."
+          hint="Omitted means posted. It never mutates."
         />
         <InstantField
           label="effective_at"
           value={effectiveAt}
           onChange={setEffectiveAt}
           hint={
-            isReversal
-              ? "Optional on a reversal: omitted means the target's own effective_at."
-              : "Required — the writer will not invent a date."
+            isReversal ? "Optional — the target's own date." : "Required."
           }
         />
         <TextField
@@ -154,14 +153,14 @@ export function PostTransaction({
           value={resolvesId}
           onChange={setResolvesId}
           placeholder="empty"
-          hint="The pending transaction this one resolves. Its postings need not mirror the pending amounts."
+          hint="The pending transaction this resolves."
         />
         <TextField
           label="reverses_id"
           value={reversesId}
           onChange={setReversesId}
           placeholder="empty"
-          hint="The transaction this one reverses. Send no postings: the server derives the mirror."
+          hint="The transaction this reverses. Send no postings."
         />
       </div>
 
@@ -175,7 +174,7 @@ export function PostTransaction({
               </span>
             ) : (
               <span>
-                — the selected account above fills leg{" "}
+                — the selected account behind this drawer fills leg{" "}
                 <Mono className="text-peach">{activeLeg + 1}</Mono>
               </span>
             )}
@@ -196,9 +195,7 @@ export function PostTransaction({
 
         {isReversal ? (
           <p className="border border-dashed border-rule px-3 py-3 text-[0.75rem] text-dim">
-            A reversal of a posted transaction is mirrored in full by the server
-            — same legs, directions flipped. A reversal of a PENDING one writes
-            a void: a transaction with no entries at all.
+            Posted: mirrored, directions flipped. Pending: a void, no entries.
           </p>
         ) : (
           <ul className="flex flex-col gap-3">
@@ -275,7 +272,7 @@ export function PostTransaction({
           value={idempotencyKey}
           onChange={setIdempotencyKey}
           placeholder="minted when you send"
-          hint="Same key, same body: the stored result comes back as 200. Same key, different body: 422 idempotency_key_reused."
+          hint="Same key, same body: 200. Different body: 422."
         />
         <Button
           variant="outline"
@@ -311,9 +308,7 @@ export function PostTransaction({
             <dt className="text-dim">transaction_id</dt>
             <dd>
               {answer.body.transaction_id === null ? (
-                <span className="text-dim">
-                  null — an accepted operation need not write a transaction
-                </span>
+                <span className="text-dim">null</span>
               ) : (
                 <Identifier value={answer.body.transaction_id} />
               )}
@@ -326,15 +321,9 @@ export function PostTransaction({
         </WriteOutcome>
       ) : null}
 
-      <PanelNote>
-        Balance is the posting type&rsquo;s, not this form&rsquo;s: every leg
-        moves one amount from a source to a destination, so a one-legged
-        transaction has no spelling here. <code>amount_minor</code> goes out as
-        an exact-integer decimal <em>string</em> (ADR-0022) — digits only, no
-        separator, no decimal point, no exponent — so a leg of
-        9007199254740993 is sent and read back as itself. The dashboard applies
-        that grammar before sending, in the API&rsquo;s own words.
-      </PanelNote>
+      <p className="mt-3 text-[0.7rem] text-dim">
+        <GuideLink>postings, and why amounts travel as strings</GuideLink>
+      </p>
     </Panel>
   );
 }

@@ -25,10 +25,7 @@ export function StatementFace({
   if (lines.length === 0) {
     return (
       <div className="mt-3">
-        <Empty>
-          No lines at this cursor. An unknown tenant answers the same way — 200
-          with nothing — because there is no tenant registry to consult.
-        </Empty>
+        <Empty>No lines at this cursor.</Empty>
       </div>
     );
   }
@@ -71,8 +68,13 @@ function FaceForCurrency({
   return (
     <div>
       <p className="mb-1 text-[0.7rem] tracking-wide text-dim">{currency}</p>
-      <div className="overflow-x-auto">
-        <table className="w-full min-w-[24rem] border-collapse text-[0.78rem]">
+      {/* No minimum width, and no horizontal scroll to hide a figure behind:
+          the caption column takes whatever is left (`w-full`) and the amount
+          column shrinks to its own content and never wraps (`w-px`,
+          `whitespace-nowrap`). On a face, the number IS the content and the
+          caption is the index to it, so the caption is what gives way. */}
+      <div>
+        <table className="w-full table-auto border-collapse text-[0.78rem]">
           <tbody>
             {sides.map((side) => (
               <SideBlock
@@ -116,18 +118,26 @@ function SideBlock({
       </tr>
       {lines.map((line) => (
         <tr key={line.fs_line} className="border-b border-rule">
-          <td className="py-1 pr-3">
-            <span>{line.caption}</span>{" "}
-            <Mono className="text-[0.68rem] text-dim">{line.fs_line}</Mono>
+          <td className="w-full py-1.5 pr-4 align-top">
+            <span className="block" title={line.caption}>
+              {line.caption}
+            </span>
+            {/* The chart's own code, demoted to its own line: it is how you
+                look the caption up, not what the row says. */}
+            <Mono className="block text-[0.66rem] text-dim">
+              {line.fs_line}
+            </Mono>
           </td>
-          <td className="py-1 text-right">
+          <td className="w-px py-1.5 text-right align-top whitespace-nowrap">
             <Amount minor={line.amount_minor} currency={currency} />
           </td>
         </tr>
       ))}
       <tr className="border-b border-line">
-        <td className="py-1 pr-3 text-[0.72rem] text-dim">total {side}</td>
-        <td className="py-1 text-right">
+        <td className="w-full py-1.5 pr-4 text-[0.72rem] text-dim">
+          total {side}
+        </td>
+        <td className="w-px py-1.5 text-right whitespace-nowrap">
           <Amount minor={total} currency={currency} className="text-peach" />
         </td>
       </tr>

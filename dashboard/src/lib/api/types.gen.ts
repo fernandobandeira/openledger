@@ -55,9 +55,19 @@ export type AccountBody = {
      * Caller's own JSON object, stored as given. It must BE an object:
      * `jsonb` would store a bare number as happily, and a metadata field
      * that is sometimes a scalar is a shape every reader has to defend
-     * against.
+     * against. A scalar, an array or a string here is
+     * `422 invalid_request` — the writer checks it (`AccountOpening::new`),
+     * so the `object` below is a claim the service actually keeps rather
+     * than a hope the schema expresses.
+     *
+     * Typed as an object because the alternative is worse than vague:
+     * `serde_json::Value` with no annotation generates as `unknown`, and a
+     * caller holding an `unknown` can only `JSON.stringify` the one field
+     * this API exists to let them put their own structure in.
      */
-    metadata?: unknown;
+    metadata?: {
+        [key: string]: unknown;
+    } | null;
     /**
      * Who owns it. Required for every `owner_type` except `house`, and
      * refused for `house` — `ck_accounts__house_has_no_owner`, answered as
@@ -180,8 +190,15 @@ export type AccountRead = {
      * feature. ADR-0021's "identity plus `stripe_count`" is extended by this
      * one field and by nothing else: the part of that sentence that was
      * load-bearing is the absence of BALANCES, and they are still absent.
+     *
+     * Always an object, never a scalar and never null: the column is
+     * `NOT NULL DEFAULT '{}'` and the writer refuses a body whose metadata
+     * is not an object, so both ends of the round trip hold the shape the
+     * schema declares.
      */
-    metadata: unknown;
+    metadata: {
+        [key: string]: unknown;
+    };
     /**
      * `debit` or `credit`. **Not derivable from `category`**: a loss
      * allowance is an asset with a credit normal balance, which is why the
@@ -291,6 +308,13 @@ export type EntryRead = {
      * in any response (ADR-0013 §4).
      */
     account_seq: number;
+    /**
+     * Minor units, as an exact-integer decimal string — **not a JSON
+     * number** (ADR-0022). `ledger_entries.amount_minor` is a `bigint` and
+     * JSON has no integer type, so a large amount read as a number comes back
+     * silently wrong. Always digits and always strictly positive here: the
+     * sign a caller may send is the domain's refusal, never a stored value.
+     */
     amount_minor: string;
     currency: string;
     /**
@@ -479,6 +503,39 @@ export type PostingBody = {
      * 9007199254740993 was accepted and `JSON.parse` read it back as
      * 9007199254740992, silently off by one in both directions. So a single
      * amount travels the way every report total already does.
+     *
+     * **The accepted form is three rules, and the schema can express one of
+     * them.** They are stated here in full because a client that has to
+     * guess ends up restating them from the refusal messages, with nothing
+     * comparing its copy against this one:
+     *
+     * 1. **The grammar `^-?[0-9]+$`** — digits, optionally preceded by a
+     * single `-`. No leading `+`, no surrounding whitespace, no decimal
+     * point, no exponent, no thousands separator, and not the empty
+     * string. Each is refused rather than trimmed or coerced, because
+     * two spellings of one amount hash differently under the idempotency
+     * key that covers the request bytes. **This rule is the `pattern`
+     * above** — a client generated from this document can check it
+     * without reading this sentence.
+     * 2. **It must fit a signed 64-bit integer**, which is
+     * `ledger_entries.amount_minor`'s own range: −9223372036854775808 to
+     * 9223372036854775807 inclusive. **JSON Schema cannot express this**
+     * — `minimum`/`maximum` bound a number and this is a string, and no
+     * pattern distinguishes 19 digits that fit from 19 that do not. It is
+     * enforced by the service, and a value outside it is
+     * `422 invalid_request` naming the field.
+     * 3. **It must be strictly positive**, so `"0"` and every negative are
+     * refused. Direction is carried by the `source`/`destination` pair
+     * and never by a sign, which is why the grammar admits a `-` that the
+     * domain then refuses: *"not a number"* and *"not positive"* are
+     * different things for a caller to fix, and they are answered
+     * separately. **Also inexpressible here**, and also
+     * `422 invalid_request`.
+     *
+     * So: rule 1 is checked by this schema; rules 2 and 3 are checked only
+     * by the server, and a client that wants to refuse before the round trip
+     * has to implement them itself, knowing that this paragraph — not a
+     * keyword — is what it is copying.
      */
     amount_minor: string;
     /**
@@ -539,6 +596,26 @@ export type StatementEntryRead = {
      * (ADR-0006).
      */
     recorded_at: string;
+    /**
+     * `pending` or `posted` — the status of the transaction this leg belongs
+     * to, and **the field that says whether the balance counts this row**.
+     *
+     * **A statement is not posted-only.** A pending hold writes entries and
+     * draws `account_seq` for them exactly as a posted charge does
+     * (ADR-0016), and this page filters no status — so a pending leg has
+     * always been here. What it had no way to say was that
+     * `GET /v1/accounts/{account_id}/balance` does not count it: that route
+     * reads the balance CACHE, which means POSTED (ADR-0010). A row the
+     * total excludes now says so on the row, rather than requiring one
+     * `GET /v1/transactions/{transaction_id}` per distinct transaction to
+     * find out.
+     *
+     * It never mutates: a pending transaction becomes posted by a NEW
+     * transaction naming it in `resolves_id`, which writes its OWN entries —
+     * so a settled hold shows on this page as two rows, the pending original
+     * and the posted resolution, and not as one row that changed its mind.
+     */
+    status: string;
     /**
      * The transaction this leg belongs to.
      */
@@ -970,14 +1047,21 @@ export type GetAccountStatementData = {
          */
         tenant_id: string;
         /**
-         * **Required, and there is no default** (ADR-0023). `recorded` orders by
-         * commit position — what the ledger learnt, and when — and `effective`
-         * orders by business date. The two disagree about where a backdated
-         * entry sits, which is what two axes MEAN (ADR-0006): whichever one were
-         * chosen for a caller who named none would be the axis they did not
-         * think about, so this endpoint refuses rather than picks.
+         * The two axes `GET /v1/accounts/{account_id}/entries` orders by, as a TYPE
+         * — so the generated client's parameter is `"recorded" | "effective"` and a
+         * misspelling is a compile error rather than a `422` in production.
+         *
+         * **It documents the parameter; it does not enforce it.** The handler still
+         * takes the axis as text and [`ledger::StatementAxis::parse`] still refuses
+         * anything that is not one of these two, by name and with both values in the
+         * message (ADR-0023). That refusal is the contract; this enum is the
+         * description of it, and a spec that describes a rule is not a spec that
+         * keeps it — which is exactly the drift class ADR-0014's cost list names.
+         * Deserializing INTO this enum instead would have moved the refusal into
+         * axum's extractor and answered `400` where the ledger answers `422` naming
+         * both axes, so the parse stays where it is.
          */
-        axis: string;
+        axis: 'recorded' | 'effective';
         /**
          * The commit position to pin the page to — a `pinned_cursor` from an
          * earlier read. Omit it and one is pinned server-side and returned. It
@@ -1050,7 +1134,7 @@ export type GetAccountStatementError = GetAccountStatementErrors[keyof GetAccoun
 
 export type GetAccountStatementResponses = {
     /**
-     * One page of the account's entries, in the axis's order, with the cursor the page was pinned at and the key of the next page. **The two axes answer the same SET in different ORDERS**, and a backdated entry is where they disagree: it sits in its own past on the effective axis and at the end of the recorded one. An account that exists and has no entries in range answers an empty list, never a 404.
+     * One page of the account's entries, in the axis's order, with the cursor the page was pinned at and the key of the next page. **The two axes answer the same SET in different ORDERS**, and a backdated entry is where they disagree: it sits in its own past on the effective axis and at the end of the recorded one. An account that exists and has no entries in range answers an empty list, never a 404. **The page is NOT posted-only**: a pending hold writes entries and they are here, each carrying its transaction's `status`, so a reader can tell a settled row from a claim — which `GET /v1/accounts/{account_id}/balance` cannot show, because it reads the balance cache and that means posted (ADR-0010). Summing this page and comparing it to that balance requires dropping the `pending` rows first.
      */
     200: AccountStatementRead;
 };

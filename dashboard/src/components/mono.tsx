@@ -42,7 +42,12 @@ export function Identifier({
   return (
     <span className={cn("inline-flex max-w-full items-center gap-1", className)}>
       <Mono
-        className={cn("text-[0.72rem]", truncate && "truncate")}
+        // `min-w-0` is what makes `truncate` actually truncate here: a flex
+        // item's default `min-width: auto` refuses to shrink below its
+        // content, so without it the identifier pushes its row wider instead
+        // of ellipsing — which is how a UUID ends up shoving an amount off
+        // the right edge of a statement.
+        className={cn("text-[0.72rem]", truncate && "min-w-0 truncate")}
         title={value}
       >
         {value}

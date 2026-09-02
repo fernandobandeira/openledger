@@ -6,15 +6,20 @@ import { Amount } from "@/components/amount";
 import { Trouble } from "@/components/answer-view";
 import { InstantField } from "@/components/field";
 import { Identifier, Mono } from "@/components/mono";
-import { Empty, Panel, PanelNote } from "@/components/panel";
+import { Empty, Panel } from "@/components/panel";
 import {
   CursorField,
   PinnedCursor,
-  ReproducibilityNote,
   RunRow,
 } from "@/components/report-frame";
 import { sumMinor } from "@/lib/amount";
-import { runTrialBalance, type Answer, type TrialBalanceRead } from "@/lib/ledger";
+import {
+  runTrialBalance,
+  type AccountRead,
+  type Answer,
+  type TrialBalanceRead,
+} from "@/lib/ledger";
+import { ownerById } from "@/lib/owner";
 import { startOfThisYear, toInstant, tomorrow } from "@/lib/time";
 
 /**
@@ -24,11 +29,18 @@ import { startOfThisYear, toInstant, tomorrow } from "@/lib/time";
  */
 export function TrialBalance({
   tenant,
+  accounts,
   pinned,
   onPin,
   onAnswer,
 }: {
   tenant: string;
+  /**
+   * The register this page already listed. The report row carries no owner —
+   * it is `(account, currency)` and nothing else — so the field that tells
+   * two `customer_wallet` rows apart is joined in from here.
+   */
+  accounts: readonly AccountRead[];
   pinned: string | null;
   onPin: (cursor: string) => void;
   onAnswer: (cursor: string, ranWithoutCursor: boolean, from: string) => void;
@@ -119,25 +131,33 @@ export function TrialBalance({
 
           {report.rows.length === 0 ? (
             <div className="mt-3">
-              <Empty>
-                No entries in this range at this cursor. That is a true
-                statement about this book, not a missing answer — an unknown
-                tenant, a book with no accounts and a quiet window all read the
-                same here.
-              </Empty>
+              <Empty>No entries in this range at this cursor.</Empty>
             </div>
           ) : (
             <div className="mt-3 overflow-x-auto">
-              <table className="w-full min-w-[34rem] border-collapse text-[0.75rem]">
+              {/* Four columns, not seven, and the three on the right are the
+                  figures. A trial balance is read across the numbers: the
+                  account is the index to a row and the row IS its three
+                  amounts, so the identity — purpose, then category, currency
+                  and the account_id under it — takes whatever width is left
+                  (`w-full`, `max-w-0`, truncating) and the figures take
+                  theirs first and never wrap. Seven columns each asking for
+                  room is what pushed the balance column off the right edge. */}
+              <table className="w-full border-collapse text-[0.75rem]">
                 <thead>
                   <tr className="border-b border-line text-[0.68rem] tracking-wide text-dim">
-                    <th className="py-1 pr-3 text-left font-medium">account</th>
-                    <th className="py-1 pr-3 text-left font-medium">purpose</th>
-                    <th className="py-1 pr-3 text-left font-medium">category</th>
-                    <th className="py-1 pr-3 text-left font-medium">ccy</th>
-                    <th className="py-1 pr-3 text-right font-medium">debits</th>
-                    <th className="py-1 pr-3 text-right font-medium">credits</th>
-                    <th className="py-1 text-right font-medium">balance</th>
+                    <th className="w-full py-1 pr-3 text-left font-medium">
+                      account
+                    </th>
+                    <th className="hidden w-px py-1 pr-3 text-right font-medium whitespace-nowrap sm:table-cell">
+                      debits
+                    </th>
+                    <th className="hidden w-px py-1 pr-3 text-right font-medium whitespace-nowrap sm:table-cell">
+                      credits
+                    </th>
+                    <th className="w-px py-1 text-right font-medium whitespace-nowrap">
+                      balance
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -146,29 +166,56 @@ export function TrialBalance({
                       key={`${row.account_id}-${row.currency}`}
                       className="border-b border-rule"
                     >
-                      <td className="max-w-[9rem] py-1.5 pr-3">
-                        <Identifier value={row.account_id} truncate />
+                      <td className="w-full max-w-0 py-1.5 pr-3 align-top">
+                        <Mono className="block truncate" title={row.purpose}>
+                          {row.purpose}
+                        </Mono>
+                        <span className="flex min-w-0 items-baseline gap-2">
+                          <Mono className="min-w-0 truncate text-[0.66rem] text-dim">
+                            {row.category} · {row.currency}
+                            {ownerById(accounts, row.account_id) === null
+                              ? ""
+                              : ` · ${ownerById(accounts, row.account_id)}`}
+                          </Mono>
+                          <Identifier value={row.account_id} truncate />
+                        </span>
+                        {/* Too narrow for three figure columns — a gross of
+                            90,071,992,547,409.93 is 130px on its own. The
+                            gross pair moves UNDER the account rather than
+                            behind a scrollbar; the balance keeps its column,
+                            because it is the one a trial balance is read
+                            down. Nothing is dropped, and no figure is ever
+                            what scrolls away. */}
+                        <span className="mt-0.5 flex flex-wrap items-baseline gap-x-3 sm:hidden">
+                          <span className="text-[0.66rem] text-dim">
+                            debits{" "}
+                            <Amount
+                              minor={row.debits}
+                              currency={row.currency}
+                              className="text-[0.72rem] text-ink"
+                            />
+                          </span>
+                          <span className="text-[0.66rem] text-dim">
+                            credits{" "}
+                            <Amount
+                              minor={row.credits}
+                              currency={row.currency}
+                              className="text-[0.72rem] text-credit"
+                            />
+                          </span>
+                        </span>
                       </td>
-                      <td className="py-1.5 pr-3">
-                        <Mono>{row.purpose}</Mono>
-                      </td>
-                      <td className="py-1.5 pr-3">
-                        <Mono className="text-dim">{row.category}</Mono>
-                      </td>
-                      <td className="py-1.5 pr-3">
-                        <Mono className="text-dim">{row.currency}</Mono>
-                      </td>
-                      <td className="py-1.5 pr-3 text-right">
+                      <td className="hidden w-px py-1.5 pr-3 text-right align-top whitespace-nowrap sm:table-cell">
                         <Amount minor={row.debits} currency={row.currency} />
                       </td>
-                      <td className="py-1.5 pr-3 text-right">
+                      <td className="hidden w-px py-1.5 pr-3 text-right align-top whitespace-nowrap sm:table-cell">
                         <Amount
                           minor={row.credits}
                           currency={row.currency}
                           className="text-credit"
                         />
                       </td>
-                      <td className="py-1.5 text-right">
+                      <td className="w-px py-1.5 text-right align-top whitespace-nowrap">
                         <Amount
                           minor={row.balance_debit_positive}
                           currency={row.currency}
@@ -179,17 +226,25 @@ export function TrialBalance({
                 </tbody>
                 <tfoot>
                   <tr className="border-t border-line">
-                    <td colSpan={4} className="py-2 text-[0.7rem] text-dim">
-                      gross, summed with BigInt
-                      {debits.exact && credits.exact ? "" : " (a value did not parse as an integer)"}
+                    <td className="w-full py-2 pr-3 text-[0.7rem] text-dim">
+                      gross{debits.exact && credits.exact ? "" : " (a value did not parse)"}
+                      <span className="mt-0.5 flex flex-wrap items-baseline gap-x-3 sm:hidden">
+                        <span>
+                          debits <Amount minor={debits.total} className="text-[0.72rem] text-ink" />
+                        </span>
+                        <span>
+                          credits{" "}
+                          <Amount minor={credits.total} className="text-[0.72rem] text-credit" />
+                        </span>
+                      </span>
                     </td>
-                    <td className="py-2 pr-3 text-right">
+                    <td className="hidden w-px py-2 pr-3 text-right whitespace-nowrap sm:table-cell">
                       <Amount minor={debits.total} />
                     </td>
-                    <td className="py-2 pr-3 text-right">
+                    <td className="hidden w-px py-2 pr-3 text-right whitespace-nowrap sm:table-cell">
                       <Amount minor={credits.total} className="text-credit" />
                     </td>
-                    <td className="py-2 text-right">
+                    <td className="w-px py-2 text-right whitespace-nowrap">
                       <span
                         className={`text-[0.7rem] ${
                           debits.total === credits.total
@@ -208,15 +263,9 @@ export function TrialBalance({
             </div>
           )}
 
-          <ReproducibilityNote kind="trial-balance" />
         </>
       ) : null}
 
-      <PanelNote>
-        <code>balance_debit_positive</code> is the arithmetic value — roll up
-        with that one. <code>normal_balance</code> never enters it, so a contra
-        account carries its own sign rather than being flipped twice.
-      </PanelNote>
     </Panel>
   );
 }

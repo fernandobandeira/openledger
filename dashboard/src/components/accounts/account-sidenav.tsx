@@ -3,6 +3,7 @@
 import { ChevronDownIcon, PlusIcon, RefreshCwIcon, RotateCcwIcon } from "lucide-react";
 
 import { Amount } from "@/components/amount";
+import { GuideLink } from "@/components/guide-link";
 import { Trouble } from "@/components/answer-view";
 import { TextField } from "@/components/field";
 import { Mono } from "@/components/mono";
@@ -10,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import type { AccountRegister } from "@/components/read/use-account-register";
 import type { AccountBalances } from "@/components/accounts/use-account-balances";
 import { isNegativeMinor } from "@/lib/amount";
+import { ownerOf } from "@/lib/owner";
 import type { AccountRead } from "@/lib/ledger";
 import { cn } from "@/lib/utils";
 
@@ -59,19 +61,28 @@ export function AccountSidenav({
 
   return (
     <nav aria-label="Accounts" className="flex min-w-0 flex-col gap-3">
-      <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
-        <h2 className="text-[0.8rem] tracking-[0.14em] text-peach uppercase">
-          Accounts
-        </h2>
-        <p className="text-[0.68rem] text-dim">
-          {register.accounts.length} on this book
-        </p>
+      <div className="flex flex-col gap-0.5">
+        <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+          <h2 className="text-[0.8rem] tracking-[0.14em] text-peach uppercase">
+            Accounts
+          </h2>
+          <p className="text-[0.68rem] text-dim">
+            {register.accounts.length} on this book
+          </p>
+        </div>
+        {/* The routes, named the way every panel names its own: these
+            figures came off the wire. There is no separate balance form any
+            more — it asked you to paste an account_id to read a number this
+            column already has. */}
+        <Mono className="text-[0.62rem] leading-relaxed text-dim">
+          GET /v1/accounts · /{"{account_id}"}/balance
+        </Mono>
       </div>
 
       {register.accounts.length === 0 ? (
         <p className="border border-dashed border-rule px-3 py-4 text-[0.75rem] leading-relaxed text-dim">
           {register.hasListed
-            ? "No accounts on this book yet. Run the first step of the walk, which opens the ten this trace needs, or open one yourself below."
+            ? "No accounts yet. Run the first step of the walk, or open one from the bar above."
             : "Listing…"}
         </p>
       ) : null}
@@ -142,12 +153,12 @@ export function AccountSidenav({
 
       <Filters register={register} />
 
-      <p className="text-[0.66rem] leading-relaxed text-dim">
-        Balances are <span className="text-ink">debit-positive</span>, so a
-        credit-normal account — a payable, revenue, equity — reads negative
-        here and the presentation flip is the reader&rsquo;s. They are the
-        POSTED balance: a pending transaction&rsquo;s legs are in the journal
-        and not in this number.
+      <p className="flex flex-wrap items-baseline gap-x-2 text-[0.66rem] leading-relaxed text-dim">
+        <span>
+          Posted, <span className="text-ink">debit-positive</span>, summed
+          across stripes — no stripe appears in the answer.
+        </span>
+        <GuideLink>reading a balance&rsquo;s sign</GuideLink>
       </p>
     </nav>
   );
@@ -199,8 +210,7 @@ function AccountRow({
             {account.purpose}
           </Mono>
           <Mono className="block truncate text-[0.64rem] text-dim">
-            {account.currency} ·{" "}
-            {account.owner_id === null ? "house" : account.owner_id}
+            {account.currency} · {ownerOf(account)}
           </Mono>
         </span>
         {posted === null ? (
@@ -244,7 +254,7 @@ function Filters({ register }: { register: AccountRegister }) {
           value={register.ownerId}
           onChange={register.setOwnerId}
           placeholder="any"
-          hint="Selects no house accounts — they have no owner."
+          hint="No house accounts — they have no owner."
         />
         <TextField
           label="limit"
@@ -252,7 +262,7 @@ function Filters({ register }: { register: AccountRegister }) {
           onChange={register.setLimit}
           inputMode="numeric"
           placeholder="100"
-          hint="1–1000. Outside that it is refused, not clamped."
+          hint="1–1000, refused not clamped."
         />
         <Button
           size="xs"

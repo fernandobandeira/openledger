@@ -7,7 +7,7 @@ import { Amount } from "@/components/amount";
 import { Trouble } from "@/components/answer-view";
 import { TextField } from "@/components/field";
 import { Identifier, Mono } from "@/components/mono";
-import { Empty, Panel, PanelNote } from "@/components/panel";
+import { Empty, Panel } from "@/components/panel";
 import { Button } from "@/components/ui/button";
 import {
   readTransaction,
@@ -80,13 +80,11 @@ export function ReadTransaction({
             </dd>
             <dt className="text-dim">effective_at</dt>
             <dd>
-              <Mono>{transaction.effective_at}</Mono>{" "}
-              <span className="text-[0.7rem] text-dim">the caller&rsquo;s clock</span>
+              <Mono>{transaction.effective_at}</Mono>
             </dd>
             <dt className="text-dim">recorded_at</dt>
             <dd>
-              <Mono>{transaction.recorded_at}</Mono>{" "}
-              <span className="text-[0.7rem] text-dim">the database&rsquo;s clock</span>
+              <Mono>{transaction.recorded_at}</Mono>
             </dd>
             <dt className="text-dim">resolves_id</dt>
             <dd>
@@ -112,11 +110,6 @@ export function ReadTransaction({
 
           <Entries entries={transaction.entries} />
 
-          <PanelNote>
-            <code>status</code> is what was recorded, not a stage this row moves
-            through: a pending transaction becomes posted through a new
-            transaction naming it in <code>resolves_id</code>.
-          </PanelNote>
         </div>
       ) : null}
     </Panel>
@@ -127,10 +120,7 @@ function Entries({ entries }: { entries: TransactionRead["entries"] }) {
   if (entries.length === 0) {
     return (
       <div className="mt-3">
-        <Empty>
-          No entries. This is a void — the zero-posting marker a reversal of a
-          pending transaction writes.
-        </Empty>
+        <Empty>No entries — this is a void.</Empty>
       </div>
     );
   }
@@ -147,7 +137,7 @@ function Entries({ entries }: { entries: TransactionRead["entries"] }) {
 
   return (
     <div className="mt-3 overflow-x-auto">
-      <table className="w-full min-w-[30rem] border-collapse text-[0.75rem]">
+      <table className="w-full min-w-[26rem] border-collapse text-[0.75rem]">
         <thead>
           <tr className="border-b border-line text-[0.68rem] tracking-wide text-dim">
             <th className="py-1 pr-3 text-left font-medium">account</th>
@@ -162,7 +152,7 @@ function Entries({ entries }: { entries: TransactionRead["entries"] }) {
             const isCredit = entry.direction === "credit";
             return (
               <tr key={index} className="border-b border-rule">
-                <td className="max-w-[16rem] py-1 pr-3">
+                <td className="max-w-[12rem] py-1 pr-3">
                   <Identifier value={entry.account_id} truncate />
                 </td>
                 <td className="py-1 pr-3">
@@ -170,7 +160,7 @@ function Entries({ entries }: { entries: TransactionRead["entries"] }) {
                     {entry.direction}
                   </Mono>
                 </td>
-                <td className="py-1 pr-3 text-right">
+                <td className="w-px py-1 pr-3 text-right whitespace-nowrap">
                   <Amount
                     minor={entry.amount_minor}
                     currency={entry.currency}
@@ -204,11 +194,6 @@ function Entries({ entries }: { entries: TransactionRead["entries"] }) {
           </tr>
         </tfoot>
       </table>
-      <p className="mt-1 text-[0.68rem] text-dim">
-        Direction carries the sign; the amount never does. Each{" "}
-        <code>amount_minor</code> is an exact-integer string, and the totals are
-        summed with BigInt — nothing here goes through <code>Number</code>.
-      </p>
     </div>
   );
 }

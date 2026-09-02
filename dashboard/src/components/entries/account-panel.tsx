@@ -28,7 +28,7 @@ export function AccountPanel({
   activeLeg,
   onFillSource,
   onFillDestination,
-  onFillBalance,
+  onComposePosting,
 }: {
   tenant: string;
   account: AccountRead | null;
@@ -41,17 +41,14 @@ export function AccountPanel({
   activeLeg: number;
   onFillSource: (accountId: string) => void;
   onFillDestination: (accountId: string) => void;
-  onFillBalance: (accountId: string, currency: string) => void;
+  /** Open the posting drawer over the page, with the legs as they stand. */
+  onComposePosting: () => void;
 }) {
   if (account === null) {
     return (
       <section aria-label="Entries" className="flex flex-col gap-3">
         <SectionHeading />
-        <Empty>
-          Pick an account on the left and its entries appear here. If the book
-          is empty, the first step of the walk above opens the ten accounts a
-          card programme needs.
-        </Empty>
+        <Empty>Pick an account on the left, or run the first step of the walk.</Empty>
       </section>
     );
   }
@@ -64,7 +61,7 @@ export function AccountPanel({
         activeLeg={activeLeg}
         onFillSource={onFillSource}
         onFillDestination={onFillDestination}
-        onFillBalance={onFillBalance}
+        onComposePosting={onComposePosting}
       />
 
       <AxisToggle
@@ -76,12 +73,7 @@ export function AccountPanel({
       <Trouble answer={entries.answer} />
 
       {entries.entries.length === 0 && !entries.busy ? (
-        <Empty>
-          No entries on this account at this commit position. An account that
-          exists and has never been written answers an empty page, never a 404
-          — the two are different questions and only the register can tell them
-          apart.
-        </Empty>
+        <Empty>No entries at this commit position — an empty page, never a 404.</Empty>
       ) : (
         <EntriesTable
           entries={entries.entries}
@@ -126,13 +118,13 @@ function AccountHeader({
   activeLeg,
   onFillSource,
   onFillDestination,
-  onFillBalance,
+  onComposePosting,
 }: {
   account: AccountRead;
   activeLeg: number;
   onFillSource: (accountId: string) => void;
   onFillDestination: (accountId: string) => void;
-  onFillBalance: (accountId: string, currency: string) => void;
+  onComposePosting: () => void;
 }) {
   return (
     <div className="flex flex-col gap-2">
@@ -166,12 +158,8 @@ function AccountHeader({
           >
             …as destination
           </Button>
-          <Button
-            size="xs"
-            variant="ghost"
-            onClick={() => onFillBalance(account.account_id, account.currency)}
-          >
-            Look its balance up below
+          <Button size="xs" variant="ghost" onClick={onComposePosting}>
+            Open the posting form
           </Button>
         </span>
       </div>
@@ -207,23 +195,15 @@ function PageFooter({ entries }: { entries: AccountEntries }) {
       )}
       <p className="text-[0.68rem] text-dim">
         {entries.entries.length} entr
-        {entries.entries.length === 1 ? "y" : "ies"} over {entries.pages} page
+        {entries.entries.length === 1 ? "y" : "ies"} · {entries.pages} page
         {entries.pages === 1 ? "" : "s"}
         {entries.pinnedCursor === null ? null : (
           <>
             {" "}
-            · pinned at{" "}
-            <Mono className="text-peach">{entries.pinnedCursor}</Mono>, and
-            every page after the first rides that same cursor
+            · pinned at <Mono className="text-peach">{entries.pinnedCursor}</Mono>
           </>
         )}
-        {entries.nextAfter === null ? (
-          <>
-            {" "}
-            · <code>next_after</code> is null, so this page did not fill and
-            there is no more
-          </>
-        ) : null}
+        {entries.nextAfter === null ? " · next_after is null" : ""}
       </p>
     </div>
   );

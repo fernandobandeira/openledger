@@ -47,9 +47,25 @@ function outOfOrder(
   return found;
 }
 
-/** `2026-08-01T10:00:00Z` → `2026-08-01 10:00:00`, with the instant on hover. */
-function readable(instant: string): string {
-  return instant.slice(0, 19).replace("T", " ");
+/**
+ * `2026-08-01T10:00:00Z` → `2026-08-01 10:00:00`, with the instant on hover.
+ *
+ * Below `sm` the two halves stack, which buys back ~80px across the two date
+ * columns — enough that the AMOUNT is still on screen on a phone. A caption
+ * may wrap; a figure may not be the thing that scrolls away.
+ */
+function Instant({ instant }: { instant: string }) {
+  const date = instant.slice(0, 10);
+  const time = instant.slice(11, 19);
+  return (
+    <>
+      <span className="block sm:hidden">{date}</span>
+      <span className="block sm:hidden">{time}</span>
+      <span className="hidden sm:inline">
+        {date} {time}
+      </span>
+    </>
+  );
 }
 
 /**
@@ -73,7 +89,7 @@ export function EntriesTable({
 
   return (
     <div className="overflow-x-auto">
-      <table className="w-full min-w-[48rem] border-collapse text-[0.75rem]">
+      <table className="w-full border-collapse text-[0.75rem] sm:min-w-[34rem]">
         <caption className="sr-only">
           The entries on this account, {axis === "recorded"
             ? "in the order the ledger recorded them"
@@ -100,7 +116,11 @@ export function EntriesTable({
             </th>
             <th className="py-1 pr-3 text-left font-medium">direction</th>
             <th className="py-1 pr-3 text-right font-medium">amount</th>
-            <th className="py-1 pr-3 text-right font-medium">account_seq</th>
+            {/* Neither a figure nor a link: on a narrow screen it is the
+                column that gives way, so the amount never has to. */}
+            <th className="hidden py-1 pr-3 text-right font-medium sm:table-cell">
+              account_seq
+            </th>
             <th className="py-1 text-left font-medium">transaction</th>
           </tr>
         </thead>
@@ -127,7 +147,7 @@ export function EntriesTable({
                     )}
                     title={entry.recorded_at}
                   >
-                    {readable(entry.recorded_at)}
+                    <Instant instant={entry.recorded_at} />
                   </Mono>
                 </td>
                 <td className="py-1.5 pr-3 whitespace-nowrap">
@@ -138,7 +158,7 @@ export function EntriesTable({
                     )}
                     title={entry.effective_at}
                   >
-                    {readable(entry.effective_at)}
+                    <Instant instant={entry.effective_at} />
                   </Mono>
                   {disagrees ? <Backdated axis={axis} /> : null}
                 </td>
@@ -147,21 +167,21 @@ export function EntriesTable({
                     {entry.direction}
                   </Mono>
                 </td>
-                <td className="py-1.5 pr-3 text-right">
+                <td className="w-px py-1.5 pr-3 text-right whitespace-nowrap">
                   <Amount
                     minor={entry.amount_minor}
                     currency={entry.currency}
                     className={isCredit ? "text-credit" : undefined}
                   />
                 </td>
-                <td className="py-1.5 pr-3 text-right">
+                <td className="hidden py-1.5 pr-3 text-right sm:table-cell">
                   <Mono className="text-dim">{entry.account_seq}</Mono>
                 </td>
                 <td className="py-1.5">
                   <button
                     type="button"
                     onClick={() => onOpenTransaction(entry.transaction_id)}
-                    className="max-w-[13rem] truncate font-mono text-[0.68rem] text-dim underline decoration-dotted underline-offset-2 hover:text-peach"
+                    className="max-w-[5rem] truncate font-mono sm:max-w-[10rem] text-[0.68rem] text-dim underline decoration-dotted underline-offset-2 hover:text-peach"
                     title={`Open ${entry.transaction_id}`}
                   >
                     {entry.transaction_id}

@@ -5,11 +5,10 @@ import { useState } from "react";
 import { Trouble } from "@/components/answer-view";
 import { InstantField, TextField } from "@/components/field";
 import { Mono } from "@/components/mono";
-import { Panel, PanelNote } from "@/components/panel";
+import { Panel } from "@/components/panel";
 import {
   CursorField,
   PinnedCursor,
-  ReproducibilityNote,
   RunRow,
 } from "@/components/report-frame";
 import { StatementFace } from "@/components/read/statement-face";
@@ -77,7 +76,7 @@ export function BalanceSheet({
           label="as_of"
           value={asOf}
           onChange={setAsOf}
-          hint="An ends_at: entries strictly before this instant. A business date here loses a day."
+          hint="Entries strictly before this instant."
         />
         <CursorField value={cursor} onChange={setCursor} />
         <TextField
@@ -86,7 +85,6 @@ export function BalanceSheet({
           onChange={setChartVersion}
           inputMode="numeric"
           placeholder="empty — the server names one"
-          hint="Naming a version pins the presentation only below max(version)."
         />
       </div>
 
@@ -119,21 +117,12 @@ export function BalanceSheet({
             onPin={onPin}
           />
           <p className="mt-2 text-[0.72rem] text-dim">
-            presented at chart version{" "}
-            <Mono className="text-ink">{report.chart_version}</Mono> — always
-            named, never defaulted
+            chart version <Mono className="text-ink">{report.chart_version}</Mono>
           </p>
           <StatementFace lines={report.lines} check="balance-sheet" />
-          <ReproducibilityNote kind="balance-sheet" />
         </>
       ) : null}
 
-      <PanelNote>
-        A version that does not present every account type with posted entries
-        as at this instant is refused as{" "}
-        <code>chart_version_incomplete</code> rather than silently dropping a
-        sub-book from a face that would still balance.
-      </PanelNote>
     </Panel>
   );
 }

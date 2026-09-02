@@ -1,7 +1,8 @@
 "use client";
 
-import { StepReport } from "@/components/scenario/step-report";
+import { GuideLink } from "@/components/guide-link";
 import { StepTile } from "@/components/scenario/step-tile";
+import { WalkLog } from "@/components/scenario/walk-log";
 import type { Scenario } from "@/components/scenario/use-scenario";
 
 /**
@@ -15,7 +16,10 @@ import type { Scenario } from "@/components/scenario/use-scenario";
  * it.
  *
  * It is an on-ramp, not a demo mode: every step writes to the live book this
- * page is pointed at, through the same routes the composer below uses.
+ * page is pointed at, through the same routes the composer's drawers use.
+ *
+ * Under the tiles is the record of the walk — every run kept, newest first —
+ * because a walk is a sequence of writes and the last one is not the story.
  */
 export function ScenarioStrip({
   scenario,
@@ -24,23 +28,15 @@ export function ScenarioStrip({
   scenario: Scenario;
   onOpenTransaction: (transactionId: string) => void;
 }) {
-  const showing =
-    scenario.showing === null
-      ? null
-      : (scenario.steps.find((step) => step.id === scenario.showing) ?? null);
-  const showingResult =
-    showing === null ? null : scenario.stateOf(showing.id).result;
-
   return (
     <section aria-label="The card lifecycle" className="flex flex-col gap-3">
       <header className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
         <h2 className="text-[0.8rem] tracking-[0.14em] text-peach uppercase">
           A card, end to end
         </h2>
-        <p className="max-w-prose text-[0.72rem] text-dim">
-          One 500.00 purchase, in the order it happens. Each step writes to the
-          book named above through the same routes the composer uses — click
-          one and read what it wrote.
+        <p className="flex items-baseline gap-3 text-[0.72rem] text-dim">
+          One 500.00 purchase, in order.
+          <GuideLink>booking a payment</GuideLink>
         </p>
       </header>
 
@@ -60,13 +56,7 @@ export function ScenarioStrip({
         ))}
       </ol>
 
-      {showing !== null && showingResult !== null ? (
-        <StepReport
-          step={showing}
-          result={showingResult}
-          onOpenTransaction={onOpenTransaction}
-        />
-      ) : null}
+      <WalkLog scenario={scenario} onOpenTransaction={onOpenTransaction} />
     </section>
   );
 }
