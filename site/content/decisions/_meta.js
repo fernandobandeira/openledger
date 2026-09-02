@@ -25,4 +25,5 @@ export default {
   '0022-amounts-are-strings': '0022 · Amounts are strings on the wire',
   '0023-account-statement': '0023 · An account has a statement',
   '0024-closing-a-period': '0024 · Closing a period',
+  '0025-shortfalls-and-balance-floors': '0025 · Shortfalls and balance floors',
 }
